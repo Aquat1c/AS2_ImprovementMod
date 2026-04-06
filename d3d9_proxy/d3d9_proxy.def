@@ -1,0 +1,6 @@
+; Alice Senki 2 - D3D9 Proxy Module Definition
+; Exports only the functions the game actually uses
+
+LIBRARY d3d9
+EXPORTS
+    Direct3DCreate9 = Proxy_Direct3DCreate9 @1

@@ -1,0 +1,452 @@
+/**
+ * Alice Senki 2 - Constants / Addresses
+ *
+ * Centralized memory addresses, offsets, and fixed-size constants used by the mod.
+ * Keep raw address macros out of feature headers.
+ */
+
+#pragma once
+
+#include <stdint.h>
+
+// Game state addresses + mode/substate constants
+#include "game_state.h"
+
+// ============================================================================
+// Game Base Address (assuming no ASLR for old games)
+// ============================================================================
+
+#define GAME_BASE 0x00400000
+
+// ============================================================================
+// Critical Function Addresses (from disassembly analysis)
+// ============================================================================
+
+// Main game loop - runs at 60fps, handles mode switching
+#define ADDR_MAIN_LOOP          (GAME_BASE + 0x1D2AC0)  // sub_5D2AC0
+
+// Match mode handler (case 8 in main loop)
+#define ADDR_MATCH_MODE         (GAME_BASE + 0x0C8F60)  // sub_4C8F60
+
+// Input system
+#define ADDR_INPUT_POLL         (GAME_BASE + 0x161F50)  // sub_561F50 - Main input poll
+#define ADDR_INPUT_PROCESS      (GAME_BASE + 0x162060)  // sub_562060 - Input processing
+#define ADDR_KEYBOARD_STATE     (GAME_BASE + 0x22FD00)  // sub_62FD00 - Keyboard check
+#define ADDR_JOYSTICK_STATE     (GAME_BASE + 0x22FF50)  // sub_62FF50 - Joystick check
+
+// Timing
+// sub_635F80 - wrapper around timeGetTime() used by the main loop frame limiter
+#define ADDR_GET_TICK           (GAME_BASE + 0x235F80)  // sub_635F80
+
+// Static CRT functions (game has statically linked CRT - NOT importing from msvcrt.dll)
+#define ADDR_STATIC_SRAND       (GAME_BASE + 0x314590)  // Static CRT srand()
+#define ADDR_STATIC_RAND        (GAME_BASE + 0x31459D)  // Static CRT rand()
+
+// Entity state functions
+#define ADDR_ENTITY_STATE_SET   (GAME_BASE + 0x0BF630)  // sub_4BF630
+#define ADDR_ENTITY_RESET       (GAME_BASE + 0x09E720)  // sub_49E720
+#define ADDR_ENTITY_INIT        (GAME_BASE + 0x09E050)  // sub_49E050
+#define ADDR_CAN_ACT_SET        (GAME_BASE + 0x09E040)  // sub_49E040
+#define ADDR_COMBO_TRACKING     (GAME_BASE + 0x09E8F0)  // sub_49E8F0
+
+// Entity checksum function
+#define ADDR_ENTITY_GET_CHECKSUM (GAME_BASE + 0x09EE60)  // sub_49EE60
+
+// Sound/effect
+#define ADDR_EFFECT_SET_PARAMS  (GAME_BASE + 0x0C3ED0)  // sub_4C3ED0 — Effect_SetParams1 (entity state writer, NOT sound)
+#define ADDR_SE_PLAY            (GAME_BASE + 0x0C3C00)  // sub_4C3C00 — SE_Play (actual sound effect trigger)
+
+// Legacy aliases (kept for backward compatibility / reference)
+#define ADDR_SOUND_TRIGGER      ADDR_EFFECT_SET_PARAMS   // DEPRECATED: was misidentified as sound trigger
+#define ADDR_BGM_CONTROL        ADDR_SE_PLAY             // DEPRECATED: was misidentified as BGM control
+
+// Network functions (existing game netcode - UDP based)
+#define ADDR_NET_INIT_HOST      (GAME_BASE + 0x1FB9E0)  // sub_5FB9E0
+#define ADDR_NET_INIT_CLIENT    (GAME_BASE + 0x1FBBC0)  // sub_5FBBC0
+#define ADDR_NET_RECV_HOST      (GAME_BASE + 0x1FBA80)  // sub_5FBA80
+#define ADDR_NET_RECV_CLIENT    (GAME_BASE + 0x1FBC40)  // sub_5FBC40
+#define ADDR_NET_SEND_HOST      (GAME_BASE + 0x1FBB60)  // sub_5FBB60
+#define ADDR_NET_SEND_CLIENT    (GAME_BASE + 0x1FBCA0)  // sub_5FBCA0
+#define ADDR_NET_CLOSE_HOST     (GAME_BASE + 0x1FBBA0)  // sub_5FBBA0
+#define ADDR_NET_CLOSE_CLIENT   (GAME_BASE + 0x1FBCE0)  // sub_5FBCE0
+
+// ============================================================================
+// Global State Addresses
+// ============================================================================
+
+#define ADDR_GAME_STATE_BASE    0x816358  // dword_816358
+
+// Debug/Logging
+#define ADDR_QUIT_FLAG          0x816358
+#define ADDR_FRAME_COUNTER      0x81635C
+#define ADDR_SIM_FRAME_COUNTER  0x816490
+#define ADDR_LAST_FRAME_TIME    0x816360
+#define ADDR_FPS_COUNT          0x816364
+#define ADDR_MATCH_INTRO_FADE_TIMER (ADDR_GAME_STATE_BASE + 0x18)  // 0x816370 - native intro/fade countdown that releases match input lock
+#define ADDR_MATCH_ACTIVE       ADDR_GAME_TYPE  // DEPRECATED (was misnamed). Use ADDR_GAME_TYPE.
+#define ADDR_CURRENT_PLAYER     0x76C5FC
+
+// ============================================================================
+// Vanilla Netplay Frame Tracking Addresses
+// ============================================================================
+
+#define ADDR_FRAME_SIMULATION   0x816490
+#define ADDR_FRAME_DISPLAY      0x816494
+#define ADDR_FRAME_WRITE_IDX    0x816498
+#define ADDR_FRAME_NET_IDX      0x81649C
+#define ADDR_REMOTE_FRAME       0x87FC20
+
+#define ADDR_VANILLA_LOCAL_INPUTS   0x8164A0
+#define ADDR_VANILLA_REMOTE_INPUTS  0x87FC24
+#define VANILLA_LOCAL_INPUT_SIZE    170978
+#define VANILLA_REMOTE_INPUT_SIZE   157672
+
+#define ADDR_VANILLA_SYNC_LOCAL     0x8E93A4
+#define ADDR_VANILLA_SYNC_REMOTE    0x8E93AE
+
+#define ADDR_MATCH_BASE         0x76C5F8
+#define MATCH_HEADER_SIZE       0x1D30
+
+// Per-frame temp data: 68 bytes at match+0x700 (0x76CCF8).
+// Cleared by Match_ClearPerFrameTempData (sub_4C3BE0) at the top of
+// Game_Update_MatchLoop, OUTSIDE the while(!Input_TryGetNextFrame) loop.
+// During rollback resimulation the while-loop iterates multiple times
+// without returning to the outer function, so this clearing never runs
+// between resim frames.  We must clear it ourselves before each frame
+// to prevent stale collision/hit temp data from bleeding across frames.
+#define MATCH_PER_FRAME_TEMP_OFFSET  0x700                // match + 0x700 = 0x76CCF8
+#define MATCH_PER_FRAME_TEMP_SIZE    0x44                 // 68 bytes (memset to 0)
+#define ADDR_MATCH_PER_FRAME_TEMP    (ADDR_MATCH_BASE + MATCH_PER_FRAME_TEMP_OFFSET)
+
+// Match context gap: state between the 16-byte match header and the effect array.
+// Contains camera scroll, screen shake, weather particles, and misc match state.
+// Camera scroll (match+1860) is read by HitDef_Create, boundary clamping, and AI logic.
+// Weather particles (match+1868, 200×28 bytes) call rand() every frame — if not
+// restored during rollback, the RNG sequence diverges and ALL gameplay desyncs.
+#define ADDR_MATCH_CONTEXT      (ADDR_MATCH_BASE + 16)   // 0x76C608
+#define MATCH_CONTEXT_SIZE      (ADDR_EFFECT_ARRAY - ADDR_MATCH_CONTEXT)  // 7456 bytes (0x1D20)
+
+// ============================================================================
+// Netplay state addresses (vanilla)
+// ============================================================================
+
+#define ADDR_NETPLAY_PORT       0x8E9480   // Network port (hostshort)
+#define ADDR_NETPLAY_ROLE       0x816474   // 1=host, 0=client
+#define ADDR_NETPLAY_CONNECTED  0x816475   // 1=connected
+
+// Input Configuration (offsets from ADDR_GAME_STATE_BASE)
+#define OFF_P1_JOY_ID           864440
+#define OFF_P1_BUTTON_MASKS     864444
+#define OFF_P2_JOY_ID           864484
+#define OFF_P2_BUTTON_MASKS     864488
+#define OFF_P1_INPUT_STATE      867110
+#define OFF_P2_INPUT_STATE      867318
+
+// ============================================================================
+// Entity Memory Layout
+// ============================================================================
+
+#define ADDR_ENTITY_ARRAY       0x776668
+#define ADDR_ENTITY_ARRAY_ALT   0x77666C
+#define ENTITY_ARRAY_STRIDE     27203
+
+#define ADDR_P1_ENTITY_BASE     0x776668
+#define ADDR_P2_ENTITY_BASE     0x790F74
+#define ENTITY_SIZE             0x1A90C
+
+// ============================================================================
+// Sound System Addresses
+// ============================================================================
+
+#define ADDR_DSOUND_INTERFACE   0x9CC414
+#define ADDR_DSOUND_PRIMARY     0x9CC418
+#define ADDR_DSOUND_LOADER      0x9CC408
+#define ADDR_DSOUND_PERF        0x9CC40C
+#define ADDR_SOUND_POOL         0x9CC44C
+#define ADDR_SOUND_MODE         0x9D046C
+#define ADDR_SOUND_STATE        0x9D0470
+#define SOUND_POOL_SIZE         4096
+
+#define ADDR_SOUND_INIT         (GAME_BASE + 0x229AA0)
+#define ADDR_SOUND_LOAD         (GAME_BASE + 0x14A840)
+#define ADDR_SOUND_PLAY         (GAME_BASE + 0x22AB40)
+#define ADDR_SOUND_CREATE       (GAME_BASE + 0x22C060)
+#define ADDR_SOUND_QUICK        (GAME_BASE + 0x22C340)
+
+// ============================================================================
+// Input Structures
+// ============================================================================
+
+#define INPUT_OFF_CURRENT       64
+#define INPUT_OFF_PREVIOUS      76
+#define INPUT_OFF_JUST_PRESSED  88
+
+#define ADDR_P1_INPUT_BUFFER    0x8E9E62
+#define ADDR_P2_INPUT_BUFFER    0x8E9F32
+// Global per-player input buffer is 104 words (208 bytes):
+// held, previous, just-pressed, cooldown, rapid-fire, hold counters, reserves.
+#define INPUT_BUFFER_SIZE       208
+
+#define ADDR_P1_INPUT_STATE     0x8E9E9A
+#define ADDR_P2_INPUT_STATE     0x8E9F6A
+// Just-pressed array is 10 words (20 bytes) at base + 56.
+#define INPUT_STATE_SIZE        20
+
+#define ADDR_INPUT_READ_IDX     0x816490
+#define ADDR_INPUT_DISPLAY_IDX  0x816494
+#define ADDR_INPUT_WRITE_IDX    0x816498
+#define ADDR_INPUT_NET_IDX      0x81649C
+
+#define ADDR_P1_INPUT_HISTORY   0x8164A0
+#define ADDR_P2_INPUT_HISTORY   0x87FC24
+#define INPUT_HISTORY_MAX       216000
+#define INPUT_HISTORY_P1_SIZE   170978
+#define INPUT_HISTORY_P2_SIZE   157672
+
+#define INPUT_HISTORY_WINDOW    20
+
+#define ADDR_DINPUT_KEYBOARD    0x9D09CC
+#define ADDR_DINPUT_JOYSTICK    0x9D2AE8
+#define DINPUT_JOY_STRUCT_SIZE  664
+#define DINPUT_JOY_MAX          16
+#define DINPUT_JOY_BTN_OFFSET   64
+
+#define ADDR_DINPUT_INTERFACE   0x9D09B8
+#define ADDR_DINPUT_KB_DEVICE   0x9D09C0
+#define ADDR_DINPUT_FALLBACK    0x9D09B0
+
+#define ADDR_DINPUT_KB_REFRESH  (GAME_BASE + 0x230130)
+#define ADDR_DINPUT_JOY_REFRESH (GAME_BASE + 0x2302F0)
+
+#define JOY_DOWN    0x0001
+#define JOY_UP      0x0002
+#define JOY_LEFT    0x0004
+#define JOY_RIGHT   0x0008
+#define JOY_BTN_A   0x0010
+#define JOY_BTN_B   0x0020
+#define JOY_BTN_C   0x0040
+#define JOY_BTN_D   0x0080
+#define JOY_START   0x0100
+#define JOY_SELECT  0x0200
+
+// ============================================================================
+// Effect/Projectile System Addresses
+// ============================================================================
+// Effect array: 200 slots, 32 bytes per entry, circular buffer
+// sub_4A92C0 spawns effects, sub_4A9330 updates all effects
+
+// Gap between ADDR_EFFECT_INDEX and ADDR_MATCH_BASE (12 bytes at 0x76C5EC..0x76C5F7)
+// Contains: byte_76C5EC (render fade/blend), 3B padding, SE_ChannelIndex (audio), 4B unknown.
+// Not critical for simulation, but captured for determinism completeness.
+#define ADDR_PRE_MATCH_GAP      0x76C5EC
+#define PRE_MATCH_GAP_SIZE      12        // 0x76C5EC to 0x76C5F7 inclusive
+
+#define ADDR_EFFECT_ARRAY       0x76E328  // dword_76E328[] - Effect entity pointers
+#define ADDR_EFFECT_INDEX       0x76C5E8  // dword_76C5E8 - Current write index (wraps at 200)
+#define ADDR_EFFECT_TYPE        0x76E32C  // byte_76E32C[] - Effect type per slot
+#define ADDR_EFFECT_X           0x76E32E  // word_76E32E[] - X position per slot
+#define ADDR_EFFECT_Y           0x76E330  // word_76E330[] - Y position per slot
+#define ADDR_EFFECT_TIMER       0x76E332  // word_76E332[] - Timer/lifetime per slot
+#define ADDR_EFFECT_DATA        0x76E334  // unk_76E334[] - Additional effect data (5 DWORDs)
+
+#define EFFECT_MAX_SLOTS        200       // Maximum effects (0-199, wraps at 0xC7)
+#define EFFECT_ENTRY_SIZE       32        // 32 bytes per effect entry
+
+// Summon/Assist Array (separate from visual effects)
+// 100 slots × 272 bytes = 27200 bytes, immediately after effects
+#define ADDR_SUMMON_ARRAY       0x76FC28  // unk_76FC28[] - Summon entity array
+#define SUMMON_MAX_SLOTS        100       // Maximum summons
+#define SUMMON_ENTRY_SIZE       272       // 272 bytes per summon
+
+// Key effect functions
+#define ADDR_EFFECT_SPAWN       (GAME_BASE + 0x0A92C0)  // sub_4A92C0 - Spawn effect
+#define ADDR_EFFECT_CLEAR       (GAME_BASE + 0x0A92A0)  // sub_4A92A0 - Clear all effects
+#define ADDR_EFFECT_UPDATE      (GAME_BASE + 0x0A9330)  // sub_4A9330 - Update all effects
+#define ADDR_SUMMON_SPAWN       (GAME_BASE + 0x0BE100)  // sub_4BE100 - Spawn summon
+#define ADDR_SUMMON_UPDATE      (GAME_BASE + 0x0BE3E0)  // sub_4BE3E0 - Update summons
+
+// Effect types (common ones from switch in sub_4A9330)
+#define EFFECT_TYPE_STANDARD_30F    0x01  // 30 frame lifetime
+#define EFFECT_TYPE_STANDARD_45F    0x02  // 45 frame lifetime
+#define EFFECT_TYPE_STANDARD_20F    0x03  // 20 frame lifetime
+#define EFFECT_TYPE_RANDOM_VEL      0x06  // Random velocity
+#define EFFECT_TYPE_LARGE_SPREAD    0x0B  // Large random spread
+#define EFFECT_TYPE_PROJECTILE_BASE 0x63  // Projectile types start
+#define EFFECT_TYPE_SUPER_BASE      0xC1  // Super effects start
+
+// ============================================================================
+// Combo Counter System Addresses
+// ============================================================================
+
+#define ENTITY_OFF_COMBO_P1     41254     // 0xA126 - P1 combo counter (byte)
+#define ENTITY_OFF_COMBO_P2     150066    // 0x249F2 - P2 combo counter (byte)
+#define ENTITY_OFF_GUARD_GAUGE  41248     // 0xA120 - Guard gauge (word)
+#define ENTITY_OFF_ROUND_WINS   41254     // 0xA126 - Round wins (shared offset with combo)
+#define ENTITY_OFF_HP_DISPLAY   41284     // 0xA144 - HP display value (word)
+#define ENTITY_OFF_GAME_STATE   42952     // 0xA7D8 - Game state (11 = active match)
+
+// Character structure size (P1 base to P2 base offset)
+#define CHARACTER_STRUCT_SIZE   108812    // 0x1A90C bytes per character
+
+// ============================================================================
+// Entity Structure Offsets
+// ============================================================================
+
+// Core entity offsets (relative to entity base)
+#define ENTITY_OFF_HP           0x00B0  // +176, 2 bytes
+#define ENTITY_OFF_METER        0x00B4  // +180, 2 bytes
+#define ENTITY_OFF_X_POS        0x00B8  // +184, 2 bytes
+#define ENTITY_OFF_Y_POS        0x00BA  // +186, 2 bytes
+#define ENTITY_OFF_PUSH_DIR     0x00BC  // +188, 1 byte (collision push direction)
+#define ENTITY_OFF_FACING       0x00BD  // +189, 1 byte
+#define ENTITY_OFF_CHAR_ID      0x00B0  // +176, character ID (from word_776718 indexing)
+#define ENTITY_OFF_ACTION_ID    0x046C  // +1132, 4 bytes (unverified)
+#define ENTITY_OFF_ANIMATION    0x0470  // +1136, 2 bytes
+#define ENTITY_OFF_OPPONENT     0x0004  // +4, pointer to opponent entity
+
+// State blocks
+#define ENTITY_OFF_STATE_A      0x0690  // +1680, set by sub_4BF630
+#define ENTITY_OFF_STATE_B      0x06CC  // +1740, cleared by sub_49E720
+#define ENTITY_OFF_COMBO        0x078C  // +1932, combo tracking
+#define ENTITY_OFF_FLAG_CE      0x00B6  // +182, flag used in AI calculations
+#define ENTITY_OFF_HITSTUN      0x1A7F0 // +108528, hitstun array (sub_4C1F60)
+
+// Box system offsets
+#define ENTITY_OFF_BOX_FLAGS    0x0674  // +1652, 24 bytes
+#define ENTITY_OFF_ANIM_INDEX   0x1004  // +4100, DWORD
+#define ENTITY_OFF_ANIM_DATA    0x1008  // +4104, animation data array
+#define ENTITY_OFF_BOX_ARRAY    0xA33F  // +41791, box processing array
+
+// Animation / box constants
+#define ANIM_DATA_STRIDE        104
+#define BOX_COORD_SCALE         20
+#define BOX_TYPE_COLLISION      0
+#define BOX_TYPE_HURTBOX        40
+#define BOX_TYPE_HITBOX         72
+#define BOX_STRUCT_SIZE         40
+
+// ============================================================================
+// Entity Base Pointers
+// ============================================================================
+
+#define ADDR_P1_BASE_PRIMARY    (GAME_BASE + 0x376050)  // Direct pointer to P1
+#define ADDR_P1_HP_DIRECT       0x00776718
+
+#define ADDR_P2_BASE_PRIMARY    (GAME_BASE + 0x390D5C)  // Estimated P2 base
+#define ADDR_P2_HP_DIRECT       0x00791024
+
+// ============================================================================
+// Round/Match State
+// ============================================================================
+
+#define ADDR_ROUND_TIMER        0x790E50
+#define ADDR_WIN_COUNT          0x790E54
+#define ADDR_COMBO_COUNT        0x790E56
+
+#define ADDR_CHAR_DATA_TABLE    0x8E95F8
+#define ADDR_CHAR_INFO_TABLE    0x8E9650
+#define ADDR_MATCH_DATA         0x8E93EC
+
+// ============================================================================
+// Savestate / Compact Entity Regions
+// ============================================================================
+
+#define ENTITY_CORE_START       0x00B0
+#define ENTITY_CORE_END         0x00D0
+
+// Action state buffer base: contains reaction state slots, action dispatch ID,
+// action priority, and action flags.  Despite the legacy name "INPUT", this is
+// NOT an input-only region — entity+0x44C is the ACTION HANDLER DISPATCH ID
+// used by every character's per-frame action switch.  DO NOT zero or exclude
+// from savestates/digests.
+#define ENTITY_INPUT_START      0x0444
+#define ENTITY_INPUT_END        0x046C
+#define ENTITY_ACTION_START     0x046C
+#define ENTITY_ACTION_END       0x04C0
+#define ENTITY_STATE_A_START    0x0690
+#define ENTITY_STATE_A_END      0x06CC
+#define ENTITY_STATE_B_START    0x06CC
+#define ENTITY_STATE_B_END      0x0778
+#define ENTITY_COMBAT_START     0x0778
+#define ENTITY_COMBAT_END       0x07D0
+#define ENTITY_TIMER_START      0x07A0
+#define ENTITY_TIMER_END        0x07B4
+
+#define ENTITY_CHAR_STATE_START 0xA060
+#define ENTITY_CHAR_STATE_SIZE  0x0600
+
+// ============================================================================
+// Character Select (Mode 6) Addresses
+// ============================================================================
+
+// Base struct pointer for game state (a1 in sub_5BD450)
+#define ADDR_CHARSEL_BASE       0x816358
+
+// P1 cursor/control block (6 bytes starting at byte_816017)
+#define ADDR_CHARSEL_P1_ENABLE  0x816017  // -1=disabled, 0=browsing, 1=selected
+#define ADDR_CHARSEL_P1_CURSOR  0x816018  // Grid index (0-20, lookup via CHARSEL_GRID_TABLE)
+#define ADDR_CHARSEL_P1_CONFIRM 0x816019  // 0=not confirmed, 1=confirmed
+#define ADDR_CHARSEL_P1_AGE     0x81601A  // Counter/timer after confirm
+
+// P2 cursor/control block (6 bytes starting at byte_81601D)
+#define ADDR_CHARSEL_P2_ENABLE  0x81601D  // -1=disabled, 0=browsing, 1=selected
+#define ADDR_CHARSEL_P2_CURSOR  0x81601E  // Grid index
+#define ADDR_CHARSEL_P2_CONFIRM 0x81601F  // Confirmed flag
+#define ADDR_CHARSEL_P2_AGE     0x816020  // Counter/timer after confirm
+
+// Character/palette selection results (inside selection structs)
+// P1 sel struct at CHARSEL_BASE + 867080, character at +176, palette at +180
+// P2 sel struct at CHARSEL_BASE + 867288, character at +176, palette at +180
+#define ADDR_CHARSEL_P1_CHAR_ID 0x8E9F10  // DWORD - P1 selected character ID
+#define ADDR_CHARSEL_P1_PALETTE 0x8E9F14  // BYTE  - P1 palette (0-7, -1=unset)
+#define ADDR_CHARSEL_P2_CHAR_ID 0x8E9FE0  // DWORD - P2 selected character ID
+#define ADDR_CHARSEL_P2_PALETTE 0x8E9FE4  // BYTE  - P2 palette (0-7, -1=unset)
+
+// Grid-to-character lookup table (21 entries)
+#define ADDR_CHARSEL_GRID_TABLE 0x74C200  // dword_74C200[21] - maps grid index → char ID
+
+// Misc CharSel state
+#define ADDR_CHARSEL_CANCEL     0x816029  // 1 = cancel (return to menu)
+#define ADDR_CHARSEL_DISCONNECT 0x81602C  // 1 = disconnect triggered
+#define ADDR_CHARSEL_MATCH_CHAR 0x816024  // LOBYTE = character for match config
+#define ADDR_STAGE_CURSOR       0x816024  // During sub=7 (Preview): LOBYTE=cursor pos, BYTE1=confirmed, BYTE2=roulette counter
+#define ADDR_CHARSEL_STAGE_ID   0x816471  // BYTE1(dword_816470) = stage ID
+#define ADDR_CHARSEL_TEAM_COLOR 0x815FFE  // Team color selection
+
+// ============================================================================
+// DXLib Internal Addresses
+// ============================================================================
+
+// DXLib "allow duplicate instance" flag. When set to 1 before DXLib_Init,
+// the FindWindowA check in sub_630C80 logs but does not abort.
+#define ADDR_DXLIB_ALLOW_DUPLICATE 0x9DB884
+
+// ============================================================================
+// Save Data / Unlock Flags (config.dat → 80-byte array at 0x8163C0)
+// ============================================================================
+
+#define ADDR_CONFIG_VERSION     0x8163BC  // dword_8163BC — config.dat checksum/version (258 when loaded)
+#define ADDR_UNLOCK_FLAGS_BASE  0x8163C0  // byte_8163C0[80] — full unlock flag array
+#define ADDR_UNLOCK_FLAGS_SIZE  80        // Total size of the unlock flag block
+#define ADDR_UNLOCK_ANY_CLEAR   0x8163C0  // Any arcade/story cleared
+#define ADDR_UNLOCK_ARCADE_DONE 0x8163C8  // Arcade mode completed
+#define ADDR_UNLOCK_STORY_DONE  0x8163C9  // Story/VS mode completed
+#define ADDR_UNLOCK_CHAR_BASE   0x8163CC  // byte_8163CC[17] — character unlock flags
+#define ADDR_UNLOCK_CHAR_COUNT  17        // Base roster size (indices 0–16)
+#define ADDR_UNLOCK_BOSS        0x8163DD  // Boss character unlock flag
+#define ADDR_UNLOCK_GALLERY_BASE 0x8163FA // byte_8163FA[~22] — gallery unlock flags
+#define ADDR_UNLOCK_GALLERY_COUNT 22      // Approximate gallery entry count
+
+// ============================================================================
+// In-Match Settings (vanilla pause menu)
+// ============================================================================
+
+// BYTE2(dword_8E93B8) — Character Select enable/disable toggle (0 or 1)
+// When 0, charsel sub-items 3-6 are grayed out and some AI behaviors skip.
+// Must be forced to 1 during mod-owned netplay to prevent desync.
+#define ADDR_CHARSEL_ENABLE     0x8E93BA
+
+// BYTE2(dword_8E93EC) — Stage Select enable/disable toggle (0 or 1)
+// When 0, stage is auto-picked from character's home stage lookup table.
+// When 1, the stage selection grid is shown during charsel.
+#define ADDR_STAGESEL_ENABLE    0x8E93EE

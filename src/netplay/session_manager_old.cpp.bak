@@ -1,0 +1,1463 @@
+/**
+ * Alice Senki 2 - Session Manager Implementation
+ *
+ * Real UDP connection layer replacing NetplayMockSession.
+ */
+
+#include "session_manager.h"
+#include "rollback_session.h"
+#include "udp_socket.h"
+#include "packet_codec.h"
+#include "state_digest.h"
+#include "netplay_hooks.h"
+#include "ack_tracker.h"
+#include "reliable_channel.h"
+#include "charsel_sync.h"
+#include "match_bootstrap.h"
+#include "adaptive_delay.h"
+#include "desync_diagnostics.h"
+#include "spectator_manager.h"
+#include "input_sync_hooks.h"
+#include "upnp_manager.h"
+#include "log_window.h"
+#include "as2_rollback.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+namespace SessionManager {
+
+// ============================================================================
+// Timing constants (in game frames at 60fps)
+// ============================================================================
+
+static constexpr int kHelloRetransmitFrames  = 30;   // ~500ms
+static constexpr int kHandshakeTimeoutFrames = 300;  // 5 seconds
+static constexpr int kConnectTimeoutFrames   = 7200; // 120 seconds (host waits for joiner)
+static constexpr int kPingIntervalEarlyFrames  = 10; // ~167ms (first N pings for fast convergence)
+static constexpr int kPingIntervalSteadyFrames = 20; // ~333ms (steady state — responsive tracking)
+static constexpr int kPingEarlyCount           = 10; // How many pings use the fast interval
+static constexpr int kPingTimeoutFrames      = 600;  // 10 seconds without pong
+static constexpr int kDigestIntervalFrames   = 600;  // Every 10 seconds during gameplay
+
+// ============================================================================
+// Internal state
+// ============================================================================
+
+namespace {
+
+static Mode     s_mode = Mode::None;
+static State    s_state = State::Idle;
+static uint32_t s_revision = 0;
+static char     s_peerNickname[NetplayConfig::kNicknameCap] = "";
+static char     s_endpoint[48] = "";
+static char     s_status[128] = "Session idle.";
+static char     s_lastError[128] = "";
+
+// Socket
+static SOCKET   s_socket = INVALID_SOCKET;
+
+// Peer address (filled on Hello receive for host, or from config for join)
+static sockaddr_in s_peerAddr = {};
+static bool     s_peerAddrValid = false;
+
+// Config snapshot (copied at Start time)
+static NetplayConfig::Config s_config = {};
+
+// Connection tracking
+static uint64_t s_sessionId  = 0;
+static uint32_t s_connectionId = 0;
+
+// Timing
+static int      s_stateTimer = 0;          // Frames since entering current state
+static int      s_retransmitTimer = 0;     // Frames since last retransmit
+static int      s_lastPongFrame = 0;       // Frame of last received pong
+static int      s_pingTimer = 0;           // Frames since last ping sent
+static int      s_digestTimer = 0;         // Frames since last digest sent
+static uint32_t s_nextPingId = 1;
+static uint32_t s_pendingPingTime = 0;     // Timestamp of pending ping
+static uint32_t s_pendingPingId = 0;
+static uint32_t s_pendingPingVisualFrame = 0;
+static uint32_t s_packetsReceivedAtPing = 0;
+static uint32_t s_pollHitCapCountAtPing = 0;
+
+// RTT
+static float    s_rttMs = 0.0f;
+static int      s_rttSamples = 0;
+static constexpr int kDelayRttWindow = 8;
+static float    s_delayRttSamples[kDelayRttWindow] = {};
+static int      s_delayRttSampleCount = 0;
+static int      s_delayRttSampleIndex = 0;
+static float    s_delayRttMs = 0.0f;
+
+// Socket pump diagnostics
+static uint32_t s_lastPollTimestampMs = 0;
+static uint32_t s_lastPollGapMs = 0;
+static uint32_t s_maxPollGapSincePingMs = 0;
+static uint32_t s_lastPollPacketCount = 0;
+static uint32_t s_pollHitCapCount = 0;
+static uint32_t s_pollGapSpikeCount = 0;
+
+// Stats
+static uint32_t s_packetsSent = 0;
+static uint32_t s_packetsReceived = 0;
+
+// Handshake nonces
+static uint64_t s_localNonce  = 0;
+static uint64_t s_remoteNonce = 0;
+
+// GekkoData packet buffer (received by SessionManager, consumed by RollbackSession adapter)
+static constexpr int kMaxGekkoBuffer = 64;
+static SessionManager::BufferedPacket s_gekkoBuffer[kMaxGekkoBuffer];
+static int s_gekkoBufferHead = 0;
+static int s_gekkoBufferTail = 0;
+static int s_gekkoBufferCount = 0;
+static uint32_t s_gekkoPacketsBuffered = 0;
+static uint32_t s_gekkoPacketsDrained = 0;
+
+// Flag: set when we receive a Ready packet from the host telling us to enter CharSel.
+// The menu controller polls this to auto-launch CharSel on the joiner's side.
+static bool s_pendingCharSelStart = false;
+static uint32_t s_charSelReadyFlags = 0;
+
+// Host-side: track whether the joiner has acked our Ready (CharSel start signal).
+// If not, we retransmit every kReadyRetransmitFrames in UpdateCharSel.
+static bool    s_readyAckedByPeer = false;
+static uint32_t s_readyRetransmitTimer = 0;
+static constexpr uint32_t kReadyRetransmitFrames = 60;  // ~1 second
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+static void CopyText(char* dst, size_t cap, const char* src) {
+    if (!dst || cap == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    strncpy_s(dst, cap, src, _TRUNCATE);
+}
+
+static int CurrentPingInterval() {
+    return (s_nextPingId <= (uint32_t)kPingEarlyCount)
+         ? kPingIntervalEarlyFrames
+         : kPingIntervalSteadyFrames;
+}
+
+static bool AddrMatches(const sockaddr_in* a, const sockaddr_in* b) {
+    if (!a || !b) return false;
+    return a->sin_family == b->sin_family &&
+           a->sin_port == b->sin_port &&
+           a->sin_addr.s_addr == b->sin_addr.s_addr;
+}
+
+static uint64_t ComputeSharedSessionId(uint64_t a, uint64_t b) {
+    uint64_t lo = (a < b) ? a : b;
+    uint64_t hi = (a < b) ? b : a;
+    uint64_t mixed = lo ^ (hi + 0x9E3779B97F4A7C15ull + (lo << 6) + (lo >> 2));
+    mixed ^= (mixed >> 33);
+    mixed *= 0xff51afd7ed558ccduLL;
+    mixed ^= (mixed >> 33);
+    return mixed ? mixed : 1ull;
+}
+
+static uint32_t ComputeSharedConnectionId(uint64_t sessionId, uint64_t a, uint64_t b) {
+    uint64_t lo = (a < b) ? a : b;
+    uint64_t hi = (a < b) ? b : a;
+    uint64_t mixed = sessionId ^ (lo + 0x517cc1b727220a95ull) ^ (hi << 1) ^ (lo >> 1);
+    mixed ^= (mixed >> 32);
+    uint32_t out = (uint32_t)(mixed & 0xFFFFFFFFu);
+    return out ? out : 1u;
+}
+
+static void FinalizeSessionIdentity() {
+    if (s_localNonce == 0 || s_remoteNonce == 0) return;
+
+    uint64_t sharedSessionId = ComputeSharedSessionId(s_localNonce, s_remoteNonce);
+    uint32_t sharedConnectionId = ComputeSharedConnectionId(sharedSessionId, s_localNonce, s_remoteNonce);
+
+    if (s_sessionId == sharedSessionId && s_connectionId == sharedConnectionId) {
+        return;
+    }
+
+    s_sessionId = sharedSessionId;
+    s_connectionId = sharedConnectionId;
+    LOG_NET_INFO("[Session] Shared identity established (session=0x%llX connection=0x%08X)",
+                 s_sessionId, s_connectionId);
+}
+
+static bool IsHandshakePacket(PacketCodec::PacketType type) {
+    return type == PacketCodec::PacketType::Hello ||
+           type == PacketCodec::PacketType::HelloAck;
+}
+
+static uint64_t GenerateNonce() {
+    // Simple nonce from timestamp + counter for uniqueness
+    static uint32_t counter = 0;
+    uint64_t t = PacketCodec::GetTimestampMs();
+    return (t << 16) ^ (++counter);
+}
+
+static void UpdateDelayRttEstimate(float sampleMs) {
+    if (sampleMs <= 0.0f) {
+        return;
+    }
+
+    s_delayRttSamples[s_delayRttSampleIndex] = sampleMs;
+    s_delayRttSampleIndex = (s_delayRttSampleIndex + 1) % kDelayRttWindow;
+    if (s_delayRttSampleCount < kDelayRttWindow) {
+        s_delayRttSampleCount++;
+    }
+
+    float sorted[kDelayRttWindow] = {};
+    for (int i = 0; i < s_delayRttSampleCount; ++i) {
+        sorted[i] = s_delayRttSamples[i];
+    }
+
+    for (int i = 0; i < s_delayRttSampleCount - 1; ++i) {
+        int best = i;
+        for (int j = i + 1; j < s_delayRttSampleCount; ++j) {
+            if (sorted[j] < sorted[best]) {
+                best = j;
+            }
+        }
+        if (best != i) {
+            float tmp = sorted[i];
+            sorted[i] = sorted[best];
+            sorted[best] = tmp;
+        }
+    }
+
+    int stableIndex = s_delayRttSampleCount / 4;
+    if (stableIndex >= s_delayRttSampleCount) {
+        stableIndex = s_delayRttSampleCount - 1;
+    }
+    s_delayRttMs = sorted[stableIndex];
+}
+
+static float GetDelaySelectionRttMs() {
+    return (s_delayRttMs > 0.0f) ? s_delayRttMs : s_rttMs;
+}
+
+static int ClampCharSelDelay(int delay) {
+    if (delay < 2) delay = 2;
+    if (delay > 10) delay = 10;
+    return delay;
+}
+
+static uint32_t EncodeCharSelReadyFlags(int delay) {
+    return (uint32_t)(ClampCharSelDelay(delay) & 0xFF);
+}
+
+static int DecodeCharSelReadyDelay(uint32_t readyFlags) {
+    const int encodedDelay = (int)(readyFlags & 0xFFu);
+    if (encodedDelay <= 0) return 0;
+    return ClampCharSelDelay(encodedDelay);
+}
+
+static int ChooseHostCharSelDelay() {
+    int delay = CharSelSync::SuggestInputDelay(s_rttMs);
+    if (s_config.preferred_delay_frames > delay) {
+        delay = s_config.preferred_delay_frames;
+    }
+    return ClampCharSelDelay(delay);
+}
+
+static void SetState(State next, const char* fmt, ...) {
+    char buffer[128];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    if (s_state != next || strcmp(s_status, buffer) != 0) {
+        LOG_NET_INFO("[Session] %s -> %s | %s",
+                    GetStateName(s_state), GetStateName(next), buffer);
+        s_state = next;
+        CopyText(s_status, sizeof(s_status), buffer);
+        s_stateTimer = 0;
+        s_retransmitTimer = 0;
+        ++s_revision;
+    }
+}
+
+static void SetError(const char* fmt, ...) {
+    char buffer[128];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, fmt, args);
+    va_end(args);
+    CopyText(s_lastError, sizeof(s_lastError), buffer);
+    SetState(State::Error, "%s", buffer);
+}
+
+static void CloseSocket() {
+    if (s_socket != INVALID_SOCKET) {
+        UdpSocket::Close(s_socket);
+        s_socket = INVALID_SOCKET;
+    }
+}
+
+// ============================================================================
+// Packet Send Helpers
+// ============================================================================
+
+static bool SendPacket(PacketCodec::PacketType type, const void* payload, int payloadLen,
+                       uint16_t channel = PacketCodec::CHANNEL_CONTROL_FAST,
+                       uint16_t flags = 0) {
+    if (s_socket == INVALID_SOCKET || !s_peerAddrValid) return false;
+
+    PacketCodec::ModNetHeader hdr;
+    PacketCodec::InitHeader(&hdr, type, channel, flags);
+    hdr.session_id = s_sessionId;
+    hdr.connection_id = s_connectionId;
+    hdr.seq = AckTracker::NextSendSeq(channel);
+    AckTracker::GetAckState(channel, &hdr.ack, &hdr.ack_bits);
+
+    uint8_t buf[PacketCodec::MAX_PACKET_SIZE];
+    int totalLen = PacketCodec::Encode(&hdr, payload, payloadLen, buf, sizeof(buf));
+    if (totalLen <= 0) return false;
+
+    int sent = UdpSocket::SimSendTo(s_socket, buf, totalLen, &s_peerAddr);
+    if (sent > 0) {
+        s_packetsSent++;
+        return true;
+    }
+    return false;
+}
+
+static void SendHello() {
+    PacketCodec::HelloPayload hello = {};
+    hello.build_hash = NetplayHooks::GetBuildSignature();
+    hello.gameplay_hash = hello.build_hash;  // Same for now
+    hello.feature_flags = 0;
+    hello.requested_player_slot = 0;
+    hello.listen_port = s_config.listen_port;
+    hello.client_nonce = s_localNonce;
+    hello.nickname_len = (uint16_t)strnlen_s(s_config.nickname, sizeof(s_config.nickname));
+    memset(hello.nickname, 0, sizeof(hello.nickname));
+    strncpy_s(hello.nickname, sizeof(hello.nickname), s_config.nickname, _TRUNCATE);
+
+    SendPacket(PacketCodec::PacketType::Hello, &hello, sizeof(hello));
+}
+
+static void SendHelloAck(bool accepted, uint16_t assignedSlot, uint32_t rejectReason = PacketCodec::REJECT_NONE) {
+    PacketCodec::HelloAckPayload ack = {};
+    ack.accepted_feature_flags = 0;
+    ack.assigned_player_slot = assignedSlot;
+    ack.max_spectators = 0;
+    ack.server_nonce = s_localNonce;
+    ack.reject_reason = accepted ? PacketCodec::REJECT_NONE : rejectReason;
+    ack.build_hash = NetplayHooks::GetBuildSignature();
+    ack.nickname_len = (uint16_t)strnlen_s(s_config.nickname, sizeof(s_config.nickname));
+    memset(ack.nickname, 0, sizeof(ack.nickname));
+    strncpy_s(ack.nickname, sizeof(ack.nickname), s_config.nickname, _TRUNCATE);
+
+    SendPacket(PacketCodec::PacketType::HelloAck, &ack, sizeof(ack));
+}
+
+static void SendPing() {
+    PacketCodec::PingPayload ping = {};
+    ping.ping_id = s_nextPingId++;
+    ping.local_time_ms = PacketCodec::GetTimestampMs();
+    if (SendPacket(PacketCodec::PacketType::Ping, &ping, sizeof(ping))) {
+        s_pendingPingTime = ping.local_time_ms;
+        s_pendingPingId = ping.ping_id;
+        s_pendingPingVisualFrame = AS2_GetVisualFrameCounter();
+        s_packetsReceivedAtPing = s_packetsReceived;
+        s_pollHitCapCountAtPing = s_pollHitCapCount;
+        s_maxPollGapSincePingMs = 0;
+    }
+}
+
+static void SendPong(uint32_t pingId, uint32_t echoedTime) {
+    PacketCodec::PongPayload pong = {};
+    pong.ping_id = pingId;
+    pong.echoed_time_ms = echoedTime;
+    SendPacket(PacketCodec::PacketType::Pong, &pong, sizeof(pong));
+}
+
+static void SendDisconnect(uint32_t reason) {
+    PacketCodec::DisconnectPayload disc = {};
+    disc.reason_code = reason;
+    // Try a few times since UDP is unreliable
+    for (int i = 0; i < 3; i++) {
+        SendPacket(PacketCodec::PacketType::Disconnect, &disc, sizeof(disc));
+    }
+}
+
+static void SendStateDigest() {
+    PacketCodec::StateDigestPayload digest;
+    StateDigest::Capture(&digest);
+    StateDigest::RecordLocal(&digest);
+    SendPacket(PacketCodec::PacketType::StateDigest, &digest, sizeof(digest));
+}
+
+// ============================================================================
+// Packet Receive / Dispatch
+// ============================================================================
+
+static void HandleHello(const PacketCodec::HelloPayload* hello, const sockaddr_in* from) {
+    if (s_mode != Mode::Host) return;
+
+    // Accept during Connecting (initial), Handshake (retransmit HelloAck), or
+    // Connected (joiner never received HelloAck — resend it).
+    if (s_state == State::Connecting) {
+        // First Hello — set up peer and transition to Handshake
+        // Validate build hash — reject immediately on mismatch
+        uint32_t localBuild = NetplayHooks::GetBuildSignature();
+        if (hello->build_hash != localBuild) {
+            LOG_NET_WARN("[Session] Build mismatch! local=0x%08X remote=0x%08X — rejecting connection",
+                        localBuild, hello->build_hash);
+            // Send the peer address so we can send the rejection
+            s_peerAddr = *from;
+            s_peerAddrValid = true;
+            SendHelloAck(false, 0, PacketCodec::REJECT_BUILD_MISMATCH);
+            s_peerAddrValid = false;
+            SetError("Version mismatch with peer (local=0x%08X remote=0x%08X). Both players must use the same mod version.",
+                     localBuild, hello->build_hash);
+            return;
+        }
+
+        s_peerAddr = *from;
+        s_peerAddrValid = true;
+        s_remoteNonce = hello->client_nonce;
+        FinalizeSessionIdentity();
+
+        memset(s_peerNickname, 0, sizeof(s_peerNickname));
+        int nickLen = hello->nickname_len;
+        if (nickLen > 0) {
+            if (nickLen >= (int)sizeof(s_peerNickname)) nickLen = (int)sizeof(s_peerNickname) - 1;
+            memcpy(s_peerNickname, hello->nickname, nickLen);
+            s_peerNickname[nickLen] = '\0';
+        }
+
+        UdpSocket::FormatAddr(from, s_endpoint, sizeof(s_endpoint));
+        LOG_NET_INFO("[Session] Hello from '%s' at %s (local_build=0x%08X remote_build=0x%08X) — match OK",
+                    s_peerNickname, s_endpoint, localBuild, hello->build_hash);
+
+        SendHelloAck(true, 2);
+        SetState(State::Handshake, "Build verified (0x%08X). Completing handshake with %s.",
+                 localBuild, s_peerNickname[0] ? s_peerNickname : "peer");
+    } else if (s_state == State::Handshake || s_state == State::Connected) {
+        // Joiner is retransmitting Hello — they never got our HelloAck. Resend it.
+        LOG_NET_INFO("[Session] Duplicate Hello from joiner (state=%s), retransmitting HelloAck",
+                    GetStateName(s_state));
+        SendHelloAck(true, 2);
+    }
+}
+
+static void HandleHelloAck(const PacketCodec::HelloAckPayload* ack) {
+    if (s_mode != Mode::Join) return;
+
+    if (s_state != State::Connecting && s_state != State::Handshake) {
+        return;
+    }
+
+    if (ack->reject_reason != 0) {
+        if (ack->reject_reason == PacketCodec::REJECT_BUILD_MISMATCH) {
+            uint32_t localBuild = NetplayHooks::GetBuildSignature();
+            SetError("Version mismatch with host (local=0x%08X host=0x%08X). Both players must use the same mod version.",
+                     localBuild, ack->build_hash);
+        } else {
+            SetError("Connection rejected by host (reason=%u).", ack->reject_reason);
+        }
+        return;
+    }
+
+    // Joiner-side build verification (in case host's code is older and doesn't reject)
+    uint32_t localBuild = NetplayHooks::GetBuildSignature();
+    if (ack->build_hash != localBuild) {
+        LOG_NET_WARN("[Session] Joiner-side build mismatch: local=0x%08X host=0x%08X — disconnecting",
+                    localBuild, ack->build_hash);
+        SetError("Version mismatch with host (local=0x%08X host=0x%08X). Both players must use the same mod version.",
+                 localBuild, ack->build_hash);
+        return;
+    }
+
+    s_remoteNonce = ack->server_nonce;
+    FinalizeSessionIdentity();
+
+    // Extract host nickname
+    memset(s_peerNickname, 0, sizeof(s_peerNickname));
+    int nickLen = ack->nickname_len;
+    if (nickLen > 0) {
+        if (nickLen >= (int)sizeof(s_peerNickname)) nickLen = (int)sizeof(s_peerNickname) - 1;
+        memcpy(s_peerNickname, ack->nickname, nickLen);
+        s_peerNickname[nickLen] = '\0';
+    }
+
+    LOG_NET_INFO("[Session] HelloAck from '%s' (slot=%u local_build=0x%08X host_build=0x%08X) — match OK",
+                s_peerNickname, ack->assigned_player_slot, localBuild, ack->build_hash);
+
+    SetState(State::Connected, "Connected to %s.",
+             s_peerNickname[0] ? s_peerNickname : "host");
+    s_lastPongFrame = 0;
+    s_pingTimer = 0;
+}
+
+static void HandlePing(const PacketCodec::PingPayload* ping) {
+    SendPong(ping->ping_id, ping->local_time_ms);
+}
+
+static void HandlePong(const PacketCodec::PongPayload* pong) {
+    uint32_t now = PacketCodec::GetTimestampMs();
+    const bool matchedPending = s_pendingPingId != 0 && pong->ping_id == s_pendingPingId;
+    const uint32_t visualNow = AS2_GetVisualFrameCounter();
+    const uint32_t visualFrames = matchedPending ? (visualNow - s_pendingPingVisualFrame) : 0;
+    const uint32_t packetsDuringPing = matchedPending ? (s_packetsReceived - s_packetsReceivedAtPing) : 0;
+    const uint32_t pollCapHitsDuringPing = matchedPending ? (s_pollHitCapCount - s_pollHitCapCountAtPing) : 0;
+    const bool pumpStallLikely = s_maxPollGapSincePingMs >= 50;
+    const char* causeHint = pumpStallLikely ? "pump-stall-or-load" : "network-or-remote-stall";
+
+    // Use modular subtraction for tick wrap safety (~49.7 day wrap)
+    uint32_t rttRaw = now - pong->echoed_time_ms;
+    if (rttRaw < 5000) {  // Sanity: discard RTT > 5 seconds (stale/wrapped)
+        float sample = (float)rttRaw;
+        if (s_rttSamples == 0) {
+            s_rttMs = sample;
+        } else {
+            s_rttMs = s_rttMs * 0.8f + sample * 0.2f;
+        }
+        s_rttSamples++;
+        UpdateDelayRttEstimate(sample);
+        AdaptiveDelay::UpdateRttFloor(sample);
+        ReliableChannel::SetRttMs(s_rttMs);
+        if (sample >= 50.0f) {
+            LOG_NET_INFO(
+                "[Session] App RTT high sample: sample=%.1fms avg=%.1fms frames=%u lastPollGap=%ums maxPollGap=%ums recvSincePing=%u pollCapHits=%u state=%s cause=%s",
+                sample,
+                s_rttMs,
+                visualFrames,
+                s_lastPollGapMs,
+                s_maxPollGapSincePingMs,
+                packetsDuringPing,
+                pollCapHitsDuringPing,
+                GetStateName(s_state),
+                causeHint);
+        } else {
+            LOG_NET_DEBUG(
+                "[Session] App RTT sample: %.1fms (avg=%.1fms, samples=%d frames=%u lastPollGap=%ums maxPollGap=%ums recvSincePing=%u pollCapHits=%u cause=%s)",
+                sample,
+                s_rttMs,
+                s_rttSamples,
+                visualFrames,
+                s_lastPollGapMs,
+                s_maxPollGapSincePingMs,
+                packetsDuringPing,
+                pollCapHitsDuringPing,
+                causeHint);
+        }
+    }
+
+    if (matchedPending) {
+        s_pendingPingId = 0;
+        s_pendingPingTime = 0;
+        s_pendingPingVisualFrame = 0;
+        s_packetsReceivedAtPing = s_packetsReceived;
+        s_pollHitCapCountAtPing = s_pollHitCapCount;
+        s_maxPollGapSincePingMs = 0;
+    }
+    s_lastPongFrame = 0;
+}
+
+static void HandleStateDigest(const PacketCodec::StateDigestPayload* remote) {
+    StateDigest::CompareRemote(remote);
+}
+
+static void HandleDisconnect(const PacketCodec::DisconnectPayload* disc) {
+    LOG_NET_INFO("[Session] Peer disconnected (reason=%u)", disc->reason_code);
+    SetError("Peer disconnected.");
+}
+
+static void HandleReady(const PacketCodec::ReadyPayload* ready) {
+    if (s_state != State::Connected && s_state != State::CharSel) {
+        LOG_NET_WARN("[Session] Ignoring Ready in state %s", GetStateName(s_state));
+        return;
+    }
+
+    const int charSelDelay = DecodeCharSelReadyDelay(ready->ready_flags);
+    
+    LOG_NET_INFO("[Session] Received Ready (flags=0x%08X charselDelay=%d)",
+                 ready->ready_flags,
+                 charSelDelay);
+    
+    if (s_mode == Mode::Join) {
+        // Joiner received "start CharSel" from host — signal the menu controller
+        s_charSelReadyFlags = ready->ready_flags;
+        s_pendingCharSelStart = true;
+        
+        // Send Ready back as acknowledgment
+        PacketCodec::ReadyPayload ack = {};
+        ack.ready_flags = ready->ready_flags;
+        SendPacket(PacketCodec::PacketType::Ready, &ack, sizeof(ack));
+        LOG_NET_INFO("[Session] Sent Ready ack to host (charselDelay=%d)", charSelDelay);
+    } else {
+        // Host received Ready ack from joiner — both sides confirmed
+        s_readyAckedByPeer = true;
+        LOG_NET_INFO("[Session] Host received Ready ack from joiner (charselDelay=%d)", charSelDelay);
+    }
+}
+
+static void ProcessReceivedPacket(const uint8_t* buf, int len, const sockaddr_in* from) {
+    PacketCodec::ModNetHeader hdr;
+    const void* payload = nullptr;
+    int payloadLen = 0;
+
+    if (!PacketCodec::Decode(buf, len, &hdr, &payload, &payloadLen)) {
+        return;  // Not our packet or corrupted
+    }
+
+    if (s_peerAddrValid && from && !AddrMatches(from, &s_peerAddr)) {
+        LOG_NET_DEBUG("[Session] Ignoring packet from unexpected endpoint");
+        return;
+    }
+
+    PacketCodec::PacketType type = (PacketCodec::PacketType)hdr.packet_type;
+    if (!IsHandshakePacket(type) && s_remoteNonce != 0) {
+        if (hdr.session_id != s_sessionId || hdr.connection_id != s_connectionId) {
+            LOG_NET_WARN("[Session] Ignoring packet with mismatched identity type=%s session=0x%llX connection=0x%08X",
+                         PacketCodec::GetPacketTypeName(type), hdr.session_id, hdr.connection_id);
+            return;
+        }
+    }
+
+    s_packetsReceived++;
+
+    // Process ack info on every received packet (for reliable channel)
+    AckTracker::OnRecvSeq(hdr.channel, hdr.seq);
+    ReliableChannel::ProcessAcks(hdr.channel, hdr.ack, hdr.ack_bits);
+
+    if ((hdr.flags & PacketCodec::FLAG_RELIABLE) != 0) {
+        bool accepted = ReliableChannel::AcceptIncoming(hdr.channel, hdr.seq);
+        if (!accepted) {
+            // Trace bootstrap-relevant packets that were deduped
+            if (type == PacketCodec::PacketType::LoadBarrierReady ||
+                type == PacketCodec::PacketType::BaselineReady ||
+                type == PacketCodec::PacketType::StartGameplay) {
+                LOG_NET_DEBUG("[Session] Reliable dedup dropped %s ch=%u seq=%u",
+                             PacketCodec::GetPacketTypeName(type), hdr.channel, hdr.seq);
+            }
+            return;
+        }
+        // Trace accepted bootstrap packets
+        if (type == PacketCodec::PacketType::LoadBarrierReady ||
+            type == PacketCodec::PacketType::BaselineReady ||
+            type == PacketCodec::PacketType::StartGameplay) {
+            LOG_NET_INFO("[Session] DISPATCH reliable %s ch=%u seq=%u payloadLen=%d",
+                        PacketCodec::GetPacketTypeName(type), hdr.channel, hdr.seq, payloadLen);
+        }
+    }
+
+    switch (type) {
+    case PacketCodec::PacketType::Hello:
+        if (payloadLen >= (int)sizeof(PacketCodec::HelloPayload)) {
+            HandleHello((const PacketCodec::HelloPayload*)payload, from);
+        }
+        break;
+
+    case PacketCodec::PacketType::HelloAck:
+        if (payloadLen >= (int)sizeof(PacketCodec::HelloAckPayload)) {
+            HandleHelloAck((const PacketCodec::HelloAckPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::Ping:
+        if (payloadLen >= (int)sizeof(PacketCodec::PingPayload)) {
+            HandlePing((const PacketCodec::PingPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::Pong:
+        if (payloadLen >= (int)sizeof(PacketCodec::PongPayload)) {
+            HandlePong((const PacketCodec::PongPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::StateDigest:
+        if (payloadLen >= (int)sizeof(PacketCodec::StateDigestPayload)) {
+            HandleStateDigest((const PacketCodec::StateDigestPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::Disconnect:
+        if (payloadLen >= (int)sizeof(PacketCodec::DisconnectPayload)) {
+            HandleDisconnect((const PacketCodec::DisconnectPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::Ready:
+        if (payloadLen >= (int)sizeof(PacketCodec::ReadyPayload)) {
+            HandleReady((const PacketCodec::ReadyPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::GekkoData:
+        // Buffer for RollbackSession adapter to consume
+        BufferGekkoPacket(payload, payloadLen);
+        break;
+
+    // ── CharSel + Bootstrap routing ──
+    case PacketCodec::PacketType::CharSelInput:
+        if (payloadLen >= (int)sizeof(PacketCodec::CharSelInputPayload)) {
+            CharSelSync::OnReceiveInput((const PacketCodec::CharSelInputPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::MatchConfig:
+        if (payloadLen >= (int)sizeof(PacketCodec::MatchConfigPayload)) {
+            CharSelSync::OnReceiveMatchConfig((const PacketCodec::MatchConfigPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::MatchConfigAck:
+        if (payloadLen >= (int)sizeof(PacketCodec::MatchConfigAckPayload)) {
+            CharSelSync::OnReceiveMatchConfigAck((const PacketCodec::MatchConfigAckPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::LoadBarrierReady:
+        if (payloadLen >= (int)sizeof(PacketCodec::LoadBarrierReadyPayload)) {
+            MatchBootstrap::OnReceiveLoadBarrierReady((const PacketCodec::LoadBarrierReadyPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::BaselineReady:
+        if (payloadLen >= (int)sizeof(PacketCodec::BaselineReadyPayload)) {
+            MatchBootstrap::OnReceiveBaselineReady((const PacketCodec::BaselineReadyPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::StartGameplay:
+        if (payloadLen >= (int)sizeof(PacketCodec::StartGameplayPayload)) {
+            MatchBootstrap::OnReceiveStartGameplay((const PacketCodec::StartGameplayPayload*)payload,
+                                                  hdr.send_timestamp_ms);
+        }
+        break;
+
+    case PacketCodec::PacketType::StartGameplayAck:
+        if (payloadLen >= (int)sizeof(PacketCodec::StartGameplayAckPayload)) {
+            MatchBootstrap::OnReceiveStartGameplayAck((const PacketCodec::StartGameplayAckPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::Rematch: {
+        if (payloadLen >= (int)sizeof(PacketCodec::RematchPayload)) {
+            const auto* rp = (const PacketCodec::RematchPayload*)payload;
+            LOG_NET_INFO("[Session] Received Rematch (seq=%u decision=%u)", rp->rematch_seq, rp->decision);
+            // TODO: Forward to menu controller for rematch flow
+        }
+        break;
+    }
+
+    case PacketCodec::PacketType::ErrorNotice: {
+        if (payloadLen >= (int)sizeof(PacketCodec::ErrorNoticePayload)) {
+            const auto* ep = (const PacketCodec::ErrorNoticePayload*)payload;
+            LOG_NET_ERROR("[Session] Received ErrorNotice (code=%u related_type=%u)",
+                      ep->error_code, ep->related_packet_type);
+        }
+        break;
+    }
+
+    // ── Adaptive Delay ──
+    case PacketCodec::PacketType::DelayChangeRequest:
+        if (payloadLen >= (int)sizeof(PacketCodec::DelayChangeRequestPayload)) {
+            AdaptiveDelay::OnReceiveDelayChangeRequest((const PacketCodec::DelayChangeRequestPayload*)payload);
+        }
+        break;
+
+    case PacketCodec::PacketType::DelayChangeAck:
+        if (payloadLen >= (int)sizeof(PacketCodec::DelayChangeAckPayload)) {
+            AdaptiveDelay::OnReceiveDelayChangeAck((const PacketCodec::DelayChangeAckPayload*)payload);
+        }
+        break;
+
+    // ── Spectator routing ──
+    case PacketCodec::PacketType::SpectatorHello:
+        SpectatorManager::OnReceiveSpectatorHello(&hdr, payload, payloadLen, from, s_socket);
+        break;
+
+    case PacketCodec::PacketType::SpectatorAccept:
+    case PacketCodec::PacketType::SpectatorReject:
+    case PacketCodec::PacketType::SpectatorKeyframe:
+        LOG_NET_DEBUG("[Session] Received spectator packet type %u (handling TBD)",
+                 hdr.packet_type);
+        break;
+
+    default:
+        LOG_NET_DEBUG("[Session] Unknown packet type %u", hdr.packet_type);
+        break;
+    }
+}
+
+// Drain all pending packets from the socket
+static void PollSocket() {
+    if (s_socket == INVALID_SOCKET) return;
+
+    uint8_t buf[PacketCodec::MAX_PACKET_SIZE];
+    sockaddr_in from = {};
+    int maxPerFrame = 32;  // Prevent infinite loop on packet flood
+    const uint32_t now = PacketCodec::GetTimestampMs();
+
+    if (s_lastPollTimestampMs != 0) {
+        s_lastPollGapMs = now - s_lastPollTimestampMs;
+        if (s_pendingPingId != 0 && s_lastPollGapMs > s_maxPollGapSincePingMs) {
+            s_maxPollGapSincePingMs = s_lastPollGapMs;
+        }
+        if (s_lastPollGapMs >= 50 &&
+            (s_state == State::Connected || s_state == State::CharSel || s_state == State::Gameplay)) {
+            s_pollGapSpikeCount++;
+            if (s_pollGapSpikeCount <= 8 || (s_pollGapSpikeCount % 60) == 0) {
+                LOG_NET_INFO("[Session] Poll gap spike: gap=%ums state=%s loadBarrier=%d pendingPing=%u",
+                             s_lastPollGapMs,
+                             GetStateName(s_state),
+                             InputSyncHooks::IsLoadBarrierFrozen() ? 1 : 0,
+                             s_pendingPingId);
+            }
+        }
+    } else {
+        s_lastPollGapMs = 0;
+    }
+    s_lastPollTimestampMs = now;
+
+    int processed = 0;
+
+    for (int i = 0; i < maxPerFrame; i++) {
+        int len = UdpSocket::RecvFrom(s_socket, buf, sizeof(buf), &from);
+        if (len <= 0) break;
+        processed++;
+        ProcessReceivedPacket(buf, len, &from);
+    }
+
+    s_lastPollPacketCount = (uint32_t)processed;
+    if (processed >= maxPerFrame) {
+        s_pollHitCapCount++;
+        if (s_pollHitCapCount <= 8 || (s_pollHitCapCount % 60) == 0) {
+            LOG_NET_WARN("[Session] PollSocket hit per-frame cap (%d packets, state=%s) - backlog likely",
+                         maxPerFrame,
+                         GetStateName(s_state));
+        }
+    }
+}
+
+// ============================================================================
+// State Update Functions
+// ============================================================================
+
+static void UpdateConnecting() {
+    s_stateTimer++;
+    s_retransmitTimer++;
+
+    // Timeout check — only joiner times out; host waits indefinitely
+    if (s_mode != Mode::Host && s_stateTimer >= kConnectTimeoutFrames) {
+        SetError("Connection timed out.");
+        return;
+    }
+
+    if (s_mode == Mode::Host) {
+        // Host: just wait for Hello packets (processed in PollSocket)
+    } else {
+        // Join: retransmit Hello periodically
+        if (s_retransmitTimer >= kHelloRetransmitFrames) {
+            s_retransmitTimer = 0;
+            SendHello();
+        }
+    }
+}
+
+static void UpdateHandshake() {
+    s_stateTimer++;
+    s_retransmitTimer++;
+
+    // Timeout check
+    if (s_stateTimer >= kHandshakeTimeoutFrames) {
+        SetError("Handshake timed out.");
+        return;
+    }
+
+    if (s_mode == Mode::Host) {
+        // Host: periodically resend HelloAck until joiner confirms (via Ping/Ready/any packet).
+        // Transition to Connected once we've received ANY packet from the joiner after HelloAck,
+        // which proves they got it. Check s_packetsReceived > handshake start count.
+        if (s_retransmitTimer >= kHelloRetransmitFrames) {
+            s_retransmitTimer = 0;
+            SendHelloAck(true, 2);
+            LOG_NET_DEBUG("[Session] Handshake: retransmitting HelloAck (timer=%d)", s_stateTimer);
+        }
+        // If we've received any packet after the first Hello, the joiner got our HelloAck
+        if (s_packetsReceived >= 2) {
+            SendHelloAck(true, 2);  // One more for safety
+            SetState(State::Connected, "Session ready with %s.",
+                     s_peerNickname[0] ? s_peerNickname : "peer");
+            s_lastPongFrame = 0;
+            s_pingTimer = 0;
+        }
+    }
+    // Join: waiting for HelloAck (handled in HandleHelloAck)
+}
+
+static void UpdateConnected() {
+    s_stateTimer++;
+    s_pingTimer++;
+    s_lastPongFrame++;
+    s_digestTimer++;
+
+    // Send periodic pings
+    if (s_pingTimer >= CurrentPingInterval()) {
+        s_pingTimer = 0;
+        SendPing();
+    }
+
+    // Timeout: no pong for too long — active after 3 seconds grace period
+    // (gives time for first ping-pong exchange even on slow connections)
+    if (s_lastPongFrame >= kPingTimeoutFrames && s_stateTimer > 180) {
+        SetError("Connection lost (no response for %d seconds).", kPingTimeoutFrames / 60);
+        return;
+    }
+
+    // Periodic state digest during interactive gameplay.
+    if (NetplayHooks::IsInPlayableGameplay() && s_digestTimer >= kDigestIntervalFrames) {
+        s_digestTimer = 0;
+        SendStateDigest();
+    }
+}
+
+static void UpdateCharSel() {
+    s_stateTimer++;
+    s_pingTimer++;
+    s_lastPongFrame++;
+
+    // Keep pinging to detect disconnect
+    if (s_pingTimer >= CurrentPingInterval()) {
+        s_pingTimer = 0;
+        SendPing();
+    }
+
+    if (s_lastPongFrame >= kPingTimeoutFrames && s_stateTimer > 180) {
+        // Don't disconnect during load barrier — the game's blocking asset load
+        // can freeze the main thread for 15-30 seconds during Mode 6→8 transition.
+        // The load barrier has its own 30-second timeout for genuinely lost peers.
+        if (!InputSyncHooks::IsLoadBarrierFrozen()) {
+            SetError("Connection lost during character select.");
+            return;
+        }
+    }
+
+    // Host: periodically retransmit Ready if joiner hasn't acked yet
+    if (s_mode == Mode::Host && !s_readyAckedByPeer) {
+        s_readyRetransmitTimer++;
+        if (s_readyRetransmitTimer >= kReadyRetransmitFrames) {
+            s_readyRetransmitTimer = 0;
+            PacketCodec::ReadyPayload ready = {};
+            ready.ready_flags = s_charSelReadyFlags;
+            SendPacket(PacketCodec::PacketType::Ready, &ready, sizeof(ready));
+            LOG_NET_INFO("[Session] Host retransmitting Ready (joiner hasn't acked, charselDelay=%d)",
+                         DecodeCharSelReadyDelay(s_charSelReadyFlags));
+        }
+    }
+
+    // Feed RTT to CharSelSync for input delay calculation
+    CharSelSync::SetRttMs(s_rttMs);
+
+    // Drive CharSel sync state machine (lockstep + config lock detection)
+    CharSelSync::FrameUpdate();
+
+    // If CharSel produced a locked config, transition to match bootstrap (once)
+    if (CharSelSync::GetPhase() == CharSelSync::Phase::Locked && !MatchBootstrap::IsActive()) {
+        LOG_NET_INFO("[Session] CharSel locked — starting match bootstrap (avgRtt=%.1fms stableRtt=%.1fms)",
+                     s_rttMs,
+                     GetDelaySelectionRttMs());
+        CharSelSync::LockedMatchConfig config;
+        if (CharSelSync::GetLockedConfig(&config)) {
+            MatchBootstrap::Begin(&config,
+                                  s_mode == Mode::Host,
+                                  s_socket,
+                                  &s_peerAddr,
+                                  s_sessionId,
+                                  s_connectionId,
+                                  GetDelaySelectionRttMs());
+        }
+    }
+
+    // Drive MatchBootstrap if it's active
+    if (MatchBootstrap::IsActive()) {
+        MatchBootstrap::SetObservedRttMs(GetDelaySelectionRttMs());
+        MatchBootstrap::FrameUpdate();
+
+        // Note: Don't auto-transition to Gameplay here.
+        // netplay_core.cpp's load barrier handles the transition after
+        // detecting bootstrap completion and starting the rollback session.
+        if (MatchBootstrap::GetPhase() == MatchBootstrap::Phase::Error) {
+            SetError("Match bootstrap failed.");
+        }
+    }
+}
+
+static void UpdateGameplay() {
+    s_stateTimer++;
+    s_pingTimer++;
+    s_lastPongFrame++;
+
+    // Keep pinging to detect disconnect
+    if (s_pingTimer >= CurrentPingInterval()) {
+        s_pingTimer = 0;
+        SendPing();
+    }
+
+    if (s_lastPongFrame >= kPingTimeoutFrames && s_stateTimer > 180) {
+        SetError("Connection lost during gameplay.");
+        RollbackSession::Destroy();
+        return;
+    }
+
+    // Check if rollback session errored
+    if (RollbackSession::IsActive() && RollbackSession::GetState() == RollbackSession::State::Error) {
+        SetError("Rollback session error.");
+        RollbackSession::Destroy();
+        return;
+    }
+
+    // Drive spectator management (snapshot capture + input forwarding)
+    SpectatorManager::FrameUpdate(s_stateTimer, s_socket);
+}
+
+} // anonymous namespace
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+void Reset() {
+    if (s_state != State::Idle || s_lastError[0] != '\0') {
+        LOG_NET_INFO("[Session] Resetting session state.");
+    }
+
+    if (s_peerAddrValid && s_socket != INVALID_SOCKET) {
+        SendDisconnect(0);  // Best-effort notify peer
+    }
+
+    // Remove UPnP mapping before closing the socket.
+    UpnpManager::RemovePortMapping();
+
+    CloseSocket();
+
+    s_mode = Mode::None;
+    s_state = State::Idle;
+    s_revision = 0;
+    s_peerNickname[0] = '\0';
+    s_endpoint[0] = '\0';
+    s_lastError[0] = '\0';
+    CopyText(s_status, sizeof(s_status), "Session idle.");
+
+    s_peerAddrValid = false;
+    memset(&s_peerAddr, 0, sizeof(s_peerAddr));
+
+    s_sessionId = 0;
+    s_connectionId = 0;
+
+    s_stateTimer = 0;
+    s_retransmitTimer = 0;
+    s_lastPongFrame = 0;
+    s_pingTimer = 0;
+    s_digestTimer = 0;
+    s_nextPingId = 1;
+    s_pendingPingTime = 0;
+    s_pendingPingId = 0;
+    s_pendingPingVisualFrame = 0;
+    s_packetsReceivedAtPing = 0;
+    s_pollHitCapCountAtPing = 0;
+
+    s_rttMs = 0.0f;
+    s_rttSamples = 0;
+    memset(s_delayRttSamples, 0, sizeof(s_delayRttSamples));
+    s_delayRttSampleCount = 0;
+    s_delayRttSampleIndex = 0;
+    s_delayRttMs = 0.0f;
+    s_lastPollTimestampMs = 0;
+    s_lastPollGapMs = 0;
+    s_maxPollGapSincePingMs = 0;
+    s_lastPollPacketCount = 0;
+    s_pollHitCapCount = 0;
+    s_packetsSent = 0;
+    s_packetsReceived = 0;
+
+    s_localNonce = 0;
+    s_remoteNonce = 0;
+
+    s_gekkoBufferHead = 0;
+    s_gekkoBufferTail = 0;
+    s_gekkoBufferCount = 0;
+    s_gekkoPacketsBuffered = 0;
+    s_gekkoPacketsDrained = 0;
+    s_pendingCharSelStart = false;
+    s_charSelReadyFlags = 0;
+    s_readyAckedByPeer = false;
+    s_readyRetransmitTimer = 0;
+
+    if (RollbackSession::IsActive()) {
+        RollbackSession::Destroy();
+    }
+    if (CharSelSync::IsActive()) {
+        CharSelSync::End();
+    }
+
+    AS2_ClearTickBaselineSync();
+
+    ReliableChannel::Reset();
+    AckTracker::Init();
+    StateDigest::ResetDesyncCount();
+}
+
+static bool StartInternal(const NetplayConfig::Config* config, Mode mode) {
+    if (!config) return false;
+
+    s_lastError[0] = '\0';
+
+    // Reset match win counts for new session
+    AS2_ResetMatchWins();
+
+    // Validate nickname
+    if (!config->nickname[0]) {
+        CopyText(s_lastError, sizeof(s_lastError), "Set a local nickname before connecting.");
+        LOG_NET_WARN("[Session] Start rejected: missing nickname.");
+        SetState(State::Error, "%s", s_lastError);
+        return false;
+    }
+
+    // Validate target IP for join mode
+    if (mode == Mode::Join) {
+        bool zeroIp = config->target_ip[0] == 0 && config->target_ip[1] == 0 &&
+                      config->target_ip[2] == 0 && config->target_ip[3] == 0;
+        if (zeroIp) {
+            CopyText(s_lastError, sizeof(s_lastError), "Set a target IP before connecting.");
+            LOG_NET_WARN("[Session] Start rejected: target IP is 0.0.0.0.");
+            SetState(State::Error, "%s", s_lastError);
+            return false;
+        }
+    }
+
+    // Initialize winsock
+    if (!UdpSocket::Init()) {
+        CopyText(s_lastError, sizeof(s_lastError), "Failed to initialize WinSock.");
+        SetState(State::Error, "%s", s_lastError);
+        return false;
+    }
+
+    // Create and bind socket
+    s_socket = UdpSocket::Create(config->listen_port);
+    if (s_socket == INVALID_SOCKET) {
+        _snprintf_s(s_lastError, sizeof(s_lastError), _TRUNCATE,
+                     "Failed to bind UDP port %u.", config->listen_port);
+        SetState(State::Error, "%s", s_lastError);
+        return false;
+    }
+
+    // Save config
+    memcpy(&s_config, config, sizeof(s_config));
+    s_mode = mode;
+    s_localNonce = GenerateNonce();
+    s_sessionId = s_localNonce;
+    s_connectionId = (uint32_t)(s_localNonce & 0xFFFFFFFF);
+    s_gekkoBufferHead = 0;
+    s_gekkoBufferTail = 0;
+    s_gekkoBufferCount = 0;
+    s_gekkoPacketsBuffered = 0;
+    s_gekkoPacketsDrained = 0;
+    AckTracker::Init();
+    ReliableChannel::Init();
+    ReliableChannel::SetRttMs(0.0f);
+
+    uint16_t boundPort = UdpSocket::GetBoundPort(s_socket);
+
+    if (mode == Mode::Host) {
+        _snprintf_s(s_endpoint, sizeof(s_endpoint), _TRUNCATE, "0.0.0.0:%u", boundPort);
+        s_peerAddrValid = false;
+        SetState(State::Connecting, "Hosting on port %u. Waiting for peer...", boundPort);
+        LOG_NET_INFO("[Session] Host started on port %u", boundPort);
+
+        // Attempt automatic UPnP port forwarding in the background.
+        UpnpManager::AddPortMapping(boundPort);
+    } else {
+        // Build peer address from config
+        s_peerAddr = UdpSocket::MakeAddr(
+            (uint8_t)config->target_ip[0], (uint8_t)config->target_ip[1],
+            (uint8_t)config->target_ip[2], (uint8_t)config->target_ip[3],
+            (uint16_t)config->target_port);
+        s_peerAddrValid = true;
+
+        NetplayConfig::FormatEndpoint(config, s_endpoint, sizeof(s_endpoint));
+        SetState(State::Connecting, "Connecting to %s...", s_endpoint);
+        LOG_NET_INFO("[Session] Joining %s from port %u", s_endpoint, boundPort);
+
+        // Send first Hello immediately
+        SendHello();
+    }
+
+    return true;
+}
+
+bool StartHost(const NetplayConfig::Config* config) {
+    return StartInternal(config, Mode::Host);
+}
+
+bool StartJoin(const NetplayConfig::Config* config) {
+    return StartInternal(config, Mode::Join);
+}
+
+void Cancel() {
+    if (s_state == State::Connecting || s_state == State::Handshake) {
+        LOG_NET_INFO("[Session] Connection cancelled by user.");
+        if (s_peerAddrValid) {
+            SendDisconnect(1);
+        }
+        UpnpManager::RemovePortMapping();
+        CloseSocket();
+        s_mode = Mode::None;
+        s_peerAddrValid = false;
+        SetState(State::Idle, "Connection cancelled.");
+    }
+}
+
+void Disconnect(const char* reason) {
+    if (s_peerAddrValid && s_socket != INVALID_SOCKET) {
+        SendDisconnect(2);
+    }
+    UpnpManager::RemovePortMapping();
+    CloseSocket();
+    CopyText(s_lastError, sizeof(s_lastError),
+             reason && reason[0] ? reason : "Session disconnected.");
+    SetState(State::Error, "%s", s_lastError);
+}
+
+void EnterCharSel() {
+    if (s_state == State::Connected) {
+        // Restore cursor positions from last match BEFORE Begin() clears CharSel state.
+        // On the client this fires before the game mode transitions, so the char IDs
+        // are in place when the game's charsel init (substate 0) runs.
+        CharSelSync::RestoreCursorsFromLastConfig();
+
+        SetState(State::CharSel, "CharSel handoff ready for %s.",
+                 s_peerNickname[0] ? s_peerNickname : "peer");
+
+        // Reset Ready retransmit state
+        s_readyAckedByPeer = false;
+        s_readyRetransmitTimer = 0;
+
+        const int charSelDelay = s_mode == Mode::Host
+            ? ChooseHostCharSelDelay()
+            : DecodeCharSelReadyDelay(s_charSelReadyFlags);
+
+        if (s_mode == Mode::Host) {
+            s_charSelReadyFlags = EncodeCharSelReadyFlags(charSelDelay);
+        }
+
+        // Activate mod-owned CharSel input relay (§5)
+        CharSelSync::Begin(
+            s_mode == Mode::Host,
+            s_socket,
+            &s_peerAddr,
+            s_sessionId,
+            s_connectionId,
+            charSelDelay);
+        
+        // If we're the host, tell the joiner to enter CharSel too
+        if (s_mode == Mode::Host) {
+            PacketCodec::ReadyPayload ready = {};
+            ready.ready_flags = s_charSelReadyFlags;
+            // Send a few times for reliability (no reliable channel needed, joiner acks)
+            for (int i = 0; i < 3; i++) {
+                SendPacket(PacketCodec::PacketType::Ready, &ready, sizeof(ready));
+            }
+            LOG_NET_INFO("[Session] Host sent Ready (CharSel start signal) to joiner with charselDelay=%d",
+                         charSelDelay);
+        } else {
+            LOG_NET_INFO("[Session] Joiner entering CharSel with host-selected charselDelay=%d",
+                         charSelDelay);
+        }
+    }
+}
+
+void EnterGameplay() {
+    if (s_state == State::CharSel || s_state == State::Connected) {
+        // Clean up CharSel sync before entering gameplay
+        if (CharSelSync::IsActive()) {
+            CharSelSync::End();
+        }
+        // Reset ping/pong tracking — s_lastPongFrame may have accumulated
+        // during loading (Mode 8 substates 0-2) while session was still in CharSel.
+        // Without this reset, the timeout check fires immediately after entering Gameplay.
+        s_lastPongFrame = 0;
+        s_pingTimer = 0;
+        SetState(State::Gameplay, "Entering gameplay with %s.",
+                 s_peerNickname[0] ? s_peerNickname : "peer");
+    }
+}
+
+void ReturnToSession() {
+    if (s_state == State::CharSel || s_state == State::Gameplay) {
+        if (RollbackSession::IsActive()) {
+            RollbackSession::Destroy();
+        }
+        if (CharSelSync::IsActive()) {
+            CharSelSync::End();
+        }
+        if (MatchBootstrap::IsActive()) {
+            MatchBootstrap::Abort("Returning to session");
+        }
+        AS2_ClearTickBaselineSync();
+        SetState(State::Connected, "Session resumed with %s.",
+                 s_peerNickname[0] ? s_peerNickname : "peer");
+    }
+}
+
+void FrameUpdate() {
+    // Always poll for incoming packets
+    PollSocket();
+
+    // Pump reliable channel retransmissions (every frame)
+    if (s_socket != INVALID_SOCKET && s_peerAddrValid) {
+        ReliableChannel::PumpRetransmits(s_socket, &s_peerAddr);
+    }
+
+    // State-specific update
+    switch (s_state) {
+    case State::Connecting:
+        UpdateConnecting();
+        break;
+    case State::Handshake:
+        UpdateHandshake();
+        break;
+    case State::Connected:
+        UpdateConnected();
+        break;
+    case State::CharSel:
+        UpdateCharSel();
+        break;
+    case State::Gameplay:
+        UpdateGameplay();
+        break;
+    default:
+        break;
+    }
+}
+
+const char* GetModeName(Mode mode) {
+    switch (mode) {
+        case Mode::Host: return "Host";
+        case Mode::Join: return "Join";
+        default: return "None";
+    }
+}
+
+bool ConsumePendingCharSelStart() {
+    if (s_pendingCharSelStart) {
+        s_pendingCharSelStart = false;
+        return true;
+    }
+    return false;
+}
+
+const char* GetStateName(State state) {
+    switch (state) {
+        case State::Idle:       return "Idle";
+        case State::Connecting: return "Connecting";
+        case State::Handshake:  return "Handshake";
+        case State::Connected:  return "Connected";
+        case State::CharSel:    return "CharSel";
+        case State::Gameplay:   return "Gameplay";
+        case State::Error:      return "Error";
+        default: return "Unknown";
+    }
+}
+
+bool GetSnapshot(Snapshot* out) {
+    if (!out) return false;
+
+    out->active           = s_state != State::Idle && s_state != State::Error;
+    out->has_error        = s_state == State::Error;
+    out->mode             = s_mode;
+    out->state            = s_state;
+    out->revision         = s_revision;
+    out->frames_remaining = 0;  // Not used in real session (timer-based instead)
+    out->rtt_ms           = s_rttMs;
+    out->packets_sent     = s_packetsSent;
+    out->packets_received = s_packetsReceived;
+    out->desync_count     = StateDigest::GetDesyncCount();
+
+    CopyText(out->peer_nickname, sizeof(out->peer_nickname), s_peerNickname);
+    CopyText(out->endpoint, sizeof(out->endpoint), s_endpoint);
+    CopyText(out->status, sizeof(out->status), s_status);
+    CopyText(out->last_error, sizeof(out->last_error), s_lastError);
+
+    return true;
+}
+
+void BufferGekkoPacket(const void* payload, int payloadLen) {
+    if (!payload || payloadLen <= 0) return;
+    if (payloadLen > (int)sizeof(BufferedPacket::data)) return;
+
+    if (s_gekkoBufferCount >= kMaxGekkoBuffer) {
+        // Drop oldest packet
+        s_gekkoBufferTail = (s_gekkoBufferTail + 1) % kMaxGekkoBuffer;
+        s_gekkoBufferCount--;
+    }
+
+    BufferedPacket* pkt = &s_gekkoBuffer[s_gekkoBufferHead];
+    memcpy(pkt->data, payload, payloadLen);
+    pkt->len = payloadLen;
+    s_gekkoBufferHead = (s_gekkoBufferHead + 1) % kMaxGekkoBuffer;
+    s_gekkoBufferCount++;
+    s_gekkoPacketsBuffered++;
+
+    if (s_gekkoPacketsBuffered <= 8) {
+        LOG_NET_DEBUG("[Session] Buffered GekkoData #%u len=%d queued=%d",
+                      s_gekkoPacketsBuffered, payloadLen, s_gekkoBufferCount);
+    }
+}
+
+int DrainGekkoPackets(BufferedPacket* out, int maxCount) {
+    if (!out || maxCount <= 0) return 0;
+
+    int drained = 0;
+    while (s_gekkoBufferCount > 0 && drained < maxCount) {
+        memcpy(&out[drained], &s_gekkoBuffer[s_gekkoBufferTail], sizeof(BufferedPacket));
+        s_gekkoBufferTail = (s_gekkoBufferTail + 1) % kMaxGekkoBuffer;
+        s_gekkoBufferCount--;
+        drained++;
+    }
+
+    if (drained > 0) {
+        s_gekkoPacketsDrained += (uint32_t)drained;
+        if (s_gekkoPacketsDrained <= 8) {
+            LOG_NET_DEBUG("[Session] Drained %d GekkoData packet(s) (total=%u queued=%d)",
+                          drained, s_gekkoPacketsDrained, s_gekkoBufferCount);
+        }
+    }
+
+    return drained;
+}
+
+SOCKET GetSocket() {
+    return s_socket;
+}
+
+const sockaddr_in* GetPeerAddr() {
+    return s_peerAddrValid ? &s_peerAddr : nullptr;
+}
+
+bool IsHost() {
+    return s_mode == Mode::Host;
+}
+
+uint64_t GetSessionId() {
+    return s_sessionId;
+}
+
+uint32_t GetConnectionId() {
+    return s_connectionId;
+}
+
+void DriveSocketPoll() {
+    PollSocket();
+}
+
+} // namespace SessionManager

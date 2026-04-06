@@ -1,0 +1,28 @@
+# Build folders
+build/
+bin/
+out/
+
+# VSCode
+.vscode/
+.github
+docs/
+lib/
+
+# Logs / temp
+logs.txt
+*.log
+temp_*.cpp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+
+# OS
+Thumbs.db
+.DS_Store
+*.bat
+*.ps1
+*.txt
+*.md
+*.c

@@ -1,0 +1,18 @@
+LIBRARY wsock32
+EXPORTS
+    accept          = proxy_accept          @1
+    bind            = proxy_bind            @2
+    closesocket     = proxy_closesocket     @3
+    htonl           = proxy_htonl           @8
+    htons           = proxy_htons           @9
+    inet_addr       = proxy_inet_addr       @10
+    ioctlsocket     = proxy_ioctlsocket     @12
+    recv            = proxy_recv            @16
+    recvfrom        = proxy_recvfrom        @17
+    send            = proxy_send            @19
+    sendto          = proxy_sendto          @20
+    socket          = proxy_socket          @23
+    WSAAsyncSelect  = proxy_WSAAsyncSelect  @101
+    WSAGetLastError = proxy_WSAGetLastError @111
+    WSAStartup      = proxy_WSAStartup     @115
+    WSACleanup      = proxy_WSACleanup     @116
