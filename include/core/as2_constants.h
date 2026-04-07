@@ -39,8 +39,11 @@
 #define ADDR_GET_TICK           (GAME_BASE + 0x235F80)  // sub_635F80
 
 // Static CRT functions (game has statically linked CRT - NOT importing from msvcrt.dll)
-#define ADDR_STATIC_SRAND       (GAME_BASE + 0x314590)  // Static CRT srand()
-#define ADDR_STATIC_RAND        (GAME_BASE + 0x31459D)  // Static CRT rand()
+// RNG uses TLS-based _tiddata struct: seed at [_getptd()+0x14]
+#define ADDR_STATIC_SRAND       (GAME_BASE + 0x314590)  // Static CRT srand()  — 0x714590
+#define ADDR_STATIC_RAND        (GAME_BASE + 0x31459D)  // Static CRT rand()   — 0x71459D
+#define ADDR_GETPTD             (GAME_BASE + 0x316D29)  // _getptd() — returns per-thread data struct
+#define RNG_SEED_OFFSET         0x14                     // holdrand offset within _tiddata
 
 // Entity state functions
 #define ADDR_ENTITY_STATE_SET   (GAME_BASE + 0x0BF630)  // sub_4BF630
@@ -450,3 +453,12 @@
 // When 0, stage is auto-picked from character's home stage lookup table.
 // When 1, the stage selection grid is shown during charsel.
 #define ADDR_STAGESEL_ENABLE    0x8E93EE
+
+// ============================================================================
+// CPU Flag Addresses (entity+172 inside player selection structs)
+// ============================================================================
+
+// byte_8E9F0C: P1 CPU flag (1=AI-controlled, 0=human)
+#define ADDR_P1_CPU_FLAG        0x8E9F0C
+// byte_8E9FDC: P2 CPU flag (1=AI-controlled, 0=human)
+#define ADDR_P2_CPU_FLAG        0x8E9FDC

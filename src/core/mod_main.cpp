@@ -16,6 +16,22 @@
 #include "patches/input_override.h"
 #include "patches/hook_installer.h"
 #include "patches/tick_hooks.h"
+#include "rollback/determinism_verify.h"
+#include "rollback/savestate.h"
+#include "rollback/rollback_session.h"
+#include "rollback/rollback_debug.h"
+#include "rollback/netplay_log.h"
+#include "rollback/stress_hooks.h"
+#include "rollback/online_wiring.h"
+#include "net/enet_transport.h"
+#include "net/session_manager.h"
+#include "net/mode_ownership.h"
+#include "net/netplay_menu_controller.h"
+#include "net/pregame_sync.h"
+#include "net/match_lifecycle.h"
+#include "net/sync_policy.h"
+#include "net/delay_policy.h"
+#include "testing/scripted_input_runner.h"
 #include "imgui.h"
 #include <stdio.h>
 #include <string.h>
@@ -208,6 +224,47 @@ static void DeferredInit() {
 
     GameConsole_Init();
 
+    // Initialize determinism verification system
+    DetVer_Init();
+    DetVer_SetLogDir(LogWindow_GetLogDir());
+
+    // Initialize savestate system
+    Savestate_Init();
+    Savestate_SetLogDir(LogWindow_GetLogDir());
+
+    // Initialize networking
+    Net::Transport_GlobalInit();
+    Net::Session_Init();
+
+    // Initialize netplay menu controller and mode ownership hooks
+    NetMenu::Init();
+    if (!ModeOwnership::Install()) {
+        LOG_ERROR("Failed to install mode ownership hooks!");
+    }
+
+    // Initialize pre-game synchronization layer
+    Net::PregameSync_Init();
+
+    // Initialize match lifecycle state management
+    Net::MatchLifecycle_Init();
+
+    // Initialize sync policy and delay policy
+    Net::SyncPolicy_Init();
+    Net::DelayPolicy_Init();
+
+    // Initialize rollback gameplay subsystems
+    Rollback::RollbackSession_Init();
+    Rollback::RollbackDebug_Init();
+
+    // Initialize netplay full-path log, stress hooks, and online wiring
+    Rollback::NetplayLog_Init();
+    Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
+    Rollback::StressHooks_Init();
+    Rollback::OnlineWiring_Init();
+
+    // Initialize scripted input runner
+    SIR_Init();
+
     LOG_INFO("Frame Counter: 0x%08X = %d", ADDR_SIM_FRAME_COUNTER, AS2_GetFrameNumber());
     LOG_INFO("Game Mode: 0x%08X = %d", ADDR_GAME_MODE, GetGameMode());
     LOG_INFO("P1 HP: 0x%08X = %d", ADDR_P1_HP_DIRECT, GetP1HP());
@@ -219,7 +276,7 @@ static void DeferredInit() {
 
     LOG_INFO("========================================");
     LOG_INFO("Initialization complete!");
-    LOG_INFO("Hotkeys: F1=Menu");
+    LOG_INFO("Hotkeys: F1=Menu  F5=SaveState  F6=LoadState");
     LOG_INFO("========================================");
 }
 
@@ -262,6 +319,22 @@ __declspec(dllexport) void ModShutdown() {
     LOG_INFO("Mod shutdown...");
 
     if (g_initialized) {
+        SIR_Shutdown();
+        Rollback::OnlineWiring_Shutdown();
+        Rollback::StressHooks_Shutdown();
+        Rollback::NetplayLog_Shutdown();
+        Rollback::RollbackDebug_Shutdown();
+        Rollback::RollbackSession_Shutdown();
+        Net::DelayPolicy_Shutdown();
+        Net::SyncPolicy_Shutdown();
+        Net::MatchLifecycle_Shutdown();
+        Net::PregameSync_Shutdown();
+        NetMenu::Shutdown();
+        ModeOwnership::Remove();
+        Net::Session_Shutdown();
+        Net::Transport_GlobalDeinit();
+        Savestate_Shutdown();
+        DetVer_Shutdown();
         RemoveHooks();
         InputSystem_Shutdown();
     }
@@ -298,6 +371,29 @@ __declspec(dllexport) void ModOnFrame() {
                 s_unlockApplied = true;
             }
         }
+    }
+
+    // Update netplay menu controller (pumps session, handles input, renders menu)
+    ModeOwnership::FrameUpdate();
+    NetMenu::FrameUpdate();
+
+    // Update pre-game synchronization layer
+    Net::PregameSync_FrameUpdate();
+
+    // Update match lifecycle state management
+    Net::MatchLifecycle_FrameUpdate();
+
+    // Update sync policy and delay policy
+    Net::SyncPolicy_FrameUpdate();
+    Net::DelayPolicy_FrameUpdate();
+
+    // Update online wiring (manages rollback session lifecycle)
+    Rollback::OnlineWiring_FrameUpdate();
+
+    // Update rollback gameplay session and debug
+    if (Rollback::RollbackSession_IsActive() && Rollback::OnlineWiring_IsGameplayActive()) {
+        Rollback::RollbackSession_FrameUpdate();
+        Rollback::RollbackDebug_FrameUpdate();
     }
 
     // Update debug info
@@ -358,6 +454,34 @@ __declspec(dllexport) void ModOnFrame() {
             g_inputDebug.joystickHookCalls, g_inputDebug.joystickInjectedCount,
             g_inputDebug.sdlInputP1, g_inputDebug.sdlInputP2);
     }
+
+    // Determinism verification: end previous frame, begin next
+    {
+        static bool s_detverFrameOpen = false;
+        static int  s_detverPrevFrame = -1;
+        int simFrame = (int)AS2_GetFrameNumber();
+
+        if (DetVer_IsEnabled() && AS2_IsInGameplay()) {
+            if (s_detverFrameOpen) {
+                DetVer_EndFrame(s_detverPrevFrame);
+            }
+            DetVer_BeginFrame(simFrame);
+            s_detverFrameOpen = true;
+            s_detverPrevFrame = simFrame;
+        } else if (s_detverFrameOpen) {
+            DetVer_EndFrame(s_detverPrevFrame);
+            s_detverFrameOpen = false;
+        }
+    }
+
+    // Update network session
+    Net::Session_Update();
+
+    // Process savestate hotkeys (F5 save, F6 load)
+    Savestate_ProcessHotkeys();
+
+    // Run scripted input runner (injects overrides before SDL update)
+    SIR_OnFrame();
 
     // Update SDL input
     InputSystem_Update();

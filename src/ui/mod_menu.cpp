@@ -11,6 +11,9 @@
 #include "patches/tick_hooks.h"
 #include "game_console.h"
 #include "hitbox_display.h"
+#include "rollback/determinism_verify.h"
+#include "rollback/savestate.h"
+#include "testing/scripted_input_runner.h"
 #include "imgui.h"
 #include <stdio.h>
 #include <string.h>
@@ -430,6 +433,18 @@ void ModMenu_Render() {
         if (g_showAdvanced) {
             if (ImGui::BeginTabItem("Debug")) {
                 TabAdvancedDebug();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Determinism")) {
+                DetVer_RenderImGui();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Savestate")) {
+                Savestate_RenderImGui();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Scenarios")) {
+                SIR_RenderImGui();
                 ImGui::EndTabItem();
             }
         }

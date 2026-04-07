@@ -418,6 +418,39 @@ int __cdecl Hook_InputProcess(int gameState) {
         return result;
     }
 
+    // Netplay override: when rollback session is active, inject rollback-controlled
+    // inputs instead of SDL data. The netplay inputs were stored by
+    // RollbackSession_FrameUpdate Step 7 via InputSystem_SetNetplayInput.
+    if (InputSystem_IsNetplayInputActive(0) || InputSystem_IsNetplayInputActive(1)) {
+        uint16_t currentP1 = InputSystem_IsNetplayInputActive(0)
+                                 ? InputSystem_GetNetplayInput(0) : 0;
+        uint16_t currentP2 = InputSystem_IsNetplayInputActive(1)
+                                 ? InputSystem_GetNetplayInput(1) : 0;
+
+        const uint16_t pressedP1 = (uint16_t)(currentP1 & (uint16_t)~prevHeldP1);
+        const uint16_t pressedP2 = (uint16_t)(currentP2 & (uint16_t)~prevHeldP2);
+
+        for (int i = 0; i < 10; i++) {
+            const uint16_t mask = g_buttonMasks[i];
+
+            {
+                const uintptr_t heldAddr = ADDR_P1_INPUT_BUFFER + (i * 2);
+                const uintptr_t justPressedAddr = ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2);
+                WriteMemory<uint16_t>(heldAddr, (currentP1 & mask) ? 1 : 0);
+                WriteMemory<uint16_t>(justPressedAddr, (pressedP1 & mask) ? 1 : 0);
+            }
+
+            {
+                const uintptr_t heldAddr = ADDR_P2_INPUT_BUFFER + (i * 2);
+                const uintptr_t justPressedAddr = ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2);
+                WriteMemory<uint16_t>(heldAddr, (currentP2 & mask) ? 1 : 0);
+                WriteMemory<uint16_t>(justPressedAddr, (pressedP2 & mask) ? 1 : 0);
+            }
+        }
+
+        return result;
+    }
+
     if (ModConfig_UseSDLInput()) {
         const uint16_t allowedMask = (INPUT_UP | INPUT_DOWN | INPUT_LEFT | INPUT_RIGHT |
                                       INPUT_A | INPUT_B | INPUT_C | INPUT_D |

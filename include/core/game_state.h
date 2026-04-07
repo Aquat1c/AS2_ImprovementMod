@@ -77,7 +77,7 @@
  *   - VS Mode -> MODE_CHARSEL  
  *   - Training -> MODE_CHARSEL
  *   - Network -> MODE_LOBBY
- *   - Replay -> MODE_VS_SELECT
+ *   - Replay -> MODE_REPLAY_SELECT
  *   - Gallery -> MODE_GALLERY
  *   - Options -> MODE_OPTIONS
  */
@@ -101,12 +101,12 @@
 #define MODE_LOBBY      4
 
 /**
- * MODE_VS_SELECT (5) - VS Select / Replay Select
+ * MODE_REPLAY_SELECT (5) - Replay Select
  * Handler: sub_59BBF0 @ 0x59BBF0
  * Substates: 0-4
  * 
  * Screen for selecting replay files to watch. Loads rep.bin/rep.pal.
- * Lists available replay files and allows selection.
+ * Lists available .rec replay files and allows selection.
  * 
  * Flow:
  *   0: Initialize, load replay list
@@ -114,10 +114,13 @@
  *   2: Selection loop
  *   3: Fade out
  *   4: Transition based on selection:
- *      - If replay selected: MODE_STAGESEL (7)
+ *      - If replay selected: MODE_PREMATCH_INTRO (7)
  *      - If cancelled: MODE_MENU (3)
  */
-#define MODE_VS_SELECT  5
+#define MODE_REPLAY_SELECT  5
+
+// Legacy alias — old code may still reference this
+#define MODE_VS_SELECT  MODE_REPLAY_SELECT
 
 /**
  * MODE_CHARSEL (6) - Character Select
@@ -135,29 +138,48 @@
  *   0: Initialize, load assets (sub_5BD530)
  *   1: Fade-in (sub_5BD910) - calls MatchSyncInit at frame 159!
  *   2: Main selection loop (sub_5BE7B0) - NETPLAY INPUT SYNC ACTIVE
+ *      → 4 (normal/skip stage sel) or → 5 (if STAGESEL_ENABLE=1) or → 3 (cancel)
  *   3: Cancel handling (sub_5BFE10)
- *   4: Confirm transition (sub_5C0030) - NETPLAY INPUT SYNC ACTIVE
- *   5-10: (unused or intermediate states)
- *   11: Stage select (sub_5C1CA0) 
- *   12: Return to MODE_MENU (3)
- *   13: Return to MODE_LOBBY (4) for netplay
- *   14: Transition to MODE_MATCH (8) or MODE_STAGESEL (7)
+ *   4: Confirm transition (sub_5C0030) - 25f fade, routes to 11/12/13
+ *   5: Stage select: portrait slide-in (16f) → 6
+ *   6: Stage select: grid zoom animation (80f) → 7
+ *   7: Stage select: INTERACTIVE GRID (24-slot, 12x2 layout) → 8 or 9
+ *   8: Stage select: confirm/cancel menu (2-item) → back to 7 or → 9
+ *   9: Stage select: fade transition (25f) → 11 (or 12/13 for cancel/netplay)
+ *  10: Fade-back transition (25f) → sub 1 (loops for next round in arcade)
+ *  11: Matchup data commit — writes stage ID, configures matchup
+ *  12: Return to MODE_MENU (3)
+ *  13: Return to MODE_LOBBY (4) for netplay
+ *  14: Transition to MODE_MATCH (8) or MODE_PREMATCH_INTRO (7)
  */
 #define MODE_CHARSEL    6
 
 /**
- * MODE_STAGESEL (7) - Stage Select
+ * MODE_PREMATCH_INTRO (7) - Pre-Match VS Intro / Loading
  * Handler: sub_46FC80 @ 0x46FC80
  * Substates: 0-38 (0x00-0x26)
  * 
- * Stage selection screen for arcade/story modes.
- * Complex state machine with many visual states.
+ * NOT stage selection — this is a non-interactive pre-match cinematic.
+ * Loads dmo.bin (demo intros) + stg.bin (stage background assets).
+ * 39 substates of animation/rendering. No player input is processed
+ * for selection — this is purely a visual loading/intro sequence.
+ * 
+ * Stage selection happens INSIDE Mode 6 (CharSel) substates 5-9,
+ * gated by the STAGESEL_ENABLE byte at 0x8E93EE.
  * 
  * Flow:
- *   0-37: Stage selection and preview states
+ *   0: Init
+ *   1: Load dmo.bin + stg.bin assets
+ *   2-37: VS intro animation sequence
  *   38 (0x26): Transition to MODE_MATCH (8) via sub_5D2EB0(8,0)
+ *
+ * Netplay note: Vanilla netplay (dword_816410==3) skips Mode 7 entirely
+ * and goes directly from CharSel sub 14 to Mode 8.
  */
-#define MODE_STAGESEL   7
+#define MODE_PREMATCH_INTRO  7
+
+// Legacy alias
+#define MODE_STAGESEL  MODE_PREMATCH_INTRO
 
 /**
  * MODE_MATCH (8) - Match/Gameplay
@@ -187,7 +209,7 @@
 #define MODE_MATCH      8
 
 /**
- * MODE_STORY (9) - Story/Arcade Mode Handler
+ * MODE_WINSCREEN (9) - Win Screen Handler
  * Handler: sub_5FBD00 @ 0x5FBD00
  * Substates: 0-36 (0x00-0x24)
  * 
@@ -197,7 +219,7 @@
  * 
  * Flow varies based on arcade progress and character selected.
  */
-#define MODE_STORY      9
+#define MODE_WINSCREEN      9
 
 /**
  * MODE_END (10) - Ending/Credits
@@ -334,7 +356,7 @@
  *   0: MODE_STORY (9) - continue arcade
  *   1: MODE_CHARSEL (6) - rematch in VS
  *   2: MODE_MENU (3) - return to menu  
- *   3: MODE_VS_SELECT (5) - replay finished
+ *   3: MODE_REPLAY_SELECT (5) - replay finished
  *   4: MODE_TITLE (2) - demo ended
  *   5: MODE_LOBBY (4) - netplay match ended
  */
@@ -397,46 +419,64 @@
 #define CHARSEL_SUB_CONFIRM     4
 
 /** 
- * Substate 5: Transition state
+ * Substate 5: Stage select path — portrait slide-in animation (16 frames)
  * Handler: sub_5C0120 @ 0x5C0120
+ * Only reached when STAGESEL_ENABLE (0x8E93EE) is 1 and game type is
+ * not arcade(0) or netplay(3). Transitions to substate 6.
  */
-#define CHARSEL_SUB_TRANS5      5
+#define CHARSEL_SUB_STAGESEL_SLIDE     5
+#define CHARSEL_SUB_TRANS5  CHARSEL_SUB_STAGESEL_SLIDE  // Legacy alias
 
 /** 
- * Substate 6: Transition state
+ * Substate 6: Stage select path — grid zoom animation (80 frames)
  * Handler: sub_5C06F0 @ 0x5C06F0
+ * Visual transition to the stage grid. Transitions to substate 7.
  */
-#define CHARSEL_SUB_TRANS6      6
+#define CHARSEL_SUB_STAGESEL_ZOOM      6
+#define CHARSEL_SUB_TRANS6  CHARSEL_SUB_STAGESEL_ZOOM   // Legacy alias
 
 /** 
- * Substate 7: Character preview/info
+ * Substate 7: Stage select grid — INTERACTIVE (24-slot, 12x2 layout)
  * Handler: sub_5C0B20 @ 0x5C0B20
+ * The actual stage selection screen. Player navigates with d-pad, confirms
+ * with A. Selection stored in dword_816024. Confirm → sub 9, menu → sub 8.
  */
-#define CHARSEL_SUB_PREVIEW     7
+#define CHARSEL_SUB_STAGESEL_GRID      7
+#define CHARSEL_SUB_PREVIEW  CHARSEL_SUB_STAGESEL_GRID   // Legacy alias
 
 /** 
- * Substate 8: Stage intro
+ * Substate 8: Stage select confirm/cancel menu (2-item)
  * Handler: sub_5C12A0 @ 0x5C12A0
+ * Shows "OK / Back" after stage is picked. Back → sub 7, proceed → sub 9/10.
  */
-#define CHARSEL_SUB_STAGE_INTRO 8
+#define CHARSEL_SUB_STAGESEL_CONFIRM   8
+#define CHARSEL_SUB_STAGE_INTRO  CHARSEL_SUB_STAGESEL_CONFIRM  // Legacy alias
 
 /** 
- * Substate 9: Loading state
+ * Substate 9: Fade transition (25 frames)
  * Handler: sub_5C1710 @ 0x5C1710
+ * Fade-out after stage confirm. Routes: netplay → 13, cancel → 12, normal → 11.
  */
-#define CHARSEL_SUB_LOADING     9
+#define CHARSEL_SUB_FADE_OUT    9
+#define CHARSEL_SUB_LOADING  CHARSEL_SUB_FADE_OUT  // Legacy alias
 
 /** 
- * Substate 10: Pre-match state
+ * Substate 10: Fade-back transition (25 frames)
  * Handler: sub_5C1A10 @ 0x5C1A10
+ * Returns to substate 1 for the next round in arcade/story flow.
  */
-#define CHARSEL_SUB_PREMATCH   10
+#define CHARSEL_SUB_FADE_BACK  10
+#define CHARSEL_SUB_PREMATCH  CHARSEL_SUB_FADE_BACK  // Legacy alias
 
 /** 
- * Substate 11: Stage select within charsel
- * Handler: sub_5C1CA0 @ 0x5C1CA0 
+ * Substate 11: Matchup data commit
+ * Handler: sub_5C1CA0 @ 0x5C1CA0
+ * NOT stage selection — this is the data commit step. Writes the stage grid
+ * selection (dword_816024) into the matchup config (a1+281 = stage ID).
+ * Configures opponent setup. Sets substate to 14.
  */
-#define CHARSEL_SUB_STAGE      11
+#define CHARSEL_SUB_MATCHUP_COMMIT  11
+#define CHARSEL_SUB_STAGE  CHARSEL_SUB_MATCHUP_COMMIT  // Legacy alias
 
 /** 
  * Substate 12: Return to MODE_MENU (3)
@@ -455,7 +495,7 @@
  * Substate 14: Transition to next mode
  * Handler: Calls sub_5D2EB0(8, 1) for netplay or sub_5D2EB0(7, 1) otherwise
  * Netplay (dword_816410==3): Goes directly to MODE_MATCH (8)
- * Other modes: Goes to MODE_STAGESEL (7) first
+ * Other modes: Goes to MODE_PREMATCH_INTRO (7) first
  */
 #define CHARSEL_SUB_TO_MATCH   14
 

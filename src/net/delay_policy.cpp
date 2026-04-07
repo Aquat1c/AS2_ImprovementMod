@@ -1,0 +1,605 @@
+/**
+ * Alice Senki 2 - Delay Policy Implementation
+ *
+ * RTT-based delay recommendation, explicit negotiation, multi-stage change
+ * state machine, safe boundary detection, and Gekko contract enforcement.
+ */
+
+#include "net/delay_policy.h"
+#include "net/sync_policy.h"
+#include "net/match_lifecycle.h"
+#include "core/game_state.h"
+#include "ui/log_window.h"
+
+#include <algorithm>
+#include <math.h>
+
+namespace Net {
+
+// ============================================================================
+// Jitter Tracker (ring buffer for short-term RTT variance)
+// ============================================================================
+
+static constexpr int JITTER_WINDOW = 32;
+
+struct JitterTracker {
+    float    samples[JITTER_WINDOW];
+    int      write_idx;
+    int      count;
+    float    smoothed_rtt;     // EWMA-smoothed RTT
+    float    smoothed_jitter;  // EWMA-smoothed jitter (abs deviation from smoothed RTT)
+
+    void Reset() {
+        for (int i = 0; i < JITTER_WINDOW; i++) samples[i] = 0.0f;
+        write_idx = 0;
+        count = 0;
+        smoothed_rtt = 0.0f;
+        smoothed_jitter = 0.0f;
+    }
+
+    void Feed(float rtt_ms) {
+        // EWMA smoothing factor — 0.1 = slow adaptation, good for stable baseline
+        constexpr float ALPHA_RTT    = 0.1f;
+        constexpr float ALPHA_JITTER = 0.1f;
+
+        if (count == 0) {
+            smoothed_rtt = rtt_ms;
+            smoothed_jitter = 0.0f;
+        } else {
+            float deviation = fabsf(rtt_ms - smoothed_rtt);
+            smoothed_jitter = ALPHA_JITTER * deviation + (1.0f - ALPHA_JITTER) * smoothed_jitter;
+            smoothed_rtt = ALPHA_RTT * rtt_ms + (1.0f - ALPHA_RTT) * smoothed_rtt;
+        }
+
+        samples[write_idx] = rtt_ms;
+        write_idx = (write_idx + 1) % JITTER_WINDOW;
+        if (count < JITTER_WINDOW) count++;
+    }
+
+    float GetSmoothedRTT() const { return smoothed_rtt; }
+    float GetJitter() const { return smoothed_jitter; }
+    bool  IsValid() const { return count >= 4; }  // Need a few samples
+};
+
+// ============================================================================
+// Internal State
+// ============================================================================
+
+// User configuration (persists across sessions)
+static int s_configuredDelay     = DELAY_DEFAULT_PREF;  // 0 = auto
+static int s_rollbackBudget      = ROLLBACK_BUDGET_DEFAULT;
+
+// Network measurement
+static JitterTracker s_jitter;
+static float s_lastRttMs         = 0.0f;
+static float s_lastVarianceMs    = 0.0f;
+static int   s_recommendedDelay  = 0;
+static bool  s_measurementValid  = false;
+
+// Session negotiation
+static int  s_agreedDelay        = 0;
+static int  s_agreedRollback     = ROLLBACK_BUDGET_DEFAULT;
+static bool s_sessionNegotiated  = false;
+
+// Active delay (what Gekko is running with)
+static int  s_activeDelay        = 0;
+static int  s_gekkoCurrentDelay  = -1;  // -1 = never set
+static bool s_gekkoSynced        = false;
+
+// Pending next-match delay (committed for next match, not yet active)
+static int  s_pendingNextDelay   = 0;
+static bool s_hasPendingNext     = false;
+
+// Change state machine
+static DelayChangeState s_changeState  = DelayChangeState::Idle;
+static int              s_changeTarget = 0;
+
+// Stats
+static uint32_t         s_changesApplied = 0;
+static DelaySafeBoundary s_lastBoundary  = DelaySafeBoundary::None;
+
+// Previous-frame state for edge detection
+static uint32_t s_prevSubstate    = 0xFFFFFFFF;
+static bool     s_prevTransition  = false;
+
+static bool s_initialized = false;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+static int ClampDelay(int delay) {
+    if (delay < DELAY_MIN) return DELAY_MIN;
+    if (delay > DELAY_MAX) return DELAY_MAX;
+    return delay;
+}
+
+static int ClampRollback(int frames) {
+    if (frames < ROLLBACK_BUDGET_MIN) return ROLLBACK_BUDGET_MIN;
+    if (frames > ROLLBACK_BUDGET_MAX) return ROLLBACK_BUDGET_MAX;
+    return frames;
+}
+
+/// Compute recommended delay from one-way trip time + jitter + safety margin.
+///
+/// Model:
+///   one_way = smoothed_rtt / 2
+///   variance_margin = jitter * 1.5 (covers ~90th percentile spikes)
+///   total_latency = one_way + variance_margin
+///   recommended_frames = ceil(total_latency / frame_time) + 1 safety frame
+///
+/// The +1 safety frame ensures that even under modest jitter, inputs arrive
+/// before the frame they're needed. Without it, borderline connections would
+/// alternate between 0 and 1 rollback frames constantly.
+static int ComputeRecommendedFromMeasurement(float smoothed_rtt, float jitter) {
+    float one_way = smoothed_rtt * 0.5f;
+    float variance_margin = jitter * 1.5f;
+    float total_latency_ms = one_way + variance_margin;
+
+    int frames = (int)ceilf(total_latency_ms / FRAME_TIME_MS);
+    frames += 1;  // Safety margin
+
+    return ClampDelay(frames);
+}
+
+/// Detect safe boundary from real mode+substate, using sync_policy context.
+static DelaySafeBoundary DetectSafeBoundary() {
+    uint32_t mode = GetGameMode();
+    uint32_t sub  = GetSubstate();
+
+    // Front-end lockstep states (CharSel, StageSel within CharSel, pause outside match)
+    // Changes here apply to the NEXT rollback match.
+    SyncMode syncMode = SyncPolicy_GetCurrentMode();
+    if (syncMode == SyncMode::Lockstep) {
+        LockstepContext ctx = SyncPolicy_GetLockstepContext();
+        // During CharSel/StageSel lockstep, delay changes are safe because
+        // no rollback session is running.
+        if (ctx == LockstepContext::CharSelect ||
+            ctx == LockstepContext::StageSelect ||
+            ctx == LockstepContext::PostMatch ||
+            ctx == LockstepContext::WinScreen) {
+            return DelaySafeBoundary::FrontEndLockstep;
+        }
+        // Pause during gameplay — both peers halted
+        if (ctx == LockstepContext::Pause) {
+            return DelaySafeBoundary::Pause;
+        }
+    }
+
+    // Match-internal boundaries
+    if (mode == MODE_MATCH) {
+        // Post-match (sub 5)
+        if (sub == MATCH_SUB_END) {
+            return DelaySafeBoundary::PostMatch;
+        }
+
+        // Round start edge: Sub 2 (INIT) → Sub 3 (GAMEPLAY)
+        if (sub == MATCH_SUB_GAMEPLAY && s_prevSubstate == MATCH_SUB_INIT) {
+            return DelaySafeBoundary::RoundStart;
+        }
+
+        // Post-round edge: transition byte went 0→1
+        if (sub == MATCH_SUB_GAMEPLAY && IsMatchTransitionActive() && !s_prevTransition) {
+            return DelaySafeBoundary::PostRound;
+        }
+    }
+
+    // Win screen (Mode 9)
+    if (mode == MODE_WINSCREEN) {
+        return DelaySafeBoundary::PostMatch;
+    }
+
+    return DelaySafeBoundary::None;
+}
+
+/// Transition change state machine forward when a safe boundary is detected.
+static void TryCommitAtBoundary(DelaySafeBoundary boundary) {
+    if (s_changeState == DelayChangeState::Pending) {
+        // Committed — ready to apply to Gekko
+        s_changeState = DelayChangeState::Committed;
+        s_lastBoundary = boundary;
+
+        bool inRollbackMatch = SyncPolicy_IsRollbackActive();
+
+        if (inRollbackMatch) {
+            // Active rollback: apply immediately (Gekko bridge will pick it up)
+            s_activeDelay = ClampDelay(s_changeTarget);
+            s_gekkoSynced = false;  // Gekko must re-sync
+            s_changesApplied++;
+
+            LOG_INFO("[DelayPolicy] Change committed to active match: delay=%d (boundary=%s, changes=%u)",
+                s_activeDelay, DelaySafeBoundaryName(boundary), s_changesApplied);
+        } else {
+            // Lockstep/front-end: stage for next match
+            s_pendingNextDelay = ClampDelay(s_changeTarget);
+            s_hasPendingNext = true;
+            s_changesApplied++;
+
+            // Also update agreed delay since no rollback session is live
+            s_agreedDelay = s_pendingNextDelay;
+
+            LOG_INFO("[DelayPolicy] Change committed for next match: delay=%d (boundary=%s, changes=%u)",
+                s_pendingNextDelay, DelaySafeBoundaryName(boundary), s_changesApplied);
+
+            // In front-end, mark as applied since there's no Gekko to sync
+            s_changeState = DelayChangeState::AppliedToGekko;
+        }
+    }
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+void DelayPolicy_Init() {
+    s_jitter.Reset();
+    s_lastRttMs = 0.0f;
+    s_lastVarianceMs = 0.0f;
+    s_recommendedDelay = 0;
+    s_measurementValid = false;
+
+    s_agreedDelay = 0;
+    s_agreedRollback = ROLLBACK_BUDGET_DEFAULT;
+    s_sessionNegotiated = false;
+
+    s_activeDelay = 0;
+    s_gekkoCurrentDelay = -1;
+    s_gekkoSynced = false;
+
+    s_pendingNextDelay = 0;
+    s_hasPendingNext = false;
+
+    s_changeState = DelayChangeState::Idle;
+    s_changeTarget = 0;
+
+    s_changesApplied = 0;
+    s_lastBoundary = DelaySafeBoundary::None;
+
+    s_prevSubstate = 0xFFFFFFFF;
+    s_prevTransition = false;
+
+    s_initialized = true;
+    LOG_INFO("[DelayPolicy] Initialized");
+}
+
+void DelayPolicy_Shutdown() {
+    s_initialized = false;
+    LOG_INFO("[DelayPolicy] Shutdown (changes=%u)", s_changesApplied);
+}
+
+// ============================================================================
+// Per-Frame Update
+// ============================================================================
+
+void DelayPolicy_FrameUpdate() {
+    if (!s_initialized) return;
+
+    // Detect safe boundaries and try to advance change state machine
+    DelaySafeBoundary boundary = DetectSafeBoundary();
+
+    if (boundary != DelaySafeBoundary::None && s_changeState == DelayChangeState::Pending) {
+        TryCommitAtBoundary(boundary);
+    }
+
+    // If active delay changed and Gekko is out of sync, the Gekko bridge
+    // will detect this via IsGekkoSynced() and call OnGekkoApplied().
+    // We do NOT auto-apply here — Gekko bridge is responsible.
+
+    // When transitioning from front-end to rollback match, apply pending next delay
+    if (s_hasPendingNext && SyncPolicy_IsRollbackActive()) {
+        s_activeDelay = s_pendingNextDelay;
+        s_hasPendingNext = false;
+        s_pendingNextDelay = 0;
+        s_gekkoSynced = false;  // Gekko must re-sync with new value
+
+        LOG_INFO("[DelayPolicy] Applied pending next-match delay: %d", s_activeDelay);
+    }
+
+    // Edge detection state for next frame
+    if (GetGameMode() == MODE_MATCH) {
+        s_prevSubstate = GetSubstate();
+        s_prevTransition = IsMatchTransitionActive();
+    } else {
+        s_prevSubstate = 0xFFFFFFFF;
+        s_prevTransition = false;
+    }
+}
+
+// ============================================================================
+// Network Measurement
+// ============================================================================
+
+void DelayPolicy_UpdateMeasurement(float rtt_ms, float rtt_variance_ms) {
+    if (!s_initialized) return;
+
+    s_lastRttMs = rtt_ms;
+    s_lastVarianceMs = rtt_variance_ms;
+
+    if (rtt_ms > 0.0f) {
+        s_jitter.Feed(rtt_ms);
+        s_measurementValid = s_jitter.IsValid();
+
+        if (s_measurementValid) {
+            s_recommendedDelay = ComputeRecommendedFromMeasurement(
+                s_jitter.GetSmoothedRTT(),
+                s_jitter.GetJitter()
+            );
+        }
+    }
+}
+
+int DelayPolicy_ComputeRecommendedDelay() {
+    if (!s_measurementValid) return 2;  // Conservative default before measurement
+    return s_recommendedDelay;
+}
+
+void DelayPolicy_GetMeasurement(NetworkMeasurement* out) {
+    if (!out) return;
+    out->rtt_ms = s_jitter.GetSmoothedRTT();
+    out->rtt_variance_ms = s_lastVarianceMs;
+    out->jitter_ms = s_jitter.GetJitter();
+    out->one_way_ms = s_jitter.GetSmoothedRTT() * 0.5f;
+    out->recommended_delay = s_recommendedDelay;
+    out->valid = s_measurementValid;
+}
+
+// ============================================================================
+// User Configuration
+// ============================================================================
+
+void DelayPolicy_SetConfiguredDelay(int delay) {
+    s_configuredDelay = (delay == 0) ? 0 : ClampDelay(delay);
+    LOG_INFO("[DelayPolicy] Configured delay set to %d (%s)",
+        s_configuredDelay, s_configuredDelay == 0 ? "auto" : "manual");
+}
+
+int DelayPolicy_GetConfiguredDelay() {
+    return s_configuredDelay;
+}
+
+void DelayPolicy_SetRollbackBudget(int frames) {
+    s_rollbackBudget = ClampRollback(frames);
+    LOG_INFO("[DelayPolicy] Rollback budget set to %d", s_rollbackBudget);
+}
+
+int DelayPolicy_GetRollbackBudget() {
+    return s_rollbackBudget;
+}
+
+// ============================================================================
+// Session Negotiation
+// ============================================================================
+
+void DelayPolicy_BuildNegotiationData(DelayNegotiationData* out) {
+    if (!out) return;
+
+    int effective_pref = s_configuredDelay;
+    if (effective_pref == 0) {
+        // Auto mode: use recommended from measurement
+        effective_pref = DelayPolicy_ComputeRecommendedDelay();
+    }
+
+    out->configured_delay  = s_configuredDelay;
+    out->recommended_delay = DelayPolicy_ComputeRecommendedDelay();
+    out->min_acceptable    = DELAY_MIN;
+    out->max_acceptable    = DELAY_MAX;
+    out->rollback_budget   = s_rollbackBudget;
+}
+
+void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
+    if (!remote) return;
+
+    // Resolve local effective preference
+    int local_effective = s_configuredDelay;
+    if (local_effective == 0) {
+        local_effective = DelayPolicy_ComputeRecommendedDelay();
+    }
+
+    int remote_effective = remote->configured_delay;
+    if (remote_effective == 0) {
+        remote_effective = remote->recommended_delay;
+    }
+
+    // Agreed delay: use the maximum of both peers' effective preferences.
+    // This ensures both peers have enough time for their inputs to arrive.
+    // Then clamp to the intersection of both peers' acceptable ranges.
+    int agreed = (std::max)(local_effective, remote_effective);
+
+    int range_min = (std::max)(DELAY_MIN, remote->min_acceptable);
+    int range_max = (std::min)(DELAY_MAX, remote->max_acceptable);
+    if (agreed < range_min) agreed = range_min;
+    if (agreed > range_max) agreed = range_max;
+
+    agreed = ClampDelay(agreed);
+
+    // Rollback budget: use the minimum of both peers' budgets.
+    // Both peers must be able to handle the agreed rollback depth.
+    int agreed_rb = (std::min)(s_rollbackBudget, remote->rollback_budget);
+    agreed_rb = ClampRollback(agreed_rb);
+
+    s_agreedDelay = agreed;
+    s_agreedRollback = agreed_rb;
+    s_activeDelay = agreed;
+    s_sessionNegotiated = true;
+    s_gekkoSynced = false;  // Gekko hasn't applied this yet
+
+    LOG_INFO("[DelayPolicy] Session negotiated:"
+        " local_eff=%d remote_eff=%d agreed=%d"
+        " local_rec=%d remote_rec=%d"
+        " rollback=%d"
+        " rtt=%.1fms jitter=%.1fms",
+        local_effective, remote_effective, agreed,
+        s_recommendedDelay, remote->recommended_delay,
+        agreed_rb,
+        s_jitter.GetSmoothedRTT(), s_jitter.GetJitter());
+}
+
+int DelayPolicy_GetAgreedDelay() {
+    return s_agreedDelay;
+}
+
+// ============================================================================
+// Active Delay (Gekko-facing)
+// ============================================================================
+
+int DelayPolicy_GetActiveDelay() {
+    return s_activeDelay;
+}
+
+int DelayPolicy_GetAgreedRollbackBudget() {
+    return s_agreedRollback;
+}
+
+bool DelayPolicy_IsGekkoSynced() {
+    return s_gekkoSynced;
+}
+
+void DelayPolicy_OnGekkoApplied(int delay_value) {
+    s_gekkoCurrentDelay = delay_value;
+    s_gekkoSynced = (delay_value == s_activeDelay);
+
+    if (s_changeState == DelayChangeState::Committed) {
+        s_changeState = DelayChangeState::AppliedToGekko;
+        LOG_INFO("[DelayPolicy] Gekko applied delay=%d (synced=%s)",
+            delay_value, s_gekkoSynced ? "yes" : "no");
+    }
+}
+
+// ============================================================================
+// Mid-Session Delay Changes
+// ============================================================================
+
+void DelayPolicy_RequestChange(int new_delay) {
+    int clamped = ClampDelay(new_delay);
+    if (clamped == s_activeDelay && !s_hasPendingNext) {
+        return;  // No change needed
+    }
+
+    if (s_changeState != DelayChangeState::Idle &&
+        s_changeState != DelayChangeState::AppliedToGekko) {
+        LOG_INFO("[DelayPolicy] Change request rejected: already in state %s",
+            DelayChangeStateName(s_changeState));
+        return;
+    }
+
+    s_changeTarget = clamped;
+    s_changeState = DelayChangeState::Requested;
+
+    LOG_INFO("[DelayPolicy] Change requested: %d -> %d (state=Requested, sync_mode=%s)",
+        s_activeDelay, clamped, SyncModeName(SyncPolicy_GetCurrentMode()));
+}
+
+void DelayPolicy_OnRemoteAck(int acked_delay) {
+    if (s_changeState != DelayChangeState::Requested) {
+        LOG_INFO("[DelayPolicy] Remote ack ignored: not in Requested state (state=%s)",
+            DelayChangeStateName(s_changeState));
+        return;
+    }
+
+    if (acked_delay != s_changeTarget) {
+        LOG_INFO("[DelayPolicy] Remote ack mismatch: expected=%d got=%d, renegotiating",
+            s_changeTarget, acked_delay);
+        // Take the max — conservative approach
+        s_changeTarget = ClampDelay((std::max)(s_changeTarget, acked_delay));
+    }
+
+    s_changeState = DelayChangeState::Pending;
+    LOG_INFO("[DelayPolicy] Change pending: target=%d (awaiting safe boundary)",
+        s_changeTarget);
+}
+
+DelayChangeState DelayPolicy_GetChangeState() {
+    return s_changeState;
+}
+
+int DelayPolicy_GetChangeTarget() {
+    return s_changeTarget;
+}
+
+bool DelayPolicy_IsSafeBoundaryAvailable() {
+    return DetectSafeBoundary() != DelaySafeBoundary::None;
+}
+
+DelaySafeBoundary DelayPolicy_GetCurrentSafeBoundary() {
+    return DetectSafeBoundary();
+}
+
+int DelayPolicy_GetPendingNextDelay() {
+    return s_hasPendingNext ? s_pendingNextDelay : s_activeDelay;
+}
+
+bool DelayPolicy_HasPendingNextDelay() {
+    return s_hasPendingNext;
+}
+
+// ============================================================================
+// Session Reset
+// ============================================================================
+
+void DelayPolicy_ResetSession() {
+    // Keep user configuration (s_configuredDelay, s_rollbackBudget)
+    // Reset everything else
+    s_jitter.Reset();
+    s_lastRttMs = 0.0f;
+    s_lastVarianceMs = 0.0f;
+    s_recommendedDelay = 0;
+    s_measurementValid = false;
+
+    s_agreedDelay = 0;
+    s_agreedRollback = ROLLBACK_BUDGET_DEFAULT;
+    s_sessionNegotiated = false;
+
+    s_activeDelay = 0;
+    s_gekkoCurrentDelay = -1;
+    s_gekkoSynced = false;
+
+    s_pendingNextDelay = 0;
+    s_hasPendingNext = false;
+
+    s_changeState = DelayChangeState::Idle;
+    s_changeTarget = 0;
+
+    s_changesApplied = 0;
+    s_lastBoundary = DelaySafeBoundary::None;
+
+    s_prevSubstate = 0xFFFFFFFF;
+    s_prevTransition = false;
+
+    LOG_INFO("[DelayPolicy] Session reset");
+}
+
+// ============================================================================
+// Diagnostics
+// ============================================================================
+
+void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
+    if (!out) return;
+
+    out->configured_delay    = s_configuredDelay;
+    out->recommended_delay   = s_recommendedDelay;
+    out->agreed_delay        = s_agreedDelay;
+    out->active_delay        = s_activeDelay;
+    out->pending_next_delay  = s_hasPendingNext ? s_pendingNextDelay : 0;
+
+    out->rollback_budget     = s_rollbackBudget;
+    out->agreed_rollback     = s_agreedRollback;
+
+    out->change_state        = s_changeState;
+    out->change_target_delay = s_changeTarget;
+
+    out->gekko_synced        = s_gekkoSynced;
+    out->gekko_current_delay = s_gekkoCurrentDelay;
+
+    out->measured_rtt_ms     = s_jitter.GetSmoothedRTT();
+    out->measured_jitter_ms  = s_jitter.GetJitter();
+    out->measured_one_way_ms = s_jitter.GetSmoothedRTT() * 0.5f;
+    out->measurement_valid   = s_measurementValid;
+
+    out->changes_applied     = s_changesApplied;
+    out->last_boundary       = s_lastBoundary;
+
+    out->in_rollback_match   = SyncPolicy_IsRollbackActive();
+    out->safe_boundary_available = (DetectSafeBoundary() != DelaySafeBoundary::None);
+}
+
+} // namespace Net

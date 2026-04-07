@@ -916,8 +916,26 @@ void InputSystem_WriteToGameBuffers(int player) {
 
     uintptr_t base = (player == 0) ? GAME_P1_INPUT_BASE : GAME_P2_INPUT_BASE;
 
-    uint16_t current     = g_inputState[player].current;
-    uint16_t justPressed = g_inputState[player].pressed;
+    uint16_t current, justPressed;
+
+    if (g_netplayInputActive[player]) {
+        // Netplay/rollback path: use rollback-controlled inputs.
+        // Derive just-pressed by reading the game buffer's previous held state.
+        uint16_t prevHeld = 0;
+        __try {
+            for (int i = 0; i < 10; i++) {
+                if (*(uint16_t*)(base + i * 2))
+                    prevHeld |= g_buttonMasks[i];
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            prevHeld = 0;
+        }
+        current = g_netplayInput[player];
+        justPressed = current & ~prevHeld;
+    } else {
+        current     = g_inputState[player].current;
+        justPressed = g_inputState[player].pressed;
+    }
 
     // Pause suppression: strip Start just-pressed during netplay match
     if (g_pauseBlocked) {
@@ -930,11 +948,8 @@ void InputSystem_WriteToGameBuffers(int player) {
         uint16_t* justPressedPtr = (uint16_t*)(base + INPUT_ARRAY_JUSTPRESSED * 2 + i * 2);
 
         __try {
-            if (current & mask)
-                *heldPtr = 1;
-
-            if (justPressed & mask)
-                *justPressedPtr = 1;
+            *heldPtr       = (current     & mask) ? 1 : 0;
+            *justPressedPtr = (justPressed & mask) ? 1 : 0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             printf("[Input] Write failed at 0x%08X (P%d btn %d)\n",
