@@ -16,6 +16,7 @@
 #include "net/match_lifecycle.h"
 #include "net/session_manager.h"
 #include "net/protocol.h"
+#include "net/player_side_mapping.h"
 #include "input/input_system.h"
 #include "as2_constants.h"
 #include "patches/memory_utils.h"
@@ -56,6 +57,11 @@ static uint32_t s_baselineChecksum  = 0;
 static int      s_activeDelay       = 0;
 static int      s_rollbackBudget    = 7;
 
+// Rollback mitigations (CCCaster-style)
+static const int MAX_ROLLBACK        = 15;   // Hard cap on rollback depth
+static const int MIN_ROLLBACK_SPACING = 2;   // Min normal frames between rollbacks
+static int32_t  s_framesSinceLastRollback = 0; // Cooldown counter
+
 // Input tracking
 static int32_t  s_lastSavedFrame    = -1;
 static int32_t  s_localInputsSent   = 0;
@@ -65,6 +71,7 @@ static int32_t  s_remoteInputsRecv  = 0;
 static bool     s_hasInjectedInput  = false;
 static int32_t  s_injectedFrame     = -1;
 static uint16_t s_injectedInput     = 0;
+static bool     s_loggedFirstFrameInput = false;
 
 // Frame advance guard: prevents double-advancing when the game's natural
 // loop will call Mode 8 handler after ModOnFrame returns.
@@ -104,6 +111,12 @@ static void SendLocalInput(int32_t frame, uint16_t input) {
         &payload, sizeof(payload),
         false  // Unreliable — speed > reliability, redundancy handles loss
     );
+
+    NetplayLog_Verbose("RBINPUT", frame,
+        "Send local input: input=0x%04X batch_start=%d count=%u",
+        input,
+        payload.start_frame,
+        payload.input_count);
 
     s_localInputsSent++;
 }
@@ -164,9 +177,9 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_localInputsSent  = 0;
     s_remoteInputsRecv = 0;
     s_hasInjectedInput = false;
+    s_loggedFirstFrameInput = false;
     s_frameAdvancePending = false;
-
-    // Capture baseline state as frame 0 (or start_frame)
+    s_framesSinceLastRollback = MIN_ROLLBACK_SPACING; // Allow rollback immediately
     if (!StateHistory_CaptureFrame(s_startFrame)) {
         LOG_ERROR("[RollbackSession] Failed to capture baseline state");
         return false;
@@ -205,6 +218,7 @@ void RollbackSession_End() {
 
     s_active = false;
     s_hasInjectedInput = false;
+    s_loggedFirstFrameInput = false;
     s_frameAdvancePending = false;
 
     // Reset subsystems so no stale state carries into next session
@@ -239,6 +253,11 @@ void RollbackSession_SubmitRemoteInput(int32_t frame, uint16_t input) {
     bool mismatch = InputTimeline_SetRemoteInput(frame, input);
 
     s_remoteInputsRecv++;
+
+    NetplayLog_Verbose("RBINPUT", frame,
+        "Remote input submitted: input=0x%04X recv_total=%d",
+        input,
+        s_remoteInputsRecv);
 
     if (mismatch) {
         LOG_INFO("[RollbackSession] Misprediction detected at frame %d "
@@ -281,11 +300,15 @@ void RollbackSession_FrameUpdate() {
 
     if (policy_delay != s_activeDelay) {
         LOG_INFO("[RollbackSession] Delay updated: %d -> %d", s_activeDelay, policy_delay);
+        NetplayLog_ValueChange("RBSESS", s_currentFrame,
+            "active_delay", s_activeDelay, policy_delay, "DelayPolicy update");
         s_activeDelay = policy_delay;
     }
     if (policy_budget != s_rollbackBudget) {
         LOG_INFO("[RollbackSession] Rollback budget updated: %d -> %d",
             s_rollbackBudget, policy_budget);
+        NetplayLog_ValueChange("RBSESS", s_currentFrame,
+            "rollback_budget", s_rollbackBudget, policy_budget, "DelayPolicy update");
         s_rollbackBudget = policy_budget;
     }
 
@@ -295,7 +318,9 @@ void RollbackSession_FrameUpdate() {
         local_input = s_injectedInput;
         s_hasInjectedInput = false;
     } else {
-        local_input = InputSystem_GetInput(s_localPlayer);
+        // Always read from local P1 SDL bindings, regardless of which game
+        // slot this machine controls. PlayerMapping handles the routing.
+        local_input = Net::PlayerMapping_ReadLocalInput();
     }
 
     // The input for frame N goes into the timeline at frame N + delay.
@@ -304,6 +329,13 @@ void RollbackSession_FrameUpdate() {
     int32_t local_target_frame = s_currentFrame + s_activeDelay;
 
     InputTimeline_SetLocalInput(local_target_frame, local_input);
+
+    NetplayLog_Verbose("RBSTEP", s_currentFrame,
+        "Begin frame: local_input=0x%04X target_frame=%d active_delay=%d rb_budget=%d",
+        local_input,
+        local_target_frame,
+        s_activeDelay,
+        s_rollbackBudget);
 
     // --- STEP 2: SEND LOCAL INPUT TO REMOTE ---
     SendLocalInput(local_target_frame, local_input);
@@ -323,49 +355,97 @@ void RollbackSession_FrameUpdate() {
         }
     }
 
+    NetplayLog_Verbose("RBSTEP", s_currentFrame,
+        "Prediction window: last_confirmed=%d predicted_outstanding=%d",
+        last_confirmed,
+        InputTimeline_GetPredictedFrameCount());
+
+    // --- STEP 3b: HARD CAP BLOCKING (CCCaster-style) ---
+    // If we've exceeded MAX_ROLLBACK predicted (unconfirmed remote) frames,
+    // block: do NOT advance the game frame. This prevents unbounded speculation
+    // and forces us to wait for remote inputs to arrive.
+    {
+        int32_t predicted_count = InputTimeline_GetPredictedFrameCount();
+        if (predicted_count >= MAX_ROLLBACK) {
+            NetplayLog_Write("RBSESS", s_currentFrame,
+                "BLOCKING: predicted_count=%d >= MAX_ROLLBACK=%d — waiting for remote",
+                predicted_count, MAX_ROLLBACK);
+            // Don't advance frame counter — the game will re-enter FrameUpdate
+            // next frame and we'll check again. We already sent our input in Step 2
+            // so remote has what it needs.
+            return;
+        }
+    }
+
     // --- STEP 4: CHECK FOR MISPREDICTIONS ---
     // Find the first frame with a known-wrong prediction.
     int32_t mispredicted_frame = InputTimeline_FindFirstMisprediction(
         (std::max)(s_startFrame, last_confirmed - s_rollbackBudget));
 
     // --- STEP 5: ROLLBACK IF NEEDED ---
+    // CCCaster-style mitigations:
+    // (a) Spacing cooldown: don't rollback if we rolled back too recently
+    // (b) Hard cap: clamp rollback depth to MAX_ROLLBACK
     if (mispredicted_frame >= 0 && mispredicted_frame < s_currentFrame) {
-        int32_t rollback_depth = s_currentFrame - mispredicted_frame;
+        // Spacing cooldown: skip this rollback if not enough normal frames have passed
+        if (s_framesSinceLastRollback < MIN_ROLLBACK_SPACING) {
+            NetplayLog_Verbose("RBSESS", s_currentFrame,
+                "Rollback deferred: spacing cooldown (%d/%d frames since last)",
+                s_framesSinceLastRollback, MIN_ROLLBACK_SPACING);
+        } else {
+            int32_t rollback_depth = s_currentFrame - mispredicted_frame;
 
-        // Clamp to budget
-        if (rollback_depth > s_rollbackBudget) {
-            LOG_WARN("[RollbackSession] Rollback depth %d exceeds budget %d — clamping",
-                rollback_depth, s_rollbackBudget);
-            mispredicted_frame = s_currentFrame - s_rollbackBudget;
-        }
+            // Hard cap: clamp to MAX_ROLLBACK (CCCaster: 15)
+            if (rollback_depth > MAX_ROLLBACK) {
+                LOG_WARN("[RollbackSession] Rollback depth %d exceeds MAX_ROLLBACK %d — clamping",
+                    rollback_depth, MAX_ROLLBACK);
+                mispredicted_frame = s_currentFrame - MAX_ROLLBACK;
+                rollback_depth = MAX_ROLLBACK;
+            }
 
-        // Verify the target frame is within state history before attempting rollback
-        int32_t oldest = StateHistory_GetOldestFrame();
-        if (oldest >= 0 && mispredicted_frame < oldest) {
-            LOG_WARN("[RollbackSession] Rollback target %d is older than history (oldest=%d) — clamping",
-                mispredicted_frame, oldest);
-            mispredicted_frame = oldest;
-        }
+            // Also clamp to configured budget
+            if (rollback_depth > s_rollbackBudget) {
+                LOG_WARN("[RollbackSession] Rollback depth %d exceeds budget %d — clamping",
+                    rollback_depth, s_rollbackBudget);
+                mispredicted_frame = s_currentFrame - s_rollbackBudget;
+            }
 
-        LOG_INFO("[RollbackSession] ROLLBACK: frame %d -> %d (depth=%d)",
-            s_currentFrame, mispredicted_frame, s_currentFrame - mispredicted_frame);
+            // Verify the target frame is within state history before attempting rollback
+            int32_t oldest = StateHistory_GetOldestFrame();
+            if (oldest >= 0 && mispredicted_frame < oldest) {
+                LOG_WARN("[RollbackSession] Rollback target %d is older than history (oldest=%d) — clamping",
+                    mispredicted_frame, oldest);
+                mispredicted_frame = oldest;
+            }
 
-        NetplayLog_Write("RBSESS", s_currentFrame,
-            "ROLLBACK: %d -> %d (depth=%d)",
-            s_currentFrame, mispredicted_frame, s_currentFrame - mispredicted_frame);
+            LOG_INFO("[RollbackSession] ROLLBACK: frame %d -> %d (depth=%d)",
+                s_currentFrame, mispredicted_frame, s_currentFrame - mispredicted_frame);
 
-        int32_t replayed = Resim_Execute(
-            mispredicted_frame,
-            s_currentFrame,
-            s_localPlayer
-        );
+            NetplayLog_Write("RBSESS", s_currentFrame,
+                "ROLLBACK: %d -> %d (depth=%d spacing=%d)",
+                s_currentFrame, mispredicted_frame,
+                s_currentFrame - mispredicted_frame,
+                s_framesSinceLastRollback);
 
-        if (replayed < 0) {
-            LOG_ERROR("[RollbackSession] Resimulation failed — ending session");
-            RollbackSession_End();
-            return;
+            int32_t replayed = Resim_Execute(
+                mispredicted_frame,
+                s_currentFrame,
+                s_localPlayer
+            );
+
+            if (replayed < 0) {
+                LOG_ERROR("[RollbackSession] Resimulation failed — ending session");
+                RollbackSession_End();
+                return;
+            }
+
+            // Reset spacing cooldown after a rollback
+            s_framesSinceLastRollback = 0;
         }
     }
+
+    // Increment spacing cooldown counter
+    s_framesSinceLastRollback++;
 
     // --- STEP 6: SAVE STATE FOR CURRENT FRAME ---
     // We save BEFORE the game advances this frame, so we can rollback
@@ -394,12 +474,19 @@ void RollbackSession_FrameUpdate() {
         InputSystem_SetNetplayInput(1, p2_input);
         InputSystem_WriteToGameBuffersBothPlayers();
 
-        if (!s_hasInjectedInput) {
+        if (!s_loggedFirstFrameInput) {
             NetplayLog_Write("RBSESS", s_currentFrame,
                 "FIRST INPUT INJECTION: P1=0x%04X P2=0x%04X (local=P%d)",
                 p1_input, p2_input, s_localPlayer + 1);
-            s_hasInjectedInput = true;
+            s_loggedFirstFrameInput = true;
         }
+
+        NetplayLog_Verbose("RBSTEP", s_currentFrame,
+            "Inject inputs: P1=0x%04X P2=0x%04X local=P%d predicted=%d",
+            p1_input,
+            p2_input,
+            s_localPlayer + 1,
+            InputTimeline_GetPredictedFrameCount());
     }
 
     // --- STEP 8: ADVANCE FRAME COUNTER ---
@@ -408,13 +495,16 @@ void RollbackSession_FrameUpdate() {
     // managed by the game itself — we just track our logical frame.
     s_currentFrame++;
 
-    // Acknowledge delay policy sync.
-    // NOTE: There is NO actual GekkoNet bridge wired yet. These calls are
-    // local bookkeeping in delay_policy to mark the active delay as consumed.
-    // When a real Gekko bridge is implemented, it will replace this.
-    if (!Net::DelayPolicy_IsGekkoSynced()) {
-        Net::DelayPolicy_OnGekkoApplied(s_activeDelay);
-    }
+    // NOTE: Delay policy consumption (marking active delay as applied) is
+    // handled by the gameplay bridge after calling this function.
+    // The bridge owns the delay policy lifecycle contract.
+
+    NetplayLog_Verbose("RBSTEP", s_currentFrame,
+        "End frame: next_frame=%d last_saved=%d local_sent=%d remote_recv=%d",
+        s_currentFrame,
+        s_lastSavedFrame,
+        s_localInputsSent,
+        s_remoteInputsRecv);
 }
 
 // ============================================================================

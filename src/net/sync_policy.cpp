@@ -66,8 +66,8 @@ static void ClassifyCurrentState(SyncMode* outMode, LockstepContext* outContext)
             *outContext = LockstepContext::CharSelect;
             return;
         }
-        // Substate 7 (STAGESEL_GRID) is stage selection within charsel
-        if (sub == CHARSEL_SUB_STAGESEL_GRID) {
+        // Substates 7/8 are the interactive shared stage-select UI.
+        if (sub == CHARSEL_SUB_STAGESEL_GRID || sub == CHARSEL_SUB_STAGESEL_CONFIRM) {
             *outMode = SyncMode::Lockstep;
             *outContext = LockstepContext::StageSelect;
             return;

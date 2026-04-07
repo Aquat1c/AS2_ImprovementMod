@@ -8,6 +8,7 @@
 #include "net/session_manager.h"
 #include "net/enet_transport.h"
 #include "log_window.h"
+#include "rollback/netplay_log.h"
 
 #include <enet/enet.h>
 #include <string.h>
@@ -39,6 +40,13 @@ static DWORD          s_stateEnteredAt  = 0;  // GetTickCount when state entered
 static void SetState(SessionState newState) {
     if (s_state == newState) return;
     LOG_INFO("[Session] State: %s -> %s", SessionStateName(s_state), SessionStateName(newState));
+    Rollback::NetplayLog_StateChange(
+        "SESSION", -1,
+        "state",
+        SessionStateName(s_state),
+        SessionStateName(newState),
+        "session manager transition"
+    );
     s_state = newState;
     s_stateEnteredAt = GetTickCount();
 }
@@ -46,6 +54,7 @@ static void SetState(SessionState newState) {
 static void SetError(const char* msg) {
     snprintf(s_errorText, sizeof(s_errorText), "%s", msg);
     LOG_ERROR("[Session] Error: %s", msg);
+    Rollback::NetplayLog_Write("SESSION", -1, "ERROR: %s", msg);
     SetState(SessionState::Failed);
 }
 
@@ -91,6 +100,33 @@ static void UpdateStatusText() {
     }
 }
 
+static void NotePacketSent(uint8_t channel, PacketType type,
+                           size_t payloadLen, bool reliable,
+                           const char* context) {
+    s_stats.bytes_sent += sizeof(PacketType) + payloadLen;
+    Rollback::NetplayLog_Verbose("SESSION", -1,
+        "SEND %s ch=%u type=%s payload=%zu total=%zu reliable=%d state=%s",
+        context ? context : "packet",
+        channel,
+        PacketTypeName(type),
+        payloadLen,
+        sizeof(PacketType) + payloadLen,
+        reliable ? 1 : 0,
+        SessionStateName(s_state));
+}
+
+static void NotePacketReceived(uint8_t channel, PacketType type, size_t payloadLen) {
+    s_stats.packets_received++;
+    s_stats.bytes_received += sizeof(PacketType) + payloadLen;
+    Rollback::NetplayLog_Verbose("SESSION", -1,
+        "RECV ch=%u type=%s payload=%zu total=%zu state=%s",
+        channel,
+        PacketTypeName(type),
+        payloadLen,
+        sizeof(PacketType) + payloadLen,
+        SessionStateName(s_state));
+}
+
 // ============================================================================
 // Handshake
 // ============================================================================
@@ -103,10 +139,17 @@ static void SendHello() {
     memset(hello.nickname, 0, sizeof(hello.nickname));
     strncpy(hello.nickname, s_config.nickname, sizeof(hello.nickname) - 1);
 
-    Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Hello,
-                        &hello, sizeof(hello), true);
+    if (!Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Hello,
+                             &hello, sizeof(hello), true)) {
+        SetError("Failed to send Hello");
+        return;
+    }
+    NotePacketSent(CHANNEL_CONTROL, PacketType::Hello, sizeof(hello), true, "hello");
     LOG_INFO("[Session] Sent Hello (nick=%s, ver=%u, hash=0x%08X)",
              hello.nickname, hello.protocol_version, hello.build_hash);
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Sent Hello: nick=%s ver=%u hash=0x%08X listen_port=%u",
+        hello.nickname, hello.protocol_version, hello.build_hash, hello.listen_port);
 }
 
 static void SendHelloAck() {
@@ -117,9 +160,16 @@ static void SendHelloAck() {
     memset(ack.nickname, 0, sizeof(ack.nickname));
     strncpy(ack.nickname, s_config.nickname, sizeof(ack.nickname) - 1);
 
-    Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::HelloAck,
-                        &ack, sizeof(ack), true);
+    if (!Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::HelloAck,
+                             &ack, sizeof(ack), true)) {
+        SetError("Failed to send HelloAck");
+        return;
+    }
+    NotePacketSent(CHANNEL_CONTROL, PacketType::HelloAck, sizeof(ack), true, "hello-ack");
     LOG_INFO("[Session] Sent HelloAck");
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Sent HelloAck: nick=%s ver=%u hash=0x%08X listen_port=%u",
+        ack.nickname, ack.protocol_version, ack.build_hash, ack.listen_port);
 }
 
 static bool ProcessHelloPayload(const void* payload, size_t len) {
@@ -156,6 +206,12 @@ static bool ProcessHelloPayload(const void* payload, size_t len) {
 
     LOG_INFO("[Session] Remote peer: nick=%s, ver=%u, hash=0x%08X",
              s_remotePeer.nickname, s_remotePeer.protocol_version, s_remotePeer.build_hash);
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Remote Hello accepted: nick=%s ver=%u hash=0x%08X listen_port=%u",
+        s_remotePeer.nickname,
+        s_remotePeer.protocol_version,
+        s_remotePeer.build_hash,
+        s_remotePeer.listen_port);
     return true;
 }
 
@@ -183,6 +239,8 @@ static bool ProcessHelloAckPayload(const void* payload, size_t len) {
 static void OnENetConnect(ENetPeer* peer) {
     s_peer = peer;
     LOG_INFO("[Session] ENet connected (peer %p)", peer);
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "ENet connected: peer=%p role=%s", peer, SessionRoleName(s_role));
 
     if (s_state == SessionState::Connecting) {
         SetState(SessionState::Handshaking);
@@ -195,6 +253,9 @@ static void OnENetConnect(ENetPeer* peer) {
 
 static void OnENetDisconnect(ENetPeer* peer, uint32_t data) {
     LOG_INFO("[Session] ENet disconnected (peer %p, data=%u)", peer, data);
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "ENet disconnected: peer=%p data=%u state=%s",
+        peer, data, SessionStateName(s_state));
     s_peer = nullptr;
 
     if (s_state == SessionState::Disconnecting) {
@@ -214,6 +275,8 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
     PacketType type = ReadPacketType(data);
     const void* payload = GetPayloadPtr(data);
     size_t payloadLen = GetPayloadSize(length);
+
+    NotePacketReceived(channelID, type, payloadLen);
 
     switch (type) {
         case PacketType::Hello:
@@ -243,6 +306,9 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
         case PacketType::Ready:
             s_remoteReady = true;
             LOG_INFO("[Session] Remote peer signaled Ready");
+            Rollback::NetplayLog_Write("SESSION", -1,
+                "Remote Ready received: local_ready=%d remote_ready=%d",
+                s_localReady ? 1 : 0, s_remoteReady ? 1 : 0);
             if (s_localReady && s_remoteReady && s_state == SessionState::Connected) {
                 SetState(SessionState::Ready);
             }
@@ -255,6 +321,8 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
                 reason = dp->message;
             }
             LOG_INFO("[Session] Received Disconnect: %s", reason);
+            Rollback::NetplayLog_Write("SESSION", -1,
+                "Remote Disconnect received: %s", reason);
             if (s_peer) {
                 Transport_ForceDisconnectPeer(s_peer);
                 s_peer = nullptr;
@@ -267,6 +335,10 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
             // Forward to external callback
             if (s_packetCallback) {
                 s_packetCallback(type, payload, payloadLen);
+            } else {
+                Rollback::NetplayLog_Verbose("SESSION", -1,
+                    "Unhandled packet with no callback: type=%s payload=%zu",
+                    PacketTypeName(type), payloadLen);
             }
             break;
     }
@@ -282,12 +354,17 @@ static void CheckTimeouts() {
 
     switch (s_state) {
         case SessionState::Connecting:
-            if (elapsed > s_config.connect_timeout_ms) {
+            // Host listens indefinitely — only joiner has a connect timeout
+            if (s_role == SessionRole::Join && elapsed > s_config.connect_timeout_ms) {
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Connect timeout after %lu ms", (unsigned long)elapsed);
                 SetError("Connection timed out");
             }
             break;
         case SessionState::Handshaking:
             if (elapsed > s_config.handshake_timeout_ms) {
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Handshake timeout after %lu ms", (unsigned long)elapsed);
                 SetError("Handshake timed out");
             }
             break;
@@ -334,6 +411,14 @@ bool Session_StartHost(const SessionConfig* config) {
     memcpy(&s_config, config, sizeof(s_config));
     s_role = SessionRole::Host;
 
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "StartHost: listen_port=%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u",
+        config->listen_port,
+        config->nickname,
+        config->build_hash,
+        config->connect_timeout_ms,
+        config->handshake_timeout_ms);
+
     if (!Transport_CreateHost(config->listen_port)) {
         SetError("Failed to create host");
         return false;
@@ -353,6 +438,18 @@ bool Session_StartJoin(const SessionConfig* config) {
 
     memcpy(&s_config, config, sizeof(s_config));
     s_role = SessionRole::Join;
+
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "StartJoin: target=%u.%u.%u.%u:%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u",
+        (config->target_ip) & 0xFF,
+        (config->target_ip >> 8) & 0xFF,
+        (config->target_ip >> 16) & 0xFF,
+        (config->target_ip >> 24) & 0xFF,
+        config->target_port,
+        config->nickname,
+        config->build_hash,
+        config->connect_timeout_ms,
+        config->handshake_timeout_ms);
 
     // Joiner creates a host on an ephemeral port, then connects out
     if (!Transport_CreateHost(0)) {
@@ -375,6 +472,8 @@ void Session_Cancel() {
     if (s_state == SessionState::Idle) return;
 
     LOG_INFO("[Session] Canceling session (was %s)", SessionStateName(s_state));
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Cancel requested from state=%s", SessionStateName(s_state));
 
     // Send a disconnect packet if we have a peer
     if (s_peer && (s_state == SessionState::Connected ||
@@ -384,8 +483,10 @@ void Session_Cancel() {
         dp.reason_code = static_cast<uint16_t>(DisconnectReason::UserCancel);
         strncpy(dp.message, "Session canceled", sizeof(dp.message) - 1);
         dp.message[sizeof(dp.message) - 1] = '\0';
-        Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Disconnect,
-                            &dp, sizeof(dp), true);
+        if (Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Disconnect,
+                                &dp, sizeof(dp), true)) {
+            NotePacketSent(CHANNEL_CONTROL, PacketType::Disconnect, sizeof(dp), true, "cancel");
+        }
         Transport_Flush();
         Transport_DisconnectPeer(s_peer);
     }
@@ -401,9 +502,17 @@ void Session_SignalReady() {
     }
 
     s_localReady = true;
-    Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Ready,
-                        nullptr, 0, true);
+    if (!Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Ready,
+                             nullptr, 0, true)) {
+        LOG_WARN("[Session] Failed to send Ready packet");
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "ERROR: failed to send Ready packet");
+        return;
+    }
+    NotePacketSent(CHANNEL_CONTROL, PacketType::Ready, 0, true, "ready");
     LOG_INFO("[Session] Signaled Ready (local)");
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Local Ready sent: remote_ready=%d", s_remoteReady ? 1 : 0);
 
     if (s_localReady && s_remoteReady) {
         SetState(SessionState::Ready);
@@ -452,9 +561,29 @@ void Session_Update() {
 bool Session_SendPacket(uint8_t channel, PacketType type,
                         const void* payload, size_t payloadLen, bool reliable) {
     if (!s_peer || (s_state != SessionState::Connected && s_state != SessionState::Ready)) {
+        Rollback::NetplayLog_Verbose("SESSION", -1,
+            "DROP send ch=%u type=%s payload=%zu reliable=%d state=%s peer=%p",
+            channel,
+            PacketTypeName(type),
+            payloadLen,
+            reliable ? 1 : 0,
+            SessionStateName(s_state),
+            s_peer);
         return false;
     }
-    return Transport_SendTyped(s_peer, channel, type, payload, payloadLen, reliable);
+
+    const bool sent = Transport_SendTyped(s_peer, channel, type, payload, payloadLen, reliable);
+    if (sent) {
+        NotePacketSent(channel, type, payloadLen, reliable, "session-send");
+    } else {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "ERROR: send failed ch=%u type=%s payload=%zu reliable=%d",
+            channel,
+            PacketTypeName(type),
+            payloadLen,
+            reliable ? 1 : 0);
+    }
+    return sent;
 }
 
 void Session_SetPacketCallback(PacketCallback cb) {
@@ -482,8 +611,7 @@ SessionRole Session_GetRole() {
 }
 
 bool Session_IsConnected() {
-    return s_state == SessionState::Handshaking ||
-           s_state == SessionState::Connected ||
+    return s_state == SessionState::Connected ||
            s_state == SessionState::Ready;
 }
 

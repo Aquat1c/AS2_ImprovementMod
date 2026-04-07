@@ -9,6 +9,7 @@
 #include "rollback/resimulation.h"
 #include "rollback/input_timeline.h"
 #include "rollback/determinism_verify.h"
+#include "rollback/netplay_log.h"
 #include "input/input_system.h"
 #include "as2_constants.h"
 #include "patches/memory_utils.h"
@@ -236,6 +237,11 @@ void StateHistory_Init() {
         STATE_HISTORY_CAPACITY,
         sizeof(StateSlot) / 1024,
         (sizeof(StateSlot) * STATE_HISTORY_CAPACITY) / 1024);
+    NetplayLog_Write("STATE", -1,
+        "State history initialized: slots=%d slot_kb=%zu total_kb=%zu",
+        STATE_HISTORY_CAPACITY,
+        sizeof(StateSlot) / 1024,
+        (sizeof(StateSlot) * STATE_HISTORY_CAPACITY) / 1024);
 }
 
 void StateHistory_Shutdown() {
@@ -256,6 +262,7 @@ void StateHistory_Reset() {
     s_writeIdx = 0;
     s_count = 0;
     LOG_INFO("[StateHistory] Reset");
+    NetplayLog_Write("STATE", -1, "State history reset");
 }
 
 bool StateHistory_CaptureFrame(int32_t frame) {
@@ -269,6 +276,13 @@ bool StateHistory_CaptureFrame(int32_t frame) {
     s_writeIdx = (s_writeIdx + 1) % STATE_HISTORY_CAPACITY;
     if (s_count < STATE_HISTORY_CAPACITY) s_count++;
 
+    NetplayLog_Verbose("STATE", frame,
+        "Captured frame: checksum=0x%08X count=%d oldest=%d newest=%d",
+        slot->checksum,
+        s_count,
+        StateHistory_GetOldestFrame(),
+        StateHistory_GetNewestFrame());
+
     return true;
 }
 
@@ -279,6 +293,10 @@ bool StateHistory_LoadFrame(int32_t frame) {
     for (int i = 0; i < s_count; i++) {
         int idx = (s_writeIdx - 1 - i + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
         if (s_slots[idx].valid && s_slots[idx].frame == frame) {
+            NetplayLog_Write("STATE", frame,
+                "Loading state: checksum=0x%08X slot=%d",
+                s_slots[idx].checksum,
+                idx);
             return RestoreFromSlot(&s_slots[idx]);
         }
     }
@@ -376,10 +394,15 @@ int32_t Resim_Execute(int32_t rollback_frame, int32_t target_frame, int local_pl
 
     LOG_INFO("[Resim] BEGIN: load=%d rollback=%d target=%d replay=%d frames",
         load_frame, rollback_frame, target_frame, replay_length);
+    NetplayLog_Write("RESIM", target_frame,
+        "BEGIN load=%d rollback=%d target=%d replay=%d local=P%d",
+        load_frame, rollback_frame, target_frame, replay_length, local_player + 1);
 
     // Load the saved state
     if (!StateHistory_LoadFrame(load_frame)) {
         LOG_ERROR("[Resim] Failed to load state at frame %d", load_frame);
+        NetplayLog_Write("RESIM", target_frame,
+            "ERROR: failed to load state at frame %d", load_frame);
         return -1;
     }
 
@@ -392,6 +415,15 @@ int32_t Resim_Execute(int32_t rollback_frame, int32_t target_frame, int local_pl
     // Resimulate frame by frame
     for (int32_t f = load_frame; f < target_frame; f++) {
         s_resimFrame = f;
+
+        const FrameInput* frameInput = InputTimeline_GetFrame(f);
+        NetplayLog_Verbose("RESIM", f,
+            "Replay frame: local=0x%04X remote=0x%04X local_ok=%d remote_ok=%d predicted=%d",
+            frameInput ? frameInput->local : INPUT_NEUTRAL,
+            frameInput ? frameInput->remote : INPUT_NEUTRAL,
+            frameInput && frameInput->local_confirmed ? 1 : 0,
+            frameInput && frameInput->remote_confirmed ? 1 : 0,
+            frameInput && frameInput->remote_predicted ? 1 : 0);
 
         // Write the correct inputs for this frame
         WriteInputsForFrame(f, local_player);
@@ -409,6 +441,8 @@ int32_t Resim_Execute(int32_t rollback_frame, int32_t target_frame, int local_pl
             g_matchHandler((uint32_t*)ADDR_GAME_STATE_BASE);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LOG_ERROR("[Resim] EXCEPTION during frame %d resimulation", f);
+            NetplayLog_Write("RESIM", f,
+                "ERROR: exception during resimulation");
             s_resimulating = false;
             s_resimFrame = -1;
             return -1;
@@ -431,6 +465,9 @@ int32_t Resim_Execute(int32_t rollback_frame, int32_t target_frame, int local_pl
     }
 
     LOG_INFO("[Resim] DONE: replayed %d frames (total_rollbacks=%d max_depth=%d)",
+        frames_replayed, s_totalRollbacks, s_maxRollbackDepth);
+    NetplayLog_Write("RESIM", target_frame,
+        "DONE replayed=%d total_rollbacks=%d max_depth=%d",
         frames_replayed, s_totalRollbacks, s_maxRollbackDepth);
 
     return frames_replayed;

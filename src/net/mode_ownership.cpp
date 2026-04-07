@@ -40,6 +40,7 @@ namespace NetMenu {
     void HandleNetworkSelected();
     void HandleDisconnection(const char* reason);
     void HandlePostMatchReturn();
+    void RenderFrame();
 }
 
 // ============================================================================
@@ -138,6 +139,9 @@ static char __cdecl Hook_MainMenuStateMachine() {
             LOG_NETPLAY(LOG_INFO, "[ModeOwn] Intercepted Network selection from main menu");
             NetMenu::HandleNetworkSelected();
             ModeOwnership::SanitizeOwnedGameType(MODE_MENU, false, "main-menu-intercept");
+            // Render immediately on the intercept frame so there's no black flash.
+            // The old code did this: OpenMenu() then RenderInGameMenu() in the same frame.
+            NetMenu::RenderFrame();
             return (char)ReadU32(ADDR_SUB_STATE, 3);
         }
 
@@ -145,9 +149,11 @@ static char __cdecl Hook_MainMenuStateMachine() {
         const char result = s_origMainMenuStateMachine ? s_origMainMenuStateMachine() : 0;
 
         // If the menu opened via SetGameMode intercept (the vanilla handler
-        // saw a MODE_LOBBY transition), re-sanitize immediately.
+        // saw a MODE_LOBBY transition), re-sanitize immediately and render.
         if (NetMenu::IsMenuActive()) {
             ModeOwnership::SanitizeOwnedGameType(MODE_MENU, false, "main-menu-post-open");
+            NetMenu::RenderFrame();
+            return (char)ReadU32(ADDR_SUB_STATE, 3);
         }
         return result;
     }
@@ -156,6 +162,10 @@ static char __cdecl Hook_MainMenuStateMachine() {
     WriteU32(ADDR_SUB_STATE, 3);
     WriteU32(ADDR_SUB_STATE_TIMER, 0);
     ModeOwnership::SanitizeOwnedGameType(MODE_MENU, false, "main-menu-visible");
+
+    // Render the menu overlay inside the game's render pass
+    NetMenu::RenderFrame();
+
     return (char)ReadU32(ADDR_SUB_STATE, 3);
 }
 
@@ -208,6 +218,18 @@ static int __cdecl Hook_SetGameMode(int mode, char fade) {
             NetMenu::HandlePostMatchReturn();
             return result;
         }
+    }
+
+    // Character swap is NOT needed with input-driven lockstep.
+    // During charsel lockstep, Host controls P1 and Join controls P2 on BOTH
+    // machines, so character assignments are already consistent.
+    // The old state-driven charsel sync needed this swap because both peers
+    // played as P1 locally — lockstep eliminates that.
+    if (s_interceptEnabled && sourceMode == MODE_CHARSEL && hasSession &&
+        (mode == MODE_PREMATCH_INTRO || mode == MODE_MATCH)) {
+        Net::SessionRole role = Net::Session_GetRole();
+        LOG_NETPLAY(LOG_DEBUG, "[ModeOwn] CharSel->Mode%u (role=%s) — lockstep, no swap needed",
+            mode, (role == Net::SessionRole::Host) ? "Host" : "Join");
     }
 
     LOG_NETPLAY(LOG_DEBUG, "[ModeOwn] SetGameMode(%u, fade=%d) from mode=%u — passthrough", mode, fade ? 1 : 0, sourceMode);

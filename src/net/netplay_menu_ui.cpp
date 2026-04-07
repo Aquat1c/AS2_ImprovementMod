@@ -13,21 +13,32 @@
 #include <string.h>
 #include <stdarg.h>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 // ============================================================================
 // Game render function addresses
 // ============================================================================
 
 namespace {
 
-constexpr uintptr_t ADDR_RENDER_FILL_RECT   = 0x5D2F50;
-constexpr uintptr_t ADDR_RENDER_SET_BLEND    = 0x5D2F80;
-constexpr uintptr_t ADDR_RENDER_CREATE_COLOR = 0x5D3150;
-constexpr uintptr_t ADDR_DRAW_FORMAT_STRING  = 0x629A20;
+constexpr uintptr_t ADDR_RENDER_FILL_RECT    = 0x5D2F50;
+constexpr uintptr_t ADDR_RENDER_SET_BLEND     = 0x5D2F80;
+constexpr uintptr_t ADDR_RENDER_SET_COLOR     = 0x5D3030;
+constexpr uintptr_t ADDR_RENDER_CREATE_COLOR  = 0x5D3150;
+constexpr uintptr_t ADDR_RENDER_DRAW_SPRITE   = 0x5D3130;
+constexpr uintptr_t ADDR_DRAW_FORMAT_STRING   = 0x629A20;
+
+constexpr uintptr_t ADDR_TITLE_MENU_BG_ACTIVE = 0x8EA00C;
 
 typedef int (__cdecl *RenderFillRect_t)(int left, int top, int right, int bottom, int color, int drawFlag);
 typedef int (__cdecl *RenderSetBlendMode_t)(int blendMode, unsigned __int8 alphaValue);
 typedef int (__cdecl *RenderCreateColor_t)(unsigned __int8 r, unsigned __int8 g, unsigned __int8 b);
+typedef int (__cdecl *RenderDrawSprite_t)(int x, int y, int spriteHandle, int transFlag);
 typedef int (__cdecl *DrawFormatString_t)(int x, int y, unsigned int color, char* fmt, ...);
+typedef int (__cdecl *RenderSetDrawColor_t)(unsigned __int8 r, unsigned __int8 g, unsigned __int8 b);
 
 // ============================================================================
 // Layout constants
@@ -57,12 +68,26 @@ static int GameCreateColor(uint8_t r, uint8_t g, uint8_t b) {
     return ((RenderCreateColor_t)ADDR_RENDER_CREATE_COLOR)(r, g, b);
 }
 
+static void GameDrawSprite(int x, int y, int spriteHandle) {
+    if (spriteHandle > 0) {
+        ((RenderDrawSprite_t)ADDR_RENDER_DRAW_SPRITE)(x, y, spriteHandle, 1);
+    }
+}
+
+static uint32_t ReadU32(uintptr_t a, uint32_t d = 0) {
+    __try { return *(volatile uint32_t*)a; } __except(EXCEPTION_EXECUTE_HANDLER) { return d; }
+}
+
 static void GameSetBlend(int mode, uint8_t alpha) {
     ((RenderSetBlendMode_t)ADDR_RENDER_SET_BLEND)(mode, alpha);
 }
 
 static void GameFillRect(int l, int t, int r, int b, uint8_t cr, uint8_t cg, uint8_t cb) {
     ((RenderFillRect_t)ADDR_RENDER_FILL_RECT)(l, t, r, b, GameCreateColor(cr, cg, cb), 1);
+}
+
+static void GameSetDrawColor(uint8_t r, uint8_t g, uint8_t b) {
+    ((RenderSetDrawColor_t)ADDR_RENDER_SET_COLOR)(r, g, b);
 }
 
 static void GameDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* fmt, ...) {
@@ -72,6 +97,15 @@ static void GameDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const ch
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
     va_end(args);
     ((DrawFormatString_t)ADDR_DRAW_FORMAT_STRING)(x, y, (unsigned int)GameCreateColor(r, g, b), (char*)"%s", buf);
+}
+
+/// Format text edit buffer with cursor indicator at the given position.
+/// Output: "> text|rest" where | is the cursor position.
+static void FormatEditBufferWithCursor(char* out, size_t outLen, const char* buf, int cursorPos) {
+    int len = (int)strlen(buf);
+    if (cursorPos < 0) cursorPos = 0;
+    if (cursorPos > len) cursorPos = len;
+    _snprintf_s(out, outLen, _TRUNCATE, "> %.*s|%s", cursorPos, buf, buf + cursorPos);
 }
 
 static int Alpha8(float normalized, int maxAlpha) {
@@ -99,66 +133,216 @@ static void RenderRow(int y, const char* label, const char* value, bool selected
 }
 
 // ============================================================================
+// Info line rendering (non-selectable, for display data)
+// ============================================================================
+
+static void RenderInfoLine(int y, const char* label, const char* value, uint8_t alpha) {
+    GameSetBlend(1, alpha);
+    GameDrawText(kLabelX, y, 180, 188, 202, "%s", label ? label : "");
+    if (value && value[0]) {
+        GameDrawText(kValueX, y, 230, 234, 242, "%s", value);
+    }
+}
+
+// ============================================================================
 // Menu page rendering
 // ============================================================================
 
 static void RenderMenuRoot(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Direct Play", nullptr, snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Settings",    nullptr, snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Close Menu",  nullptr, snap->selected_index == 2, true, alpha);
+    RenderRow(y, "Direct Play", "Host / Join", snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Settings",    "Config",      snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, "Close Menu",  nullptr,       snap->selected_index == 2, true, alpha);
 }
 
 static void RenderDirectConnect(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Host",  nullptr, snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Join",  nullptr, snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Back",  nullptr, snap->selected_index == 2, true, alpha);
+    RenderRow(y, "Host",  "Wait for peer", snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Join",  "Dial remote",   snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, "Back",  "Root",          snap->selected_index == 2, true, alpha);
 }
 
 static void RenderHostEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
     RenderRow(y, "Start Host",  nullptr,  snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Listen Port", "10700",  snap->selected_index == 1, true, alpha); y += kRowStep;
+
+    // Listen Port: show text edit buffer if editing, else the current value
+    char portVal[16];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::ListenPort) {
+        FormatEditBufferWithCursor(portVal, sizeof(portVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(portVal, sizeof(portVal), _TRUNCATE, "%u", snap->listen_port);
+    }
+    RenderRow(y, "Listen Port", portVal, snap->selected_index == 1, true, alpha); y += kRowStep;
     RenderRow(y, "Back",        nullptr,  snap->selected_index == 2, true, alpha);
+    y += kRowStep + 8;
+
+    // Show your address for sharing
+    char addrBuf[80];
+    if (snap->clipboard_flash[0]) {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s  (%s)", snap->your_address, snap->clipboard_flash);
+    } else {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s", snap->your_address);
+    }
+    RenderInfoLine(y, "Your Address", addrBuf, alpha);
 }
 
 static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
     RenderRow(y, "Join Host",        nullptr,           snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Remote Endpoint", "127.0.0.1:10700",  snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Back",            nullptr,             snap->selected_index == 2, true, alpha);
+
+    // Remote Endpoint: show text edit buffer if editing, else the current value
+    char endpointVal[72];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::RemoteEndpoint) {
+        FormatEditBufferWithCursor(endpointVal, sizeof(endpointVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(endpointVal, sizeof(endpointVal), _TRUNCATE, "%s", snap->remote_endpoint);
+    }
+    RenderRow(y, "Remote Endpoint", endpointVal,  snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, "Back",            nullptr,       snap->selected_index == 2, true, alpha);
 }
 
 static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Input Delay", "0",    snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Verbose Log", "Off",  snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Back",        nullptr, snap->selected_index == 2, true, alpha);
+
+    // Nickname: show text edit buffer if editing, else current value
+    char nickVal[40];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::Nickname) {
+        FormatEditBufferWithCursor(nickVal, sizeof(nickVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(nickVal, sizeof(nickVal), _TRUNCATE, "%s", snap->local_nickname);
+    }
+    RenderRow(y, "Nickname",    nickVal,  snap->selected_index == 0, true, alpha); y += kRowStep;
+
+    // Input Delay: show current value with left/right hint
+    char delayVal[16];
+    _snprintf_s(delayVal, sizeof(delayVal), _TRUNCATE, "< %d >", snap->preferred_delay);
+    RenderRow(y, "Input Delay", delayVal, snap->selected_index == 1, true, alpha); y += kRowStep;
+
+    // Verbose Log (placeholder for now)
+    RenderRow(y, "Verbose Log", "Off",    snap->selected_index == 2, true, alpha); y += kRowStep;
+
+    RenderRow(y, "Back",        nullptr,  snap->selected_index == 3, true, alpha);
 }
 
 static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Cancel", nullptr, snap->selected_index == 0, true, alpha);
+    RenderRow(y, "Cancel", "Stop", snap->selected_index == 0, true, alpha);
+    y += kRowStep + 8;
+
+    // Show your address for sharing
+    char addrBuf[80];
+    if (snap->clipboard_flash[0]) {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s  (%s)", snap->your_address, snap->clipboard_flash);
+    } else {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s", snap->your_address);
+    }
+    RenderInfoLine(y, "Your Address", addrBuf, alpha);
+
+    if (snap->rtt_ms > 0.0f) {
+        y += 22;
+        char pingBuf[32];
+        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms", snap->rtt_ms);
+        RenderInfoLine(y, "Ping", pingBuf, alpha);
+    }
 }
 
 static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Launch CharSel", nullptr, snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Disconnect",     nullptr, snap->selected_index == 1, true, alpha);
+    RenderRow(y, "Launch CharSel", "Enter", snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Disconnect",     "Leave", snap->selected_index == 1, true, alpha);
+    y += kRowStep + 8;
+
+    // Role
+    RenderInfoLine(y, "Role", snap->is_host ? "Host" : "Client", alpha);
+    y += 22;
+
+    // Local identity
+    if (snap->local_nickname[0]) {
+        RenderInfoLine(y, "You", snap->local_nickname, alpha);
+        y += 22;
+    }
+    // Remote identity
+    if (snap->peer_nickname[0]) {
+        RenderInfoLine(y, "Peer", snap->peer_nickname, alpha);
+        y += 22;
+    }
+    if (snap->rtt_ms > 0.0f) {
+        char pingBuf[32];
+        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms", snap->rtt_ms);
+        RenderInfoLine(y, "Ping", pingBuf, alpha);
+        y += 22;
+    }
+    // Delay
+    {
+        char delayBuf[32];
+        _snprintf_s(delayBuf, sizeof(delayBuf), _TRUNCATE, "%d frames", snap->active_delay);
+        RenderInfoLine(y, "Delay", delayBuf, alpha);
+        y += 22;
+    }
+    // Score
+    if (snap->local_wins > 0 || snap->remote_wins > 0) {
+        char scoreBuf[48];
+        _snprintf_s(scoreBuf, sizeof(scoreBuf), _TRUNCATE, "%d - %d",
+            snap->local_wins, snap->remote_wins);
+        RenderInfoLine(y, "Score", scoreBuf, alpha);
+        y += 22;
+    }
+    // Show your address for sharing
+    char addrBuf[80];
+    if (snap->clipboard_flash[0]) {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s  (%s)", snap->your_address, snap->clipboard_flash);
+    } else {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s", snap->your_address);
+    }
+    RenderInfoLine(y, "Your Address", addrBuf, alpha);
 }
 
 static void RenderCharSelTransition(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Launch", nullptr, snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Back",   nullptr, snap->selected_index == 1, true, alpha);
+    RenderRow(y, "Launch", "CharSel", snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Back",   "Session", snap->selected_index == 1, true, alpha);
+    y += kRowStep + 8;
+
+    if (snap->local_nickname[0]) {
+        RenderInfoLine(y, "You", snap->local_nickname, alpha);
+        y += 22;
+    }
+    if (snap->peer_nickname[0]) {
+        RenderInfoLine(y, "Peer", snap->peer_nickname, alpha);
+        y += 22;
+    }
+    // Show set score if any matches have been played
+    if (snap->local_wins > 0 || snap->remote_wins > 0) {
+        char scoreBuf[48];
+        _snprintf_s(scoreBuf, sizeof(scoreBuf), _TRUNCATE, "%d - %d",
+            snap->local_wins, snap->remote_wins);
+        RenderInfoLine(y, "Score", scoreBuf, alpha);
+    }
 }
 
 static void RenderPostMatch(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Rematch",    nullptr, snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Return",     nullptr, snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Disconnect", nullptr, snap->selected_index == 2, true, alpha);
+    RenderRow(y, "Rematch",    "CharSel", snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Return",     "Session", snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, "Disconnect", "Leave",   snap->selected_index == 2, true, alpha);
+    y += kRowStep + 8;
+
+    if (snap->local_nickname[0]) {
+        RenderInfoLine(y, "You", snap->local_nickname, alpha);
+        y += 22;
+    }
+    if (snap->peer_nickname[0]) {
+        RenderInfoLine(y, "Peer", snap->peer_nickname, alpha);
+        y += 22;
+    }
+    // Show set score
+    {
+        char scoreBuf[48];
+        _snprintf_s(scoreBuf, sizeof(scoreBuf), _TRUNCATE, "%d - %d",
+            snap->local_wins, snap->remote_wins);
+        RenderInfoLine(y, "Score", scoreBuf, alpha);
+    }
 }
 
 static void RenderDisconnectError(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
@@ -170,8 +354,8 @@ static void RenderDisconnectError(const NetMenu::MenuSnapshot* snap, uint8_t alp
         y += kRowStep;
     }
     y += kRowStep;
-    RenderRow(y, "OK",         nullptr, snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Close Menu", nullptr, snap->selected_index == 1, true, alpha);
+    RenderRow(y, "OK",         "Clear", snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Close Menu", "Close", snap->selected_index == 1, true, alpha);
 }
 
 // ============================================================================
@@ -217,11 +401,23 @@ namespace NetMenuUI {
 void Render(const NetMenu::MenuSnapshot* snap) {
     if (!snap || !snap->menu_active) return;
 
+    // Always draw the vanilla background sprite at full opacity with white
+    // draw color, exactly as the old working code and vanilla case 3 do.
+    const int bgHandle = (int)ReadU32(ADDR_TITLE_MENU_BG_ACTIVE, 0);
+    GameSetBlend(0, 255);
+    GameSetDrawColor(255, 255, 255);
+    GameDrawSprite(0, 0, bgHandle);
+
+    // Calculate fade alpha for overlay elements
     float fadeNorm = (float)snap->fade_frames / (float)kFadeFrames;
     if (fadeNorm < 0.0f) fadeNorm = 0.0f;
     if (fadeNorm > 1.0f) fadeNorm = 1.0f;
     uint8_t alpha = (uint8_t)Alpha8(fadeNorm, 255);
-    if (alpha < 8) return;
+    if (!alpha) return;
+
+    // Full-screen dark overlay between background and panel
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 72));
+    GameFillRect(0, 0, 639, 479, 0, 0, 0);
 
     // Background panel
     GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 210));
@@ -268,10 +464,29 @@ void Render(const NetMenu::MenuSnapshot* snap) {
     GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 160));
     GameFillRect(kRowLeft, kFooterTop, kRowRight, kFooterTop + 1, 80, 100, 140);
     GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 180));
-    GameDrawText(kLabelX, kFooterTop + 6, 160, 168, 190, "A=Select  B=Back  Up/Down=Navigate");
 
-    // Restore blend mode
+    // Context-sensitive hints (line 1)
+    const char* hint1 = "A=Select  B=Back  Up/Down=Navigate";
+    switch (snap->state) {
+        case NetMenu::MenuState::HostEntry:
+        case NetMenu::MenuState::Connecting:
+        case NetMenu::MenuState::Handshake:
+        case NetMenu::MenuState::ConnectedSession:
+            hint1 = "A=Select  B=Back  C=Copy Address";
+            break;
+        case NetMenu::MenuState::SettingsEntry:
+            hint1 = "A=Select  B=Back  Left/Right=Adjust";
+            break;
+        default: break;
+    }
+    GameDrawText(kLabelX, kFooterTop + 6, 160, 168, 190,  "%s", hint1);
+    GameDrawText(kLabelX, kFooterTop + 6 + kFooterStep, 220, 224, 236,
+        "AS2 Rollback | %s", NetMenu::MenuStateName(snap->state));
+
+    // Restore render state (blend + draw color) so the game's next frame
+    // starts clean — matches what the old working code does.
     GameSetBlend(0, 255);
+    GameSetDrawColor(255, 255, 255);
 }
 
 } // namespace NetMenuUI

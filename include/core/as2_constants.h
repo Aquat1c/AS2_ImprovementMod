@@ -31,8 +31,18 @@
 // Input system
 #define ADDR_INPUT_POLL         (GAME_BASE + 0x161F50)  // sub_561F50 - Main input poll
 #define ADDR_INPUT_PROCESS      (GAME_BASE + 0x162060)  // sub_562060 - Input processing
+#define ADDR_INPUT_DISPATCHER   (GAME_BASE + 0x1625E0)  // sub_5625E0 - Input_TryGetNextFrame (per-frame input dispatch)
+#define ADDR_SEND_INPUT         (GAME_BASE + 0x162450)  // sub_562450 - Send local input packet
+#define ADDR_RECV_INPUT         (GAME_BASE + 0x1623D0)  // sub_5623D0 - Receive remote input packet
+#define ADDR_GET_SYNC_INPUT     (GAME_BASE + 0x1624E0)  // sub_5624E0 - Get synchronized inputs
+#define ADDR_ADVANCE_FRAME      (GAME_BASE + 0x162760)  // sub_562760 - Frame_AdvanceSimulation
+#define ADDR_MATCH_SYNC_INIT    (GAME_BASE + 0x162550)  // sub_562550 - Netplay_InitialSync
 #define ADDR_KEYBOARD_STATE     (GAME_BASE + 0x22FD00)  // sub_62FD00 - Keyboard check
 #define ADDR_JOYSTICK_STATE     (GAME_BASE + 0x22FF50)  // sub_62FF50 - Joystick check
+
+// Vanilla timeout counters — must be kept at 0 to prevent auto-disconnect
+#define ADDR_HOST_TIMEOUT_CTR   0x8EA200   // dword_8EA200
+#define ADDR_CLIENT_TIMEOUT_CTR 0x8EA3A8   // g_NetTimeoutCounter
 
 // Timing
 // sub_635F80 - wrapper around timeGetTime() used by the main loop frame limiter

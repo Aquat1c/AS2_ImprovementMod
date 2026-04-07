@@ -53,6 +53,7 @@ enum class MatchLifecyclePhase : uint8_t {
     MatchEnd,               // Mode 8 Sub 5: match end handler running
 
     // Post-match flow
+    WinScreenActive,        // Mode 9: win screen active, waiting for confirm sync
     PostMatchRoute,         // Match end committed, routing decision pending
     ReturningToCharSel,     // Routing back to CharSel for rematch (session alive)
     ReturningToMenu,        // Routing back to custom menu (session alive, match done)
@@ -72,8 +73,7 @@ inline const char* MatchLifecyclePhaseName(MatchLifecyclePhase phase) {
         case MatchLifecyclePhase::PlayableGameplay:    return "PlayableGameplay";
         case MatchLifecyclePhase::PauseActive:         return "PauseActive";
         case MatchLifecyclePhase::RoundTransition:     return "RoundTransition";
-        case MatchLifecyclePhase::MatchEnd:            return "MatchEnd";
-        case MatchLifecyclePhase::PostMatchRoute:      return "PostMatchRoute";
+        case MatchLifecyclePhase::MatchEnd:            return "MatchEnd";        case MatchLifecyclePhase::WinScreenActive:       return "WinScreenActive";        case MatchLifecyclePhase::PostMatchRoute:      return "PostMatchRoute";
         case MatchLifecyclePhase::ReturningToCharSel:  return "ReturningToCharSel";
         case MatchLifecyclePhase::ReturningToMenu:     return "ReturningToMenu";
         case MatchLifecyclePhase::DisconnectRecovery:  return "DisconnectRecovery";

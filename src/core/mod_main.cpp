@@ -31,6 +31,9 @@
 #include "net/match_lifecycle.h"
 #include "net/sync_policy.h"
 #include "net/delay_policy.h"
+#include "net/gameplay_bridge.h"
+#include "net/set_tracker.h"
+#include "net/player_side_mapping.h"
 #include "testing/scripted_input_runner.h"
 #include "imgui.h"
 #include <stdio.h>
@@ -58,7 +61,7 @@ static ModConfig g_config = {
     1,      // inputDisplayMode
     false,  // showHitboxes
     false,  // showFrameData
-    false,  // verboseLogging
+    true,   // verboseLogging
     8,      // rollbackFrames (unused, kept for compat)
     0       // inputDelay    (unused, kept for compat)
 };
@@ -89,6 +92,8 @@ bool ModConfig_VerboseLogging() {
 
 void SetVerboseLogging(bool enabled) {
     g_config.verboseLogging = enabled;
+    Rollback::NetplayLog_SetVerbose(enabled);
+    LOG_INFO("[Mod] Verbose logging %s", enabled ? "enabled" : "disabled");
 }
 
 bool GetVerboseLogging() {
@@ -252,6 +257,9 @@ static void DeferredInit() {
     Net::SyncPolicy_Init();
     Net::DelayPolicy_Init();
 
+    // Initialize gameplay bridge (checks GekkoNet availability for future use)
+    Net::GameplayBridge_Init();
+
     // Initialize rollback gameplay subsystems
     Rollback::RollbackSession_Init();
     Rollback::RollbackDebug_Init();
@@ -259,6 +267,7 @@ static void DeferredInit() {
     // Initialize netplay full-path log, stress hooks, and online wiring
     Rollback::NetplayLog_Init();
     Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
+    Rollback::NetplayLog_SetVerbose(g_config.verboseLogging);
     Rollback::StressHooks_Init();
     Rollback::OnlineWiring_Init();
 
@@ -327,6 +336,7 @@ __declspec(dllexport) void ModShutdown() {
         Rollback::RollbackSession_Shutdown();
         Net::DelayPolicy_Shutdown();
         Net::SyncPolicy_Shutdown();
+        Net::GameplayBridge_Shutdown();
         Net::MatchLifecycle_Shutdown();
         Net::PregameSync_Shutdown();
         NetMenu::Shutdown();
@@ -390,9 +400,10 @@ __declspec(dllexport) void ModOnFrame() {
     // Update online wiring (manages rollback session lifecycle)
     Rollback::OnlineWiring_FrameUpdate();
 
-    // Update rollback gameplay session and debug
-    if (Rollback::RollbackSession_IsActive() && Rollback::OnlineWiring_IsGameplayActive()) {
-        Rollback::RollbackSession_FrameUpdate();
+    // Drive gameplay bridge per-frame (rollback session + delay policy consumption)
+    // The bridge is the single entry point for per-frame gameplay runtime.
+    if (Net::GameplayBridge_IsSessionActive() && Rollback::OnlineWiring_IsGameplayActive()) {
+        Net::GameplayBridge_FrameUpdate();
         Rollback::RollbackDebug_FrameUpdate();
     }
 
@@ -508,7 +519,69 @@ __declspec(dllexport) bool ModGetNetplayHudText(char* out, int cap) {
 __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
-    return false;
+    if (!g_initialized) return false;
+
+    // Only show HUD when a session is active
+    Net::SessionSnapshot sessionSnap{};
+    Net::Session_GetSnapshot(&sessionSnap);
+    if (!sessionSnap.active || sessionSnap.state < Net::SessionState::Connected)
+        return false;
+
+    // Show HUD during match, charsel, winscreen modes — any online phase
+    Net::MatchLifecycleSnapshot lifeSnap{};
+    Net::MatchLifecycle_GetSnapshot(&lifeSnap);
+
+    bool inMatch = lifeSnap.active && lifeSnap.match_owned;
+    bool rollbackActive = Net::GameplayBridge_IsSessionActive();
+
+    // Show HUD if session is connected and either in match or rollback active
+    if (!inMatch && !rollbackActive) return false;
+
+    out->active = true;
+    out->is_host = (Net::Session_GetRole() == Net::SessionRole::Host);
+
+    // --- Names: P1 = game P1, P2 = game P2 ---
+    // Get local and remote nicknames
+    NetMenu::MenuSnapshot menuSnap{};
+    NetMenu::GetSnapshot(&menuSnap);
+
+    const char* localNick = menuSnap.local_nickname[0] ? menuSnap.local_nickname : "Local";
+    const char* remoteNick = sessionSnap.remote_peer.nickname[0] ? sessionSnap.remote_peer.nickname : "Remote";
+
+    int localSlot = Net::PlayerMapping_GetLocalGameSlot();
+    if (localSlot == 0) {
+        // Local is P1
+        strncpy_s(out->p1_name, sizeof(out->p1_name), localNick, _TRUNCATE);
+        strncpy_s(out->p2_name, sizeof(out->p2_name), remoteNick, _TRUNCATE);
+    } else {
+        // Local is P2
+        strncpy_s(out->p1_name, sizeof(out->p1_name), remoteNick, _TRUNCATE);
+        strncpy_s(out->p2_name, sizeof(out->p2_name), localNick, _TRUNCATE);
+    }
+
+    // --- Win counts: game-side P1/P2 ---
+    Net::SetTracker_GetGameSideWins(&out->p1_wins, &out->p2_wins);
+
+    // --- Ping: from session stats ---
+    out->ping_ms = sessionSnap.stats.rtt_ms;
+
+    // --- Delay and rollback: from rollback session if active ---
+    if (rollbackActive) {
+        Rollback::RollbackSessionSnapshot rbSnap{};
+        Rollback::RollbackSession_GetSnapshot(&rbSnap);
+        out->delay_frames = rbSnap.active_delay;
+        out->rollback_frames = rbSnap.last_rollback_replay_length;
+        out->local_frame = rbSnap.current_frame;
+        out->remote_frame = rbSnap.last_remote_received_frame;
+    } else {
+        // Pre-match: use delay policy values
+        out->delay_frames = Net::DelayPolicy_GetActiveDelay();
+        out->rollback_frames = 0;
+        out->local_frame = 0;
+        out->remote_frame = 0;
+    }
+
+    return true;
 }
 
 __declspec(dllexport) uint32_t GetCurrentFrame() {

@@ -168,8 +168,11 @@ static MatchLifecyclePhase ClassifyMatchState() {
     uint32_t mode = GetGameMode();
     uint32_t sub  = GetSubstate();
 
-    // Not in Mode 8 — check if we're in a post-match return flow
+    // Not in Mode 8 — check adjacent modes
     if (mode != MODE_MATCH) {
+        if (mode == MODE_WINSCREEN) {
+            return MatchLifecyclePhase::WinScreenActive;
+        }
         if (mode == MODE_CHARSEL) {
             return MatchLifecyclePhase::ReturningToCharSel;
         }
@@ -327,13 +330,33 @@ static void UpdateMatchEnd() {
     uint32_t mode = GetGameMode();
     if (mode != MODE_MATCH) {
         // Match ended — determine route
-        if (mode == MODE_CHARSEL) {
+        if (mode == MODE_WINSCREEN) {
+            SetPhase(MatchLifecyclePhase::WinScreenActive, "match end → win screen");
+        } else if (mode == MODE_CHARSEL) {
             SetPhase(MatchLifecyclePhase::PostMatchRoute, "match end → charsel route");
         } else if (mode == MODE_MENU) {
             SetPhase(MatchLifecyclePhase::PostMatchRoute, "match end → menu route");
         } else {
             // Unexpected mode — likely vanilla fallback intercepted
             SetPhase(MatchLifecyclePhase::PostMatchRoute, "match end → unexpected route");
+        }
+    }
+}
+
+static void UpdateWinScreenActive() {
+    EnforceModOwnership();
+
+    // Mode 9 (win screen) is active. Session stays alive.
+    // WinScreenSync handles the confirm gate synchronization.
+    // We wait for the mode to change away from Mode 9.
+    uint32_t mode = GetGameMode();
+    if (mode != MODE_WINSCREEN) {
+        if (mode == MODE_CHARSEL) {
+            SetPhase(MatchLifecyclePhase::PostMatchRoute, "win screen → charsel");
+        } else if (mode == MODE_MENU) {
+            SetPhase(MatchLifecyclePhase::PostMatchRoute, "win screen → menu");
+        } else {
+            SetPhase(MatchLifecyclePhase::PostMatchRoute, "win screen → other");
         }
     }
 }
@@ -465,6 +488,7 @@ void MatchLifecycle_FrameUpdate() {
         case MatchLifecyclePhase::PauseActive:         UpdatePauseActive();         break;
         case MatchLifecyclePhase::RoundTransition:     UpdateRoundTransition();     break;
         case MatchLifecyclePhase::MatchEnd:            UpdateMatchEnd();            break;
+        case MatchLifecyclePhase::WinScreenActive:     UpdateWinScreenActive();     break;
         case MatchLifecyclePhase::PostMatchRoute:      UpdatePostMatchRoute();      break;
         case MatchLifecyclePhase::ReturningToCharSel:  UpdateReturningToCharSel();  break;
         case MatchLifecyclePhase::ReturningToMenu:     UpdateReturningToMenu();     break;

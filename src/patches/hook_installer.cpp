@@ -1,5 +1,6 @@
 #include "patches/hook_installer.h"
 #include "patches/input_override.h"
+#include "patches/input_sync_hooks.h"
 #include "patches/tick_hooks.h"
 #include "patches/locale_patch.h"
 #include "patches/filesystem_patch.h"
@@ -83,6 +84,19 @@ bool InstallHooks() {
         return false;
     }
     LOG_INFO("Hooked sub_562060 (input processing - just pressed flags)");
+    
+    // --- Input dispatcher hook (charsel lockstep) ---
+    
+    LOG_INFO("ADDR_INPUT_DISPATCHER = 0x%08X (sub_5625E0)", ADDR_INPUT_DISPATCHER);
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_INPUT_DISPATCHER),
+            reinterpret_cast<void*>(&Hook_InputDispatcher),
+            reinterpret_cast<void**>(&g_origInputDispatcher));
+    if (status != MH_OK) {
+        LOG_ERROR("Failed to hook InputDispatcher! Status: %d", status);
+        return false;
+    }
+    LOG_INFO("Hooked sub_5625E0 (input dispatcher - charsel lockstep)");
     
     // --- Locale hooks ---
     
@@ -180,6 +194,14 @@ bool InstallHooks() {
     }
     
     LOG_INFO("Input hooks installed and enabled!");
+
+    // --- Vanilla netplay suppression hooks ---
+    // These must be installed AFTER MH_EnableHook(MH_ALL_HOOKS) since
+    // InputSyncHooks_Install creates + enables its own hooks.
+    if (!InputSyncHooks_Install()) {
+        LOG_WARN("Failed to install vanilla netplay suppression hooks (continuing anyway)");
+    }
+
     return true;
 }
 

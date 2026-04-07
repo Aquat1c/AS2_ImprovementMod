@@ -6,13 +6,17 @@
  */
 
 #include "net/match_bootstrap.h"
+#include "net/barrier_protocol.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/protocol.h"
 #include "net/locked_match_config.h"
+#include "net/delay_policy.h"
 #include "rollback/savestate.h"
+#include "rollback/determinism_verify.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
+#include "patches/memory_utils.h"
 #include "ui/log_window.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -81,6 +85,13 @@ constexpr DWORD        BASELINE_TIMEOUT_MS    = 15000;  // 15s
 // Error
 static char            s_error[128]         = "";
 
+// Periodic logging counter (for rate-limiting state dumps)
+static uint32_t        s_logTickCounter     = 0;
+
+// Remote delay negotiation data (received from peer)
+static bool            s_remoteDelayReceived = false;
+static DelayNegotiationData s_remoteDelayData = {};
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -106,12 +117,20 @@ static void SendConfig() {
     payload.rng_seed = s_config.rng_seed;
     payload.session_seed = s_config.session_seed;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::ConfigExchange,
-                       &payload, sizeof(payload), true);
+    // Delay negotiation: include local preferences
+    DelayNegotiationData delayData{};
+    DelayPolicy_BuildNegotiationData(&delayData);
+    payload.delay_configured  = (uint8_t)delayData.configured_delay;
+    payload.delay_recommended = (uint8_t)delayData.recommended_delay;
+    payload.delay_rollback    = (uint8_t)delayData.rollback_budget;
+
+    BarrierProtocol_SendPacket(PacketType::ConfigExchange,
+                              &payload, sizeof(payload));
 
     s_configSent = true;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent config (hash=0x%08X)",
-        LockedMatchConfig_Hash(&s_config));
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent config (hash=0x%08X delay_cfg=%d delay_rec=%d rb=%d)",
+        LockedMatchConfig_Hash(&s_config),
+        delayData.configured_delay, delayData.recommended_delay, delayData.rollback_budget);
 }
 
 static void SendConfigAck(uint32_t hash, bool accepted) {
@@ -119,19 +138,27 @@ static void SendConfigAck(uint32_t hash, bool accepted) {
     payload.config_hash = hash;
     payload.accepted = accepted ? 1 : 0;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::ConfigAck,
-                       &payload, sizeof(payload), true);
+    // Include join's delay preferences for negotiation
+    DelayNegotiationData delayData{};
+    DelayPolicy_BuildNegotiationData(&delayData);
+    payload.delay_configured  = (uint8_t)delayData.configured_delay;
+    payload.delay_recommended = (uint8_t)delayData.recommended_delay;
+    payload.delay_rollback    = (uint8_t)delayData.rollback_budget;
 
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent ConfigAck: hash=0x%08X accepted=%d",
-        hash, accepted ? 1 : 0);
+    BarrierProtocol_SendPacket(PacketType::ConfigAck,
+                              &payload, sizeof(payload));
+
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent ConfigAck: hash=0x%08X accepted=%d delay_cfg=%d delay_rec=%d rb=%d",
+        hash, accepted ? 1 : 0,
+        delayData.configured_delay, delayData.recommended_delay, delayData.rollback_budget);
 }
 
 static void SendLoadBarrier() {
     LoadBarrierPayload payload{};
     payload.loaded = 1;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::LoadBarrier,
-                       &payload, sizeof(payload), true);
+    BarrierProtocol_SendPacket(PacketType::LoadBarrier,
+                              &payload, sizeof(payload));
 
     s_loadBarrierSent = true;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent LoadBarrier");
@@ -141,8 +168,8 @@ static void SendBaselineReady() {
     BaselineReadyPayload payload{};
     payload.captured = 1;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::BaselineReady,
-                       &payload, sizeof(payload), true);
+    BarrierProtocol_SendPacket(PacketType::BaselineReady,
+                              &payload, sizeof(payload));
 
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent BaselineReady");
 }
@@ -151,8 +178,8 @@ static void SendBaselineDigest(uint32_t crc) {
     BaselineDigestPayload payload{};
     payload.crc32 = crc;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::BaselineDigest,
-                       &payload, sizeof(payload), true);
+    BarrierProtocol_SendPacket(PacketType::BaselineDigest,
+                              &payload, sizeof(payload));
 
     s_baselineDigestSent = true;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent BaselineDigest: crc=0x%08X", crc);
@@ -162,8 +189,8 @@ static void SendGameplayStart(uint32_t frame) {
     GameplayStartPayload payload{};
     payload.start_frame = frame;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::GameplayStart,
-                       &payload, sizeof(payload), true);
+    BarrierProtocol_SendPacket(PacketType::GameplayStart,
+                              &payload, sizeof(payload));
 
     s_gameplayStartSent = true;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent GameplayStart: frame=%u", frame);
@@ -179,7 +206,19 @@ static void UpdateConfigExchange() {
     if (s_isHost && !s_configSent) {
         SendConfig();
     }
-    // Otherwise wait for packet callbacks
+
+    // Join: if we already received config before entering this phase
+    // (race condition), agree + ack now.
+    if (!s_isHost && s_configReceived && !s_configAgreed) {
+        uint32_t hash = LockedMatchConfig_Hash(&s_config);
+        s_configAgreed = true;
+        SendConfigAck(hash, true);
+        if (s_remoteDelayReceived) {
+            DelayPolicy_NegotiateSession(&s_remoteDelayData);
+        }
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted early config (hash=0x%08X) agreed_delay=%d",
+            hash, DelayPolicy_GetAgreedDelay());
+    }
 }
 
 static void UpdateLoading() {
@@ -188,11 +227,26 @@ static void UpdateLoading() {
     uint32_t mode = GetGameMode();
     uint32_t sub = GetSubstate();
 
+    // Periodic state dump every ~1s (60 frames) while waiting
+    if ((s_logTickCounter++ % 60) == 0) {
+        DWORD elapsed = s_loadStartTime ? (GetTickCount() - s_loadStartTime) : 0;
+        LOG_NETPLAY(LOG_DEBUG, "[MatchBoot] Loading state: mode=%u sub=%u local=%s remote=%s elapsed=%lums",
+            mode, sub,
+            s_localLoaded ? "yes" : "no",
+            s_remoteLoaded ? "yes" : "no",
+            elapsed);
+    }
+
     // Consider loaded when we reach MODE_MATCH with substate >= MATCH_SETUP(1)
     // or when charsel leaves loading substate
     bool justLoaded = false;
 
     if (mode == MODE_MATCH && sub >= 1) {
+        justLoaded = true;
+    } else if (mode == MODE_PREMATCH_INTRO) {
+        // VS_HUMAN flow goes CharSel → Mode 7 (prematch intro/loading) → Mode 8.
+        // Mode 7 means we've left CharSel and are running the VS cinematic.
+        // Baseline capture has its own MODE_MATCH sub>=2 gate, so this is safe.
         justLoaded = true;
     } else if (mode == MODE_CHARSEL && sub >= CHARSEL_SUB_FADE_BACK) {
         justLoaded = true;
@@ -201,6 +255,14 @@ static void UpdateLoading() {
     if (justLoaded && !s_localLoaded) {
         s_localLoaded = true;
         LOG_NETPLAY(LOG_INFO, "[MatchBoot] Local loading complete (mode=%u sub=%u)", mode, sub);
+
+        // Defensive RNG seeding: ensure the CRT rand state is set to the
+        // agreed session seed as early as possible.  The authoritative seed
+        // is also applied right before baseline capture, but seeding here
+        // prevents any stray rand() calls between loading and baseline from
+        // diverging the two peers.
+        DetVer_SetRngSeed(s_config.session_seed);
+
         SendLoadBarrier();
     }
 
@@ -211,13 +273,44 @@ static void UpdateLoading() {
 }
 
 static void UpdateBaseline() {
-    // Capture baseline savestate at pre-frame-0
+    // Periodic state dump every ~1s (60 frames) while waiting
+    if ((s_logTickCounter % 60) == 0) {
+        uint32_t m = GetGameMode();
+        uint32_t s = GetSubstate();
+        DWORD elapsed = s_baselineStartTime ? (GetTickCount() - s_baselineStartTime) : 0;
+        LOG_NETPLAY(LOG_DEBUG,
+            "[MatchBoot] Baseline state: mode=%u sub=%u localReady=%s remoteReady=%s "
+            "localCRC=0x%08X remoteCRC=0x%08X digestSent=%s agreed=%s elapsed=%lums",
+            m, s,
+            s_localBaselineReady ? "yes" : "no",
+            s_remoteBaselineReady ? "yes" : "no",
+            s_localBaselineCRC, s_remoteBaselineCRC,
+            s_baselineDigestSent ? "yes" : "no",
+            s_baselineAgreed ? "yes" : "no",
+            elapsed);
+    }
+
+    // Capture baseline savestate at match gameplay start (sub 3).
+    // The load-barrier freeze holds the game at sub 3 while we wait,
+    // so BOTH peers capture at the exact same stable point.
+    // Previous code targeted sub==2 but that substate is too transient
+    // (sub 0→1→2→3 all advance within a few frames).
     if (!s_localBaselineReady) {
         uint32_t mode = GetGameMode();
         uint32_t sub = GetSubstate();
 
-        // Capture baseline when match reaches INIT(2) or GAMEPLAY(3) substate
-        if (mode == MODE_MATCH && sub >= 2) {
+        if (mode == MODE_MATCH && sub == MATCH_SUB_GAMEPLAY) {
+            uint32_t simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Capturing baseline at mode=%u sub=%u simFrame=%u",
+                mode, sub, simFrame);
+
+            // Re-assert the authoritative match seed immediately before
+            // baseline capture.  Both peers must have identical CRT rand
+            // state for the captured savestate CRCs to match.
+            DetVer_SetRngSeed(s_config.session_seed);
+            LOG_NETPLAY(LOG_INFO, "[MatchBoot] RNG seed asserted: 0x%08X before baseline capture",
+                s_config.session_seed);
+
             // Capture savestate
             if (Savestate_Save()) {
                 const SavestateInfo* info = Savestate_GetInfo();
@@ -226,8 +319,8 @@ static void UpdateBaseline() {
                     s_localBaselineReady = true;
                     SendBaselineReady();
                     SendBaselineDigest(s_localBaselineCRC);
-                    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline captured: crc=0x%08X frame=%u",
-                        s_localBaselineCRC, info->frame);
+                    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline captured: crc=0x%08X frame=%u rng=0x%08X",
+                        s_localBaselineCRC, info->frame, info->rng_seed);
                 } else {
                     SetError("Failed to capture baseline savestate");
                 }
@@ -239,7 +332,8 @@ static void UpdateBaseline() {
     if (s_localBaselineReady && s_remoteBaselineReady && s_baselineDigestSent && !s_baselineAgreed) {
         if (s_localBaselineCRC == s_remoteBaselineCRC) {
             s_baselineAgreed = true;
-            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline agreed: crc=0x%08X", s_localBaselineCRC);
+            s_phase = BootPhase::Ready;
+            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline agreed: crc=0x%08X -> Ready phase", s_localBaselineCRC);
         } else {
             SetError("Baseline CRC mismatch: local=0x%08X remote=0x%08X",
                 s_localBaselineCRC, s_remoteBaselineCRC);
@@ -290,30 +384,75 @@ void MatchBootstrap_Shutdown() {
 void MatchBootstrap_BeginConfigExchange(const LockedMatchConfig* config) {
     if (!config) return;
 
-    memcpy(&s_config, config, sizeof(LockedMatchConfig));
     s_isHost = (Session_GetRole() == SessionRole::Host);
 
+    // Host always uses its own config.
+    // Join: only overwrite if we haven't already received the host's config
+    // via an early ConfigExchange packet (race condition where the host
+    // sends config before the client enters this phase).
+    if (s_isHost || !s_configReceived) {
+        memcpy(&s_config, config, sizeof(LockedMatchConfig));
+    }
+
     s_configSent = false;
-    s_configReceived = false;
-    s_configAgreed = false;
+    // NOTE: Do NOT reset s_configReceived or s_configAgreed here.
+    // The host's ConfigExchange packet may have arrived while we were
+    // still in FrontendLocked. Resetting would discard that early packet
+    // and cause config exchange to time out.
     s_error[0] = '\0';
 
     s_phase = BootPhase::ConfigExchange;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin config exchange (role=%s)",
-        s_isHost ? "Host" : "Join");
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin config exchange (role=%s config_already=%s agreed_already=%s)",
+        s_isHost ? "Host" : "Join",
+        s_configReceived ? "yes" : "no",
+        s_configAgreed ? "yes" : "no");
 }
 
 void MatchBootstrap_BeginLoading() {
     s_localLoaded = false;
-    s_remoteLoaded = false;
+    // NOTE: Do NOT reset s_remoteLoaded here.
+    // The remote peer's LoadBarrier packet may have arrived
+    // while we were still in ConfigExchange/ConfigAgreed.
+    // Resetting it would discard that early notification and
+    // cause the loading barrier to time out.
     s_loadBarrierSent = false;
 
     s_loadStartTime = GetTickCount();
     s_phase = BootPhase::Loading;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin loading barrier");
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin loading barrier (remote_already=%s)",
+        s_remoteLoaded ? "yes" : "no");
 }
 
 void MatchBootstrap_BeginBaseline() {
+    s_localBaselineReady = false;
+    // NOTE: Do NOT reset s_remoteBaselineReady or s_remoteBaselineCRC here.
+    // The remote peer's BaselineReady/Digest packets may have arrived
+    // while we were still in the Loading phase. Resetting them would
+    // discard that early notification and cause baseline agreement to
+    // time out.
+    s_baselineAgreed = false;
+    s_localBaselineCRC = 0;
+    s_baselineDigestSent = false;
+    s_gameplayStart = false;
+    s_gameplayStartSent = false;
+
+    s_baselineStartTime = GetTickCount();
+    s_phase = BootPhase::Baseline;
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin baseline capture (remote_baseline_already=%s crc=0x%08X)",
+        s_remoteBaselineReady ? "yes" : "no", s_remoteBaselineCRC);
+}
+
+void MatchBootstrap_Abort() {
+    s_phase = BootPhase::Idle;
+    s_error[0] = '\0';
+    s_configSent = false;
+    s_configReceived = false;
+    s_configAgreed = false;
+    s_remoteDelayReceived = false;
+    memset(&s_remoteDelayData, 0, sizeof(s_remoteDelayData));
+    s_localLoaded = false;
+    s_remoteLoaded = false;
+    s_loadBarrierSent = false;
     s_localBaselineReady = false;
     s_remoteBaselineReady = false;
     s_baselineAgreed = false;
@@ -322,18 +461,7 @@ void MatchBootstrap_BeginBaseline() {
     s_baselineDigestSent = false;
     s_gameplayStart = false;
     s_gameplayStartSent = false;
-
-    s_baselineStartTime = GetTickCount();
-    s_phase = BootPhase::Baseline;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin baseline capture");
-}
-
-void MatchBootstrap_Abort() {
-    s_phase = BootPhase::Idle;
-    s_error[0] = '\0';
-    s_configAgreed = false;
-    s_gameplayStart = false;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Aborted");
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Aborted (all state reset)");
 }
 
 void MatchBootstrap_FrameUpdate() {
@@ -353,7 +481,7 @@ void MatchBootstrap_FrameUpdate() {
 // ============================================================================
 
 void MatchBootstrap_OnConfigExchange(const ConfigExchangePayload* p) {
-    if (!p || s_phase != BootPhase::ConfigExchange) return;
+    if (!p) return;
 
     // Build a LockedMatchConfig from the payload
     LockedMatchConfig received{};
@@ -376,22 +504,54 @@ void MatchBootstrap_OnConfigExchange(const ConfigExchangePayload* p) {
         // Host received config from join (shouldn't happen normally)
         LOG_NETPLAY(LOG_WARNING, "[MatchBoot] Host received ConfigExchange from join");
     } else {
-        // Join: adopt host's config, send ack
+        // Join: adopt host's config
+        // NOTE: Do NOT gate on s_phase == ConfigExchange. The host may
+        // send ConfigExchange before the client enters that phase (the
+        // client may still be in FrontendLocked building its own config).
+        // Store the config unconditionally; the ack is sent once the
+        // client actually enters ConfigExchange and sees s_configReceived.
         memcpy(&s_config, &received, sizeof(LockedMatchConfig));
-        s_configAgreed = true;
-        SendConfigAck(receivedHash, true);
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted config (hash=0x%08X)", receivedHash);
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join received config (hash=0x%08X phase=%u)",
+            receivedHash, (unsigned)s_phase);
+
+        // Store host's delay negotiation data
+        s_remoteDelayData.configured_delay  = p->delay_configured;
+        s_remoteDelayData.recommended_delay = p->delay_recommended;
+        s_remoteDelayData.rollback_budget   = p->delay_rollback;
+        s_remoteDelayReceived = true;
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join received host delay: cfg=%d rec=%d rb=%d",
+            p->delay_configured, p->delay_recommended, p->delay_rollback);
+
+        // Only agree+ack if we are already in ConfigExchange phase.
+        // If we haven't entered yet, UpdateConfigExchange will handle it.
+        if (s_phase == BootPhase::ConfigExchange) {
+            s_configAgreed = true;
+            SendConfigAck(receivedHash, true);
+            DelayPolicy_NegotiateSession(&s_remoteDelayData);
+            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted config (hash=0x%08X) agreed_delay=%d",
+                receivedHash, DelayPolicy_GetAgreedDelay());
+        }
     }
 }
 
 void MatchBootstrap_OnConfigAck(const ConfigAckPayload* p) {
-    if (!p || s_phase != BootPhase::ConfigExchange) return;
+    if (!p) return;
 
     uint32_t localHash = LockedMatchConfig_Hash(&s_config);
 
     if (p->accepted && p->config_hash == localHash) {
+        // Store join's delay negotiation data
+        s_remoteDelayData.configured_delay  = p->delay_configured;
+        s_remoteDelayData.recommended_delay = p->delay_recommended;
+        s_remoteDelayData.rollback_budget   = p->delay_rollback;
+        s_remoteDelayReceived = true;
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Host received join delay: cfg=%d rec=%d rb=%d",
+            p->delay_configured, p->delay_recommended, p->delay_rollback);
+
         s_configAgreed = true;
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Config agreed (hash=0x%08X)", localHash);
+        DelayPolicy_NegotiateSession(&s_remoteDelayData);
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Config agreed (hash=0x%08X phase=%u) agreed_delay=%d",
+            localHash, (unsigned)s_phase, DelayPolicy_GetAgreedDelay());
     } else {
         SetError("Config rejected by peer (local=0x%08X remote=0x%08X)",
             localHash, p->config_hash);
@@ -413,6 +573,16 @@ void MatchBootstrap_OnBaselineReady(const BaselineReadyPayload* p) {
     if (p->captured) {
         s_remoteBaselineReady = true;
         LOG_NETPLAY(LOG_INFO, "[MatchBoot] Remote baseline ready");
+
+        // Implicit LoadBarrierReady: if we're still in Loading phase and
+        // receive BaselineReady, the remote peer is obviously past loading.
+        // Treat this as implicit load completion to avoid a deadlock where
+        // the explicit LoadBarrier packet was processed before we entered
+        // the Loading phase and was therefore discarded.
+        if (s_phase == BootPhase::Loading && !s_remoteLoaded) {
+            s_remoteLoaded = true;
+            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Implicit LoadBarrierReady from BaselineReady");
+        }
     }
 }
 

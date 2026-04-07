@@ -2,13 +2,17 @@
  * Alice Senki 2 - Delay Policy Implementation
  *
  * RTT-based delay recommendation, explicit negotiation, multi-stage change
- * state machine, safe boundary detection, and Gekko contract enforcement.
+ * state machine, safe boundary detection, and delay sync enforcement.
+ * The gameplay bridge calls IsRollbackSynced/OnRollbackApplied to mark
+ * delay as consumed. See delay_policy.h for details.
  */
 
 #include "net/delay_policy.h"
+#include "net/session_manager.h"
 #include "net/sync_policy.h"
 #include "net/match_lifecycle.h"
 #include "core/game_state.h"
+#include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
 #include <algorithm>
@@ -81,10 +85,10 @@ static int  s_agreedDelay        = 0;
 static int  s_agreedRollback     = ROLLBACK_BUDGET_DEFAULT;
 static bool s_sessionNegotiated  = false;
 
-// Active delay (what Gekko is running with)
+// Active delay (consumed by rollback session via gameplay bridge)
 static int  s_activeDelay        = 0;
-static int  s_gekkoCurrentDelay  = -1;  // -1 = never set
-static bool s_gekkoSynced        = false;
+static int  s_rollbackCurrentDelay  = -1;  // Last delay value consumed by rollback session
+static bool s_rollbackSynced        = false; // true when rollback session has consumed active_delay
 
 // Pending next-match delay (committed for next match, not yet active)
 static int  s_pendingNextDelay   = 0;
@@ -195,16 +199,16 @@ static DelaySafeBoundary DetectSafeBoundary() {
 /// Transition change state machine forward when a safe boundary is detected.
 static void TryCommitAtBoundary(DelaySafeBoundary boundary) {
     if (s_changeState == DelayChangeState::Pending) {
-        // Committed — ready to apply to Gekko
+        // Committed — ready to apply
         s_changeState = DelayChangeState::Committed;
         s_lastBoundary = boundary;
 
         bool inRollbackMatch = SyncPolicy_IsRollbackActive();
 
         if (inRollbackMatch) {
-            // Active rollback: apply immediately (Gekko bridge will pick it up)
+            // Active rollback: apply immediately (rollback session will pick it up)
             s_activeDelay = ClampDelay(s_changeTarget);
-            s_gekkoSynced = false;  // Gekko must re-sync
+            s_rollbackSynced = false;  // Rollback session must re-sync
             s_changesApplied++;
 
             LOG_INFO("[DelayPolicy] Change committed to active match: delay=%d (boundary=%s, changes=%u)",
@@ -221,8 +225,8 @@ static void TryCommitAtBoundary(DelaySafeBoundary boundary) {
             LOG_INFO("[DelayPolicy] Change committed for next match: delay=%d (boundary=%s, changes=%u)",
                 s_pendingNextDelay, DelaySafeBoundaryName(boundary), s_changesApplied);
 
-            // In front-end, mark as applied since there's no Gekko to sync
-            s_changeState = DelayChangeState::AppliedToGekko;
+            // In front-end, mark as applied since there's no rollback session to sync
+            s_changeState = DelayChangeState::Applied;
         }
     }
 }
@@ -243,8 +247,8 @@ void DelayPolicy_Init() {
     s_sessionNegotiated = false;
 
     s_activeDelay = 0;
-    s_gekkoCurrentDelay = -1;
-    s_gekkoSynced = false;
+    s_rollbackCurrentDelay = -1;
+    s_rollbackSynced = false;
 
     s_pendingNextDelay = 0;
     s_hasPendingNext = false;
@@ -274,6 +278,12 @@ void DelayPolicy_Shutdown() {
 void DelayPolicy_FrameUpdate() {
     if (!s_initialized) return;
 
+    if (Session_IsConnected()) {
+        ConnectionStats stats{};
+        Session_GetStats(&stats);
+        DelayPolicy_UpdateMeasurement(stats.rtt_ms, stats.rtt_variance_ms);
+    }
+
     // Detect safe boundaries and try to advance change state machine
     DelaySafeBoundary boundary = DetectSafeBoundary();
 
@@ -281,16 +291,16 @@ void DelayPolicy_FrameUpdate() {
         TryCommitAtBoundary(boundary);
     }
 
-    // If active delay changed and Gekko is out of sync, the Gekko bridge
-    // will detect this via IsGekkoSynced() and call OnGekkoApplied().
-    // We do NOT auto-apply here — Gekko bridge is responsible.
+    // If active delay changed and rollback session is out of sync,
+    // The gameplay bridge will detect this via IsRollbackSynced() and
+    // call OnRollbackApplied(). We do NOT auto-apply here.
 
     // When transitioning from front-end to rollback match, apply pending next delay
     if (s_hasPendingNext && SyncPolicy_IsRollbackActive()) {
         s_activeDelay = s_pendingNextDelay;
         s_hasPendingNext = false;
         s_pendingNextDelay = 0;
-        s_gekkoSynced = false;  // Gekko must re-sync with new value
+        s_rollbackSynced = false;  // Rollback session must re-sync with new value
 
         LOG_INFO("[DelayPolicy] Applied pending next-match delay: %d", s_activeDelay);
     }
@@ -312,19 +322,62 @@ void DelayPolicy_FrameUpdate() {
 void DelayPolicy_UpdateMeasurement(float rtt_ms, float rtt_variance_ms) {
     if (!s_initialized) return;
 
+    const bool prevValid = s_measurementValid;
+    const int prevRecommended = s_recommendedDelay;
+
     s_lastRttMs = rtt_ms;
     s_lastVarianceMs = rtt_variance_ms;
 
-    if (rtt_ms > 0.0f) {
-        s_jitter.Feed(rtt_ms);
-        s_measurementValid = s_jitter.IsValid();
+    if (rtt_ms <= 0.0f) {
+        return;
+    }
 
-        if (s_measurementValid) {
-            s_recommendedDelay = ComputeRecommendedFromMeasurement(
-                s_jitter.GetSmoothedRTT(),
-                s_jitter.GetJitter()
-            );
-        }
+    s_jitter.Feed(rtt_ms);
+    s_measurementValid = s_jitter.IsValid();
+
+    if (s_measurementValid) {
+        s_recommendedDelay = ComputeRecommendedFromMeasurement(
+            s_jitter.GetSmoothedRTT(),
+            s_jitter.GetJitter()
+        );
+    }
+
+    if (prevValid != s_measurementValid) {
+        Rollback::NetplayLog_StateChange(
+            "DELAY", -1,
+            "measurement_valid",
+            prevValid ? "true" : "false",
+            s_measurementValid ? "true" : "false",
+            "ENet RTT sample window"
+        );
+    }
+
+    if (s_measurementValid && prevRecommended != s_recommendedDelay) {
+        LOG_INFO("[DelayPolicy] Recommended delay updated: %d -> %d (RTT=%.1fms jitter=%.1fms)",
+            prevRecommended, s_recommendedDelay,
+            s_jitter.GetSmoothedRTT(), s_jitter.GetJitter());
+        Rollback::NetplayLog_ValueChange(
+            "DELAY", -1,
+            "recommended_delay",
+            prevRecommended,
+            s_recommendedDelay,
+            "RTT/jitter measurement update"
+        );
+    }
+
+    // Rate-limit verbose measurement log to every ~2s (120 frames at 60fps)
+    // to avoid flooding the log file during normal gameplay.
+    static uint32_t s_measureLogCounter = 0;
+    if ((s_measureLogCounter++ % 120) == 0) {
+        Rollback::NetplayLog_Verbose("DELAY", -1,
+            "Measurement: rtt=%.1fms smoothed=%.1fms variance=%.1fms jitter=%.1fms one_way=%.1fms recommended=%d valid=%d",
+            rtt_ms,
+            s_jitter.GetSmoothedRTT(),
+            rtt_variance_ms,
+            s_jitter.GetJitter(),
+            s_jitter.GetSmoothedRTT() * 0.5f,
+            s_recommendedDelay,
+            s_measurementValid ? 1 : 0);
     }
 }
 
@@ -421,7 +474,7 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
     s_agreedRollback = agreed_rb;
     s_activeDelay = agreed;
     s_sessionNegotiated = true;
-    s_gekkoSynced = false;  // Gekko hasn't applied this yet
+    s_rollbackSynced = false;  // Rollback session hasn't applied this yet
 
     LOG_INFO("[DelayPolicy] Session negotiated:"
         " local_eff=%d remote_eff=%d agreed=%d"
@@ -439,7 +492,7 @@ int DelayPolicy_GetAgreedDelay() {
 }
 
 // ============================================================================
-// Active Delay (Gekko-facing)
+// Active Delay (rollback-session-facing)
 // ============================================================================
 
 int DelayPolicy_GetActiveDelay() {
@@ -450,18 +503,18 @@ int DelayPolicy_GetAgreedRollbackBudget() {
     return s_agreedRollback;
 }
 
-bool DelayPolicy_IsGekkoSynced() {
-    return s_gekkoSynced;
+bool DelayPolicy_IsRollbackSynced() {
+    return s_rollbackSynced;
 }
 
-void DelayPolicy_OnGekkoApplied(int delay_value) {
-    s_gekkoCurrentDelay = delay_value;
-    s_gekkoSynced = (delay_value == s_activeDelay);
+void DelayPolicy_OnRollbackApplied(int delay_value) {
+    s_rollbackCurrentDelay = delay_value;
+    s_rollbackSynced = (delay_value == s_activeDelay);
 
     if (s_changeState == DelayChangeState::Committed) {
-        s_changeState = DelayChangeState::AppliedToGekko;
-        LOG_INFO("[DelayPolicy] Gekko applied delay=%d (synced=%s)",
-            delay_value, s_gekkoSynced ? "yes" : "no");
+        s_changeState = DelayChangeState::Applied;
+        LOG_INFO("[DelayPolicy] Delay consumed by rollback session: delay=%d (synced=%s)",
+            delay_value, s_rollbackSynced ? "yes" : "no");
     }
 }
 
@@ -476,7 +529,7 @@ void DelayPolicy_RequestChange(int new_delay) {
     }
 
     if (s_changeState != DelayChangeState::Idle &&
-        s_changeState != DelayChangeState::AppliedToGekko) {
+        s_changeState != DelayChangeState::Applied) {
         LOG_INFO("[DelayPolicy] Change request rejected: already in state %s",
             DelayChangeStateName(s_changeState));
         return;
@@ -550,8 +603,8 @@ void DelayPolicy_ResetSession() {
     s_sessionNegotiated = false;
 
     s_activeDelay = 0;
-    s_gekkoCurrentDelay = -1;
-    s_gekkoSynced = false;
+    s_rollbackCurrentDelay = -1;
+    s_rollbackSynced = false;
 
     s_pendingNextDelay = 0;
     s_hasPendingNext = false;
@@ -587,8 +640,8 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
     out->change_state        = s_changeState;
     out->change_target_delay = s_changeTarget;
 
-    out->gekko_synced        = s_gekkoSynced;
-    out->gekko_current_delay = s_gekkoCurrentDelay;
+    out->rollback_synced        = s_rollbackSynced;
+    out->rollback_current_delay = s_rollbackCurrentDelay;
 
     out->measured_rtt_ms     = s_jitter.GetSmoothedRTT();
     out->measured_jitter_ms  = s_jitter.GetJitter();

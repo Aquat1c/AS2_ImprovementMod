@@ -1,14 +1,18 @@
 /**
  * Alice Senki 2 - Character Select / Stage Select Sync
  *
- * Lockstep synchronization for the CharSel and StageSel front-end phases.
- * Reads local cursor/confirm state from game memory, sends it to the remote
- * peer, and applies remote state to the P2 slot (or P1 if we are client-side P2).
+ * Input-driven lockstep synchronization for CharSel and StageSel phases.
  *
- * This module does NOT modify the game's CharSel state machine — it only
- * relays input state between peers so both sides see identical selections.
- * The actual game CharSel runs as GAMETYPE_VS_HUMAN (local 2P), and we
- * puppet the remote player's cursor/confirm from network data.
+ * Both peers exchange raw per-frame inputs.  The input dispatcher hook
+ * (Hook_InputDispatcher on sub_5625E0) injects lockstep inputs so the
+ * game's native charsel handler processes them identically on both sides.
+ *
+ * Side assignment:
+ *   Host  = P1 (left cursor),  local input → outputInputs[0]
+ *   Join  = P2 (right cursor), local input → outputInputs[1]
+ *
+ * The game runs as GAMETYPE_VS_HUMAN.  Both cursors are driven by
+ * lockstep data, not local hardware.
  */
 
 #pragma once
@@ -19,21 +23,21 @@
 namespace Net {
 
 // ============================================================================
-// CharSel Sync Snapshot
+// CharSel Sync Snapshot (queried by pregame_sync)
 // ============================================================================
 
 struct CharSelSyncSnapshot {
     bool     active;
-    bool     in_stage_phase;          // true if in StageSel phase
+    bool     in_stage_phase;
 
-    // Character selection state
+    // Character selection state (from game memory polling)
     uint8_t  local_cursor;
     uint8_t  local_confirmed;
     uint8_t  remote_cursor;
     uint8_t  remote_confirmed;
     bool     both_characters_locked;
 
-    // Resolved character IDs (after grid lookup)
+    // Resolved character IDs
     uint8_t  p1_character;
     uint8_t  p1_palette;
     uint8_t  p2_character;
@@ -46,6 +50,11 @@ struct CharSelSyncSnapshot {
     bool     remote_stage_confirmed;
     bool     both_stage_locked;
     uint8_t  stage_id;
+
+    // Lockstep diagnostics
+    uint32_t lockstep_frame;
+    uint32_t local_input_frame;
+    int      input_delay;
 };
 
 // ============================================================================
@@ -59,27 +68,41 @@ void CharSelSync_Shutdown();
 // Control
 // ============================================================================
 
-/// Begin CharSel sync. Call when entering CharSel.
 void CharSelSync_Begin();
-
-/// Transition to stage select phase.
 void CharSelSync_BeginStagePhase();
-
-/// Abort CharSel sync (disconnect/quit).
 void CharSelSync_Abort();
 
 // ============================================================================
 // Per-Frame
 // ============================================================================
 
-/// Drive charsel/stage sync. Call every frame during frontend sync.
+/// Drive charsel sync. Called every frame from pregame_sync.
 void CharSelSync_FrameUpdate();
 
 // ============================================================================
-// Packet Reception (called by PregameSync packet handler)
+// Lockstep Input Interface (called by Hook_InputDispatcher)
 // ============================================================================
 
-void CharSelSync_OnRemoteInput(const CharSelInputPayload* p);
+/// Capture local player's raw input for the current lockstep frame.
+/// Called once per game frame from Hook_InputProcess, before the charsel
+/// handler runs.  Input is in game-packed format (from ReadPlayerInput).
+void CharSelSync_CaptureLocalInput(uint16_t packedInput);
+
+/// Are both local and remote inputs available for the current consume frame?
+bool CharSelSync_HasInputsForCurrentFrame();
+
+/// Consume the current frame's inputs and return P1/P2 in game-packed format.
+/// Advances the consume frame counter.  Host→P1, Join→P2.
+bool CharSelSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2);
+
+/// Is the lockstep system actively running?
+bool CharSelSync_IsLockstepActive();
+
+// ============================================================================
+// Packet Reception
+// ============================================================================
+
+void CharSelSync_OnRemoteFrameInput(const CharSelFrameInputPayload* p);
 void CharSelSync_OnRemoteLock(const CharSelLockPayload* p);
 void CharSelSync_OnRemoteStage(const StageSyncPayload* p);
 

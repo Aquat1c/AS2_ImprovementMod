@@ -11,12 +11,18 @@
 #include "net/charsel_sync.h"
 #include "net/match_bootstrap.h"
 #include "net/match_lifecycle.h"
+#include "net/pause_handler.h"
+#include "net/winscreen_sync.h"
+#include "net/barrier_protocol.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/protocol.h"
 #include "net/mode_ownership.h"
+#include "net/netplay_menu_controller.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
+#include "patches/input_sync_hooks.h"
+#include "patches/memory_utils.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
@@ -67,6 +73,9 @@ constexpr DWORD        CONFIG_TIMEOUT_MS     = 10000;  // 10s for config exchang
 constexpr DWORD        LOAD_TIMEOUT_MS       = 30000;  // 30s for load barrier
 constexpr DWORD        BASELINE_TIMEOUT_MS   = 15000;  // 15s for baseline
 
+// Periodic logging counter
+static uint32_t        s_logTickCounter      = 0;
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -75,12 +84,28 @@ static void SetPhase(PregamePhase next, const char* why) {
     if (s_phase == next) return;
     const char* oldName = PregamePhaseName(s_phase);
     const char* newName = PregamePhaseName(next);
-    LOG_NETPLAY(LOG_INFO, "[PregameSync] Phase %s -> %s (%s)",
-        oldName, newName, why ? why : "?");
-    Rollback::NetplayLog_StateChange("PREGAME", -1,
+
+    uint32_t mode = GetGameMode();
+    uint32_t sub  = GetSubstate();
+    uint32_t simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+
+    LOG_NETPLAY(LOG_INFO, "[PregameSync] Phase %s -> %s (%s) | mode=%u sub=%u simFrame=%u",
+        oldName, newName, why ? why : "?", mode, sub, simFrame);
+    Rollback::NetplayLog_StateChange("PREGAME", (int32_t)simFrame,
         "PregamePhase", oldName, newName, why ? why : "?");
     s_phase = next;
     s_phaseStartTime = GetTickCount();
+
+    // Error phase → immediately trigger full disconnect.
+    // This ensures the load barrier freeze is cleared, the session is
+    // canceled, and the game returns to the menu with an error message.
+    // Without this the Error phase was a dead-end: FrameUpdate() stopped
+    // driving the state machine but nothing disconnected, so the game
+    // fell through to local-only gameplay.
+    if (next == PregamePhase::Error) {
+        InputSyncHooks_SetLoadBarrierFreeze(false);
+        NetMenu::HandleDisconnection(s_errorText[0] ? s_errorText : why);
+    }
 }
 
 static void SetStatusFmt(const char* fmt, ...) {
@@ -108,6 +133,27 @@ static bool PhaseTimedOut(DWORD timeoutMs) {
     return (GetTickCount() - s_phaseStartTime) >= timeoutMs;
 }
 
+static void UpdateBootstrapFreezeForBoundary() {
+    const bool inBootstrap =
+        s_phase == PregamePhase::BootstrapLoading ||
+        s_phase == PregamePhase::BootstrapBaseline ||
+        s_phase == PregamePhase::BootstrapReady;
+
+    if (!inBootstrap) {
+        InputSyncHooks_SetLoadBarrierFreeze(false);
+        return;
+    }
+
+    const uint32_t mode = GetGameMode();
+    const uint32_t sub = GetSubstate();
+
+    // Match the old working behavior: let Mode 8 loading/setup/init progress
+    // naturally, and only freeze once the game reaches the gameplay boundary
+    // before bootstrap has finished.
+    const bool shouldFreeze = (mode == MODE_MATCH && sub == MATCH_SUB_GAMEPLAY);
+    InputSyncHooks_SetLoadBarrierFreeze(shouldFreeze);
+}
+
 // ============================================================================
 // Session sync packet handlers (called before OnPregamePacket dispatch)
 // ============================================================================
@@ -133,6 +179,14 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
     }
 
     s_remoteSyncConfirmed = true;
+
+    // Receiving a SyncConfirm implies the remote already announced
+    // (they went through Announce→Exchange→Confirm). If we missed their
+    // SyncAnnounce due to callback registration timing, this recovers.
+    if (!s_remoteSyncAnnounced) {
+        s_remoteSyncAnnounced = true;
+        LOG_NETPLAY(LOG_INFO, "[PregameSync] Inferred remote announce from SyncConfirm");
+    }
 
     // Join adopts host's session ID and side assignment
     SessionRole role = Session_GetRole();
@@ -164,8 +218,13 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             break;
 
         case PacketType::CharSelInput:
-            if (payloadLen >= sizeof(CharSelInputPayload)) {
-                CharSelSync_OnRemoteInput(static_cast<const CharSelInputPayload*>(payload));
+            // Legacy state-driven charsel sync — no longer used.
+            // Input-driven lockstep uses CharSelFrameInput instead.
+            break;
+
+        case PacketType::CharSelFrameInput:
+            if (payloadLen >= sizeof(CharSelFrameInputPayload)) {
+                CharSelSync_OnRemoteFrameInput(static_cast<const CharSelFrameInputPayload*>(payload));
             }
             break;
 
@@ -221,6 +280,15 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             break;
 
         default:
+            // Handle cross-phase packets that can arrive at any time
+            if (type == PacketType::PauseQuit) {
+                PauseHandler_OnRemotePauseQuit();
+                break;
+            }
+            if (type == PacketType::WinScreenConfirm) {
+                WinScreenSync_OnRemoteConfirm();
+                break;
+            }
             LOG_NETPLAY(LOG_WARNING, "[PregameSync] Unhandled packet type %u", (unsigned)type);
             break;
     }
@@ -235,8 +303,8 @@ static void SendSyncAnnounce() {
     payload.session_id = s_sessionId;
     payload.capability_flags = s_localCapabilities;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::SyncAnnounce,
-                       &payload, sizeof(payload), true);
+    BarrierProtocol_SendPacket(PacketType::SyncAnnounce,
+                              &payload, sizeof(payload));
     s_syncAnnounceSent = true;
     LOG_NETPLAY(LOG_INFO, "[PregameSync] Sent SyncAnnounce: session=0x%08X caps=0x%02X",
         s_sessionId, s_localCapabilities);
@@ -248,23 +316,47 @@ static void SendSyncConfirm() {
     payload.confirmed = 1;
     payload.assigned_side = s_assignedSide;
 
-    Session_SendPacket(CHANNEL_CONTROL, PacketType::SyncConfirm,
-                       &payload, sizeof(payload), true);
+    BarrierProtocol_SendPacket(PacketType::SyncConfirm,
+                              &payload, sizeof(payload));
     s_syncConfirmSent = true;
     LOG_NETPLAY(LOG_INFO, "[PregameSync] Sent SyncConfirm: session=0x%08X side=%u",
         s_sessionId, s_assignedSide);
 }
 
+static DWORD s_lastAnnounceSendTime = 0;
+constexpr DWORD ANNOUNCE_RESEND_MS  = 500;  // Resend every 500ms
+
 static void UpdateSyncAnnounce() {
     // Send our announce if not yet sent
     if (!s_syncAnnounceSent) {
         SendSyncAnnounce();
+        s_lastAnnounceSendTime = GetTickCount();
     }
 
-    // Wait for remote announce
+    // Periodically resend announce in case the first was dropped
+    // (remote may not have registered packet callback yet)
+    if (s_syncAnnounceSent && !s_remoteSyncAnnounced) {
+        DWORD now = GetTickCount();
+        if (now - s_lastAnnounceSendTime >= ANNOUNCE_RESEND_MS) {
+            LOG_NETPLAY(LOG_DEBUG, "[PregameSync] Resending SyncAnnounce (no remote announce yet)");
+            SendSyncAnnounce();
+            s_lastAnnounceSendTime = now;
+        }
+    }
+
+    // If remote already confirmed (implies they announced + exchanged),
+    // skip directly to SyncExchange.
+    if (s_remoteSyncConfirmed) {
+        SetStatusFmt("Session confirmed (fast path). Exchanging...");
+        SetPhase(PregamePhase::SyncExchange, "remote already confirmed");
+        return;
+    }
+
+    // Normal path: wait for remote announce
     if (s_remoteSyncAnnounced) {
         SetStatusFmt("Session announced. Confirming...");
         SetPhase(PregamePhase::SyncExchange, "remote announced");
+        return;
     }
 
     if (PhaseTimedOut(SYNC_TIMEOUT_MS)) {
@@ -272,6 +364,9 @@ static void UpdateSyncAnnounce() {
         SetPhase(PregamePhase::Error, "sync announce timeout");
     }
 }
+
+static DWORD s_lastConfirmSendTime = 0;
+constexpr DWORD CONFIRM_RESEND_MS  = 500;
 
 static void UpdateSyncExchange() {
     // Both have announced — send our confirm
@@ -283,6 +378,17 @@ static void UpdateSyncExchange() {
         }
 
         SendSyncConfirm();
+        s_lastConfirmSendTime = GetTickCount();
+    }
+
+    // Periodically resend confirm in case it was missed
+    if (s_syncConfirmSent && !s_remoteSyncConfirmed) {
+        DWORD now = GetTickCount();
+        if (now - s_lastConfirmSendTime >= CONFIRM_RESEND_MS) {
+            LOG_NETPLAY(LOG_DEBUG, "[PregameSync] Resending SyncConfirm (no remote confirm yet)");
+            SendSyncConfirm();
+            s_lastConfirmSendTime = now;
+        }
     }
 
     // Wait for remote confirm
@@ -299,8 +405,10 @@ static void UpdateSyncExchange() {
 
 static void UpdateSyncConfirmed() {
     // Transition immediately to CharSel lockstep
-    LOG_NETPLAY(LOG_INFO, "[PregameSync] Session sync complete: session=0x%08X side=%u",
-        s_sessionId, s_assignedSide);
+    SessionRole role = Session_GetRole();
+    LOG_NETPLAY(LOG_INFO, "[PregameSync] Session sync complete: session=0x%08X side=%u role=%s",
+        s_sessionId, s_assignedSide,
+        role == SessionRole::Host ? "Host" : "Join");
 
     CharSelSync_Begin();
     SetStatusFmt("Character select...");
@@ -311,6 +419,8 @@ static void UpdateSyncConfirmed() {
 // Phase update: Front-End Sync
 // ============================================================================
 
+static uint32_t s_charselLogCounter = 0;
+
 static void UpdateFrontendCharSel() {
     CharSelSync_FrameUpdate();
 
@@ -319,6 +429,16 @@ static void UpdateFrontendCharSel() {
 
     s_localCharSelLocked = csSnap.local_confirmed;
     s_remoteCharSelLocked = csSnap.remote_confirmed;
+
+    // Periodic charsel state logging (every 120 frames ~2s)
+    s_charselLogCounter++;
+    if (s_charselLogCounter == 1 || (s_charselLogCounter % 120) == 0) {
+        LOG_NETPLAY(LOG_DEBUG,
+            "[PregameSync] CharSel tick=%u lockstep_frame=%u local_input=%u delay=%d "
+            "localConfirm=%u remoteConfirm=%u",
+            s_charselLogCounter, csSnap.lockstep_frame, csSnap.local_input_frame,
+            csSnap.input_delay, csSnap.local_confirmed, csSnap.remote_confirmed);
+    }
 
     if (csSnap.both_characters_locked) {
         SetStatusFmt("Characters locked. Stage select...");
@@ -366,6 +486,12 @@ static void UpdateFrontendLocked() {
         s_lockedConfig.time_limit = 0;
     }
 
+    // Front-end selections are fully resolved at this point.
+    // End CharSel lockstep before the game transitions into Mode 7 / Mode 8,
+    // otherwise Hook_InputDispatcher will keep treating later states as
+    // frontend-owned and stall the bootstrap handoff.
+    CharSelSync_Abort();
+
     SetPhase(PregamePhase::ConfigExchange, "config ready");
     MatchBootstrap_BeginConfigExchange(&s_lockedConfig);
 }
@@ -375,6 +501,17 @@ static void UpdateConfigExchange() {
 
     MatchBootstrapSnapshot bSnap{};
     MatchBootstrap_GetSnapshot(&bSnap);
+
+    // Periodic state context every ~2s (120 frames)
+    if ((s_logTickCounter++ % 120) == 0) {
+        DWORD elapsed = s_phaseStartTime ? (GetTickCount() - s_phaseStartTime) : 0;
+        LOG_NETPLAY(LOG_INFO,
+            "[PregameSync] ConfigExchange: sent=%s recv=%s agreed=%s elapsed=%lums",
+            bSnap.config_sent ? "yes" : "no",
+            bSnap.config_received ? "yes" : "no",
+            bSnap.config_agreed ? "yes" : "no",
+            elapsed);
+    }
 
     if (bSnap.config_agreed) {
         // Get the final agreed config from bootstrap
@@ -400,7 +537,9 @@ static void UpdateConfigExchange() {
 }
 
 static void UpdateConfigAgreed() {
-    // Transition immediately to loading phase
+    // Transition immediately to loading phase.
+    // Do not freeze here: Mode 7 / Mode 8 substates 0-2 must continue running
+    // so both peers can actually finish loading and reach the baseline gate.
     SetStatusFmt("Waiting for assets to load...");
     SetPhase(PregamePhase::BootstrapLoading, "begin loading");
     MatchBootstrap_BeginLoading();
@@ -411,6 +550,23 @@ static void UpdateBootstrapLoading() {
 
     MatchBootstrapSnapshot bSnap{};
     MatchBootstrap_GetSnapshot(&bSnap);
+
+    UpdateBootstrapFreezeForBoundary();
+
+    // Periodic state context every ~2s (120 frames)
+    if ((s_logTickCounter++ % 120) == 0) {
+        uint32_t mode = GetGameMode();
+        uint32_t sub  = GetSubstate();
+        DWORD elapsed = s_phaseStartTime ? (GetTickCount() - s_phaseStartTime) : 0;
+        bool frozen = (mode == MODE_MATCH && sub == MATCH_SUB_GAMEPLAY);
+        LOG_NETPLAY(LOG_INFO,
+            "[PregameSync] BootstrapLoading: mode=%u sub=%u frozen=%s "
+            "local=%s remote=%s elapsed=%lums",
+            mode, sub, frozen ? "yes" : "no",
+            bSnap.local_loaded ? "yes" : "no",
+            bSnap.remote_loaded ? "yes" : "no",
+            elapsed);
+    }
 
     if (bSnap.both_loaded) {
         SetStatusFmt("Assets loaded. Capturing baseline...");
@@ -435,6 +591,26 @@ static void UpdateBootstrapBaseline() {
     MatchBootstrapSnapshot bSnap{};
     MatchBootstrap_GetSnapshot(&bSnap);
 
+    UpdateBootstrapFreezeForBoundary();
+
+    // Periodic state context every ~2s (120 frames)
+    if ((s_logTickCounter % 120) == 0) {
+        uint32_t mode = GetGameMode();
+        uint32_t sub  = GetSubstate();
+        DWORD elapsed = s_phaseStartTime ? (GetTickCount() - s_phaseStartTime) : 0;
+        bool frozen = (mode == MODE_MATCH && sub == MATCH_SUB_GAMEPLAY);
+        LOG_NETPLAY(LOG_INFO,
+            "[PregameSync] BootstrapBaseline: mode=%u sub=%u frozen=%s "
+            "localReady=%s remoteReady=%s localCRC=0x%08X remoteCRC=0x%08X "
+            "digestSent=%s elapsed=%lums",
+            mode, sub, frozen ? "yes" : "no",
+            bSnap.local_baseline_ready ? "yes" : "no",
+            bSnap.remote_baseline_ready ? "yes" : "no",
+            bSnap.local_baseline_crc, bSnap.remote_baseline_crc,
+            bSnap.baseline_agreed ? "yes" : "no",
+            elapsed);
+    }
+
     if (bSnap.baseline_agreed) {
         SetStatusFmt("Baseline agreed. Ready to play!");
         SetPhase(PregamePhase::BootstrapReady, "baseline agreed");
@@ -457,9 +633,24 @@ static void UpdateBootstrapReady() {
     MatchBootstrapSnapshot bSnap{};
     MatchBootstrap_GetSnapshot(&bSnap);
 
+    UpdateBootstrapFreezeForBoundary();
+
+    // Periodic state context every ~2s (120 frames)
+    if ((s_logTickCounter % 120) == 0) {
+        DWORD elapsed = s_phaseStartTime ? (GetTickCount() - s_phaseStartTime) : 0;
+        LOG_NETPLAY(LOG_INFO,
+            "[PregameSync] BootstrapReady: gameplayStart=%s startFrame=%u elapsed=%lums",
+            bSnap.gameplay_start ? "yes" : "no",
+            bSnap.start_frame,
+            elapsed);
+    }
+
     if (bSnap.gameplay_start) {
         SetStatusFmt("Gameplay starting!");
         SetPhase(PregamePhase::GameplayHandoff, "gameplay start");
+
+        // Disable load barrier freeze — the rollback session will take over
+        InputSyncHooks_SetLoadBarrierFreeze(false);
 
         // Notify match lifecycle layer — it now owns the match flow
         MatchLifecycle_OnMatchEnter();
@@ -586,6 +777,8 @@ bool PregameSync_Begin() {
     s_remoteSyncAnnounced = false;
     s_syncConfirmSent = false;
     s_remoteSyncConfirmed = false;
+    s_lastAnnounceSendTime = 0;
+    s_lastConfirmSendTime = 0;
 
     // Start with initial session sync (announce → exchange → confirmed → charsel)
     SetStatusFmt("Synchronizing session...");
@@ -600,6 +793,9 @@ void PregameSync_Abort(const char* reason) {
 
     LOG_NETPLAY(LOG_WARNING, "[PregameSync] Abort: %s (was %s)",
         reason ? reason : "?", PregamePhaseName(s_phase));
+
+    // Always clear load barrier freeze on abort — ensure game isn't stuck
+    InputSyncHooks_SetLoadBarrierFreeze(false);
 
     CharSelSync_Abort();
     MatchBootstrap_Abort();
@@ -617,6 +813,8 @@ void PregameSync_Abort(const char* reason) {
     s_remoteSyncAnnounced = false;
     s_syncConfirmSent = false;
     s_remoteSyncConfirmed = false;
+    s_lastAnnounceSendTime = 0;
+    s_lastConfirmSendTime = 0;
 }
 
 PregamePhase PregameSync_GetPhase() {

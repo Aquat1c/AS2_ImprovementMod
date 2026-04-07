@@ -4,6 +4,7 @@
 
 #include "rollback/prediction.h"
 #include "rollback/input_timeline.h"
+#include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
 namespace Rollback {
@@ -27,6 +28,7 @@ void Prediction_Init() {
     s_lastConfirmedFrame = -1;
     s_initialized = true;
     LOG_INFO("[Prediction] Initialized (strategy=RepeatLast)");
+    NetplayLog_Write("PREDICT", -1, "Prediction initialized: strategy=RepeatLast");
 }
 
 void Prediction_Shutdown() {
@@ -37,6 +39,7 @@ void Prediction_Reset() {
     s_lastConfirmedInput = INPUT_NEUTRAL;
     s_lastConfirmedFrame = -1;
     LOG_INFO("[Prediction] Reset");
+    NetplayLog_Write("PREDICT", -1, "Prediction reset");
 }
 
 // ============================================================================
@@ -46,6 +49,9 @@ void Prediction_Reset() {
 void Prediction_SetStrategy(PredictionStrategy strategy) {
     s_strategy = strategy;
     LOG_INFO("[Prediction] Strategy set to %s",
+        strategy == PredictionStrategy::RepeatLast ? "RepeatLast" : "Neutral");
+    NetplayLog_Write("PREDICT", -1,
+        "Strategy set to %s",
         strategy == PredictionStrategy::RepeatLast ? "RepeatLast" : "Neutral");
 }
 
@@ -58,22 +64,35 @@ PredictionStrategy Prediction_GetStrategy() {
 // ============================================================================
 
 uint16_t Prediction_PredictRemote(int32_t frame) {
-    (void)frame;
+    uint16_t predicted = INPUT_NEUTRAL;
 
     switch (s_strategy) {
         case PredictionStrategy::RepeatLast:
-            return s_lastConfirmedInput;
+            predicted = s_lastConfirmedInput;
+            break;
 
         case PredictionStrategy::Neutral:
         default:
-            return INPUT_NEUTRAL;
+            predicted = INPUT_NEUTRAL;
+            break;
     }
+
+    NetplayLog_Verbose("PREDICT", frame,
+        "Predict remote: strategy=%s input=0x%04X last_confirmed_frame=%d",
+        s_strategy == PredictionStrategy::RepeatLast ? "RepeatLast" : "Neutral",
+        predicted,
+        s_lastConfirmedFrame);
+
+    return predicted;
 }
 
 void Prediction_OnRemoteConfirmed(int32_t frame, uint16_t input) {
     if (frame > s_lastConfirmedFrame) {
         s_lastConfirmedInput = input;
         s_lastConfirmedFrame = frame;
+        NetplayLog_Verbose("PREDICT", frame,
+            "Confirmed remote input: input=0x%04X",
+            input);
     }
 }
 

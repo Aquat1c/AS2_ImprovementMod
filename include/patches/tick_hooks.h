@@ -22,3 +22,6 @@ DWORD __cdecl Hook_GetTick();
 // Tick scale control
 void SetGlobalTickScale(float scale);
 float GetGlobalTickScale();
+void SetNetplayTickScale(float scale);
+float GetNetplayTickScale();
+float GetEffectiveTickScale();

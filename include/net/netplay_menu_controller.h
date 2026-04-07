@@ -55,4 +55,7 @@ bool ConsumesGameInput();
 /// Get a read-only snapshot for UI rendering and diagnostics.
 void GetSnapshot(MenuSnapshot* out);
 
+/// Render the menu in the game's render pass (called from Hook_MainMenuStateMachine).
+void RenderFrame();
+
 } // namespace NetMenu

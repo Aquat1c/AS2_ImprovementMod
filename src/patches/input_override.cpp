@@ -1,8 +1,14 @@
 #include "patches/input_override.h"
+#include "patches/input_sync_hooks.h"
 #include "input_system.h"
 #include "patches/memory_utils.h"
 #include "as2_constants.h"
 #include "log_window.h"
+#include "net/netplay_menu_controller.h"
+#include "net/session_manager.h"
+#include "net/charsel_sync.h"
+#include "net/stagesel_sync.h"
+#include "core/game_state.h"
 #include "imgui.h"
 
 // ============================================================================
@@ -12,6 +18,7 @@
 KeyboardState_t g_origKeyboardState = nullptr;
 JoystickState_t g_origJoystickState = nullptr;
 InputProcess_t g_origInputProcess = nullptr;
+InputDispatcher_t g_origInputDispatcher = nullptr;
 DInputKBRefresh_t g_origDInputKBRefresh = nullptr;
 DInputJoyRefresh_t g_origDInputJoyRefresh = nullptr;
 GetKeyboardState_t g_origGetKeyboardState = nullptr;
@@ -32,6 +39,16 @@ static int g_hookCallCount = 0;
 static int g_lastInputUpdateFrame = -1;
 
 InputDebugInfo g_inputDebug = {};
+
+static inline bool IsCharSelDispatcherLockstepSubstate(uint32_t substate) {
+    return substate == CHARSEL_SUB_SELECT ||
+           substate == CHARSEL_SUB_CONFIRM;
+}
+
+static inline bool IsStageSelRawLockstepSubstate(uint32_t substate) {
+    return substate == CHARSEL_SUB_STAGESEL_GRID ||
+           substate == CHARSEL_SUB_STAGESEL_CONFIRM;
+}
 
 // ============================================================================
 // Frame-based input update tracking
@@ -165,7 +182,7 @@ static bool IsGameWindowFocused() {
 // ============================================================================
 
 BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
-    if (InputSystem_IsBindingActive() && lpKeyState) {
+    if ((InputSystem_IsBindingActive() || NetMenu::ConsumesGameInput()) && lpKeyState) {
         memset(lpKeyState, 0, 256);
         return TRUE;
     }
@@ -276,7 +293,7 @@ int __cdecl Hook_KeyboardState(int keyCode) {
     
     EnsureInputUpdated();
 
-    if (InputSystem_IsBindingActive()) {
+    if (InputSystem_IsBindingActive() || NetMenu::ConsumesGameInput()) {
         g_inputDebug.lastOrigResult = 0;
         g_inputDebug.lastFinalResult = 0;
         return 0;
@@ -335,6 +352,15 @@ int __cdecl Hook_JoystickState(int playerID) {
         int playerIndex = (playerID == p1JoyID) ? 0 : (playerID == p2JoyID) ? 1 : 0;
         g_inputDebug.lastMappedPlayer = playerIndex;
         
+        // During netplay: suppress local P2 hardware input entirely.
+        // P2 is controlled by the remote peer (charsel_sync / rollback input).
+        if (playerIndex == 1 && Net::Session_IsConnected()) {
+            g_inputDebug.sdlInputP2 = 0;
+            g_inputDebug.gameInputP2 = 0;
+            g_inputDebug.lastFinalResult = 0;
+            return 0;
+        }
+
         uint16_t sdlInput = InputSystem_GetInput(playerIndex);
         uint16_t gameInput = ConvertToGameJoyFormat(sdlInput);
         
@@ -362,10 +388,156 @@ int __cdecl Hook_JoystickState(int playerID) {
 }
 
 // ============================================================================
-// Input Processing Hook (sub_562060)
+// Input Dispatcher Hook (sub_5625E0 / Input_TryGetNextFrame)
+//
+// During charsel lockstep: replaces vanilla input dispatch with lockstep data.
+// Both peers see identical P1/P2 inputs → identical charsel navigation.
 // ============================================================================
 
+// Shared constant: just-pressed starts at word offset 28 in the input buffer.
 #define JUST_PRESSED_OFFSET_WORDS 28
+
+// Edge detection state for raw array overwrite
+static uint16_t s_dispPrevP1 = 0;
+static uint16_t s_dispPrevP2 = 0;
+
+// Logging throttle
+static uint32_t s_dispatchCount = 0;
+static uint32_t s_dispatchWaitCount = 0;
+static bool     s_dispatchFirstLog = false;
+
+// Charsel: prevent producing more than one input per game-loop iteration.
+// The game calls the dispatcher in a while-loop; we return 0 once (produce
+// a frame) then -1 to break out. This flag resets when -1 is returned.
+static bool s_charsel_produced_this_loop = false;
+
+int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
+    if (!outputInputs) return -1;
+
+    // ── Load barrier freeze ─────────────────────────────────────────
+    // Game reached match loading but bootstrap hasn't completed.
+    // Freeze gameplay (return -1) while keeping game loop alive for
+    // SessionManager updates, packet exchange, and ImGui rendering.
+    if (InputSyncHooks_IsGameplayFreezeActive()) {
+        return -1;
+    }
+
+    // ── CharSel lockstep ────────────────────────────────────────────
+    // Replaces vanilla dispatch with deterministic lockstep.
+    // Both sides exchange inputs frame-by-frame. Game only advances
+    // when BOTH local and remote inputs are available.
+    if (Net::CharSelSync_IsLockstepActive()) {
+        const uint32_t gameMode = GetGameMode();
+        const uint32_t subState = GetSubstate();
+
+        // Only run lockstep during active selection substates
+        if (gameMode != MODE_CHARSEL || !IsCharSelDispatcherLockstepSubstate(subState)) {
+            // Not in a lockstep substate — freeze and suppress vanilla
+            return -1;
+        }
+
+        // Log first intercept
+        if (!s_dispatchFirstLog) {
+            s_dispatchFirstLog = true;
+            s_dispatchCount = 0;
+            s_dispatchWaitCount = 0;
+            s_charsel_produced_this_loop = false;
+            LOG_NETPLAY(LOG_INFO, "[InputDispatch] Lockstep intercept ACTIVE (mode=%u sub=%u)",
+                gameMode, subState);
+        }
+
+        // Frame gate: only produce one frame per game-loop iteration.
+        // The while-loop calls us repeatedly; after producing one frame,
+        // return -1 to break out. Reset when we're called again next iteration.
+        if (s_charsel_produced_this_loop) {
+            s_charsel_produced_this_loop = false;  // Reset for next iteration
+            return -1;
+        }
+
+        // Poll SDL input and get local packed input
+        InputSystem_Update();
+        uint16_t localInput = InputSystem_GetInput(0);
+
+        // Buffer locally and send to peer (with redundant history)
+        Net::CharSelSync_CaptureLocalInput(localInput);
+
+        // Lockstep gate: only advance when both inputs are available
+        if (!Net::CharSelSync_HasInputsForCurrentFrame()) {
+            s_dispatchWaitCount++;
+            if (s_dispatchWaitCount <= 3 || (s_dispatchWaitCount % 60) == 0) {
+                LOG_NETPLAY(LOG_DEBUG, "[InputDispatch] Waiting for remote input (wait#%u)",
+                    s_dispatchWaitCount);
+            }
+            return -1;  // Freeze — wait for remote input
+        }
+
+        // Consume confirmed inputs for this frame
+        uint16_t p1 = 0, p2 = 0;
+        if (!Net::CharSelSync_ConsumeCurrentFrame(&p1, &p2)) {
+            LOG_NETPLAY(LOG_WARNING, "[InputDispatch] Lockstep inconsistency: inputs ready but consume failed");
+            return -1;
+        }
+
+        s_dispatchCount++;
+        s_dispatchWaitCount = 0;
+
+        // Log consumed frames (first 5, then every 60)
+        if (s_dispatchCount <= 5 || (s_dispatchCount % 60) == 0) {
+            LOG_NETPLAY(LOG_DEBUG, "[InputDispatch] Consumed frame #%u: P1=0x%04X P2=0x%04X (sub=%u)",
+                s_dispatchCount, p1, p2, subState);
+        }
+
+        // Stage select uses a shared cursor / confirm menu.
+        // Merge both players' confirmed inputs into one shared input so both
+        // peers drive the same stage UI path deterministically.
+        // Write to output array
+        outputInputs[0] = (__int16)p1;
+        outputInputs[1] = (__int16)p2;
+
+        // Advance Frame_Inputs (vanilla dispatcher does this)
+        volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
+        (*pFrameWrite)++;
+
+        // Edge detection for raw array just-pressed
+        uint16_t justP1 = p1 & ~s_dispPrevP1;
+        uint16_t justP2 = p2 & ~s_dispPrevP2;
+        s_dispPrevP1 = p1;
+        s_dispPrevP2 = p2;
+
+        // Overwrite P1/P2 raw input arrays (held + just-pressed).
+        // In GAMETYPE_VS_HUMAN, the vanilla engine DIRECTLY polls the raw
+        // arrays (0x8E9E62 for P1, 0x8E9F32 for P2) for menu navigation,
+        // completely ignoring the lockstep arrays. By forcibly overwriting
+        // these, we guarantee both cursors are enslaved by network lockstep.
+        for (int i = 0; i < 10; i++) {
+            uint16_t mask = (uint16_t)(1 << i);
+            WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (i * 2),
+                (uint16_t)((p1 & mask) ? 1 : 0));
+            WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
+                (uint16_t)((justP1 & mask) ? 1 : 0));
+            WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (i * 2),
+                (uint16_t)((p2 & mask) ? 1 : 0));
+            WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
+                (uint16_t)((justP2 & mask) ? 1 : 0));
+        }
+
+        s_charsel_produced_this_loop = true;
+        return 0;
+    }
+
+    // ── Vanilla passthrough (offline/local play only) ────────────────
+    // Reset logging state when not intercepting
+    if (s_dispatchFirstLog) {
+        s_dispatchFirstLog = false;
+        s_dispatchCount = 0;
+        s_dispatchWaitCount = 0;
+    }
+    return g_origInputDispatcher(outputInputs);
+}
+
+// ============================================================================
+// Input Processing Hook (sub_562060)
+// ============================================================================
 
 static_assert(ADDR_P1_INPUT_BUFFER == 0x8E9E62,
               "Alt-buffer IS the main buffer — they must be the same address");
@@ -393,7 +565,7 @@ static uint16_t ReadHeldMaskFromAltBuffer(uintptr_t altBufferAddr) {
 }
 
 int __cdecl Hook_InputProcess(int gameState) {
-    const bool consumeForCustomMenu = InputSystem_IsBindingActive();
+    const bool consumeForCustomMenu = InputSystem_IsBindingActive() || NetMenu::ConsumesGameInput();
 
     if (ModConfig_UseSDLInput()) {
         EnsureInputUpdated();
@@ -416,6 +588,47 @@ int __cdecl Hook_InputProcess(int gameState) {
     if (consumeForCustomMenu) {
         clearLiveInputBuffers();
         return result;
+    }
+
+    if (Net::CharSelSync_IsLockstepActive()) {
+        const uint32_t gameMode = GetGameMode();
+        const uint32_t subState = GetSubstate();
+
+        if (gameMode == MODE_CHARSEL && IsStageSelRawLockstepSubstate(subState)) {
+            InputSystem_Update();
+            const uint16_t localInput = InputSystem_GetInput(0);
+            Net::CharSelSync_CaptureLocalInput(localInput);
+
+            if (!Net::CharSelSync_HasInputsForCurrentFrame()) {
+                clearLiveInputBuffers();
+                return result;
+            }
+
+            uint16_t p1 = 0;
+            uint16_t p2 = 0;
+            if (!Net::CharSelSync_ConsumeCurrentFrame(&p1, &p2)) {
+                clearLiveInputBuffers();
+                return result;
+            }
+
+            const uint16_t merged = Net::StageSelSync_MergeConfirmed(
+                (uint32_t)ReadMemory<int>(ADDR_INPUT_WRITE_IDX), p1, p2);
+            const uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~prevHeldP1);
+
+            for (int i = 0; i < 10; i++) {
+                const uint16_t mask = g_buttonMasks[i];
+
+                WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (i * 2),
+                    (merged & mask) ? 1 : 0);
+                WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
+                    (pressedMerged & mask) ? 1 : 0);
+
+                WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (i * 2), 0);
+                WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2), 0);
+            }
+
+            return result;
+        }
     }
 
     // Netplay override: when rollback session is active, inject rollback-controlled
@@ -461,6 +674,12 @@ int __cdecl Hook_InputProcess(int gameState) {
         uint16_t currentP1 = (uint16_t)((p1State ? p1State->current : 0) & allowedMask);
         uint16_t currentP2 = (uint16_t)((p2State ? p2State->current : 0) & allowedMask);
 
+        // During netplay: suppress local P2 hardware input.
+        // P2 is controlled by the remote peer via charsel_sync or rollback input injection.
+        if (Net::Session_IsConnected()) {
+            currentP2 = 0;
+        }
+
         if (InputSystem_GetControlSwap()) {
             const uint16_t tmp = currentP1;
             currentP1 = currentP2;
@@ -493,6 +712,9 @@ int __cdecl Hook_InputProcess(int gameState) {
                 WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (i * 2), heldVal);
             }
         }
+
+        // During netplay: charsel lockstep capture is handled by Hook_InputDispatcher.
+        // Do NOT capture here — it would cause unbounded send-head growth.
     }
 
     return result;

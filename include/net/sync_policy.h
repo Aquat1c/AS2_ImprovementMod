@@ -33,7 +33,7 @@ namespace Net {
 enum class SyncMode : uint8_t {
     None = 0,       // Not in any synced state (offline, menu, etc.)
     Lockstep,       // Deterministic lockstep — wait for peer agreement
-    Rollback,       // Speculative rollback — GekkoNet drives frame advance
+    Rollback,       // Speculative rollback — mod-owned rollback session drives frame advance
     Passive,        // Session alive, no input sync — visual/timer states
 };
 

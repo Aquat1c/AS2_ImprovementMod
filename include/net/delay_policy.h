@@ -1,27 +1,30 @@
 /**
  * Alice Senki 2 - Delay Policy
  *
- * Manages input delay computation, negotiation, lifecycle, and Gekko contract.
+ * Manages input delay computation, negotiation, and lifecycle.
  *
- * The mod owns ALL delay and rollback-budget decisions. GekkoNet is a consumer
- * that receives values only through explicit commit/apply calls.
+ * The mod owns ALL delay and rollback-budget decisions. The rollback session
+ * (RollbackSession_FrameUpdate) consumes the active delay directly.
+ *
+ * The gameplay bridge (gameplay_bridge) calls IsRollbackSynced() and
+ * OnRollbackApplied() to mark delay as consumed by the rollback session.
  *
  * === Delay value taxonomy ===
  *
  *   configured_delay   — user's persistent preference (from config/UI)
  *   recommended_delay  — computed at connect time from measured RTT + jitter
  *   agreed_delay       — negotiated startup value both peers accept
- *   active_delay       — the delay Gekko is currently executing with
+ *   active_delay       — the delay the rollback session is currently using
  *   pending_next_delay — committed for next match/round, not yet active
  *
  * === Delay change state machine ===
  *
- *   Requested → Pending → Committed → AppliedToGekko
+ *   Requested → Pending → Committed → Applied
  *
  *   - Requested: one peer wants a change
  *   - Pending:   both peers acknowledge, waiting for safe boundary
  *   - Committed: safe boundary reached, ready to apply
- *   - AppliedToGekko: Gekko has acknowledged the new value
+ *   - Applied:   rollback session has consumed the new value
  *
  * === Safe boundaries (where commit/apply may occur) ===
  *
@@ -38,12 +41,6 @@
  *
  *   Rollback budget is an independent policy, NOT a derived formula.
  *   Both delay and rollback budget are exchanged and agreed explicitly.
- *
- * === Gekko contract ===
- *
- *   Gekko must NEVER run on stale delay. After a commit, the policy layer
- *   calls the Gekko update hook before the next Gekko frame advance.
- *   The `gekko_synced` flag tracks whether Gekko's value matches ours.
  */
 
 #pragma once
@@ -72,8 +69,8 @@ enum class DelayChangeState : uint8_t {
     Idle = 0,         // No change in progress
     Requested,        // Change requested by one peer
     Pending,          // Both peers acknowledged, awaiting safe boundary
-    Committed,        // Safe boundary reached, ready to apply to Gekko
-    AppliedToGekko,   // Gekko is running with this value
+    Committed,        // Safe boundary reached, ready to apply
+    Applied,          // Rollback session has consumed this value
 };
 
 inline const char* DelayChangeStateName(DelayChangeState s) {
@@ -82,7 +79,7 @@ inline const char* DelayChangeStateName(DelayChangeState s) {
         case DelayChangeState::Requested:      return "Requested";
         case DelayChangeState::Pending:        return "Pending";
         case DelayChangeState::Committed:      return "Committed";
-        case DelayChangeState::AppliedToGekko: return "AppliedToGekko";
+        case DelayChangeState::Applied:        return "Applied";
         default:                               return "Unknown";
     }
 }
@@ -147,7 +144,7 @@ struct DelayPolicySnapshot {
     int      configured_delay;      // User's persistent preference (0=auto)
     int      recommended_delay;     // Computed from RTT + jitter
     int      agreed_delay;          // Session startup negotiated value
-    int      active_delay;          // Currently applied to Gekko
+    int      active_delay;          // Currently used by rollback session
     int      pending_next_delay;    // Committed for next match/boundary (0 = none)
 
     // Rollback budget (independent policy)
@@ -158,9 +155,9 @@ struct DelayPolicySnapshot {
     DelayChangeState change_state;
     int      change_target_delay;   // Target delay of in-progress change
 
-    // Gekko contract
-    bool     gekko_synced;          // Gekko is running with active_delay
-    int      gekko_current_delay;   // Last value applied to Gekko
+    // Delay sync tracking (consumed by rollback session via gameplay bridge)
+    bool     rollback_synced;       // Rollback session is using active_delay
+    int      rollback_current_delay;// Last value consumed by rollback session
 
     // Network measurement
     float    measured_rtt_ms;
@@ -231,21 +228,21 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote);
 int  DelayPolicy_GetAgreedDelay();
 
 // ============================================================================
-// Active Delay (Gekko-facing)
+// Active Delay (rollback-session-facing)
 // ============================================================================
 
-/// The delay Gekko is currently running with.
+/// The delay the rollback session is currently running with.
 int  DelayPolicy_GetActiveDelay();
 
 /// The agreed rollback budget.
 int  DelayPolicy_GetAgreedRollbackBudget();
 
-/// True if Gekko's delay matches the committed value.
-bool DelayPolicy_IsGekkoSynced();
+/// True if the rollback session's delay matches the committed value.
+bool DelayPolicy_IsRollbackSynced();
 
-/// Called by the Gekko bridge AFTER it has applied the delay value.
-/// This completes the Requested→Pending→Committed→AppliedToGekko cycle.
-void DelayPolicy_OnGekkoApplied(int delay_value);
+/// Called by the gameplay bridge AFTER the rollback session has consumed
+/// the delay value. Completes the Requested→Pending→Committed→Applied cycle.
+void DelayPolicy_OnRollbackApplied(int delay_value);
 
 // ============================================================================
 // Mid-Session Delay Changes

@@ -61,8 +61,19 @@ enum class PacketType : uint16_t {
     BaselineDigest  = 18,   // CRC32 of baseline savestate for agreement
     GameplayStart   = 19,   // Both peers ready — begin gameplay
 
+    // CharSel lockstep (unreliable, channel 1)
+    CharSelFrameInput = 40, // Per-frame charsel input with redundancy
+
+    // Win screen / pause (reliable, channel 0)
+    WinScreenConfirm = 41,  // Win screen A/C confirm signal
+    PauseQuit        = 42,  // Pause menu quit signal
+
     // Gameplay (unreliable, channel 1) — placeholders for rollback layer
     GameplayInput   = 20,   // Reserved for future rollback input sync
+
+    // Mid-match delay changes (reliable, channel 0)
+    DelayChangeReq  = 21,   // Request to change input delay
+    DelayChangeAck  = 22,   // Acknowledge delay change request
 
     // Debug / diagnostics (unreliable, channel 2)
     Ping            = 30,   // Application-level ping (supplements ENet RTT)
@@ -158,12 +169,20 @@ struct ConfigExchangePayload {
     uint8_t  time_limit;
     uint32_t rng_seed;
     uint32_t session_seed;
+    // Delay negotiation (sender's preferences)
+    uint8_t  delay_configured;   // 0 = auto, 1-15 = manual preference
+    uint8_t  delay_recommended;  // Auto-computed from RTT measurement
+    uint8_t  delay_rollback;     // Rollback budget (frames)
+    uint8_t  _delay_pad;
 };
 
 struct ConfigAckPayload {
     uint32_t config_hash;        // CRC32 of the LockedMatchConfig peer built
     uint8_t  accepted;           // 1 = matches, 0 = mismatch
-    uint8_t  _pad[3];
+    // Delay negotiation (join's preferences)
+    uint8_t  delay_configured;   // 0 = auto, 1-15 = manual preference
+    uint8_t  delay_recommended;  // Auto-computed from RTT measurement
+    uint8_t  delay_rollback;     // Rollback budget (frames)
 };
 
 struct LoadBarrierPayload {
@@ -182,6 +201,25 @@ struct BaselineDigestPayload {
 
 struct GameplayStartPayload {
     uint32_t start_frame;        // Agreed frame to begin gameplay (typically 0)
+};
+
+struct CharSelFrameInputPayload {
+    uint32_t frame;              // Lockstep frame number
+    uint32_t ack_frame;          // Latest remote frame we received
+    uint16_t inputs[4];          // Redundant history: [frame, frame-1, frame-2, frame-3]
+    uint16_t input_count;        // Number of valid entries in inputs[] (1-4)
+    uint16_t _pad;
+};
+
+struct DelayChangeReqPayload {
+    uint8_t  new_delay;          // Requested input delay (1-15)
+    uint8_t  _pad[3];
+};
+
+struct DelayChangeAckPayload {
+    uint8_t  acked_delay;        // Acknowledged delay value
+    uint8_t  accepted;           // 1 = accepted, 0 = counter-proposed
+    uint8_t  _pad[2];
 };
 
 #pragma pack(pop)
@@ -209,7 +247,10 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::BaselineReady:  return "BaselineReady";
         case PacketType::BaselineDigest: return "BaselineDigest";
         case PacketType::GameplayStart:  return "GameplayStart";
-        case PacketType::GameplayInput:  return "GameplayInput";
+        case PacketType::GameplayInput:      return "GameplayInput";
+        case PacketType::CharSelFrameInput:  return "CharSelFrameInput";
+        case PacketType::WinScreenConfirm:   return "WinScreenConfirm";
+        case PacketType::PauseQuit:           return "PauseQuit";
         case PacketType::Ping:           return "Ping";
         case PacketType::Pong:           return "Pong";
         case PacketType::StateDigest:    return "StateDigest";

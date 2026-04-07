@@ -109,6 +109,28 @@ struct MenuSnapshot {
     int           fade_frames;
     char          status[128];
     char          last_error[128];
+    char          your_address[64];
+    char          clipboard_flash[48];
+    char          local_nickname[32];
+    char          peer_nickname[32];
+    float         rtt_ms;
+    int           local_wins;
+    int           remote_wins;
+
+    // Connection config (editable by user)
+    uint16_t      listen_port;
+    char          remote_endpoint[64];
+    int           preferred_delay;
+
+    // Session display
+    bool          is_host;
+    int           active_delay;
+
+    // Text editing state
+    bool          is_text_editing;
+    TextEditField text_edit_field;
+    char          text_edit_buffer[64];
+    int           text_cursor_pos;
 };
 
 } // namespace NetMenu

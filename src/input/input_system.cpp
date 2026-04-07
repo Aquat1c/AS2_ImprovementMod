@@ -899,14 +899,16 @@ bool InputSystem_SaveConfig(const char* filename) {
 //   Base+84:  Cooldown      (10 words)
 //   Base+140: Hold counter  (10 words)
 //
-// Button order: Down(0), Up(1), Left(2), Right(3), A(4), B(5), C(6), D(7), Start(8), Select(9)
+// Button order matches game's mask array at OFF_P1_BUTTON_MASKS (decompilation):
+//   Slot 0=Up(8), 1=Down(1), 2=Left(2), 3=Right(4), 4..9=A,B,C,D,Start,Select
+// The SDL bit values differ from game joy bits, but SLOT ORDER must match.
 
 #define GAME_P1_INPUT_BASE  0x8E9E62
 #define GAME_P2_INPUT_BASE  0x8E9F32
 #define INPUT_ARRAY_JUSTPRESSED 28   // word offset for just-pressed array
 
 static const uint16_t g_buttonMasks[10] = {
-    INPUT_DOWN, INPUT_UP, INPUT_LEFT, INPUT_RIGHT,
+    INPUT_UP, INPUT_DOWN, INPUT_LEFT, INPUT_RIGHT,
     INPUT_A, INPUT_B, INPUT_C, INPUT_D,
     INPUT_START, INPUT_SELECT
 };

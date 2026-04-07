@@ -3,6 +3,7 @@
  */
 
 #include "rollback/input_timeline.h"
+#include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
 #include <string.h>
@@ -56,6 +57,10 @@ static void EnsureFrameFits(int32_t frame) {
             memset(s_buffer, 0, sizeof(s_buffer));
         }
         s_baseFrame += shift;
+
+        NetplayLog_Verbose("TIMELINE", frame,
+            "Shifted timeline window by %d frames -> base=%d latest_local=%d latest_remote=%d",
+            shift, s_baseFrame, s_latestLocal, s_latestRemoteConf);
     }
 }
 
@@ -86,6 +91,7 @@ void InputTimeline_Reset() {
     s_latestRemoteConf = -1;
     // Keep lifetime stats
     LOG_INFO("[InputTimeline] Reset");
+    NetplayLog_Write("TIMELINE", -1, "Reset timeline state");
 }
 
 // ============================================================================
@@ -105,6 +111,10 @@ void InputTimeline_SetLocalInput(int32_t frame, uint16_t input) {
     if (frame > s_latestLocal) {
         s_latestLocal = frame;
     }
+
+    NetplayLog_Verbose("TIMELINE", frame,
+        "Local input set: input=0x%04X latest_local=%d base=%d",
+        input, s_latestLocal, s_baseFrame);
 }
 
 bool InputTimeline_SetRemoteInput(int32_t frame, uint16_t input) {
@@ -136,6 +146,19 @@ bool InputTimeline_SetRemoteInput(int32_t frame, uint16_t input) {
         s_latestRemoteConf = frame;
     }
 
+    if (mismatch) {
+        NetplayLog_Write("TIMELINE", frame,
+            "Remote input mismatch: predicted=0x%04X actual=0x%04X",
+            was_predicted ? s_buffer[idx].remote : INPUT_NEUTRAL,
+            input);
+    } else {
+        NetplayLog_Verbose("TIMELINE", frame,
+            "Remote input confirmed: input=0x%04X predicted=%d latest_remote=%d",
+            input,
+            was_predicted ? 1 : 0,
+            s_latestRemoteConf);
+    }
+
     return mismatch;
 }
 
@@ -153,6 +176,10 @@ void InputTimeline_PredictRemoteInput(int32_t frame, uint16_t predicted_input) {
     s_buffer[idx].remote_predicted = true;
     s_buffer[idx].prediction_wrong = false;
     s_totalPredictions++;
+
+    NetplayLog_Verbose("TIMELINE", frame,
+        "Remote input predicted: input=0x%04X total_predictions=%d",
+        predicted_input, s_totalPredictions);
 }
 
 // ============================================================================

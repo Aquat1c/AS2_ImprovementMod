@@ -20,7 +20,9 @@
 #include "rollback/prediction.h"
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
+#include "net/gameplay_bridge.h"
 #include "net/match_lifecycle.h"
+#include "net/set_tracker.h"
 #include "net/pregame_sync.h"
 #include "net/match_bootstrap.h"
 #include "net/session_manager.h"
@@ -30,6 +32,9 @@
 #include "net/delay_policy.h"
 #include "net/locked_match_config.h"
 #include "net/enet_transport.h"
+#include "net/player_side_mapping.h"
+#include "net/winscreen_sync.h"
+#include "net/pause_handler.h"
 #include "input/input_system.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
@@ -107,8 +112,8 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
 
             s_packetsDispatched++;
 
-            // Submit primary input
-            RollbackSession_SubmitRemoteInput(p->frame, p->input);
+            // Submit primary input through GameplayBridge
+            Net::GameplayBridge_SubmitRemoteInput(p->frame, p->input);
             s_remoteInputsReceived++;
 
             // Submit redundant batch (for packet loss recovery)
@@ -117,7 +122,7 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
                 for (int i = 1; i < p->input_count && i < 8; i++) {
                     int32_t batchFrame = p->frame - i;
                     if (batchFrame >= 0) {
-                        RollbackSession_SubmitRemoteInput(batchFrame, p->inputs[i]);
+                        Net::GameplayBridge_SubmitRemoteInput(batchFrame, p->inputs[i]);
                     }
                 }
             }
@@ -141,6 +146,15 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
         }
 
         default:
+            // Check for win screen / pause packets
+            if (type == Net::PacketType::WinScreenConfirm) {
+                Net::WinScreenSync_OnRemoteConfirm();
+                break;
+            }
+            if (type == Net::PacketType::PauseQuit) {
+                Net::PauseHandler_OnRemotePauseQuit();
+                break;
+            }
             // Not a gameplay packet; unhandled at this level.
             // During gameplay, the pregame handler is not active,
             // so non-gameplay packets are just logged.
@@ -173,22 +187,11 @@ static bool TryStartRollbackSession() {
     int activeDelay = Net::DelayPolicy_GetActiveDelay();
     int rollbackBudget = Net::DelayPolicy_GetAgreedRollbackBudget();
 
-    // Determine local/remote player from side assignment
-    Net::PregameSnapshot pregameSnap{};
-    Net::PregameSync_GetSnapshot(&pregameSnap);
-
-    int localPlayer, remotePlayer;
+    // Determine local/remote player via PlayerMapping module
     Net::SessionRole role = Net::Session_GetRole();
-
-    if (role == Net::SessionRole::Host) {
-        // Host is P1 if host_side == 0
-        localPlayer  = (config->host_side == 0) ? 0 : 1;
-        remotePlayer = (config->host_side == 0) ? 1 : 0;
-    } else {
-        // Join is the opposite side
-        localPlayer  = (config->host_side == 0) ? 1 : 0;
-        remotePlayer = (config->host_side == 0) ? 0 : 1;
-    }
+    bool isHost = (role == Net::SessionRole::Host);
+    int localPlayer = Net::PlayerMapping_DeriveFromRole(config->host_side, isHost);
+    int remotePlayer = Net::PlayerMapping_GetRemoteGameSlot();
 
     // Build rollback session config
     RollbackSessionConfig rbConfig{};
@@ -237,12 +240,12 @@ static bool TryStartRollbackSession() {
     // Register gameplay packet callback
     Net::Session_SetPacketCallback(OnGameplayPacket);
 
-    // Start rollback session
-    bool ok = RollbackSession_Begin(rbConfig);
+    // Start rollback session through GameplayBridge
+    bool ok = Net::GameplayBridge_StartSession(rbConfig);
     if (!ok) {
         NetplayLog_Write("HANDOFF", s_handoffFrame,
-            "ERROR: RollbackSession_Begin FAILED");
-        LOG_ERROR("[OnlineWiring] RollbackSession_Begin failed");
+            "ERROR: GameplayBridge_StartSession FAILED");
+        LOG_ERROR("[OnlineWiring] GameplayBridge_StartSession failed");
         return false;
     }
 
@@ -297,7 +300,8 @@ static void StopRollbackSession(const char* reason) {
             "WARNING: Desync was detected at frame %d", desyncFrame);
     }
 
-    RollbackSession_End();
+    // End session through GameplayBridge
+    Net::GameplayBridge_EndSession();
     RollbackDebug_SetDigestEnabled(false);
 
     s_rollbackActive = false;
@@ -376,6 +380,7 @@ static void CheckLifecyclePhase() {
             if (curPhase == Net::MatchLifecyclePhase::PauseActive) {
                 // Pause — keep session alive but stop advancing
                 s_gameplayActive = false;
+                Net::PauseHandler_OnPauseEnter();
                 NetplayLog_Write("LIFE", RollbackSession_GetCurrentFrame(),
                     "Gameplay paused — rollback session suspended");
             } else if (curPhase == Net::MatchLifecyclePhase::RoundTransition) {
@@ -392,6 +397,14 @@ static void CheckLifecyclePhase() {
         }
 
         // Match end from any state
+        if (curPhase == Net::MatchLifecyclePhase::MatchEnd &&
+            s_lastLifecyclePhase != Net::MatchLifecyclePhase::MatchEnd) {
+            // Record match result for set tracking
+            Net::MatchLifecycleSnapshot lifeSnap{};
+            Net::MatchLifecycle_GetSnapshot(&lifeSnap);
+            Net::SetTracker_RecordResult(lifeSnap.winner);
+        }
+
         if (curPhase == Net::MatchLifecyclePhase::MatchEnd && s_rollbackActive) {
             StopRollbackSession("match ended (non-gameplay)");
         }
@@ -399,6 +412,23 @@ static void CheckLifecyclePhase() {
         // Disconnect from any state
         if (curPhase == Net::MatchLifecyclePhase::DisconnectRecovery && s_rollbackActive) {
             StopRollbackSession("disconnect");
+        }
+
+        // Entering WinScreenActive — begin win screen sync
+        if (curPhase == Net::MatchLifecyclePhase::WinScreenActive &&
+            s_lastLifecyclePhase != Net::MatchLifecyclePhase::WinScreenActive) {
+            Net::WinScreenSync_Begin();
+        }
+
+        // Leaving WinScreenActive — abort sync if still running
+        if (s_lastLifecyclePhase == Net::MatchLifecyclePhase::WinScreenActive &&
+            curPhase != Net::MatchLifecyclePhase::WinScreenActive) {
+            Net::WinScreenSync_Abort();
+        }
+
+        // Disconnect kills win screen sync
+        if (curPhase == Net::MatchLifecyclePhase::DisconnectRecovery) {
+            Net::WinScreenSync_Abort();
         }
 
         // Inactive — full cleanup
@@ -412,6 +442,9 @@ static void CheckLifecyclePhase() {
             s_handoffFrame = -1;
             s_remoteInputsReceived = 0;
             s_packetsDispatched = 0;
+
+            // Reset set tracker when session fully ends
+            Net::SetTracker_Reset();
         }
 
         // MatchInit — potential round restart, re-enable gameplay flag
@@ -451,6 +484,9 @@ void OnlineWiring_Init() {
     s_lastRollbackBudget = -1;
 
     StressHooks_Init();
+    Net::SetTracker_Init();
+    Net::WinScreenSync_Init();
+    Net::PauseHandler_Init();
 
     LOG_INFO("[OnlineWiring] Initialized");
     NetplayLog_Write("WIRING", -1, "OnlineWiring initialized");
@@ -460,6 +496,8 @@ void OnlineWiring_Shutdown() {
     if (s_rollbackActive) {
         StopRollbackSession("mod shutdown");
     }
+    Net::WinScreenSync_Shutdown();
+    Net::PauseHandler_Shutdown();
     StressHooks_Shutdown();
     s_initialized = false;
 }
@@ -479,10 +517,22 @@ void OnlineWiring_FrameUpdate() {
         TryStartRollbackSession();
     }
 
+    // Drive win screen sync when in win screen phase
+    Net::MatchLifecyclePhase curPhase = Net::MatchLifecycle_GetPhase();
+    if (curPhase == Net::MatchLifecyclePhase::WinScreenActive) {
+        Net::WinScreenSync_FrameUpdate();
+    }
+
+    // Drive pause handler when session is owned
+    if (Net::MatchLifecycle_IsMatchOwned()) {
+        Net::PauseHandler_FrameUpdate();
+    }
+
     // Drive rollback subsystems only when gameplay is active
     if (s_rollbackActive && s_gameplayActive) {
-        // The actual RollbackSession_FrameUpdate is called from mod_main.cpp
-        // We just do auxiliary work here.
+        // GameplayBridge_FrameUpdate (rollback session + delay consumption)
+        // is called from mod_main.cpp after OnlineWiring_FrameUpdate.
+        // We only do auxiliary diagnostic work here.
 
         // Periodic RTT/stats logging (every 5 seconds = 300 frames)
         int32_t frame = RollbackSession_GetCurrentFrame();
@@ -535,6 +585,9 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     if (s_rollbackActive) {
         StopRollbackSession(reason ? reason : "disconnect");
     }
+
+    // Reset set tracker on session end
+    Net::SetTracker_Reset();
 
     // Log final state
     Net::ConnectionStats stats{};
