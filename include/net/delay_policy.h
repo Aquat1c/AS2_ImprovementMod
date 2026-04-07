@@ -133,6 +133,7 @@ struct DelayNegotiationData {
     int      min_acceptable;       // Floor the peer will accept
     int      max_acceptable;       // Ceiling the peer will accept
     int      rollback_budget;      // Peer's rollback budget
+    int      rollback_delay;       // Input pipeline delay (CCCaster-style: residual after rollback absorbs latency)
 };
 
 // ============================================================================
@@ -147,9 +148,10 @@ struct DelayPolicySnapshot {
     int      active_delay;          // Currently used by rollback session
     int      pending_next_delay;    // Committed for next match/boundary (0 = none)
 
-    // Rollback budget (independent policy)
-    int      rollback_budget;       // Agreed max rollback frames
+    // Rollback parameters (CCCaster-style separation)
+    int      rollback_budget;       // Max frames local can run ahead of confirmed remote
     int      agreed_rollback;       // Session-agreed rollback budget
+    int      rollback_delay;        // Input pipeline delay when rollback is active
 
     // Change state machine
     DelayChangeState change_state;
@@ -209,9 +211,17 @@ void DelayPolicy_GetMeasurement(NetworkMeasurement* out);
 void DelayPolicy_SetConfiguredDelay(int delay);
 int  DelayPolicy_GetConfiguredDelay();
 
-/// Set rollback budget preference.
+/// Set rollback budget preference (max frames ahead of confirmed remote).
 void DelayPolicy_SetRollbackBudget(int frames);
 int  DelayPolicy_GetRollbackBudget();
+
+/// Set rollback delay (input pipeline delay when rollback is active).
+/// CCCaster formula: max(0, recommended_delay - rollback_budget)
+void DelayPolicy_SetRollbackDelay(int frames);
+int  DelayPolicy_GetRollbackDelay();
+
+/// Compute suggested rollback delay from current recommended delay and rollback budget.
+int  DelayPolicy_ComputeSuggestedRollbackDelay();
 
 // ============================================================================
 // Session Negotiation
@@ -231,11 +241,16 @@ int  DelayPolicy_GetAgreedDelay();
 // Active Delay (rollback-session-facing)
 // ============================================================================
 
-/// The delay the rollback session is currently running with.
+/// The input pipeline delay the rollback session is currently running with.
+/// In rollback mode, this is rollback_delay (residual after rollback absorbs latency).
+/// NOT the same as agreed_delay (which is the full computed delay before rollback subtraction).
 int  DelayPolicy_GetActiveDelay();
 
-/// The agreed rollback budget.
+/// The agreed rollback budget (max frames ahead).
 int  DelayPolicy_GetAgreedRollbackBudget();
+
+/// The agreed rollback delay (input pipeline delay in rollback mode).
+int  DelayPolicy_GetAgreedRollbackDelay();
 
 /// True if the rollback session's delay matches the committed value.
 bool DelayPolicy_IsRollbackSynced();

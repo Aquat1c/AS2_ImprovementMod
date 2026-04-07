@@ -5,8 +5,6 @@
 #include "rollback/rollback_debug.h"
 #include "rollback/rollback_session.h"
 #include "rollback/resimulation.h"
-#include "rollback/input_timeline.h"
-#include "rollback/prediction.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
 #include "net/delay_policy.h"
@@ -43,9 +41,55 @@ static int32_t  s_digestsRecv       = 0;
 static int32_t  s_digestsMatched    = 0;
 static int32_t  s_digestsMismatched = 0;
 static int32_t  s_lastDigestFrame   = -1;
+static int32_t  s_statusSent        = 0;
+static int32_t  s_statusRecv        = 0;
+static int32_t  s_statusInterval    = 15;
+
+static constexpr int kChecksumHistorySize = 512;
+static int32_t  s_checksumHistoryFrame[kChecksumHistorySize] = {};
+static uint32_t s_checksumHistoryCrc[kChecksumHistorySize] = {};
+
+// Last remote frame-status telemetry
+static int32_t  s_remoteStatusFrame          = -1;
+static int32_t  s_remoteStatusGameFrame      = -1;
+static int32_t  s_remoteStatusViewFrame      = -1;
+static int32_t  s_remoteStatusConfirmedFrame = -1;
+static int32_t  s_remoteStatusPredicted      = 0;
+static uint32_t s_remoteStatusChecksum       = 0;
 
 // Current frame checksum (cached)
 static uint32_t s_currentChecksum   = 0;
+
+static void ResetChecksumHistory() {
+    for (int i = 0; i < kChecksumHistorySize; ++i) {
+        s_checksumHistoryFrame[i] = -1;
+        s_checksumHistoryCrc[i] = 0;
+    }
+}
+
+static void StoreChecksumForFrame(int32_t frame, uint32_t checksum) {
+    if (frame < 0) {
+        return;
+    }
+
+    const int index = frame % kChecksumHistorySize;
+    s_checksumHistoryFrame[index] = frame;
+    s_checksumHistoryCrc[index] = checksum;
+}
+
+static bool TryGetChecksumForFrame(int32_t frame, uint32_t* checksum) {
+    if (!checksum || frame < 0) {
+        return false;
+    }
+
+    const int index = frame % kChecksumHistorySize;
+    if (s_checksumHistoryFrame[index] != frame) {
+        return false;
+    }
+
+    *checksum = s_checksumHistoryCrc[index];
+    return true;
+}
 
 // ============================================================================
 // Lifecycle
@@ -59,7 +103,16 @@ void RollbackDebug_Init() {
     s_digestsMatched = 0;
     s_digestsMismatched = 0;
     s_lastDigestFrame = -1;
+    s_statusSent = 0;
+    s_statusRecv = 0;
+    s_remoteStatusFrame = -1;
+    s_remoteStatusGameFrame = -1;
+    s_remoteStatusViewFrame = -1;
+    s_remoteStatusConfirmedFrame = -1;
+    s_remoteStatusPredicted = 0;
+    s_remoteStatusChecksum = 0;
     s_currentChecksum = 0;
+    ResetChecksumHistory();
     s_initialized = true;
     LOG_INFO("[RollbackDebug] Initialized");
 }
@@ -75,7 +128,7 @@ void RollbackDebug_Shutdown() {
 void RollbackDebug_FrameUpdate() {
     if (!s_initialized) return;
     if (!RollbackSession_IsActive()) return;
-    if (RollbackSession_IsResimulating()) return;  // Don't log during resim
+    if (RollbackSession_IsRollingBack()) return;  // Don't log during resim
 
     int32_t frame = RollbackSession_GetCurrentFrame();
 
@@ -87,6 +140,8 @@ void RollbackDebug_FrameUpdate() {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         s_currentChecksum = 0xDEADDEAD;
     }
+
+    StoreChecksumForFrame(frame, s_currentChecksum);
 
     // Send state digest at configured interval
     if (s_digestEnabled && s_digestInterval > 0 &&
@@ -109,6 +164,38 @@ void RollbackDebug_FrameUpdate() {
 
         NetplayLog_Verbose("DIGEST", frame,
             "Sent: crc=0x%08X", s_currentChecksum);
+    }
+
+    if (s_digestEnabled && s_statusInterval > 0 &&
+        (frame % s_statusInterval == 0) && Net::Session_IsConnected()) {
+
+        Net::FrameSyncStatusPayload status{};
+        status.current_frame = frame;
+        status.game_frame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+
+        RollbackSessionSnapshot rbSnap{};
+        RollbackSession_GetSnapshot(&rbSnap);
+        status.remote_view_frame = 0;  // GekkoNet manages this internally
+        status.confirmed_frame = rbSnap.last_confirmed_frame;
+        status.predicted_frames = rbSnap.predicted_frames_outstanding;
+        status.checksum = s_currentChecksum;
+
+        Net::Session_SendPacket(
+            Net::CHANNEL_DEBUG,
+            Net::PacketType::FrameSyncStatus,
+            &status, sizeof(status),
+            false
+        );
+
+        s_statusSent++;
+
+        NetplayLog_Verbose("FSYNC", frame,
+            "Sent status: game=%d remote_view=%d confirmed=%d predicted=%d crc=0x%08X",
+            status.game_frame,
+            status.remote_view_frame,
+            status.confirmed_frame,
+            status.predicted_frames,
+            status.checksum);
     }
 
     // Rate-limited diagnostics log (every 300 frames = ~5 seconds)
@@ -136,17 +223,15 @@ void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc) {
     s_digestsRecv++;
 
     // Only compare if we have a confirmed (non-predicted) state for this frame.
-    // If we haven't reached that frame yet, or are still predicting, skip.
-    int32_t confirmed = RollbackSession_GetLastConfirmedFrame();
-    if (frame > confirmed) return;
+    // With GekkoNet, use last_confirmed_frame from the snapshot.
+    RollbackSessionSnapshot snap{};
+    RollbackSession_GetSnapshot(&snap);
+    if (frame > snap.last_confirmed_frame) return;
 
-    // Compute what our state was at that frame (we can only check current).
-    // For true per-frame comparison, we'd need to store checksums per frame.
-    // For now, if the remote digest frame matches our current frame, compare directly.
-    int32_t current = RollbackSession_GetCurrentFrame();
-    if (frame != current - 1) return;  // Only compare on matching frames
-
-    uint32_t local_crc = s_currentChecksum;
+    uint32_t local_crc = 0;
+    if (!TryGetChecksumForFrame(frame, &local_crc)) {
+        return;
+    }
 
     if (local_crc == remote_crc) {
         s_digestsMatched++;
@@ -171,6 +256,61 @@ void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc) {
                 s_digestsMatched, s_digestsMismatched);
             NetplayLog_Flush();
         }
+    }
+}
+
+void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_frame,
+                                           int32_t remote_game_frame,
+                                           int32_t remote_view_frame,
+                                           int32_t remote_confirmed_frame,
+                                           int32_t remote_predicted_frames,
+                                           uint32_t remote_checksum) {
+    s_statusRecv++;
+    s_remoteStatusFrame = remote_frame;
+    s_remoteStatusGameFrame = remote_game_frame;
+    s_remoteStatusViewFrame = remote_view_frame;
+    s_remoteStatusConfirmedFrame = remote_confirmed_frame;
+    s_remoteStatusPredicted = remote_predicted_frames;
+    s_remoteStatusChecksum = remote_checksum;
+
+    if (!RollbackSession_IsActive()) {
+        return;
+    }
+
+    const int32_t localFrame = RollbackSession_GetCurrentFrame();
+    const int32_t localGameFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    const int32_t frameDelta = localFrame - remote_frame;
+    const int32_t gameDelta = localGameFrame - remote_game_frame;
+    const int32_t remoteViewDelta = localFrame - remote_view_frame;
+
+    NetplayLog_Verbose("FSYNC", localFrame,
+        "Remote status: remote_frame=%d remote_game=%d remote_view=%d confirmed=%d predicted=%d "
+        "frame_delta=%d game_delta=%d remote_view_delta=%d crc=0x%08X",
+        remote_frame,
+        remote_game_frame,
+        remote_view_frame,
+        remote_confirmed_frame,
+        remote_predicted_frames,
+        frameDelta,
+        gameDelta,
+        remoteViewDelta,
+        remote_checksum);
+
+    if (frameDelta > 2 || frameDelta < -2 ||
+        gameDelta > 2 || gameDelta < -2 ||
+        remoteViewDelta > 4 || remoteViewDelta < -4) {
+        NetplayLog_Write("FSYNC", localFrame,
+            "SKEW: local_frame=%d remote_frame=%d local_game=%d remote_game=%d remote_view=%d "
+            "confirmed=%d predicted=%d local_crc=0x%08X remote_crc=0x%08X",
+            localFrame,
+            remote_frame,
+            localGameFrame,
+            remote_game_frame,
+            remote_view_frame,
+            remote_confirmed_frame,
+            remote_predicted_frames,
+            s_currentChecksum,
+            remote_checksum);
     }
 }
 
@@ -280,9 +420,9 @@ void RollbackDebug_RenderImGui(bool* p_open) {
         ImGui::Text("Inputs Received:  %d", snap.remote_inputs_received);
 
         // Resim state
-        if (snap.is_resimulating) {
+        if (snap.is_rolling_back) {
             ImGui::Separator();
-            ImGui::TextColored(ImVec4(1,1,0,1), "RESIMULATING");
+            ImGui::TextColored(ImVec4(1,1,0,1), "ROLLING BACK");
         }
 
         // Checksums

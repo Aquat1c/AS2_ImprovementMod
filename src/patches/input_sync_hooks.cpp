@@ -22,6 +22,7 @@
 #include "MinHook.h"
 
 #include <stdint.h>
+#include <string.h>
 
 // ============================================================================
 // Typedefs for vanilla netplay functions
@@ -128,7 +129,22 @@ static int __cdecl Hook_GetSyncInput(int frame, int16_t* out) {
  * loop to advance. Do not suppress Frame_AdvanceSimulation for live gameplay.
  */
 static int __cdecl Hook_AdvanceFrame() {
-    if (ShouldSuppressAdvanceFrame()) return 0;
+    bool suppress = ShouldSuppressAdvanceFrame();
+    if (suppress) {
+        static uint32_t s_advSuppressCount = 0;
+        s_advSuppressCount++;
+        if (s_advSuppressCount <= 5 || (s_advSuppressCount % 120) == 0) {
+            Rollback::NetplayLog_Write("SYNC", -1,
+                "AdvanceFrame SUPPRESSED (#%u): lockstep=%d freeze=%d frameSim=%d frameDisp=%d",
+                s_advSuppressCount,
+                (int)Net::CharSelSync_IsLockstepActive(),
+                (int)IsGameplayFreezeActiveInternal(),
+                *(volatile int32_t*)ADDR_FRAME_SIMULATION,
+                *(volatile int32_t*)ADDR_FRAME_DISPLAY);
+            Rollback::NetplayLog_Flush();
+        }
+        return 0;
+    }
     return g_origAdvanceFrame ? g_origAdvanceFrame() : 0;
 }
 
@@ -139,12 +155,38 @@ static int __cdecl Hook_AdvanceFrame() {
  */
 static int __cdecl Hook_MatchSyncInit() {
     if (InputSyncHooks_IsModOwnedSync()) {
-        // Replicate vanilla Netplay_InitialSync state resets:
-        // zero frame counters so Match starts from a clean slate.
+        Rollback::NetplayLog_Write("SYNC", -1,
+            "MatchSyncInit ENTER: clearing all frame counters + history");
+        Rollback::NetplayLog_Flush();
+
+        // Replicate vanilla Netplay_InitialSync state resets exactly.
         *reinterpret_cast<volatile int32_t*>(ADDR_FRAME_SIMULATION) = 0;
-        *reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX) = 0;
+        *reinterpret_cast<volatile int32_t*>(ADDR_FRAME_DISPLAY)    = 0;
+        *reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX)  = 0;
+        *reinterpret_cast<volatile int32_t*>(ADDR_FRAME_NET_IDX)    = 0;
+        *reinterpret_cast<volatile int32_t*>(ADDR_REMOTE_FRAME)     = 0;
+
+        // Clear input history buffers (vanilla fills with 0xFF = empty marker)
+        memset(reinterpret_cast<void*>(ADDR_P1_INPUT_HISTORY), 0xFF, INPUT_HISTORY_P1_SIZE);
+        memset(reinterpret_cast<void*>(ADDR_P2_INPUT_HISTORY), 0xFF, INPUT_HISTORY_P2_SIZE);
+
+        // Clear vanilla netplay combat/sync flags (10 bytes each)
+        memset(reinterpret_cast<void*>(0x8E93A4), 0, 10);
+        memset(reinterpret_cast<void*>(0x8E93AE), 0, 10);
+
         ResetVanillaTimeouts();
-        LOG_NETPLAY(LOG_INFO, "[InputSyncHooks] Suppressed vanilla Netplay_InitialSync, reset counters");
+
+        Rollback::NetplayLog_Write("SYNC", -1,
+            "MatchSyncInit DONE: frameSim=%d frameDisp=%d writeIdx=%d netIdx=%d remote=%d",
+            *(volatile int32_t*)ADDR_FRAME_SIMULATION,
+            *(volatile int32_t*)ADDR_FRAME_DISPLAY,
+            *(volatile int32_t*)ADDR_INPUT_WRITE_IDX,
+            *(volatile int32_t*)ADDR_FRAME_NET_IDX,
+            *(volatile int32_t*)ADDR_REMOTE_FRAME);
+        Rollback::NetplayLog_Flush();
+
+        LOG_NETPLAY(LOG_INFO, "[InputSyncHooks] Suppressed vanilla Netplay_InitialSync — "
+            "reset ALL frame counters + cleared input history");
         return 0;
     }
     return g_origMatchSyncInit ? g_origMatchSyncInit() : 0;

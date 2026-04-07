@@ -204,6 +204,17 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
 // ============================================================================
 
 static void OnPregamePacket(PacketType type, const void* payload, size_t payloadLen) {
+    Rollback::NetplayLog_Write("PREGAME", -1,
+        "OnPregamePacket: type=%s payload=%zu phase=%s session=0x%08X remoteSession=0x%08X announced=%d confirmed=%d",
+        PacketTypeName(type),
+        payloadLen,
+        PregamePhaseName(s_phase),
+        s_sessionId,
+        s_remoteSessionId,
+        s_remoteSyncAnnounced ? 1 : 0,
+        s_remoteSyncConfirmed ? 1 : 0);
+    Rollback::NetplayLog_Flush();
+
     switch (type) {
         case PacketType::SyncAnnounce:
             if (payloadLen >= sizeof(SyncAnnouncePayload)) {
@@ -287,6 +298,15 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             }
             if (type == PacketType::WinScreenConfirm) {
                 WinScreenSync_OnRemoteConfirm();
+                break;
+            }
+            // Gameplay/debug packets that can arrive during handoff transition
+            // — silently ignore rather than spam warnings
+            if (type == PacketType::GameplayInput ||
+                type == PacketType::FrameSyncStatus ||
+                type == PacketType::StateDigest ||
+                type == PacketType::Ping ||
+                type == PacketType::Pong) {
                 break;
             }
             LOG_NETPLAY(LOG_WARNING, "[PregameSync] Unhandled packet type %u", (unsigned)type);
@@ -561,10 +581,12 @@ static void UpdateBootstrapLoading() {
         bool frozen = (mode == MODE_MATCH && sub == MATCH_SUB_GAMEPLAY);
         LOG_NETPLAY(LOG_INFO,
             "[PregameSync] BootstrapLoading: mode=%u sub=%u frozen=%s "
-            "local=%s remote=%s elapsed=%lums",
+            "local=%s remote=%s localFrame=%d remoteFrame=%d elapsed=%lums",
             mode, sub, frozen ? "yes" : "no",
             bSnap.local_loaded ? "yes" : "no",
             bSnap.remote_loaded ? "yes" : "no",
+            bSnap.local_load_sim_frame,
+            bSnap.remote_load_sim_frame,
             elapsed);
     }
 
@@ -602,11 +624,13 @@ static void UpdateBootstrapBaseline() {
         LOG_NETPLAY(LOG_INFO,
             "[PregameSync] BootstrapBaseline: mode=%u sub=%u frozen=%s "
             "localReady=%s remoteReady=%s localCRC=0x%08X remoteCRC=0x%08X "
-            "digestSent=%s elapsed=%lums",
+            "localFrame=%d remoteFrame=%d digestSent=%s elapsed=%lums",
             mode, sub, frozen ? "yes" : "no",
             bSnap.local_baseline_ready ? "yes" : "no",
             bSnap.remote_baseline_ready ? "yes" : "no",
             bSnap.local_baseline_crc, bSnap.remote_baseline_crc,
+            bSnap.local_baseline_sim_frame,
+            bSnap.remote_baseline_sim_frame,
             bSnap.baseline_agreed ? "yes" : "no",
             elapsed);
     }
@@ -639,9 +663,10 @@ static void UpdateBootstrapReady() {
     if ((s_logTickCounter % 120) == 0) {
         DWORD elapsed = s_phaseStartTime ? (GetTickCount() - s_phaseStartTime) : 0;
         LOG_NETPLAY(LOG_INFO,
-            "[PregameSync] BootstrapReady: gameplayStart=%s startFrame=%u elapsed=%lums",
+            "[PregameSync] BootstrapReady: gameplayStart=%s startFrame=%u startSimFrame=%d elapsed=%lums",
             bSnap.gameplay_start ? "yes" : "no",
             bSnap.start_frame,
+            bSnap.gameplay_start_sim_frame,
             elapsed);
     }
 
@@ -756,6 +781,9 @@ bool PregameSync_Begin() {
     }
 
     // Register our packet handler
+    Rollback::NetplayLog_Write("PREGAME", -1,
+        "Registering pregame packet callback");
+    Rollback::NetplayLog_Flush();
     Session_SetPacketCallback(OnPregamePacket);
 
     // Reset all tracking state

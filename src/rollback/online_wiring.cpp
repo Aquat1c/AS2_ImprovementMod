@@ -16,8 +16,6 @@
 #include "rollback/rollback_debug.h"
 #include "rollback/netplay_log.h"
 #include "rollback/stress_hooks.h"
-#include "rollback/input_timeline.h"
-#include "rollback/prediction.h"
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "net/gameplay_bridge.h"
@@ -80,58 +78,16 @@ static bool     s_rollbackBeginPending   = false;
 /// All other packets are forwarded to the pregame handler.
 static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t payloadLen) {
     switch (type) {
-        case Net::PacketType::GameplayInput: {
-            // Deserialize the GameplayInputPayload
-            // (defined identically in rollback_session.cpp — binary-compatible)
-            #pragma pack(push, 1)
-            struct GameplayInputPayload {
-                int32_t  frame;
-                uint16_t input;
-                int32_t  start_frame;
-                uint8_t  input_count;
-                uint16_t inputs[8];
-            };
-            #pragma pack(pop)
+        case Net::PacketType::GekkoData: {
+            // GekkoNet internal protocol data — buffer for GekkoNet to drain
+            if (payloadLen == 0 || !payload) break;
 
-            if (payloadLen < sizeof(int32_t) + sizeof(uint16_t)) {
-                NetplayLog_Write("INPUT", -1,
-                    "WARN: GameplayInput packet too small (%zu bytes)", payloadLen);
-                break;
-            }
-
-            auto* p = static_cast<const GameplayInputPayload*>(payload);
-
-            // Validate frame range
-            int32_t currentFrame = RollbackSession_GetCurrentFrame();
-            if (p->frame < 0 || p->frame > currentFrame + 300) {
-                NetplayLog_Write("INPUT", currentFrame,
-                    "WARN: Remote input frame %d out of range (current=%d)",
-                    p->frame, currentFrame);
-                break;
-            }
-
+            RollbackSession_BufferGekkoPacket(payload, payloadLen);
             s_packetsDispatched++;
-
-            // Submit primary input through GameplayBridge
-            Net::GameplayBridge_SubmitRemoteInput(p->frame, p->input);
             s_remoteInputsReceived++;
 
-            // Submit redundant batch (for packet loss recovery)
-            if (p->input_count > 1 && payloadLen >= sizeof(GameplayInputPayload)) {
-                // Batch starts at start_frame, inputs[0] = newest (frame), etc.
-                for (int i = 1; i < p->input_count && i < 8; i++) {
-                    int32_t batchFrame = p->frame - i;
-                    if (batchFrame >= 0) {
-                        Net::GameplayBridge_SubmitRemoteInput(batchFrame, p->inputs[i]);
-                    }
-                }
-            }
-
-            // Verbose logging: per-input trace
-            NetplayLog_Verbose("INPUT", p->frame,
-                "Remote: frame=%d input=0x%04X batch=%d",
-                p->frame, p->input, p->input_count);
-
+            NetplayLog_Verbose("GEKKO", RollbackSession_GetCurrentFrame(),
+                "Buffered GekkoData packet (%zu bytes)", payloadLen);
             break;
         }
 
@@ -142,6 +98,19 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
 
             NetplayLog_Verbose("DESYNC", (int32_t)p->frame_number,
                 "Remote digest: crc=0x%08X", p->crc32);
+            break;
+        }
+
+        case Net::PacketType::FrameSyncStatus: {
+            if (payloadLen < sizeof(Net::FrameSyncStatusPayload)) break;
+            auto* p = static_cast<const Net::FrameSyncStatusPayload*>(payload);
+            RollbackDebug_OnRemoteFrameSyncStatus(
+                p->current_frame,
+                p->game_frame,
+                p->remote_view_frame,
+                p->confirmed_frame,
+                p->predicted_frames,
+                p->checksum);
             break;
         }
 
@@ -200,14 +169,16 @@ static bool TryStartRollbackSession() {
     rbConfig.initial_delay = activeDelay;
     rbConfig.rollback_budget = rollbackBudget;
     rbConfig.baseline_checksum = bootSnap.local_baseline_crc;
-    rbConfig.start_frame = (int32_t)bootSnap.start_frame;
+    const int32_t bootstrapFrame = (int32_t)bootSnap.start_frame;
+    const int32_t gameplayFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    rbConfig.start_frame = gameplayFrame;
 
     // Config hash for logging
     s_configHash = Net::LockedMatchConfig_Hash(config);
     s_baselineCRC = bootSnap.local_baseline_crc;
     s_handoffDelay = activeDelay;
     s_handoffBudget = rollbackBudget;
-    s_handoffFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    s_handoffFrame = gameplayFrame;
 
     // --- LOG BEFORE/AFTER for handoff ---
     NetplayLog_Write("HANDOFF", s_handoffFrame,
@@ -226,8 +197,18 @@ static bool TryStartRollbackSession() {
         (role == Net::SessionRole::Host) ? "Host" : "Join",
         config->host_side);
     NetplayLog_Write("HANDOFF", s_handoffFrame,
-        "Baseline CRC=0x%08X start_frame=%d",
-        s_baselineCRC, rbConfig.start_frame);
+        "Baseline CRC=0x%08X bootstrap_frame=%d rollback_start_frame=%d",
+        s_baselineCRC, bootstrapFrame, rbConfig.start_frame);
+    NetplayLog_Write("HANDOFF", s_handoffFrame,
+        "Load barrier sim: local=%d remote=%d | baseline sim: local=%d remote=%d | start sim=%d",
+        bootSnap.local_load_sim_frame,
+        bootSnap.remote_load_sim_frame,
+        bootSnap.local_baseline_sim_frame,
+        bootSnap.remote_baseline_sim_frame,
+        bootSnap.gameplay_start_sim_frame);
+    NetplayLog_Write("HANDOFF", s_handoffFrame,
+        "Gameplay ownership delta: %d frames from bootstrap baseline",
+        rbConfig.start_frame - bootstrapFrame);
     NetplayLog_Write("HANDOFF", s_handoffFrame,
         "Active delay=%d rollback_budget=%d",
         activeDelay, rollbackBudget);
@@ -238,6 +219,8 @@ static bool TryStartRollbackSession() {
         Net::MatchLifecyclePhaseName(phase));
 
     // Register gameplay packet callback
+    NetplayLog_Write("HANDOFF", s_handoffFrame,
+        "Registering gameplay packet callback");
     Net::Session_SetPacketCallback(OnGameplayPacket);
 
     // Start rollback session through GameplayBridge
@@ -282,13 +265,9 @@ static void StopRollbackSession(const char* reason) {
     NetplayLog_Write("TEARDOWN", frame,
         "Reason: %s", reason ? reason : "unknown");
     NetplayLog_Write("TEARDOWN", frame,
-        "Final stats: frames=%d confirmed=%d rollbacks=%d maxdepth=%d",
-        snap.current_frame, snap.last_confirmed_frame,
+        "Final stats: frames=%d rollbacks=%d maxdepth=%d",
+        snap.current_frame,
         snap.rollback_count, snap.max_rollback_distance);
-    NetplayLog_Write("TEARDOWN", frame,
-        "Predictions: total=%d mispredict=%d correct=%d",
-        snap.total_predictions, snap.total_mispredictions,
-        snap.total_correct_predictions);
     NetplayLog_Write("TEARDOWN", frame,
         "IO: sent=%d recv=%d",
         snap.local_inputs_sent, snap.remote_inputs_received);
@@ -553,11 +532,10 @@ void OnlineWiring_FrameUpdate() {
                 dpSnap.active_delay, dpSnap.rollback_budget);
 
             NetplayLog_Write("STATS", frame,
-                "Confirmed=%d predicted=%d rollbacks=%d maxdepth=%d",
-                rbSnap.last_confirmed_frame,
-                rbSnap.predicted_frames_outstanding,
+                "Rollbacks=%d maxdepth=%d frames_ahead=%.1f",
                 rbSnap.rollback_count,
-                rbSnap.max_rollback_distance);
+                rbSnap.max_rollback_distance,
+                rbSnap.frames_ahead);
         }
     }
 }

@@ -249,9 +249,36 @@ static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
 
 static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
-    RenderRow(y, "Launch CharSel", "Enter", snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Disconnect",     "Leave", snap->selected_index == 1, true, alpha);
+
+    // Row 0: Rollback Frames (adjustable left/right)
+    {
+        char rbVal[24];
+        _snprintf_s(rbVal, sizeof(rbVal), _TRUNCATE, "< %d >", snap->rollback_budget);
+        RenderRow(y, "Rollback Frames", rbVal, snap->selected_index == 0, true, alpha);
+        y += kRowStep;
+    }
+
+    // Row 1: Input Delay (adjustable left/right)
+    {
+        char delVal[24];
+        _snprintf_s(delVal, sizeof(delVal), _TRUNCATE, "< %d >", snap->rollback_delay);
+        RenderRow(y, "Input Delay", delVal, snap->selected_index == 1, true, alpha);
+        y += kRowStep;
+    }
+
+    // Row 2: Accept Match
+    {
+        const char* label = snap->local_accepted ? "Accepted" : "Accept Match";
+        const char* hint  = snap->local_accepted ? "Waiting..." : "Enter";
+        RenderRow(y, label, hint, snap->selected_index == 2, !snap->local_accepted, alpha);
+        y += kRowStep;
+    }
+
+    // Row 3: Decline
+    RenderRow(y, "Decline", "Leave", snap->selected_index == 3, true, alpha);
     y += kRowStep + 8;
+
+    // Info section: role, identity, accept status, ping, recommended delay, score, address
 
     // Role
     RenderInfoLine(y, "Role", snap->is_host ? "Host" : "Client", alpha);
@@ -267,17 +294,21 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
         RenderInfoLine(y, "Peer", snap->peer_nickname, alpha);
         y += 22;
     }
-    if (snap->rtt_ms > 0.0f) {
-        char pingBuf[32];
-        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms", snap->rtt_ms);
-        RenderInfoLine(y, "Ping", pingBuf, alpha);
+    // Accept status
+    {
+        char acceptBuf[64];
+        _snprintf_s(acceptBuf, sizeof(acceptBuf), _TRUNCATE, "%s / %s",
+            snap->local_accepted  ? "You: Ready" : "You: Pending",
+            snap->remote_accepted ? "Peer: Ready" : "Peer: Pending");
+        RenderInfoLine(y, "Status", acceptBuf, alpha);
         y += 22;
     }
-    // Delay
-    {
-        char delayBuf[32];
-        _snprintf_s(delayBuf, sizeof(delayBuf), _TRUNCATE, "%d frames", snap->active_delay);
-        RenderInfoLine(y, "Delay", delayBuf, alpha);
+    // Ping
+    if (snap->rtt_ms > 0.0f) {
+        char pingBuf[48];
+        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms  (rec. delay: %d)",
+            snap->rtt_ms, snap->recommended_delay);
+        RenderInfoLine(y, "Ping", pingBuf, alpha);
         y += 22;
     }
     // Score
@@ -382,7 +413,7 @@ static const char* GetHeaderSubtitle(const NetMenu::MenuSnapshot* snap) {
         case NetMenu::MenuState::SettingsEntry:       return "Settings";
         case NetMenu::MenuState::Connecting:          return "Connecting...";
         case NetMenu::MenuState::Handshake:           return "Handshake...";
-        case NetMenu::MenuState::ConnectedSession:    return "Session Ready";
+        case NetMenu::MenuState::ConnectedSession:    return "Accept Match";
         case NetMenu::MenuState::CharSelTransition:   return "Character Select";
         case NetMenu::MenuState::PostMatch:           return "Post Match";
         case NetMenu::MenuState::DisconnectError:     return "Disconnected";

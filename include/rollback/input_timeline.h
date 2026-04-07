@@ -54,6 +54,10 @@ void InputTimeline_Shutdown();
 /// Clear all history and reset to frame 0.
 void InputTimeline_Reset();
 
+/// Clear all history and prime the timeline so the next simulated frame is
+/// `start_frame`. Frames before `start_frame` are treated as already elapsed.
+void InputTimeline_BeginAtFrame(int32_t start_frame);
+
 // ============================================================================
 // Writing Input
 // ============================================================================
@@ -105,6 +109,11 @@ int32_t InputTimeline_GetLatestConfirmedRemoteFrame();
 /// Find the first frame >= start_frame where remote was predicted and is
 /// now known to be wrong. Returns -1 if no mismatch found.
 int32_t InputTimeline_FindFirstMisprediction(int32_t start_frame);
+
+/// Clear prediction_wrong flags for frames in [from_frame, to_frame).
+/// Must be called after a successful resimulation so the same misprediction
+/// is not re-detected on subsequent frames.
+void InputTimeline_ClearMispredictions(int32_t from_frame, int32_t to_frame);
 
 /// Number of frames currently predicted (remote not yet confirmed).
 int32_t InputTimeline_GetPredictedFrameCount();

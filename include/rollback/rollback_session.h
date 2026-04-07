@@ -1,25 +1,28 @@
 /**
- * Alice Senki 2 - Rollback Session
+ * Alice Senki 2 - Rollback Session (GekkoNet-driven)
  *
- * Central runtime owner of rollback gameplay state.
- * Orchestrates:
- *   - Input collection (local from SDL, remote from network)
- *   - Input prediction and misprediction detection
- *   - State capture into rolling history
- *   - Rollback trigger and resimulation
- *   - Frame advance contract
- *   - Delay policy consumption
- *   - Side-effect suppression flag
- *   - Diagnostics/snapshot
+ * GekkoNet event-driven rollback session. GekkoNet owns all rollback
+ * logic: prediction, misprediction detection, savestate management,
+ * resimulation scheduling, and timesync.
+ *
+ * The mod provides:
+ *   - Transport adapter (ENet ↔ GekkoNet)
+ *   - State capture/restore callbacks
+ *   - Input injection into game buffers
+ *   - Frame advance via game's match handler
+ *
+ * Two-phase API for the input dispatcher hook:
+ *   1. BeginFrame(localInput) — feed local input to GekkoNet, update session
+ *   2. ProcessNextEvent() — iterate GekkoNet events (save/load/advance)
+ *      Returns Advance → dispatcher writes inputs, returns 0 (game steps)
+ *      Returns Done → dispatcher returns -1 (break game's loop)
  *
  * Lifecycle:
- *   1. Pre-game sync completes, bootstrap captures baseline
- *   2. RollbackSession_Begin() starts the session
- *   3. RollbackSession_FrameUpdate() runs every frame during playable gameplay
- *   4. RollbackSession_End() cleans up on match exit or disconnect
- *
- * The rollback session does NOT own the match lifecycle or sync policy.
- * It consumes them via read-only queries.
+ *   1. RollbackSession_Init() at mod startup
+ *   2. RollbackSession_Begin() at bootstrap handoff
+ *   3. BeginFrame/ProcessNextEvent called by input dispatcher each frame
+ *   4. RollbackSession_End() on match exit or disconnect
+ *   5. RollbackSession_Shutdown() at mod shutdown
  */
 
 #pragma once
@@ -35,91 +38,96 @@ namespace Rollback {
 struct RollbackSessionConfig {
     int      local_player;       // 0 = P1, 1 = P2
     int      remote_player;      // 0 = P1, 1 = P2
-    int      initial_delay;      // Agreed input delay at session start
-    int      rollback_budget;    // Max rollback frames allowed
+    int      initial_delay;      // Input delay for local player
+    int      rollback_budget;    // Max prediction window (GekkoNet input_prediction_window)
     uint32_t baseline_checksum;  // CRC32 of baseline state (for verification)
-    int32_t  start_frame;        // Frame number to begin at (typically 0)
+    int32_t  start_frame;        // Native gameplay frame where rollback ownership begins
+};
+
+// ============================================================================
+// Event Result (returned by ProcessNextEvent)
+// ============================================================================
+
+enum class EventResult {
+    Advance,     // GekkoNet wants one frame advanced — inputs written to game buffers
+    Done,        // No more events this update — break game's dispatcher loop
+    Error        // Session error — caller should end session
 };
 
 // ============================================================================
 // Lifecycle
 // ============================================================================
 
-/// Initialize rollback subsystems. Called once at mod init.
+/// Initialize rollback subsystems (state history, GekkoNet). Called once at mod init.
 void RollbackSession_Init();
 
 /// Shutdown rollback subsystems.
 void RollbackSession_Shutdown();
 
-/// Begin a rollback gameplay session after bootstrap handoff.
-/// Captures the initial baseline state.
+/// Begin a GekkoNet rollback session after bootstrap handoff.
 bool RollbackSession_Begin(const RollbackSessionConfig& config);
 
-/// End the current rollback session.
+/// End the current session. Destroys GekkoNet session and cleans up.
 void RollbackSession_End();
 
 /// Is a rollback session currently active?
 bool RollbackSession_IsActive();
 
 // ============================================================================
-// Per-Frame (called from ModOnFrame during playable gameplay)
+// Two-Phase Frame Processing (called from input dispatcher hook)
 // ============================================================================
 
-/// Main per-frame update. This is the rollback gameplay loop entry point.
-/// Must be called every frame when SyncPolicy_IsRollbackActive() is true.
-///
-/// Performs:
-///   1. Collect local input from SDL
-///   2. Send local input to remote peer
-///   3. Check for new remote inputs
-///   4. Predict missing remote frames if needed
-///   5. Check for mispredictions
-///   6. If misprediction: rollback + resimulate
-///   7. Save state for current frame
-///   8. Write inputs to game buffers
-///   9. (Game loop will advance the frame via normal Mode 8 handler)
-void RollbackSession_FrameUpdate();
+/// Phase 1: Feed local input to GekkoNet, trigger session update.
+/// Call ONCE per game loop iteration before ProcessNextEvent.
+void RollbackSession_BeginFrame(uint16_t localInput);
+
+/// Phase 2: Process the next GekkoNet event.
+/// Call repeatedly until it returns Done or Error.
+///   Advance → inputs written to game buffers; dispatcher should return 0
+///   Done    → no more events; dispatcher should return -1
+///   Error   → session broken; dispatcher should return -1
+EventResult RollbackSession_ProcessNextEvent();
+
+/// Get the P1/P2 inputs from the last Advance event.
+/// Only valid after ProcessNextEvent returns Advance.
+void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2);
 
 // ============================================================================
-// Remote Input Ingestion
+// GekkoNet Packet Ingestion
 // ============================================================================
 
-/// Submit a remote gameplay input received from the network.
-/// Called by the session packet callback when a GameplayInput arrives.
-void RollbackSession_SubmitRemoteInput(int32_t frame, uint16_t input);
-
-/// Submit a batch of remote inputs (for redundant/cumulative packets).
-void RollbackSession_SubmitRemoteInputBatch(int32_t start_frame, const uint16_t* inputs, int count);
-
-// ============================================================================
-// Local Input Injection (for testing/verification)
-// ============================================================================
-
-/// Override local input for a specific frame (for test harness / scripted input).
-/// If not called, local input comes from SDL.
-void RollbackSession_InjectLocalInput(int32_t frame, uint16_t input);
+/// Buffer a received GekkoData packet payload for GekkoNet to drain.
+/// Called by the packet callback when a GekkoData packet arrives.
+void RollbackSession_BufferGekkoPacket(const void* data, size_t len);
 
 // ============================================================================
 // Queries
 // ============================================================================
 
-/// Current simulation frame.
+/// Current simulation frame (from last advance event).
 int32_t RollbackSession_GetCurrentFrame();
 
-/// Last fully confirmed frame (both local and remote confirmed).
-int32_t RollbackSession_GetLastConfirmedFrame();
+/// Whether the current advance event is a rollback resimulation frame.
+bool RollbackSession_IsRollingBack();
 
-/// Whether resimulation is currently in progress.
-bool RollbackSession_IsResimulating();
+/// GekkoNet's frame advantage metric for timesync decisions.
+float RollbackSession_FramesAhead();
 
-/// Current active delay being used.
+/// Current active delay.
 int RollbackSession_GetActiveDelay();
 
-/// Current rollback budget being used.
+/// Current rollback budget.
 int RollbackSession_GetRollbackBudget();
 
-/// Whether side effects should be suppressed (during resim).
+/// Whether side effects should be suppressed (during rollback resim).
 bool RollbackSession_ShouldSuppressSideEffects();
+
+// ============================================================================
+// Local Input Injection (for testing/verification)
+// ============================================================================
+
+/// Override local input for the next BeginFrame call (test harness).
+void RollbackSession_InjectLocalInput(uint16_t input);
 
 // ============================================================================
 // Diagnostics
@@ -136,18 +144,19 @@ struct RollbackSessionSnapshot {
     int32_t  last_remote_received_frame;
     int32_t  last_saved_state_frame;
 
-    // Rollback stats
+    // Rollback stats (from resim subsystem)
     int32_t  rollback_count;
     int32_t  last_rollback_start_frame;
     int32_t  last_rollback_replay_length;
     int32_t  max_rollback_distance;
     int32_t  predicted_frames_outstanding;
 
-    // Resimulation state
-    bool     is_resimulating;
+    // GekkoNet state
+    bool     is_rolling_back;
     bool     side_effects_suppressed;
+    float    frames_ahead;
 
-    // Policy consumption
+    // Policy
     int      active_delay;
     int      rollback_budget;
 
@@ -160,9 +169,13 @@ struct RollbackSessionSnapshot {
     int32_t  total_mispredictions;
     int32_t  total_correct_predictions;
 
-    // Frames sent/received
+    // IO counts
     int32_t  local_inputs_sent;
     int32_t  remote_inputs_received;
+
+    // GekkoNet network stats
+    float    gekko_avg_ping;
+    float    gekko_jitter;
 };
 
 void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out);

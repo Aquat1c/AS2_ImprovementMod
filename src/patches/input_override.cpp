@@ -8,7 +8,10 @@
 #include "net/session_manager.h"
 #include "net/charsel_sync.h"
 #include "net/stagesel_sync.h"
+#include "net/player_side_mapping.h"
 #include "core/game_state.h"
+#include "rollback/rollback_session.h"
+#include "rollback/netplay_log.h"
 #include "imgui.h"
 
 // ============================================================================
@@ -422,6 +425,18 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         return -1;
     }
 
+    // Diagnostic: log every dispatcher call when charsel lockstep is active
+    if (Net::CharSelSync_IsLockstepActive()) {
+        static uint32_t s_diagCount = 0;
+        s_diagCount++;
+        if (s_diagCount <= 5) {
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Dispatcher ENTRY (lockstep active): call#%u mode=%u sub=%u produced=%d",
+                s_diagCount, GetGameMode(), GetSubstate(), (int)s_charsel_produced_this_loop);
+            Rollback::NetplayLog_Flush();
+        }
+    }
+
     // ── CharSel lockstep ────────────────────────────────────────────
     // Replaces vanilla dispatch with deterministic lockstep.
     // Both sides exchange inputs frame-by-frame. Game only advances
@@ -433,6 +448,9 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         // Only run lockstep during active selection substates
         if (gameMode != MODE_CHARSEL || !IsCharSelDispatcherLockstepSubstate(subState)) {
             // Not in a lockstep substate — freeze and suppress vanilla
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Lockstep FREEZE (non-lockstep substate): mode=%u sub=%u", gameMode, subState);
+            Rollback::NetplayLog_Flush();
             return -1;
         }
 
@@ -442,8 +460,26 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_dispatchCount = 0;
             s_dispatchWaitCount = 0;
             s_charsel_produced_this_loop = false;
-            LOG_NETPLAY(LOG_INFO, "[InputDispatch] Lockstep intercept ACTIVE (mode=%u sub=%u)",
-                gameMode, subState);
+
+            // Reset edge detection so first frame doesn't ghost-press everything
+            s_dispPrevP1 = 0;
+            s_dispPrevP2 = 0;
+
+            // Snapshot all frame counters for diagnostics
+            int32_t frameSim   = *(volatile int32_t*)ADDR_FRAME_SIMULATION;
+            int32_t frameDisp  = *(volatile int32_t*)ADDR_FRAME_DISPLAY;
+            int32_t frameWrite = *(volatile int32_t*)ADDR_INPUT_WRITE_IDX;
+            int32_t frameNet   = *(volatile int32_t*)ADDR_FRAME_NET_IDX;
+            uint32_t gameType  = GetGameType();
+
+            LOG_NETPLAY(LOG_INFO, "[InputDispatch] Lockstep intercept ACTIVE "
+                "(mode=%u sub=%u type=%u frameSim=%d frameDisp=%d frameWrite=%d frameNet=%d)",
+                gameMode, subState, gameType, frameSim, frameDisp, frameWrite, frameNet);
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Lockstep intercept ACTIVE: mode=%u sub=%u type=%u "
+                "frameSim=%d frameDisp=%d frameWrite=%d frameNet=%d",
+                gameMode, subState, gameType, frameSim, frameDisp, frameWrite, frameNet);
+            Rollback::NetplayLog_Flush();
         }
 
         // Frame gate: only produce one frame per game-loop iteration.
@@ -451,52 +487,84 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         // return -1 to break out. Reset when we're called again next iteration.
         if (s_charsel_produced_this_loop) {
             s_charsel_produced_this_loop = false;  // Reset for next iteration
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Frame gate: produced_this_loop reset, returning -1 (frame#%u)", s_dispatchCount);
+            Rollback::NetplayLog_Flush();
             return -1;
         }
+
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 1: SDL poll + CaptureLocalInput (frame#%u mode=%u sub=%u)",
+            s_dispatchCount, gameMode, subState);
+        Rollback::NetplayLog_Flush();
 
         // Poll SDL input and get local packed input
         InputSystem_Update();
         uint16_t localInput = InputSystem_GetInput(0);
 
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 2: localInput=0x%04X, calling CaptureLocalInput", localInput);
+        Rollback::NetplayLog_Flush();
+
         // Buffer locally and send to peer (with redundant history)
         Net::CharSelSync_CaptureLocalInput(localInput);
+
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 3: CaptureLocalInput done, checking HasInputsForCurrentFrame");
+        Rollback::NetplayLog_Flush();
 
         // Lockstep gate: only advance when both inputs are available
         if (!Net::CharSelSync_HasInputsForCurrentFrame()) {
             s_dispatchWaitCount++;
-            if (s_dispatchWaitCount <= 3 || (s_dispatchWaitCount % 60) == 0) {
-                LOG_NETPLAY(LOG_DEBUG, "[InputDispatch] Waiting for remote input (wait#%u)",
-                    s_dispatchWaitCount);
-            }
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Step 3a: Waiting for remote input (wait#%u)", s_dispatchWaitCount);
+            Rollback::NetplayLog_Flush();
             return -1;  // Freeze — wait for remote input
         }
+
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 4: Both inputs ready, calling ConsumeCurrentFrame");
+        Rollback::NetplayLog_Flush();
 
         // Consume confirmed inputs for this frame
         uint16_t p1 = 0, p2 = 0;
         if (!Net::CharSelSync_ConsumeCurrentFrame(&p1, &p2)) {
             LOG_NETPLAY(LOG_WARNING, "[InputDispatch] Lockstep inconsistency: inputs ready but consume failed");
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Step 4a: CONSUME FAILED");
+            Rollback::NetplayLog_Flush();
             return -1;
         }
 
         s_dispatchCount++;
         s_dispatchWaitCount = 0;
 
-        // Log consumed frames (first 5, then every 60)
-        if (s_dispatchCount <= 5 || (s_dispatchCount % 60) == 0) {
-            LOG_NETPLAY(LOG_DEBUG, "[InputDispatch] Consumed frame #%u: P1=0x%04X P2=0x%04X (sub=%u)",
-                s_dispatchCount, p1, p2, subState);
+        {
+            int32_t frameSim   = *(volatile int32_t*)ADDR_FRAME_SIMULATION;
+            int32_t frameDisp  = *(volatile int32_t*)ADDR_FRAME_DISPLAY;
+            int32_t frameWrite = *(volatile int32_t*)ADDR_INPUT_WRITE_IDX;
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Step 5: Consumed frame#%u P1=0x%04X P2=0x%04X sub=%u "
+                "frameSim=%d frameDisp=%d frameWrite=%d",
+                s_dispatchCount, p1, p2, subState, frameSim, frameDisp, frameWrite);
+            Rollback::NetplayLog_Flush();
         }
 
-        // Stage select uses a shared cursor / confirm menu.
-        // Merge both players' confirmed inputs into one shared input so both
-        // peers drive the same stage UI path deterministically.
         // Write to output array
         outputInputs[0] = (__int16)p1;
         outputInputs[1] = (__int16)p2;
 
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 6: Wrote outputInputs[0]=0x%04X [1]=0x%04X", (uint16_t)outputInputs[0], (uint16_t)outputInputs[1]);
+        Rollback::NetplayLog_Flush();
+
         // Advance Frame_Inputs (vanilla dispatcher does this)
         volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
         (*pFrameWrite)++;
+
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 7: Frame_Inputs incremented to %d", *pFrameWrite);
+        Rollback::NetplayLog_Flush();
 
         // Edge detection for raw array just-pressed
         uint16_t justP1 = p1 & ~s_dispPrevP1;
@@ -504,25 +572,150 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         s_dispPrevP1 = p1;
         s_dispPrevP2 = p2;
 
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 8: Edge detect: justP1=0x%04X justP2=0x%04X prevP1=0x%04X prevP2=0x%04X",
+            justP1, justP2, s_dispPrevP1, s_dispPrevP2);
+        Rollback::NetplayLog_Flush();
+
         // Overwrite P1/P2 raw input arrays (held + just-pressed).
-        // In GAMETYPE_VS_HUMAN, the vanilla engine DIRECTLY polls the raw
-        // arrays (0x8E9E62 for P1, 0x8E9F32 for P2) for menu navigation,
-        // completely ignoring the lockstep arrays. By forcibly overwriting
-        // these, we guarantee both cursors are enslaved by network lockstep.
-        for (int i = 0; i < 10; i++) {
-            uint16_t mask = (uint16_t)(1 << i);
-            WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (i * 2),
-                (uint16_t)((p1 & mask) ? 1 : 0));
-            WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
-                (uint16_t)((justP1 & mask) ? 1 : 0));
-            WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (i * 2),
-                (uint16_t)((p2 & mask) ? 1 : 0));
-            WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
-                (uint16_t)((justP2 & mask) ? 1 : 0));
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 9: Writing raw input buffers P1@0x%08X P2@0x%08X",
+            ADDR_P1_INPUT_BUFFER, ADDR_P2_INPUT_BUFFER);
+        Rollback::NetplayLog_Flush();
+
+        __try {
+            for (int i = 0; i < 10; i++) {
+                uint16_t mask = (uint16_t)(1 << i);
+                WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (i * 2),
+                    (uint16_t)((p1 & mask) ? 1 : 0));
+                WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
+                    (uint16_t)((justP1 & mask) ? 1 : 0));
+                WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (i * 2),
+                    (uint16_t)((p2 & mask) ? 1 : 0));
+                WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
+                    (uint16_t)((justP2 & mask) ? 1 : 0));
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            LOG_NETPLAY(LOG_ERROR, "[InputDispatch] EXCEPTION writing raw input buffers! "
+                "P1=0x%04X P2=0x%04X frame#%u sub=%u",
+                p1, p2, s_dispatchCount, subState);
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "EXCEPTION writing raw input buffers! P1=0x%04X P2=0x%04X frame#%u",
+                p1, p2, s_dispatchCount);
+            Rollback::NetplayLog_Flush();
         }
+
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Step 10: Raw buffers written OK, setting produced=true, returning 0");
+        Rollback::NetplayLog_Flush();
 
         s_charsel_produced_this_loop = true;
         return 0;
+    }
+
+    // ── GekkoNet rollback session ───────────────────────────────────
+    // Two-phase event processing: BeginFrame once, then ProcessNextEvent
+    // until all events are consumed. Each AdvanceEvent = one game frame.
+    if (Rollback::RollbackSession_IsActive()) {
+        // Timesync — 3sx-style double-tick catch-up.
+        // gekko_frames_ahead() > 0 means we're AHEAD (should slow down).
+        // gekko_frames_ahead() < 0 means we're BEHIND (should catch up).
+        // We skip our own frame when too far ahead (return -1),
+        // and run an extra tick when behind (double-tick).
+        static int s_frameSkipTimer = 0;
+        float framesAhead = Rollback::RollbackSession_FramesAhead();
+
+        if (framesAhead > 2.0f) {
+            // Too far ahead — skip frame advancement, just poll network
+            Rollback::NetplayLog_Write("TIMESYNC", -1,
+                "Skip frame: framesAhead=%.2f (too far ahead)", framesAhead);
+            Net::Session_Update();
+            return -1;
+        }
+
+        // If we're behind (frames_ahead < -1.0), run an extra catch-up tick
+        // Rate-limited to once per 60 frames to prevent jitter
+        if (framesAhead < -1.0f && s_frameSkipTimer <= 0) {
+            s_frameSkipTimer = 60;
+            // Extra tick: run a full BeginFrame + drain events
+            InputSystem_Update();
+            uint16_t catchUpInput = Net::PlayerMapping_ReadLocalInput();
+            Rollback::RollbackSession_BeginFrame(catchUpInput);
+
+            // Drain all events from the extra tick internally
+            Rollback::EventResult extra;
+            do {
+                extra = Rollback::RollbackSession_ProcessNextEvent();
+                if (extra == Rollback::EventResult::Advance) {
+                    // Advance from catch-up — write to history + increment write index
+                    uint16_t cp1 = 0, cp2 = 0;
+                    Rollback::RollbackSession_GetAdvanceInputs(&cp1, &cp2);
+                    volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
+                    const uint32_t wi = (uint32_t)*pFrameWrite;
+                    if (wi < INPUT_HISTORY_MAX) {
+                        *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (wi * sizeof(uint16_t))) = cp1;
+                        *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (wi * sizeof(uint16_t))) = cp2;
+                    }
+                    *pFrameWrite = (int32_t)(wi + 1);
+                }
+            } while (extra != Rollback::EventResult::Done);
+
+            Rollback::NetplayLog_Write("TIMESYNC", -1,
+                "Catch-up tick complete: framesAhead=%.2f input=0x%04X", framesAhead, catchUpInput);
+        }
+        if (s_frameSkipTimer > 0) s_frameSkipTimer--;
+
+        // State: track whether we've started this frame's event batch
+        static bool s_gekkoFrameStarted = false;
+
+        if (!s_gekkoFrameStarted) {
+            // Phase 1: Collect local input and feed to GekkoNet
+            InputSystem_Update();
+            uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
+
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Dispatcher: starting new frame, local_input=0x%04X framesAhead=%.2f",
+                localInput, framesAhead);
+
+            Rollback::RollbackSession_BeginFrame(localInput);
+            s_gekkoFrameStarted = true;
+        }
+
+        // Phase 2: Process next GekkoNet event
+        Rollback::EventResult result = Rollback::RollbackSession_ProcessNextEvent();
+
+        if (result == Rollback::EventResult::Advance) {
+            // GekkoNet wants one frame advanced (normal or rollback).
+            // Inputs already set via InputSystem_SetNetplayInput by HandleAdvanceEvent.
+            // Write to outputInputs for the game's dispatcher contract.
+            uint16_t p1 = 0, p2 = 0;
+            Rollback::RollbackSession_GetAdvanceInputs(&p1, &p2);
+            outputInputs[0] = (__int16)p1;
+            outputInputs[1] = (__int16)p2;
+
+            // Write inputs to history buffers (game's match handler reads from these)
+            volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
+            const uint32_t writeIdx = (uint32_t)*pFrameWrite;
+            if (writeIdx < INPUT_HISTORY_MAX) {
+                *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p1;
+                *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p2;
+            }
+            *pFrameWrite = (int32_t)(writeIdx + 1);
+
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Dispatcher: Advance → P1=0x%04X P2=0x%04X writeIdx=%u->%u rb=%d",
+                p1, p2, writeIdx, writeIdx + 1, Rollback::RollbackSession_IsRollingBack() ? 1 : 0);
+
+            return 0;  // Game's loop runs one full tick (InputProcess + matchHandler)
+        } else {
+            // No more events (Done) — frame batch complete
+            s_gekkoFrameStarted = false;
+
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Dispatcher: Done, breaking dispatcher loop");
+
+            return -1;  // Break game's dispatcher loop
+        }
     }
 
     // ── Vanilla passthrough (offline/local play only) ────────────────

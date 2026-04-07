@@ -7,7 +7,6 @@
  */
 
 #include "rollback/resimulation.h"
-#include "rollback/input_timeline.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
 #include "input/input_system.h"
@@ -195,22 +194,10 @@ static bool RestoreFromSlot(const StateSlot* slot) {
 /// Write input pair (local + remote) into game buffers for the next frame advance.
 /// local_player: 0 = P1 is local, 1 = P2 is local.
 static void WriteInputsForFrame(int32_t frame, int local_player) {
-    uint16_t local_input  = InputTimeline_GetLocalInput(frame);
-    uint16_t remote_input = InputTimeline_GetRemoteInput(frame);
-
-    uint16_t p1_input, p2_input;
-    if (local_player == 0) {
-        p1_input = local_input;
-        p2_input = remote_input;
-    } else {
-        p1_input = remote_input;
-        p2_input = local_input;
-    }
-
-    // Write through the SDL input system's netplay override path
-    InputSystem_SetNetplayInput(0, p1_input);
-    InputSystem_SetNetplayInput(1, p2_input);
-    InputSystem_WriteToGameBuffersBothPlayers();
+    // Dead code — GekkoNet handles rollback resimulation internally.
+    // Kept as a compilation stub for Resim_Execute (also dead code).
+    (void)frame;
+    (void)local_player;
 }
 
 // ============================================================================
@@ -416,14 +403,8 @@ int32_t Resim_Execute(int32_t rollback_frame, int32_t target_frame, int local_pl
     for (int32_t f = load_frame; f < target_frame; f++) {
         s_resimFrame = f;
 
-        const FrameInput* frameInput = InputTimeline_GetFrame(f);
         NetplayLog_Verbose("RESIM", f,
-            "Replay frame: local=0x%04X remote=0x%04X local_ok=%d remote_ok=%d predicted=%d",
-            frameInput ? frameInput->local : INPUT_NEUTRAL,
-            frameInput ? frameInput->remote : INPUT_NEUTRAL,
-            frameInput && frameInput->local_confirmed ? 1 : 0,
-            frameInput && frameInput->remote_confirmed ? 1 : 0,
-            frameInput && frameInput->remote_predicted ? 1 : 0);
+            "Replay frame %d (dead path — GekkoNet owns rollback)", f);
 
         // Write the correct inputs for this frame
         WriteInputsForFrame(f, local_player);

@@ -312,6 +312,132 @@ static void AnalyzeLog(const char* logPath, const char* label) {
     if (timings) printf("  Avg save/load/adv: %ld/%ld/%ld us\n", sumSv/timings, sumLd/timings, sumAdv/timings);
 }
 
+static bool FindNewestPidLog(const char* logsRoot, const char* prefix, DWORD pid,
+                             char* outPath, size_t outPathLen) {
+    if (!logsRoot || !outPath || outPathLen == 0 || pid == 0) return false;
+
+    outPath[0] = '\0';
+
+    char targetFile[MAX_PATH];
+    _snprintf_s(targetFile, sizeof(targetFile), _TRUNCATE, "%s_%lu.log", prefix, pid);
+
+    WIN32_FIND_DATAA dirFd;
+    char searchPath[MAX_PATH];
+    _snprintf_s(searchPath, sizeof(searchPath), _TRUNCATE, "%s\\*", logsRoot);
+
+    HANDLE hFind = FindFirstFileA(searchPath, &dirFd);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    bool found = false;
+    FILETIME newestTime = {};
+
+    do {
+        if (!(dirFd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || dirFd.cFileName[0] == '.')
+            continue;
+
+        char candidate[MAX_PATH];
+        _snprintf_s(candidate, sizeof(candidate), _TRUNCATE,
+                    "%s\\%s\\%s", logsRoot, dirFd.cFileName, targetFile);
+
+        WIN32_FIND_DATAA logFd;
+        HANDLE hLog = FindFirstFileA(candidate, &logFd);
+        if (hLog == INVALID_HANDLE_VALUE)
+            continue;
+
+        if (!found || CompareFileTime(&logFd.ftLastWriteTime, &newestTime) > 0) {
+            strncpy_s(outPath, outPathLen, candidate, _TRUNCATE);
+            newestTime = logFd.ftLastWriteTime;
+            found = true;
+        }
+        FindClose(hLog);
+    } while (FindNextFileA(hFind, &dirFd));
+
+    FindClose(hFind);
+    return found;
+}
+
+static void AnalyzeCurrentLogs(const char* gameDir, DWORD pid, const char* label) {
+    char logsRoot[MAX_PATH];
+    _snprintf_s(logsRoot, sizeof(logsRoot), _TRUNCATE, "%s\\logs", gameDir);
+
+    char rollbackLog[MAX_PATH] = {};
+    char fullpathLog[MAX_PATH] = {};
+    char netcodeLog[MAX_PATH] = {};
+    char gekkoLog[MAX_PATH] = {};
+
+    const bool haveRollback = FindNewestPidLog(logsRoot, "as2_rollback", pid, rollbackLog, sizeof(rollbackLog));
+    const bool haveFullpath = FindNewestPidLog(logsRoot, "as2_netplay_fullpath", pid, fullpathLog, sizeof(fullpathLog));
+    const bool haveNetcode = FindNewestPidLog(logsRoot, "as2_netcode", pid, netcodeLog, sizeof(netcodeLog));
+    const bool haveGekko = FindNewestPidLog(logsRoot, "as2_gekko", pid, gekkoLog, sizeof(gekkoLog));
+
+    printf("\n--- %s Current Logs ---\n", label);
+    printf("  PID: %lu\n", pid);
+    if (haveRollback) printf("  rollback: %s\n", rollbackLog);
+    if (haveFullpath) printf("  fullpath: %s\n", fullpathLog);
+    if (haveNetcode) printf("  netcode:  %s\n", netcodeLog);
+    if (haveGekko) printf("  gekko:    %s\n", gekkoLog);
+
+    if (!haveRollback && !haveFullpath && !haveNetcode && !haveGekko) {
+        printf("  No current mod logs found for this PID\n");
+        return;
+    }
+
+    bool autoconnect = false;
+    bool connected = false;
+    bool charsel = false;
+    bool loadBarrier = false;
+    bool handoff = false;
+    bool rollbackStart = false;
+    bool frameSync = false;
+    bool skew = false;
+    int frameSyncCount = 0;
+    int errorCount = 0;
+
+    const char* files[] = {
+        haveRollback ? rollbackLog : nullptr,
+        haveFullpath ? fullpathLog : nullptr,
+        haveNetcode ? netcodeLog : nullptr,
+        haveGekko ? gekkoLog : nullptr,
+    };
+
+    for (const char* path : files) {
+        if (!path) continue;
+
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "r") != 0 || !f) continue;
+
+        char line[2048];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "[AutoConnect]")) autoconnect = true;
+            if (strstr(line, "Session connected") || strstr(line, "Connected to '") || strstr(line, "Connected to host")) connected = true;
+            if (strstr(line, "Launching netplay CharSel") || strstr(line, "entered charsel") || strstr(line, "CHARSEL LOCKSTEP BEGIN")) charsel = true;
+            if (strstr(line, "LoadBarrier") || strstr(line, "loading barrier") || strstr(line, "BootstrapLoading")) loadBarrier = true;
+            if (strstr(line, "ROLLBACK HANDOFF") || strstr(line, "rollback handoff") || strstr(line, "handoffFrame=")) handoff = true;
+            if (strstr(line, "RollbackSession begin") || strstr(line, "Begin: start_frame=") || strstr(line, "=== SESSION BEGIN ===")) rollbackStart = true;
+            if (strstr(line, "FSYNC")) {
+                frameSync = true;
+                frameSyncCount++;
+            }
+            if (strstr(line, "SKEW")) skew = true;
+            if (strstr(line, "[ERR]") || strstr(line, "ERROR") || strstr(line, "Failed")) errorCount++;
+        }
+
+        fclose(f);
+    }
+
+    printf("  autoconnect=%s connected=%s charsel=%s load_barrier=%s handoff=%s rollback=%s fsync=%s(%d) skew=%s errors=%d\n",
+        autoconnect ? "yes" : "no",
+        connected ? "yes" : "no",
+        charsel ? "yes" : "no",
+        loadBarrier ? "yes" : "no",
+        handoff ? "yes" : "no",
+        rollbackStart ? "yes" : "no",
+        frameSync ? "yes" : "no",
+        frameSyncCount,
+        skew ? "yes" : "no",
+        errorCount);
+}
+
 static bool FindNewestHarnessLog(const char* logsRoot, const char* fileName,
                                  char* outPath, size_t outPathLen) {
     WIN32_FIND_DATAA dirFd;
@@ -367,13 +493,8 @@ struct HarnessRunLogs {
 };
 
 static void CaptureHarnessLogPath(HarnessRunLogs* runLogs, const HarnessSharedData* data) {
-    if (!runLogs || !data || !data->session_log_dir[0]) return;
-
-    char* outPath = data->is_host ? runLogs->hostLog : runLogs->clientLog;
-    if (outPath[0]) return;
-
-    const char* fileName = data->is_host ? "harness_host.log" : "harness_client.log";
-    _snprintf_s(outPath, MAX_PATH, _TRUNCATE, "%s\\%s", data->session_log_dir, fileName);
+    (void)runLogs;
+    (void)data;
 }
 
 static bool OpenShmSlot(ShmSlot* slot, const char* name) {
@@ -517,8 +638,8 @@ static void DrawSlotPanel(const char* title, ShmSlot* slot,
 
     // Game State
     if (ImGui::CollapsingHeader("Game State##gs", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Text("Mode: %u (%s)  Sub: %u  Stage: %u  Type: %u",
-                    d->game_mode, GameModeName(d->game_mode), d->sub_state, d->stage_id, d->game_type);
+        ImGui::Text("Mode: %u (%s)  Sub: %u  Type: %u",
+                    d->game_mode, GameModeName(d->game_mode), d->sub_state, d->game_type);
         ImGui::Text("Sim: %u  Disp: %u  Write: %u  Net: %u",
                     d->sim_frame, d->display_frame, d->write_frame, d->net_frame);
         ImGui::Text("RNG: 0x%08X  Checksum: 0x%04X", d->rng_seed, d->checksum);
@@ -568,12 +689,6 @@ static void DrawSlotPanel(const char* title, ShmSlot* slot,
     if (ImGui::CollapsingHeader("Net Sim##ns")) {
         ImGui::Text("Latency: %d ms  Jitter: %d ms  Loss: %.1f%%  Dup: %.1f%%",
                     d->sim_latency_ms, d->sim_jitter_ms, d->sim_loss_pct, d->sim_dup_pct);
-    }
-
-    if (ImGui::CollapsingHeader("Rollback Trace##trace", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextWrapped("Trace log: %s", d->rollback_trace_log[0] ? d->rollback_trace_log : "<not available>");
-        ImGui::TextWrapped("Trace bin: %s", d->rollback_trace_bin[0] ? d->rollback_trace_bin : "<not available>");
-        ImGui::TextWrapped("Session dir: %s", d->session_log_dir[0] ? d->session_log_dir : "<not available>");
     }
 
     // Log tail
@@ -635,11 +750,6 @@ static void DrawComparisonPanel(ShmSlot* host, ShmSlot* client) {
     ImGui::TextColored(hpMatch ? ImVec4(0.3f,0.8f,0.3f,1) : ImVec4(1,0,0,1),
         "HP: P1=%d/%d P2=%d/%d %s",
         h->p1_hp, c->p1_hp, h->p2_hp, c->p2_hp, hpMatch ? "MATCH" : "MISMATCH");
-
-    const bool stageMatch = (h->stage_id == c->stage_id);
-    ImGui::TextColored(stageMatch ? ImVec4(0.3f,0.8f,0.3f,1) : ImVec4(1,0.5f,0,1),
-        "Stage ID: Host=%u Client=%u %s",
-        h->stage_id, c->stage_id, stageMatch ? "MATCH" : "MISMATCH");
 
     // Rollback comparison
     ImGui::Text("Rollbacks: Host=%u Client=%u  MaxDepth: %u/%u",
@@ -933,10 +1043,10 @@ static bool RunGui(const LauncherConfig* cfg, HANDLE hHost, HANDLE hClient, Harn
 
 static const char* PhaseStr(uint32_t p) {
     static const char* names[] = {
-        "Idle","WaitForGame","StartSession","WaitConnect",
-        "LaunchCharSel","WaitCharSel","AutoSelect","WaitMatch","InMatch","Done"
+        "Disabled","WaitMenu","WaitConnect","WaitCharSel",
+        "SelChar","SelStage","WaitGameplay","InMatch","Failed"
     };
-    return p <= 9 ? names[p] : "???";
+    return p <= 8 ? names[p] : "???";
 }
 
 static const char* ModeStr(uint32_t m) {
@@ -949,13 +1059,12 @@ static const char* ModeStr(uint32_t m) {
 
 static void PrintSlotLine(const char* tag, const HarnessSharedData* d) {
     if (!d) { printf("  %-6s [not connected]\n", tag); return; }
-    printf("  %-6s phase=%-12s mode=%-7s sub=%u stage=%u f=%u gekko[L=%d R=%d ahead=%.1f adv=%u] "
+    printf("  %-6s phase=%-12s mode=%-7s sub=%u f=%u gekko[L=%d R=%d ahead=%.1f adv=%u] "
             "rb=%u/%u ld=%u tsync=%u p1=%d p2=%d rtt=%.0f pkt=%u/%u dsync=%u warn=%u\n",
         tag,
         PhaseStr(d->phase),
         ModeStr(d->game_mode),
         d->sub_state,
-        d->stage_id,
         d->total_frames,
         d->rb_local_frame, d->rb_remote_frame, d->rb_frames_ahead, d->rb_advance_count,
         d->total_rollbacks, d->max_rollback_depth,
@@ -1001,12 +1110,12 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
     bool shmOpened = false;
     int retryCount = 0;
     const int kMaxRetries = 30;  // Client needs more time to start up
+    bool shmFallbackAnnounced = false;
 
     // Phase tracking for transition logging
     uint32_t prevHostPhase = UINT32_MAX, prevClientPhase = UINT32_MAX;
     uint32_t prevHostMode = UINT32_MAX, prevClientMode = UINT32_MAX;
     uint32_t prevHostSub = UINT32_MAX, prevClientSub = UINT32_MAX;
-    uint32_t prevHostStage = UINT32_MAX, prevClientStage = UINT32_MAX;
 
     printf("\n--- Live Console Monitor ---\n\n");
 
@@ -1047,6 +1156,11 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
             if (hostSlot.valid && hostSlot.data) CaptureHarnessLogPath(runLogs, hostSlot.data);
             if (clientSlot.valid && clientSlot.data) CaptureHarnessLogPath(runLogs, clientSlot.data);
 
+            if (!hostSlot.valid && !clientSlot.valid && !shmFallbackAnnounced && elapsed >= 5) {
+                printf("  [SHM] No shared-memory publisher detected; using duration timer + current-log analysis fallback\n");
+                shmFallbackAnnounced = true;
+            }
+
             // Print phase transitions
             if (hostSlot.valid && hostSlot.data) {
                 if (hostSlot.data->phase != prevHostPhase) {
@@ -1057,16 +1171,13 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
                 }
                 if (prevHostMode == UINT32_MAX ||
                     hostSlot.data->game_mode != prevHostMode ||
-                    hostSlot.data->sub_state != prevHostSub ||
-                    hostSlot.data->stage_id != prevHostStage) {
-                    printf("  [HOST]   Game: mode=%u(%s) sub=%u stage=%u\n",
+                    hostSlot.data->sub_state != prevHostSub) {
+                    printf("  [HOST]   Game: mode=%u(%s) sub=%u\n",
                            hostSlot.data->game_mode,
                            ModeStr(hostSlot.data->game_mode),
-                           hostSlot.data->sub_state,
-                           hostSlot.data->stage_id);
+                           hostSlot.data->sub_state);
                     prevHostMode = hostSlot.data->game_mode;
                     prevHostSub = hostSlot.data->sub_state;
-                    prevHostStage = hostSlot.data->stage_id;
                 }
             }
             if (clientSlot.valid && clientSlot.data) {
@@ -1078,16 +1189,13 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
                 }
                 if (prevClientMode == UINT32_MAX ||
                     clientSlot.data->game_mode != prevClientMode ||
-                    clientSlot.data->sub_state != prevClientSub ||
-                    clientSlot.data->stage_id != prevClientStage) {
-                    printf("  [CLIENT] Game: mode=%u(%s) sub=%u stage=%u\n",
+                    clientSlot.data->sub_state != prevClientSub) {
+                    printf("  [CLIENT] Game: mode=%u(%s) sub=%u\n",
                            clientSlot.data->game_mode,
                            ModeStr(clientSlot.data->game_mode),
-                           clientSlot.data->sub_state,
-                           clientSlot.data->stage_id);
+                           clientSlot.data->sub_state);
                     prevClientMode = clientSlot.data->game_mode;
                     prevClientSub = clientSlot.data->sub_state;
-                    prevClientStage = clientSlot.data->stage_id;
                 }
             }
 
@@ -1104,6 +1212,13 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
             // Safety timeout
             if (elapsed > (DWORD)(cfg->durationSec + 60)) {
                 printf("\n  >>> SAFETY TIMEOUT (%lus) — terminating <<<\n", elapsed);
+                for (int i = 0; i < handleCount; i++)
+                    if (handles[i] != INVALID_HANDLE_VALUE) TerminateProcess(handles[i], 0);
+                remaining = 0;
+            }
+
+            if (!hostSlot.valid && !clientSlot.valid && elapsed >= (DWORD)cfg->durationSec) {
+                printf("\n  >>> Duration reached without shared memory (%lus) — terminating instances <<<\n", elapsed);
                 for (int i = 0; i < handleCount; i++)
                     if (handles[i] != INVALID_HANDLE_VALUE) TerminateProcess(handles[i], 0);
                 remaining = 0;
@@ -1129,7 +1244,7 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
     printf("\n--- Final State ---\n");
     if (hostSlot.valid && hostSlot.data) {
         printf("  HOST:   frames=%u gekko[L=%d R=%d ahead=%.1f adv=%u] rb=%u(max %u) saves=%u loads=%u desyncs=%u "
-                    "rtt=%.1f/%.1fms anomalies=%u trace=%s\n",
+                    "rtt=%.1f/%.1fms anomalies=%u\n",
             hostSlot.data->total_frames,
             hostSlot.data->rb_local_frame, hostSlot.data->rb_remote_frame,
             hostSlot.data->rb_frames_ahead, hostSlot.data->rb_advance_count,
@@ -1137,12 +1252,11 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
             hostSlot.data->total_saves, hostSlot.data->total_loads,
             hostSlot.data->desync_count,
             hostSlot.data->avg_rtt_ms, hostSlot.data->peak_rtt_ms,
-                hostSlot.data->frame_counter_anomalies,
-                hostSlot.data->rollback_trace_log[0] ? hostSlot.data->rollback_trace_log : "<none>");
+                hostSlot.data->frame_counter_anomalies);
     }
     if (clientSlot.valid && clientSlot.data) {
         printf("  CLIENT: frames=%u gekko[L=%d R=%d ahead=%.1f adv=%u] rb=%u(max %u) saves=%u loads=%u desyncs=%u "
-                    "rtt=%.1f/%.1fms anomalies=%u trace=%s\n",
+                    "rtt=%.1f/%.1fms anomalies=%u\n",
             clientSlot.data->total_frames,
             clientSlot.data->rb_local_frame, clientSlot.data->rb_remote_frame,
             clientSlot.data->rb_frames_ahead, clientSlot.data->rb_advance_count,
@@ -1150,8 +1264,7 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
             clientSlot.data->total_saves, clientSlot.data->total_loads,
             clientSlot.data->desync_count,
             clientSlot.data->avg_rtt_ms, clientSlot.data->peak_rtt_ms,
-                clientSlot.data->frame_counter_anomalies,
-                clientSlot.data->rollback_trace_log[0] ? clientSlot.data->rollback_trace_log : "<none>");
+                clientSlot.data->frame_counter_anomalies);
     }
 
     CloseShmSlot(&hostSlot);
@@ -1236,6 +1349,7 @@ int main(int argc, char** argv) {
     printf("\nLaunching HOST instance...\n");
     HANDLE hHost = LaunchGame(cfg.gameDir, cfg.gameExe, "Host");
     if (hHost == INVALID_HANDLE_VALUE) return 1;
+    DWORD hostPid = GetProcessId(hHost);
 
     // Wait then swap config for client
     printf("Waiting 3 seconds before launching client...\n");
@@ -1247,6 +1361,7 @@ int main(int argc, char** argv) {
 
     printf("Launching CLIENT instance...\n");
     HANDLE hClient = LaunchGame(cfg.gameDir, cfg.gameExe, "Client");
+    DWORD clientPid = (hClient != INVALID_HANDLE_VALUE) ? GetProcessId(hClient) : 0;
 
     printf("\n--- Dashboard starting ---\n\n");
 
@@ -1296,6 +1411,8 @@ int main(int argc, char** argv) {
 
     AnalyzeLog(hostLog, "Host");
     AnalyzeLog(clientLog, "Client");
+    AnalyzeCurrentLogs(cfg.gameDir, hostPid, "Host");
+    AnalyzeCurrentLogs(cfg.gameDir, clientPid, "Client");
 
     printf("\n============================================\n");
     printf("  Test complete.\n");

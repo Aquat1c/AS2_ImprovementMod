@@ -125,6 +125,13 @@ struct MenuSnapshot {
     // Session display
     bool          is_host;
     int           active_delay;
+    int           rollback_budget;
+    int           rollback_delay;       // Input pipeline delay (CCCaster-style)
+    int           recommended_delay;    // Auto-computed from RTT
+
+    // Accept state
+    bool          local_accepted;
+    bool          remote_accepted;
 
     // Text editing state
     bool          is_text_editing;

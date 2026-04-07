@@ -322,6 +322,11 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
     }
 
     LOG_INFO("Initialization deferred - will complete when game is ready...");
+
+    // Cache autoconnect config immediately at DLL load time.
+    // The test harness overwrites this file 3s later with the client config,
+    // so we must snapshot it before DeferredInit (which may run after that).
+    NetMenu::CacheAutoConnectFile();
 }
 
 __declspec(dllexport) void ModShutdown() {
@@ -396,6 +401,21 @@ __declspec(dllexport) void ModOnFrame() {
     // Update sync policy and delay policy
     Net::SyncPolicy_FrameUpdate();
     Net::DelayPolicy_FrameUpdate();
+
+    // Refresh network and SDL input immediately before rollback/pregame
+    // decisions so gameplay uses the newest packets and local sample.
+    // NetMenu also pumps the session earlier for menu state, but that can
+    // still miss packets that arrive in the same frame before simulation.
+    Net::Session_Update();
+
+    // Process savestate hotkeys (F5 save, F6 load)
+    Savestate_ProcessHotkeys();
+
+    // Run scripted input runner (injects overrides before SDL update)
+    SIR_OnFrame();
+
+    // Poll SDL just before rollback collects local input.
+    InputSystem_Update();
 
     // Update online wiring (manages rollback session lifecycle)
     Rollback::OnlineWiring_FrameUpdate();
@@ -485,17 +505,6 @@ __declspec(dllexport) void ModOnFrame() {
         }
     }
 
-    // Update network session
-    Net::Session_Update();
-
-    // Process savestate hotkeys (F5 save, F6 load)
-    Savestate_ProcessHotkeys();
-
-    // Run scripted input runner (injects overrides before SDL update)
-    SIR_OnFrame();
-
-    // Update SDL input
-    InputSystem_Update();
 }
 
 __declspec(dllexport) void ModOnPresent(void* pDevice) {

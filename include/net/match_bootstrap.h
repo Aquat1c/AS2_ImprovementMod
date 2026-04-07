@@ -33,6 +33,8 @@ struct MatchBootstrapSnapshot {
     bool     local_loaded;
     bool     remote_loaded;
     bool     both_loaded;
+    int32_t  local_load_sim_frame;
+    int32_t  remote_load_sim_frame;
 
     // Baseline
     bool     local_baseline_ready;
@@ -40,10 +42,13 @@ struct MatchBootstrapSnapshot {
     bool     baseline_agreed;
     uint32_t local_baseline_crc;
     uint32_t remote_baseline_crc;
+    int32_t  local_baseline_sim_frame;
+    int32_t  remote_baseline_sim_frame;
 
     // Gameplay start
     bool     gameplay_start;
     uint32_t start_frame;
+    int32_t  gameplay_start_sim_frame;
 
     // Error
     char     error[128];

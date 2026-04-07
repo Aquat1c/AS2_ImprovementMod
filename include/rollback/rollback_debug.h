@@ -38,6 +38,14 @@ void RollbackDebug_FrameUpdate();
 /// Feed a remote state digest for comparison.
 void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc);
 
+/// Feed remote frame-progress telemetry for live frame skew diagnosis.
+void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_frame,
+                                           int32_t remote_game_frame,
+                                           int32_t remote_view_frame,
+                                           int32_t remote_confirmed_frame,
+                                           int32_t remote_predicted_frames,
+                                           uint32_t remote_checksum);
+
 /// Check if a desync has been detected.
 bool RollbackDebug_IsDesyncDetected();
 

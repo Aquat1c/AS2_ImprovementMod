@@ -5,7 +5,7 @@
  * This is the integration glue — NOT a new architecture — just wiring:
  *
  *   1. Bootstrap completion → RollbackSession_Begin
- *   2. GameplayInput packets → RollbackSession_SubmitRemoteInput
+ *   2. GekkoData packets → RollbackSession_BufferGekkoPacket
  *   3. Lifecycle transitions → RollbackSession_End / state safety
  *   4. Disconnect/failure → safe teardown 
  *   5. Post-match/rematch → clean handoff

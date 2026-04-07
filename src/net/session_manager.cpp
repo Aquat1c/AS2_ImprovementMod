@@ -334,11 +334,29 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
         default:
             // Forward to external callback
             if (s_packetCallback) {
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Dispatching packet to callback: cb=0x%llX type=%s ch=%u payload=%zu state=%s role=%s peer=%p",
+                    (unsigned long long)(uintptr_t)s_packetCallback,
+                    PacketTypeName(type),
+                    channelID,
+                    payloadLen,
+                    SessionStateName(s_state),
+                    SessionRoleName(s_role),
+                    peer);
+                Rollback::NetplayLog_Flush();
                 s_packetCallback(type, payload, payloadLen);
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Callback returned: cb=0x%llX type=%s ch=%u",
+                    (unsigned long long)(uintptr_t)s_packetCallback,
+                    PacketTypeName(type),
+                    channelID);
+                Rollback::NetplayLog_Flush();
             } else {
-                Rollback::NetplayLog_Verbose("SESSION", -1,
-                    "Unhandled packet with no callback: type=%s payload=%zu",
-                    PacketTypeName(type), payloadLen);
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Unhandled packet with no callback: type=%s ch=%u payload=%zu state=%s role=%s peer=%p",
+                    PacketTypeName(type), channelID, payloadLen,
+                    SessionStateName(s_state), SessionRoleName(s_role), peer);
+                Rollback::NetplayLog_Flush();
             }
             break;
     }
@@ -587,6 +605,13 @@ bool Session_SendPacket(uint8_t channel, PacketType type,
 }
 
 void Session_SetPacketCallback(PacketCallback cb) {
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Packet callback change: old=0x%llX new=0x%llX state=%s role=%s",
+        (unsigned long long)(uintptr_t)s_packetCallback,
+        (unsigned long long)(uintptr_t)cb,
+        SessionStateName(s_state),
+        SessionRoleName(s_role));
+    Rollback::NetplayLog_Flush();
     s_packetCallback = cb;
 }
 
@@ -598,6 +623,8 @@ void Session_GetSnapshot(SessionSnapshot* out) {
     out->role   = s_role;
     out->remote_peer = s_remotePeer;
     out->stats  = s_stats;
+    out->local_ready  = s_localReady;
+    out->remote_ready = s_remoteReady;
     memcpy(out->status_text, s_statusText, sizeof(out->status_text));
     memcpy(out->error_text, s_errorText, sizeof(out->error_text));
 }

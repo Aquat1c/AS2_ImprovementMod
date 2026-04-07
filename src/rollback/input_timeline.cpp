@@ -94,6 +94,20 @@ void InputTimeline_Reset() {
     NetplayLog_Write("TIMELINE", -1, "Reset timeline state");
 }
 
+void InputTimeline_BeginAtFrame(int32_t start_frame) {
+    memset(s_buffer, 0, sizeof(s_buffer));
+    s_baseFrame = start_frame;
+    s_latestLocal = start_frame - 1;
+    s_latestRemoteConf = start_frame - 1;
+
+    LOG_INFO("[InputTimeline] Begin at frame %d", start_frame);
+    NetplayLog_Write("TIMELINE", start_frame,
+        "Begin timeline at frame=%d latest_local=%d latest_remote=%d",
+        start_frame,
+        s_latestLocal,
+        s_latestRemoteConf);
+}
+
 // ============================================================================
 // Writing
 // ============================================================================
@@ -247,6 +261,14 @@ int32_t InputTimeline_GetPredictedFrameCount() {
         }
     }
     return count;
+}
+
+void InputTimeline_ClearMispredictions(int32_t from_frame, int32_t to_frame) {
+    for (int32_t f = from_frame; f < to_frame; f++) {
+        int idx = BufIndex(f);
+        if (idx < 0) continue;
+        s_buffer[idx].prediction_wrong = false;
+    }
 }
 
 // ============================================================================

@@ -30,6 +30,8 @@ struct SessionSnapshot {
     SessionRole     role;
     PeerInfo        remote_peer;
     ConnectionStats stats;
+    bool            local_ready;
+    bool            remote_ready;
     char            status_text[128];
     char            error_text[128];
 };

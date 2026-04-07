@@ -72,6 +72,7 @@ struct JitterTracker {
 // User configuration (persists across sessions)
 static int s_configuredDelay     = DELAY_DEFAULT_PREF;  // 0 = auto
 static int s_rollbackBudget      = ROLLBACK_BUDGET_DEFAULT;
+static int s_rollbackDelay       = 0;  // Input pipeline delay (CCCaster-style)
 
 // Network measurement
 static JitterTracker s_jitter;
@@ -83,6 +84,7 @@ static bool  s_measurementValid  = false;
 // Session negotiation
 static int  s_agreedDelay        = 0;
 static int  s_agreedRollback     = ROLLBACK_BUDGET_DEFAULT;
+static int  s_agreedRollbackDelay = 0;  // Agreed input pipeline delay
 static bool s_sessionNegotiated  = false;
 
 // Active delay (consumed by rollback session via gameplay bridge)
@@ -244,6 +246,7 @@ void DelayPolicy_Init() {
 
     s_agreedDelay = 0;
     s_agreedRollback = ROLLBACK_BUDGET_DEFAULT;
+    s_agreedRollbackDelay = 0;
     s_sessionNegotiated = false;
 
     s_activeDelay = 0;
@@ -419,6 +422,21 @@ int DelayPolicy_GetRollbackBudget() {
     return s_rollbackBudget;
 }
 
+void DelayPolicy_SetRollbackDelay(int frames) {
+    s_rollbackDelay = ClampDelay(frames);
+    LOG_INFO("[DelayPolicy] Rollback delay set to %d", s_rollbackDelay);
+}
+
+int DelayPolicy_GetRollbackDelay() {
+    return s_rollbackDelay;
+}
+
+int DelayPolicy_ComputeSuggestedRollbackDelay() {
+    int rec = DelayPolicy_ComputeRecommendedDelay();
+    int residual = rec - s_rollbackBudget;
+    return (residual < 0) ? 0 : residual;
+}
+
 // ============================================================================
 // Session Negotiation
 // ============================================================================
@@ -437,6 +455,7 @@ void DelayPolicy_BuildNegotiationData(DelayNegotiationData* out) {
     out->min_acceptable    = DELAY_MIN;
     out->max_acceptable    = DELAY_MAX;
     out->rollback_budget   = s_rollbackBudget;
+    out->rollback_delay    = s_rollbackDelay;
 }
 
 void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
@@ -458,8 +477,20 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
     // Then clamp to the intersection of both peers' acceptable ranges.
     int agreed = (std::max)(local_effective, remote_effective);
 
-    int range_min = (std::max)(DELAY_MIN, remote->min_acceptable);
-    int range_max = (std::min)(DELAY_MAX, remote->max_acceptable);
+    int remote_range_min = remote->min_acceptable;
+    int remote_range_max = remote->max_acceptable;
+
+    // Current bootstrap packets only carry configured/recommended/rollback.
+    // If the remote range arrives as the zero-initialized default 0..0,
+    // treat that as "unspecified" and fall back to the shared global range
+    // instead of collapsing the negotiated delay to zero.
+    if (remote_range_max <= remote_range_min) {
+        remote_range_min = DELAY_MIN;
+        remote_range_max = DELAY_MAX;
+    }
+
+    int range_min = (std::max)(DELAY_MIN, remote_range_min);
+    int range_max = (std::min)(DELAY_MAX, remote_range_max);
     if (agreed < range_min) agreed = range_min;
     if (agreed > range_max) agreed = range_max;
 
@@ -472,18 +503,21 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
 
     s_agreedDelay = agreed;
     s_agreedRollback = agreed_rb;
-    s_activeDelay = agreed;
+    s_agreedRollbackDelay = s_rollbackDelay;  // Each peer uses its own rollback delay
+    s_activeDelay = s_rollbackDelay;  // Active delay = rollback delay (input pipeline)
     s_sessionNegotiated = true;
     s_rollbackSynced = false;  // Rollback session hasn't applied this yet
 
     LOG_INFO("[DelayPolicy] Session negotiated:"
         " local_eff=%d remote_eff=%d agreed=%d"
+        " range=[%d,%d] remote_range=[%d,%d]"
         " local_rec=%d remote_rec=%d"
-        " rollback=%d"
+        " rollback=%d rollback_delay=%d"
         " rtt=%.1fms jitter=%.1fms",
         local_effective, remote_effective, agreed,
+        DELAY_MIN, DELAY_MAX, remote_range_min, remote_range_max,
         s_recommendedDelay, remote->recommended_delay,
-        agreed_rb,
+        agreed_rb, s_rollbackDelay,
         s_jitter.GetSmoothedRTT(), s_jitter.GetJitter());
 }
 
@@ -501,6 +535,10 @@ int DelayPolicy_GetActiveDelay() {
 
 int DelayPolicy_GetAgreedRollbackBudget() {
     return s_agreedRollback;
+}
+
+int DelayPolicy_GetAgreedRollbackDelay() {
+    return s_agreedRollbackDelay;
 }
 
 bool DelayPolicy_IsRollbackSynced() {
@@ -590,7 +628,7 @@ bool DelayPolicy_HasPendingNextDelay() {
 // ============================================================================
 
 void DelayPolicy_ResetSession() {
-    // Keep user configuration (s_configuredDelay, s_rollbackBudget)
+    // Keep user configuration (s_configuredDelay, s_rollbackBudget, s_rollbackDelay)
     // Reset everything else
     s_jitter.Reset();
     s_lastRttMs = 0.0f;
@@ -600,6 +638,7 @@ void DelayPolicy_ResetSession() {
 
     s_agreedDelay = 0;
     s_agreedRollback = ROLLBACK_BUDGET_DEFAULT;
+    s_agreedRollbackDelay = 0;
     s_sessionNegotiated = false;
 
     s_activeDelay = 0;
@@ -636,6 +675,7 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
 
     out->rollback_budget     = s_rollbackBudget;
     out->agreed_rollback     = s_agreedRollback;
+    out->rollback_delay      = s_rollbackDelay;
 
     out->change_state        = s_changeState;
     out->change_target_delay = s_changeTarget;

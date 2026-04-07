@@ -16,6 +16,11 @@ namespace NetMenu {
 // Lifecycle
 // ============================================================================
 
+/// Cache the raw autoconnect config file contents from disk immediately.
+/// Call this as early as possible (e.g. ModInit) before the harness overwrites
+/// the config file with the other role's settings.
+void CacheAutoConnectFile();
+
 /// Initialize the menu controller. Call after ModeOwnership::Install().
 void Init();
 

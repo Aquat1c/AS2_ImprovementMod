@@ -44,13 +44,16 @@ using namespace Net;
 
 static const int RING_SIZE           = 512;
 static const int RING_MASK           = RING_SIZE - 1;
-static const int INPUT_REDUNDANCY    = 8;    // Send this many frames per packet (CCCaster uses 30)
+static const int INPUT_REDUNDANCY    =
+    (int)(sizeof(((CharSelFrameInputPayload*)0)->inputs) / sizeof(uint16_t));
 static const int MIN_INPUT_DELAY     = 2;
 static const int MAX_INPUT_DELAY     = 10;
 static const int DEFAULT_INPUT_DELAY = 2;
 static const int SEND_HEAD_BUFFER    = RING_SIZE / 2;   // Max send-ahead beyond consumeFrame
 static const int LOCKSTEP_TIMEOUT_MS = 10000;            // 10s timeout (same as CCCaster)
 static const int RESEND_INTERVAL_MS  = 100;              // Re-send latest input every 100ms while waiting
+
+static_assert(INPUT_REDUNDANCY > 0, "CharSelFrameInputPayload must contain input history slots");
 
 // ============================================================================
 // Memory access helpers
@@ -152,8 +155,28 @@ static void SendFrameInputPacket(uint32_t frame) {
     }
     payload.input_count = (uint16_t)count;
 
-    BarrierProtocol_SendPacket(PacketType::CharSelFrameInput,
-                              &payload, sizeof(payload));
+    Rollback::NetplayLog_Write("CHARSEL", -1,
+        "SendFrameInputPacket: frame=%u ack=%u count=%u inputs=[0x%04X,0x%04X,0x%04X,0x%04X] consume=%u localFrame=%u remoteLatest=%u",
+        payload.frame,
+        payload.ack_frame,
+        payload.input_count,
+        payload.inputs[0],
+        payload.inputs[1],
+        payload.inputs[2],
+        payload.inputs[3],
+        s_consumeFrame,
+        s_localInputFrame,
+        s_remoteLatestFrame);
+    Rollback::NetplayLog_Flush();
+
+    const bool sent = BarrierProtocol_SendPacket(PacketType::CharSelFrameInput,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        Rollback::NetplayLog_Write("CHARSEL", -1,
+            "SendFrameInputPacket FAILED: frame=%u ack=%u count=%u state-active=%d",
+            payload.frame, payload.ack_frame, payload.input_count, s_active ? 1 : 0);
+        Rollback::NetplayLog_Flush();
+    }
 }
 
 // ============================================================================
@@ -255,6 +278,7 @@ void CharSelSync_Begin() {
     Rollback::NetplayLog_Write("CHARSEL", -1,
         "=== CHARSEL LOCKSTEP BEGIN (role=%s delay=%d) ===",
         s_isHost ? "Host" : "Join", s_inputDelay);
+    Rollback::NetplayLog_Flush();
     LOG_NETPLAY(LOG_INFO, "[CharSelSync] Begin (role=%s)",
         s_isHost ? "Host" : "Join");
 }
@@ -288,6 +312,11 @@ void CharSelSync_Abort() {
 void CharSelSync_CaptureLocalInput(uint16_t packedInput) {
     if (!s_active) return;
 
+    Rollback::NetplayLog_Write("CHARSEL", -1,
+        "CaptureLocalInput ENTER: input=0x%04X delayLocked=%d localFrame=%u consumeFrame=%u",
+        packedInput, (int)s_delayLocked, s_localInputFrame, s_consumeFrame);
+    Rollback::NetplayLog_Flush();
+
     // Initialize input delay on first capture
     if (!s_delayLocked) {
         s_delayLocked = true;
@@ -304,6 +333,7 @@ void CharSelSync_CaptureLocalInput(uint16_t packedInput) {
             s_inputDelay, rttMs);
         Rollback::NetplayLog_Write("CHARSEL", -1,
             "Input delay locked: %d frames (RTT=%.1f ms)", s_inputDelay, rttMs);
+        Rollback::NetplayLog_Flush();
 
         // Pre-fill delay frames with neutral input (0) so lockstep can start
         for (int f = 0; f < s_inputDelay; f++) {
@@ -313,21 +343,28 @@ void CharSelSync_CaptureLocalInput(uint16_t packedInput) {
         }
         s_localInputFrame = (uint32_t)s_inputDelay;
 
+        Rollback::NetplayLog_Write("CHARSEL", -1,
+            "Pre-filled %d delay frames, localInputFrame now=%u", s_inputDelay, s_localInputFrame);
+        Rollback::NetplayLog_Flush();
+
         // Send pre-fill frames to peer so they also have our neutral inputs
         for (int f = 0; f < s_inputDelay; f++) {
             SendFrameInputPacket((uint32_t)f);
         }
+
+        Rollback::NetplayLog_Write("CHARSEL", -1,
+            "Sent %d pre-fill packets to peer", s_inputDelay);
+        Rollback::NetplayLog_Flush();
     }
 
     // Send-then-wait pattern (CCCaster style):
-    // Always advance local send-head by 1 per call. Do NOT cap tightly
-    // at consumeFrame + delay — that causes mutual deadlock when both
-    // sides stall waiting for remote input.
-    // Only cap at consumeFrame + SEND_HEAD_BUFFER to prevent ring overflow.
     const uint32_t maxSendFrame = s_consumeFrame + (uint32_t)SEND_HEAD_BUFFER;
 
     if (s_localInputFrame > maxSendFrame) {
-        // Safety cap: ring buffer would overflow. Re-send latest for reliability.
+        Rollback::NetplayLog_Write("CHARSEL", -1,
+            "CaptureLocalInput: CAPPED at maxSendFrame=%u (localInputFrame=%u consumeFrame=%u)",
+            maxSendFrame, s_localInputFrame, s_consumeFrame);
+        Rollback::NetplayLog_Flush();
         if (s_localInputFrame > 0) {
             SendFrameInputPacket(s_localInputFrame - 1);
         }
@@ -343,11 +380,10 @@ void CharSelSync_CaptureLocalInput(uint16_t packedInput) {
     // Send to peer
     SendFrameInputPacket(targetFrame);
 
-    // Log first capture and periodically
-    if (targetFrame == (uint32_t)s_inputDelay || (targetFrame % 60) == 0) {
-        LOG_NETPLAY(LOG_DEBUG, "[CharSelSync] Capture local frame=%u input=0x%04X (consume=%u remoteLatest=%u delay=%d)",
-            targetFrame, packedInput, s_consumeFrame, s_remoteLatestFrame, s_inputDelay);
-    }
+    Rollback::NetplayLog_Write("CHARSEL", -1,
+        "CaptureLocalInput: stored+sent frame=%u idx=%d input=0x%04X (consume=%u remoteLatest=%u delay=%d)",
+        targetFrame, idx, packedInput, s_consumeFrame, s_remoteLatestFrame, s_inputDelay);
+    Rollback::NetplayLog_Flush();
 
     s_localInputFrame = targetFrame + 1;
 }
@@ -363,7 +399,14 @@ bool CharSelSync_IsLockstepActive() {
 bool CharSelSync_HasInputsForCurrentFrame() {
     if (!s_active) return false;
     int idx = (int)(s_consumeFrame & RING_MASK);
-    bool ready = s_hasLocalInput[idx] && s_hasRemoteInput[idx];
+    bool hasLocal = s_hasLocalInput[idx];
+    bool hasRemote = s_hasRemoteInput[idx];
+    bool ready = hasLocal && hasRemote;
+
+    Rollback::NetplayLog_Write("CHARSEL", -1,
+        "HasInputs: consumeFrame=%u idx=%d hasLocal=%d hasRemote=%d ready=%d",
+        s_consumeFrame, idx, (int)hasLocal, (int)hasRemote, (int)ready);
+    Rollback::NetplayLog_Flush();
 
     if (!ready && !s_timedOut) {
         DWORD now = GetTickCount();
@@ -376,6 +419,7 @@ bool CharSelSync_HasInputsForCurrentFrame() {
             Rollback::NetplayLog_Write("CHARSEL", -1,
                 "TIMEOUT: no remote input for %d ms (consume=%u remoteLatest=%u)",
                 LOCKSTEP_TIMEOUT_MS, s_consumeFrame, s_remoteLatestFrame);
+            Rollback::NetplayLog_Flush();
             Net::Session_Cancel();
             return false;
         }
@@ -406,6 +450,11 @@ bool CharSelSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         *outP1 = remoteInput;   // Host's input -> P1
         *outP2 = localInput;    // Join's input -> P2
     }
+
+    Rollback::NetplayLog_Write("CHARSEL", -1,
+        "ConsumeFrame: frame=%u idx=%d local=0x%04X remote=0x%04X -> P1=0x%04X P2=0x%04X (host=%d)",
+        s_consumeFrame, idx, localInput, remoteInput, *outP1, *outP2, (int)s_isHost);
+    Rollback::NetplayLog_Flush();
 
     // Clear consumed slot for reuse
     s_hasLocalInput[idx] = false;
@@ -552,15 +601,24 @@ void CharSelSync_OnRemoteFrameInput(const CharSelFrameInputPayload* p) {
         s_lastRemoteInputTime = GetTickCount();
     }
 
-    // Log first remote frame arrival
+    // Log every remote frame during debug
+    Rollback::NetplayLog_Write("CHARSEL", -1,
+        "OnRemoteInput: frame=%u ack=%u count=%d new=%d remoteLatest=%u consumeFrame=%u inputs=[0x%04X,0x%04X,0x%04X,0x%04X]",
+        frame,
+        p->ack_frame,
+        count,
+        newFramesApplied,
+        s_remoteLatestFrame,
+        s_consumeFrame,
+        p->inputs[0],
+        p->inputs[1],
+        p->inputs[2],
+        p->inputs[3]);
+    Rollback::NetplayLog_Flush();
+
     if (isFirst) {
         LOG_NETPLAY(LOG_INFO, "[CharSelSync] First remote frame received: frame=%u count=%d input=0x%04X",
             frame, count, p->inputs[0]);
-    }
-    // Log periodically
-    else if ((frame % 60) == 0) {
-        LOG_NETPLAY(LOG_DEBUG, "[CharSelSync] Remote frame=%u count=%d new=%d (consume=%u)",
-            frame, count, newFramesApplied, s_consumeFrame);
     }
 }
 

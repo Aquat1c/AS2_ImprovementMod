@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 2;
+constexpr uint16_t PROTOCOL_VERSION = 3;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 
@@ -68,8 +68,9 @@ enum class PacketType : uint16_t {
     WinScreenConfirm = 41,  // Win screen A/C confirm signal
     PauseQuit        = 42,  // Pause menu quit signal
 
-    // Gameplay (unreliable, channel 1) — placeholders for rollback layer
-    GameplayInput   = 20,   // Reserved for future rollback input sync
+    // Gameplay (unreliable, channel 1)
+    GameplayInput   = 20,   // Legacy mod-owned rollback input sync
+    GekkoData       = 23,   // Raw GekkoNet internal protocol data
 
     // Mid-match delay changes (reliable, channel 0)
     DelayChangeReq  = 21,   // Request to change input delay
@@ -79,6 +80,7 @@ enum class PacketType : uint16_t {
     Ping            = 30,   // Application-level ping (supplements ENet RTT)
     Pong            = 31,   // Application-level pong
     StateDigest     = 32,   // CRC32 state digest for desync detection
+    FrameSyncStatus = 33,   // Lightweight frame-progress telemetry
 };
 
 // ============================================================================
@@ -120,6 +122,15 @@ struct PongPayload {
 struct StateDigestPayload {
     uint32_t frame_number;
     uint32_t crc32;
+};
+
+struct FrameSyncStatusPayload {
+    int32_t  current_frame;     // Sender's logical rollback frame
+    int32_t  game_frame;        // Sender's native sim frame counter
+    int32_t  remote_view_frame; // Sender's latest confirmed frame for the peer
+    int32_t  confirmed_frame;   // Sender's fully confirmed frame
+    int32_t  predicted_frames;  // Sender's outstanding predicted frames
+    uint32_t checksum;          // Sender's current state checksum
 };
 
 // Initial session sync payloads
@@ -173,7 +184,7 @@ struct ConfigExchangePayload {
     uint8_t  delay_configured;   // 0 = auto, 1-15 = manual preference
     uint8_t  delay_recommended;  // Auto-computed from RTT measurement
     uint8_t  delay_rollback;     // Rollback budget (frames)
-    uint8_t  _delay_pad;
+    uint8_t  delay_rollback_delay; // Input pipeline delay for rollback mode
 };
 
 struct ConfigAckPayload {
@@ -183,16 +194,23 @@ struct ConfigAckPayload {
     uint8_t  delay_configured;   // 0 = auto, 1-15 = manual preference
     uint8_t  delay_recommended;  // Auto-computed from RTT measurement
     uint8_t  delay_rollback;     // Rollback budget (frames)
+    uint8_t  delay_rollback_delay; // Input pipeline delay for rollback mode
 };
 
 struct LoadBarrierPayload {
     uint8_t  loaded;             // 1 = assets loaded
-    uint8_t  _pad[3];
+    uint8_t  mode;               // Local game mode when barrier was sent
+    uint8_t  substate;           // Local substate when barrier was sent
+    uint8_t  _pad;
+    uint32_t sim_frame;          // Native sim frame at load completion
 };
 
 struct BaselineReadyPayload {
     uint8_t  captured;           // 1 = baseline savestate captured
-    uint8_t  _pad[3];
+    uint8_t  mode;               // Local game mode when baseline was captured
+    uint8_t  substate;           // Local substate when baseline was captured
+    uint8_t  _pad;
+    uint32_t sim_frame;          // Native sim frame when baseline was captured
 };
 
 struct BaselineDigestPayload {
@@ -200,7 +218,8 @@ struct BaselineDigestPayload {
 };
 
 struct GameplayStartPayload {
-    uint32_t start_frame;        // Agreed frame to begin gameplay (typically 0)
+    uint32_t start_frame;        // Bootstrap baseline frame (typically 0)
+    uint32_t host_sim_frame;     // Host native sim frame when start was sent
 };
 
 struct CharSelFrameInputPayload {
@@ -254,6 +273,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::Ping:           return "Ping";
         case PacketType::Pong:           return "Pong";
         case PacketType::StateDigest:    return "StateDigest";
+        case PacketType::FrameSyncStatus:return "FrameSyncStatus";
         default:                         return "Unknown";
     }
 }

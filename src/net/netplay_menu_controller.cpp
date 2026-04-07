@@ -11,6 +11,7 @@
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/netplay_menu_ui.h"
+#include "net/charsel_sync.h"
 #include "net/pregame_sync.h"
 #include "net/match_lifecycle.h"
 #include "net/sync_policy.h"
@@ -19,6 +20,7 @@
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "input/input_system.h"
+#include "testing/autoconnect_harness.h"
 #include "ui/log_window.h"
 #include "ui/menu_utils.h"
 
@@ -58,9 +60,67 @@ static char          s_localNickname[24]  = "Player";
 static uint16_t      s_listenPort         = 10700;
 static char          s_remoteEndpoint[64] = "127.0.0.1:10700";
 static int           s_preferredDelay     = 0;
+static int           s_rollbackBudget     = 7;  // Max rollback frames
+static int           s_rollbackDelay      = 0;  // Input pipeline delay (CCCaster-style)
 
 // Config file path (relative to game directory)
 static const char*   kConfigFile          = "as2_netplay.cfg";
+static const char*   kAutoConnectFile     = "as2_autoconnect.cfg";
+
+// Early-cached autoconnect file content (read during ModInit before harness
+// overwrites the file with the other role's config).
+static char  s_cachedAutoConnectContent[4096] = {};
+static bool  s_cachedAutoConnectValid = false;
+
+enum class AutoConnectState : uint8_t {
+    Disabled = 0,
+    WaitingForMenu,
+    WaitingForConnection,
+    WaitingForCharSel,
+    SelectingCharacter,
+    SelectingStage,
+    WaitingForGameplay,
+    InMatch,
+    Failed,
+};
+
+struct AutoConnectConfig {
+    bool     enabled;
+    bool     valid;
+    bool     isHost;
+    char     nickname[24];
+    uint16_t listenPort;
+    char     targetIp[64];
+    uint16_t targetPort;
+    int      preferredDelay;
+    int      characterGridIndex;
+    int      palette;
+    int      matchDurationSec;
+};
+
+static AutoConnectConfig s_autoConnect = {};
+static AutoConnectState  s_autoConnectState = AutoConnectState::Disabled;
+static int              s_autoConnectStateFrames = 0;
+static int              s_autoConnectGlobalFrames = 0;
+static uint32_t         s_autoConnectMatchFrame = 0;
+static bool             s_autoConnectReleasePending = false;
+static bool             s_autoConnectStageGridPressed = false;
+static bool             s_autoConnectStageConfirmPressed = false;
+
+static const char* AutoConnectStateName(AutoConnectState state) {
+    switch (state) {
+        case AutoConnectState::Disabled:            return "Disabled";
+        case AutoConnectState::WaitingForMenu:      return "WaitingForMenu";
+        case AutoConnectState::WaitingForConnection:return "WaitingForConnection";
+        case AutoConnectState::WaitingForCharSel:   return "WaitingForCharSel";
+        case AutoConnectState::SelectingCharacter:  return "SelectingCharacter";
+        case AutoConnectState::SelectingStage:      return "SelectingStage";
+        case AutoConnectState::WaitingForGameplay:  return "WaitingForGameplay";
+        case AutoConnectState::InMatch:             return "InMatch";
+        case AutoConnectState::Failed:              return "Failed";
+        default:                                    return "Unknown";
+    }
+}
 
 // ============================================================================
 // Settings persistence (INI-style text file)
@@ -77,6 +137,8 @@ static void SaveSettings() {
     fprintf(f, "port=%u\n", s_listenPort);
     fprintf(f, "endpoint=%s\n", s_remoteEndpoint);
     fprintf(f, "delay=%d\n", s_preferredDelay);
+    fprintf(f, "rollback=%d\n", s_rollbackBudget);
+    fprintf(f, "rollback_delay=%d\n", s_rollbackDelay);
     fclose(f);
     LOG_NETPLAY(LOG_DEBUG, "[NetMenu] Settings saved to %s", kConfigFile);
 }
@@ -115,12 +177,18 @@ static void LoadSettings() {
         } else if (_stricmp(key, "delay") == 0) {
             int d = atoi(val);
             if (d >= 0 && d <= 15) s_preferredDelay = d;
+        } else if (_stricmp(key, "rollback") == 0) {
+            int r = atoi(val);
+            if (r >= 2 && r <= 10) s_rollbackBudget = r;
+        } else if (_stricmp(key, "rollback_delay") == 0) {
+            int rd = atoi(val);
+            if (rd >= 0 && rd <= 15) s_rollbackDelay = rd;
         }
     }
 
     fclose(f);
-    LOG_NETPLAY(LOG_INFO, "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d",
-        s_localNickname, s_listenPort, s_remoteEndpoint, s_preferredDelay);
+    LOG_NETPLAY(LOG_INFO, "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_delay=%d",
+        s_localNickname, s_listenPort, s_remoteEndpoint, s_preferredDelay, s_rollbackBudget, s_rollbackDelay);
 }
 
 // ============================================================================
@@ -139,6 +207,25 @@ static void CopyText(char* dst, size_t cap, const char* src) {
     if (!dst || cap == 0) return;
     if (!src) { dst[0] = '\0'; return; }
     strncpy_s(dst, cap, src, _TRUNCATE);
+}
+
+static void TrimWhitespace(char* s) {
+    if (!s) return;
+
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == '\r' || s[len - 1] == '\n' ||
+                       s[len - 1] == ' ' || s[len - 1] == '\t')) {
+        s[--len] = '\0';
+    }
+
+    size_t start = 0;
+    while (s[start] == ' ' || s[start] == '\t') {
+        ++start;
+    }
+
+    if (start > 0) {
+        memmove(s, s + start, len - start + 1);
+    }
 }
 
 template <typename... Args>
@@ -185,6 +272,426 @@ static bool ParseEndpoint(const char* str, uint32_t* outIP, uint16_t* outPort) {
     *outIP = (uint32_t)(a | (b << 8) | (c << 16) | (d << 24));
     *outPort = (uint16_t)port;
     return true;
+}
+
+static bool LaunchNetplayCharSel();
+
+static void ClearAutoConnectOverride() {
+    if (!s_autoConnectReleasePending) return;
+    InputSystem_ClearOverride(0);
+    s_autoConnectReleasePending = false;
+}
+
+static void AutoConnectTransition(AutoConnectState next, const char* why) {
+    if (s_autoConnectState == next) return;
+
+    LOG_NETPLAY(LOG_INFO, "[AutoConnect] State %s -> %s (%s)",
+        AutoConnectStateName(s_autoConnectState),
+        AutoConnectStateName(next),
+        why ? why : "?");
+
+    if (next == AutoConnectState::Disabled || next == AutoConnectState::Failed || next == AutoConnectState::InMatch) {
+        ClearAutoConnectOverride();
+    }
+
+    if (next == AutoConnectState::SelectingStage) {
+        s_autoConnectStageGridPressed = false;
+        s_autoConnectStageConfirmPressed = false;
+    }
+
+    if (next == AutoConnectState::InMatch) {
+        s_autoConnectMatchFrame = 0;
+    }
+
+    s_autoConnectState = next;
+    s_autoConnectStateFrames = 0;
+}
+
+static void AutoConnectInjectPress(uint16_t input, const char* why) {
+    InputSystem_SetOverride(0, input);
+    s_autoConnectReleasePending = true;
+
+    LOG_NETPLAY(LOG_INFO, "[AutoConnect] Inject input 0x%04X (%s) mode=%u sub=%u",
+        input,
+        why ? why : "?",
+        GetGameMode(),
+        GetSubstate());
+}
+
+// ============================================================================
+// Early autoconnect config caching
+// ============================================================================
+
+static void CacheAutoConnectFileImpl() {
+    FILE* f = nullptr;
+    if (fopen_s(&f, kAutoConnectFile, "r") != 0 || !f) {
+        s_cachedAutoConnectValid = false;
+        return;
+    }
+    size_t n = fread(s_cachedAutoConnectContent, 1, sizeof(s_cachedAutoConnectContent) - 1, f);
+    s_cachedAutoConnectContent[n] = '\0';
+    fclose(f);
+    s_cachedAutoConnectValid = true;
+}
+
+static void LoadAutoConnectConfig() {
+    memset(&s_autoConnect, 0, sizeof(s_autoConnect));
+    s_autoConnect.enabled = false;
+    s_autoConnect.valid = false;
+    s_autoConnect.isHost = true;
+    s_autoConnect.listenPort = s_listenPort;
+    strncpy_s(s_autoConnect.nickname, sizeof(s_autoConnect.nickname), s_localNickname, _TRUNCATE);
+    strncpy_s(s_autoConnect.targetIp, sizeof(s_autoConnect.targetIp), "127.0.0.1", _TRUNCATE);
+    s_autoConnect.targetPort = s_listenPort;
+    s_autoConnect.preferredDelay = s_preferredDelay;
+    s_autoConnect.characterGridIndex = 0;
+    s_autoConnect.palette = 0;
+    s_autoConnect.matchDurationSec = 0;
+    s_autoConnectState = AutoConnectState::Disabled;
+    s_autoConnectStateFrames = 0;
+    s_autoConnectReleasePending = false;
+    s_autoConnectStageGridPressed = false;
+    s_autoConnectStageConfirmPressed = false;
+
+    // Use early-cached content if available (avoids race with harness overwriting
+    // the config file), otherwise read from disk.
+    char localBuf[4096] = {};
+    const char* parseSource = nullptr;
+
+    if (s_cachedAutoConnectValid) {
+        strncpy_s(localBuf, sizeof(localBuf), s_cachedAutoConnectContent, _TRUNCATE);
+        parseSource = "cache";
+    } else {
+        FILE* f = nullptr;
+        if (fopen_s(&f, kAutoConnectFile, "r") != 0 || !f) {
+            return;
+        }
+        size_t n = fread(localBuf, 1, sizeof(localBuf) - 1, f);
+        localBuf[n] = '\0';
+        fclose(f);
+        parseSource = "disk";
+    }
+
+    enum class Section : uint8_t {
+        None = 0,
+        AutoConnect,
+    } section = Section::None;
+
+    // Parse line-by-line from localBuf
+    char* ctx = nullptr;
+    char* linePtr = strtok_s(localBuf, "\n", &ctx);
+    while (linePtr) {
+        char line[256];
+        strncpy_s(line, sizeof(line), linePtr, _TRUNCATE);
+        linePtr = strtok_s(nullptr, "\n", &ctx);
+        TrimWhitespace(line);
+        if (line[0] == '\0' || line[0] == '#' || line[0] == ';') continue;
+
+        if (line[0] == '[') {
+            if (_stricmp(line, "[autoconnect]") == 0) {
+                section = Section::AutoConnect;
+            } else {
+                section = Section::None;
+            }
+            continue;
+        }
+
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+
+        char* key = line;
+        char* val = eq + 1;
+        TrimWhitespace(key);
+        TrimWhitespace(val);
+
+        if (section != Section::AutoConnect) continue;
+
+        if (_stricmp(key, "enabled") == 0) {
+            s_autoConnect.enabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "role") == 0) {
+            s_autoConnect.isHost = (_stricmp(val, "host") == 0);
+        } else if (_stricmp(key, "nickname") == 0 && val[0]) {
+            strncpy_s(s_autoConnect.nickname, sizeof(s_autoConnect.nickname), val, _TRUNCATE);
+        } else if (_stricmp(key, "port") == 0) {
+            int port = atoi(val);
+            if (port > 0 && port <= 65535) {
+                s_autoConnect.listenPort = (uint16_t)port;
+            }
+        } else if (_stricmp(key, "target_ip") == 0 && val[0]) {
+            strncpy_s(s_autoConnect.targetIp, sizeof(s_autoConnect.targetIp), val, _TRUNCATE);
+        } else if (_stricmp(key, "target_port") == 0) {
+            int port = atoi(val);
+            if (port > 0 && port <= 65535) {
+                s_autoConnect.targetPort = (uint16_t)port;
+            }
+        } else if (_stricmp(key, "delay_frames") == 0) {
+            int delay = atoi(val);
+            if (delay >= 0 && delay <= 15) {
+                s_autoConnect.preferredDelay = delay;
+            }
+        } else if (_stricmp(key, "character_id") == 0) {
+            s_autoConnect.characterGridIndex = atoi(val);
+        } else if (_stricmp(key, "palette") == 0) {
+            s_autoConnect.palette = atoi(val);
+        } else if (_stricmp(key, "match_duration_sec") == 0) {
+            s_autoConnect.matchDurationSec = atoi(val);
+        }
+    }
+
+    if (!s_autoConnect.enabled) {
+        return;
+    }
+
+    s_autoConnect.valid = true;
+    strncpy_s(s_localNickname, sizeof(s_localNickname), s_autoConnect.nickname, _TRUNCATE);
+    s_listenPort = s_autoConnect.listenPort;
+    _snprintf_s(s_remoteEndpoint, sizeof(s_remoteEndpoint), _TRUNCATE,
+        "%s:%u", s_autoConnect.targetIp, s_autoConnect.targetPort);
+    s_preferredDelay = s_autoConnect.preferredDelay;
+    Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
+
+    LOG_NETPLAY(LOG_INFO,
+        "[AutoConnect] Loaded %s (from %s): role=%s nick='%s' port=%u target=%s delay=%d char=%d pal=%d duration=%d",
+        kAutoConnectFile,
+        parseSource,
+        s_autoConnect.isHost ? "Host" : "Join",
+        s_localNickname,
+        s_listenPort,
+        s_remoteEndpoint,
+        s_preferredDelay,
+        s_autoConnect.characterGridIndex,
+        s_autoConnect.palette,
+        s_autoConnect.matchDurationSec);
+
+    // Initialize the test harness SHM so the launcher can see real-time state
+    AutoConnectHarness_Init(s_autoConnect.isHost, s_autoConnect.nickname,
+                            s_autoConnect.matchDurationSec);
+
+    AutoConnectTransition(AutoConnectState::WaitingForMenu, "config loaded");
+}
+
+static bool IsAutoConnectSessionReady(Net::SessionState state) {
+    return state == Net::SessionState::Connected || state == Net::SessionState::Ready;
+}
+
+static bool BeginAutoConnectSession() {
+    Net::SessionConfig cfg{};
+    Net::SessionConfig_SetDefaults(&cfg);
+    strncpy_s(cfg.nickname, sizeof(cfg.nickname), s_localNickname, _TRUNCATE);
+    cfg.listen_port = s_listenPort;
+    cfg.connect_timeout_ms = 10000;
+    cfg.handshake_timeout_ms = 5000;
+
+    Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
+
+    if (s_autoConnect.isHost) {
+        LOG_NETPLAY(LOG_INFO, "[AutoConnect] Starting host session on port %u", cfg.listen_port);
+        return Net::Session_StartHost(&cfg);
+    }
+
+    uint32_t targetIP = 0;
+    uint16_t targetPort = 0;
+    if (!ParseEndpoint(s_remoteEndpoint, &targetIP, &targetPort)) {
+        LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Invalid endpoint '%s'", s_remoteEndpoint);
+        return false;
+    }
+
+    cfg.target_ip = targetIP;
+    cfg.target_port = targetPort;
+
+    LOG_NETPLAY(LOG_INFO, "[AutoConnect] Starting join session to %s", s_remoteEndpoint);
+    return Net::Session_StartJoin(&cfg);
+}
+
+static void HandleAutoConnect() {
+    if (s_autoConnectState == AutoConnectState::Disabled) return;
+
+    ClearAutoConnectOverride();
+    ++s_autoConnectStateFrames;
+    ++s_autoConnectGlobalFrames;
+
+    // Update harness SHM every frame (all phases)
+    AutoConnectHarness_Update(
+        AutoConnectStateName(s_autoConnectState),
+        (uint32_t)s_autoConnectState,
+        (uint32_t)s_autoConnectGlobalFrames);
+
+    Net::SessionSnapshot snap{};
+    Net::Session_GetSnapshot(&snap);
+
+    if (snap.state == Net::SessionState::Failed && s_autoConnectState != AutoConnectState::Failed) {
+        LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Session failed: %s",
+            snap.error_text[0] ? snap.error_text : "Unknown error");
+        AutoConnectTransition(AutoConnectState::Failed, "session failed");
+        return;
+    }
+
+    const uint32_t mode = GetGameMode();
+    const uint32_t sub = GetSubstate();
+
+    switch (s_autoConnectState) {
+        case AutoConnectState::WaitingForMenu:
+            if (mode == MODE_MENU && !ModeOwnership::IsPendingMenuRestore() &&
+                snap.state == Net::SessionState::Idle) {
+                if (BeginAutoConnectSession()) {
+                    AutoConnectTransition(AutoConnectState::WaitingForConnection, "session started");
+                } else {
+                    AutoConnectTransition(AutoConnectState::Failed, "session start failed");
+                }
+            }
+            break;
+
+        case AutoConnectState::WaitingForConnection:
+            if (snap.state == Net::SessionState::Connected && !snap.local_ready) {
+                // Auto-accept the match
+                Net::Session_SignalReady();
+                AutoConnectTransition(AutoConnectState::WaitingForConnection, "auto-accepted, waiting for peer");
+            } else if (snap.state == Net::SessionState::Ready) {
+                // Both accepted — launch charsel
+                if (LaunchNetplayCharSel()) {
+                    AutoConnectTransition(AutoConnectState::WaitingForCharSel, "both accepted, launching charsel");
+                } else {
+                    AutoConnectTransition(AutoConnectState::Failed, "charsel launch failed");
+                }
+            } else if (s_autoConnectStateFrames > 3600) {
+                LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Timed out waiting for connection");
+                AutoConnectTransition(AutoConnectState::Failed, "connection timeout");
+            }
+            break;
+
+        case AutoConnectState::WaitingForCharSel:
+            if (mode == MODE_CHARSEL) {
+                if (sub >= CHARSEL_SUB_STAGESEL_SLIDE) {
+                    AutoConnectTransition(AutoConnectState::SelectingStage, "entered stage select");
+                } else {
+                    AutoConnectTransition(AutoConnectState::SelectingCharacter, "entered charsel");
+                }
+            } else if (mode == MODE_MATCH) {
+                AutoConnectTransition(AutoConnectState::InMatch, "entered match early");
+            } else if (s_autoConnectStateFrames > 900) {
+                LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Timed out waiting for charsel");
+                AutoConnectTransition(AutoConnectState::Failed, "charsel timeout");
+            }
+            break;
+
+        case AutoConnectState::SelectingCharacter: {
+            Net::CharSelSyncSnapshot csSnap{};
+            Net::CharSelSync_GetSnapshot(&csSnap);
+
+            if (mode == MODE_MATCH) {
+                AutoConnectTransition(AutoConnectState::InMatch, "entered match");
+                break;
+            }
+
+            if (mode == MODE_CHARSEL && (csSnap.both_characters_locked || sub >= CHARSEL_SUB_STAGESEL_SLIDE)) {
+                AutoConnectTransition(AutoConnectState::SelectingStage, "characters locked");
+                break;
+            }
+
+            if (mode == MODE_CHARSEL &&
+                (sub == CHARSEL_SUB_SELECT || sub == CHARSEL_SUB_CONFIRM) &&
+                (s_autoConnectStateFrames == 31 ||
+                 (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
+                AutoConnectInjectPress(INPUT_A, "confirm character");
+            }
+
+            if (s_autoConnectStateFrames > 1800) {
+                LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Timed out during character selection");
+                AutoConnectTransition(AutoConnectState::Failed, "character select timeout");
+            }
+            break;
+        }
+
+        case AutoConnectState::SelectingStage: {
+            Net::CharSelSyncSnapshot csSnap{};
+            Net::CharSelSync_GetSnapshot(&csSnap);
+
+            if (mode == MODE_MATCH) {
+                AutoConnectTransition(AutoConnectState::InMatch, "entered match");
+                break;
+            }
+
+            if (mode == MODE_PREMATCH_INTRO ||
+                (mode == MODE_CHARSEL && (csSnap.both_stage_locked ||
+                                          sub == CHARSEL_SUB_MATCHUP_COMMIT ||
+                                          sub == CHARSEL_SUB_TO_MATCH))) {
+                AutoConnectTransition(AutoConnectState::WaitingForGameplay, "stage locked");
+                break;
+            }
+
+            if (mode == MODE_CHARSEL && sub == CHARSEL_SUB_STAGESEL_GRID &&
+                (!s_autoConnectStageGridPressed ||
+                 (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
+                AutoConnectInjectPress(INPUT_A, "open stage confirm");
+                s_autoConnectStageGridPressed = true;
+            } else if (mode == MODE_CHARSEL && sub == CHARSEL_SUB_STAGESEL_CONFIRM &&
+                       (!s_autoConnectStageConfirmPressed ||
+                        (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
+                AutoConnectInjectPress(INPUT_A, "confirm stage");
+                s_autoConnectStageConfirmPressed = true;
+            }
+
+            if (s_autoConnectStateFrames > 2400) {
+                LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Timed out during stage selection");
+                AutoConnectTransition(AutoConnectState::Failed, "stage select timeout");
+            }
+            break;
+        }
+
+        case AutoConnectState::WaitingForGameplay:
+            if (mode == MODE_MATCH) {
+                AutoConnectTransition(AutoConnectState::InMatch, "entered match");
+            } else if (s_autoConnectStateFrames > 2400) {
+                LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Timed out waiting for gameplay");
+                AutoConnectTransition(AutoConnectState::Failed, "gameplay timeout");
+            }
+            break;
+
+        case AutoConnectState::InMatch: {
+            // Run fighting AI — inject combat inputs every frame
+            uint16_t input = AutoConnectHarness_RunFightingAI(
+                s_autoConnect.isHost, s_autoConnectMatchFrame);
+            s_autoConnectMatchFrame++;
+
+            // Periodic log
+            if (s_autoConnectMatchFrame % 300 == 0) {
+                LOG_NETPLAY(LOG_INFO, "[AutoConnect] InMatch frame=%u input=0x%04X mode=%u sub=%u",
+                    s_autoConnectMatchFrame, input, mode, sub);
+            }
+
+            // Detect match end: mode changed away from match
+            if (mode != MODE_MATCH) {
+                LOG_NETPLAY(LOG_INFO, "[AutoConnect] Match ended (mode=%u) after %u frames",
+                    mode, s_autoConnectMatchFrame);
+                AutoConnectHarness_Shutdown();
+                AutoConnectTransition(AutoConnectState::Failed, "match ended");
+                break;
+            }
+
+            // Safety timeout
+            if (s_autoConnect.matchDurationSec > 0) {
+                int elapsedSec = (int)(s_autoConnectMatchFrame / 60);
+                if (elapsedSec >= s_autoConnect.matchDurationSec) {
+                    LOG_NETPLAY(LOG_INFO, "[AutoConnect] Safety timeout after %d seconds",
+                        elapsedSec);
+                    AutoConnectHarness_Shutdown();
+                    AutoConnectTransition(AutoConnectState::Failed, "duration limit");
+                }
+            }
+            break;
+        }
+
+        case AutoConnectState::Failed:
+            // Shut down harness if still active when we reach Failed
+            if (AutoConnectHarness_IsActive()) {
+                AutoConnectHarness_Shutdown();
+            }
+            break;
+
+        case AutoConnectState::Disabled:
+            break;
+    }
 }
 
 // ============================================================================
@@ -298,12 +805,6 @@ static void OpenDisconnectError(const char* why) {
 }
 
 // ============================================================================
-// Forward declarations
-// ============================================================================
-
-static bool LaunchNetplayCharSel();
-
-// ============================================================================
 // Session state sync
 // ============================================================================
 
@@ -333,15 +834,25 @@ static void SyncSessionState() {
             }
             break;
         case Net::SessionState::Connected:
-        case Net::SessionState::Ready:
-            // Auto-launch CharSel on initial connection (from Connecting/Handshake)
+            // Show ConnectedSession config/accept screen
             if (s_state == MenuState::Connecting || s_state == MenuState::Handshake) {
-                LOG_NETPLAY(LOG_INFO, "[NetMenu] Session connected — auto-launching CharSel");
-                LaunchNetplayCharSel();
+                LOG_NETPLAY(LOG_INFO, "[NetMenu] Session connected — opening config screen");
+                s_activeBranch = RootBranch::DirectPlay;
+                TransitionTo(MenuState::ConnectedSession, "session connected");
+                s_selectedIndex = 0;
             } else if (s_state != MenuState::ConnectedSession && s_state != MenuState::CharSelTransition) {
                 s_activeBranch = RootBranch::DirectPlay;
                 TransitionTo(MenuState::ConnectedSession, "session connected");
                 s_selectedIndex = 0;
+            }
+            break;
+        case Net::SessionState::Ready:
+            // Both peers accepted — auto-launch character selection
+            if (s_state == MenuState::ConnectedSession ||
+                s_state == MenuState::Connecting ||
+                s_state == MenuState::Handshake) {
+                LOG_NETPLAY(LOG_INFO, "[NetMenu] Both peers accepted — launching charsel");
+                LaunchNetplayCharSel();
             }
             break;
         case Net::SessionState::Failed:
@@ -450,7 +961,7 @@ static int ItemCount(MenuState st) {
         case MenuState::SettingsEntry:       return 4; // Nickname, Delay, Verbose, Back
         case MenuState::Connecting:          return 1; // Cancel
         case MenuState::Handshake:           return 1; // Cancel
-        case MenuState::ConnectedSession:    return 2; // Launch CharSel, Disconnect
+        case MenuState::ConnectedSession:    return 4; // Rollback Frames, Input Delay, Launch CharSel, Disconnect
         case MenuState::CharSelTransition:   return 2; // Launch, Back
         case MenuState::PostMatch:           return 3; // Rematch, Return, Disconnect
         case MenuState::DisconnectError:     return 2; // OK, Close Menu
@@ -779,6 +1290,54 @@ static void HandleNavigationInput() {
         }
     }
 
+    // Left/Right for ConnectedSession: Rollback Frames (index 0) and Input Delay (index 1)
+    if (s_state == MenuState::ConnectedSession) {
+        if (s_selectedIndex == 0) {
+            // Rollback budget
+            if (InputSystem_JustPressed(0, INPUT_LEFT)) {
+                int cur = s_rollbackBudget;
+                if (cur > Net::ROLLBACK_BUDGET_MIN) {
+                    s_rollbackBudget = cur - 1;
+                    Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
+                    // Auto-compute suggested rollback delay
+                    s_rollbackDelay = Net::DelayPolicy_ComputeSuggestedRollbackDelay();
+                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
+                    SetStatus("Rollback: %d  Delay: %d", s_rollbackBudget, s_rollbackDelay);
+                    SaveSettings();
+                }
+            }
+            if (InputSystem_JustPressed(0, INPUT_RIGHT)) {
+                int cur = s_rollbackBudget;
+                if (cur < Net::ROLLBACK_BUDGET_MAX) {
+                    s_rollbackBudget = cur + 1;
+                    Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
+                    s_rollbackDelay = Net::DelayPolicy_ComputeSuggestedRollbackDelay();
+                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
+                    SetStatus("Rollback: %d  Delay: %d", s_rollbackBudget, s_rollbackDelay);
+                    SaveSettings();
+                }
+            }
+        } else if (s_selectedIndex == 1) {
+            // Input delay override
+            if (InputSystem_JustPressed(0, INPUT_LEFT)) {
+                if (s_rollbackDelay > Net::DELAY_MIN) {
+                    s_rollbackDelay--;
+                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
+                    SetStatus("Input delay: %d", s_rollbackDelay);
+                    SaveSettings();
+                }
+            }
+            if (InputSystem_JustPressed(0, INPUT_RIGHT)) {
+                if (s_rollbackDelay < Net::DELAY_MAX) {
+                    s_rollbackDelay++;
+                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
+                    SetStatus("Input delay: %d", s_rollbackDelay);
+                    SaveSettings();
+                }
+            }
+        }
+    }
+
     if (ConfirmPressed()) {
         ActivateCurrentSelection();
         return;
@@ -894,14 +1453,15 @@ static void ActivateCurrentSelection() {
             break;
 
         case MenuState::ConnectedSession:
-            if (s_selectedIndex == 0) {
-                // Launch CharSel
-                LaunchNetplayCharSel();
-            } else {
-                // Disconnect
+            if (s_selectedIndex == 2) {
+                // Accept Match — signal ready to peer
+                Net::Session_SignalReady();
+            } else if (s_selectedIndex == 3) {
+                // Decline
                 Net::Session_Cancel();
-                OpenDisconnectError("Session cancelled by user.");
+                OpenDisconnectError("Match declined.");
             }
+            // Items 0 (Rollback) and 1 (Delay): adjusted via left/right, not confirm
             break;
 
         case MenuState::CharSelTransition:
@@ -1009,6 +1569,10 @@ static void HandleBackNavigation() {
 
 namespace NetMenu {
 
+void CacheAutoConnectFile() {
+    CacheAutoConnectFileImpl();
+}
+
 void Init() {
     if (s_initialized) return;
     s_state = MenuState::Inactive;
@@ -1016,12 +1580,17 @@ void Init() {
     s_fadeFrames = 0;
     s_captureInput = false;
     LoadSettings();
+    LoadAutoConnectConfig();
     s_initialized = true;
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Initialized");
 }
 
 void Shutdown() {
     if (!s_initialized) return;
+    ClearAutoConnectOverride();
+    AutoConnectHarness_Shutdown();
+    s_autoConnectState = AutoConnectState::Disabled;
+    memset(&s_autoConnect, 0, sizeof(s_autoConnect));
     FinishClose();
     MenuUtils::Cleanup();
     s_initialized = false;
@@ -1037,6 +1606,8 @@ void FrameUpdate() {
 
     // Re-read mode after session sync (disconnect may have forced mode change)
     mode = GetGameMode();
+
+    HandleAutoConnect();
 
     if (!MenuVisible()) return;
 
@@ -1156,10 +1727,17 @@ void GetSnapshot(MenuSnapshot* out) {
         CopyText(out->peer_nickname, sizeof(out->peer_nickname), sessionSnap.remote_peer.nickname);
         out->rtt_ms = sessionSnap.stats.rtt_ms;
         out->is_host = (sessionSnap.role == Net::SessionRole::Host);
+        out->local_accepted  = sessionSnap.local_ready;
+        out->remote_accepted = sessionSnap.remote_ready;
     }
 
     // Active delay from delay policy
     out->active_delay = Net::DelayPolicy_GetActiveDelay();
+
+    // Rollback config
+    out->rollback_budget = s_rollbackBudget;
+    out->rollback_delay = s_rollbackDelay;
+    out->recommended_delay = Net::DelayPolicy_ComputeRecommendedDelay();
 
     // Local nickname
     CopyText(out->local_nickname, sizeof(out->local_nickname), s_localNickname);
