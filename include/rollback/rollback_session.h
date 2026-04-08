@@ -81,6 +81,11 @@ bool RollbackSession_IsActive();
 /// Call ONCE per game loop iteration before ProcessNextEvent.
 void RollbackSession_BeginFrame(uint16_t localInput);
 
+/// Poll GekkoNet network/session state without feeding local input or
+/// generating gameplay events. Used while gameplay is intentionally frozen so
+/// disconnects and session state changes still propagate.
+bool RollbackSession_PollSession();
+
 /// Phase 2: Process the next GekkoNet event.
 /// Call repeatedly until it returns Done or Error.
 ///   Advance → inputs written to game buffers; dispatcher should return 0
@@ -110,6 +115,9 @@ int32_t RollbackSession_GetCurrentFrame();
 /// Whether the current advance event is a rollback resimulation frame.
 bool RollbackSession_IsRollingBack();
 
+/// Whether GekkoNet has completed its initial sync and is producing game events.
+bool RollbackSession_IsSessionRunning();
+
 /// GekkoNet's frame advantage metric for timesync decisions.
 float RollbackSession_FramesAhead();
 
@@ -121,6 +129,9 @@ int RollbackSession_GetRollbackBudget();
 
 /// Whether side effects should be suppressed (during rollback resim).
 bool RollbackSession_ShouldSuppressSideEffects();
+
+/// Fatal session error text, or an empty string when healthy.
+const char* RollbackSession_GetErrorReason();
 
 // ============================================================================
 // Local Input Injection (for testing/verification)

@@ -169,12 +169,15 @@ static int32_t        s_startFrame     = 0;
 static int32_t        s_currentFrame   = 0;
 static int32_t        s_lastSavedFrame = -1;
 static bool           s_rollingBack    = false;
+static bool           s_sessionRunning = false;  // true after GekkoSessionStarted event
 
 // Two-phase event processing state
 static GekkoGameEvent** s_events       = nullptr;
 static int              s_eventCount   = 0;
 static int              s_eventIdx     = 0;
 static bool             s_frameStarted = false;
+static bool             s_sessionBroken = false;
+static char             s_sessionError[128] = "";
 
 // Current advance event inputs (valid after ProcessNextEvent returns Advance)
 static uint16_t s_advP1 = 0;
@@ -494,9 +497,16 @@ static void HandleSessionEvents() {
                     ev->data.disconnected.handle);
                 LOG_WARN("[RollbackSession] GekkoNet: Player %d disconnected",
                     ev->data.disconnected.handle);
+                if (!s_sessionBroken) {
+                    s_sessionBroken = true;
+                    _snprintf_s(s_sessionError, sizeof(s_sessionError), _TRUNCATE,
+                        "Rollback peer disconnected (handle=%d)",
+                        ev->data.disconnected.handle);
+                }
                 break;
 
             case GekkoSessionStarted:
+                s_sessionRunning = true;
                 NetplayLog_Write("GEKKO", -1, "SESSION: Started");
                 LOG_INFO("[RollbackSession] GekkoNet session started");
                 break;
@@ -531,7 +541,7 @@ void RollbackSession_Init() {
     s_active = false;
     s_session = nullptr;
     s_initialized = true;
-    LOG_INFO("[RollbackSession] Initialized (GekkoNet mode)");
+    LOG_INFO("[RollbackSession] Initialized (GekkoNet mode, local StateHistory is diagnostic-only)");
 }
 
 void RollbackSession_Shutdown() {
@@ -629,6 +639,8 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_eventCount   = 0;
     s_eventIdx     = 0;
     s_frameStarted = false;
+    s_sessionBroken = false;
+    s_sessionError[0] = '\0';
 
     // Reset stats
     s_totalRollbacks    = 0;
@@ -667,6 +679,9 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
         config.initial_delay, (int)gkConfig.input_prediction_window,
         sizeof(GekkoState) / 1024, config.baseline_checksum);
 
+    NetplayLog_Write("GEKKO", s_startFrame,
+        "Timesync metric: framesAhead>0 means local behind, framesAhead<0 means local ahead");
+
     return true;
 }
 
@@ -694,11 +709,14 @@ void RollbackSession_End() {
     // Clear state
     s_active = false;
     s_rollingBack = false;
+    s_sessionRunning = false;
     s_frameStarted = false;
     s_events = nullptr;
     s_eventCount = 0;
     s_eventIdx = 0;
     s_hasInjectedInput = false;
+    s_sessionBroken = false;
+    s_sessionError[0] = '\0';
 
     // Clear netplay input overrides
     InputSystem_ClearNetplayInput(0);
@@ -726,19 +744,20 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
         s_hasInjectedInput = false;
     }
 
-    // Step 1: Poll network adapter — drains receive buffer and processes
-    // GekkoNet's internal sync/connection messages.
-    gekko_network_poll(s_session);
+    // Step 1: Poll network/session state before feeding new local input.
+    if (!RollbackSession_PollSession()) {
+        s_events = nullptr;
+        s_eventCount = 0;
+        s_eventIdx = 0;
+        s_frameStarted = false;
+        return;
+    }
 
-    // Step 2: Process session events BEFORE update (3sx reference pattern).
-    // This ensures connection state changes are visible before game events.
-    HandleSessionEvents();
-
-    // Step 3: Feed local input to GekkoNet
+    // Step 2: Feed local input to GekkoNet
     gekko_add_local_input(s_session, s_localHandle, &localInput);
     s_localInputsSent++;
 
-    // Step 4: Update GekkoNet session — this produces game events
+    // Step 3: Update GekkoNet session — this produces game events
     s_events = gekko_update_session(s_session, &s_eventCount);
     s_eventIdx = 0;
     s_frameStarted = true;
@@ -748,7 +767,23 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
         localInput, s_eventCount, s_recvCount);
 }
 
+bool RollbackSession_PollSession() {
+    if (!s_active || !s_session) return true;
+
+    gekko_network_poll(s_session);
+    HandleSessionEvents();
+    return !s_sessionBroken;
+}
+
 EventResult RollbackSession_ProcessNextEvent() {
+    if (s_sessionBroken) {
+        s_frameStarted = false;
+        s_events = nullptr;
+        s_eventCount = 0;
+        s_eventIdx = 0;
+        return EventResult::Error;
+    }
+
     if (!s_active || !s_session || !s_frameStarted) {
         return EventResult::Done;
     }
@@ -809,7 +844,12 @@ void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
 
     if (s_recvCount >= MAX_PENDING_RECV) {
         NetplayLog_Write("GEKKO", -1,
-            "WARN: Receive buffer full (%d packets), dropping", MAX_PENDING_RECV);
+            "WARN: Receive buffer full (%d packets), dropping len=%zu queued=%d frame=%d remote_recv=%d",
+            MAX_PENDING_RECV,
+            len,
+            s_recvCount,
+            s_currentFrame,
+            s_remoteInputsRecv);
         return;
     }
 
@@ -835,6 +875,10 @@ bool RollbackSession_IsRollingBack() {
     return s_rollingBack;
 }
 
+bool RollbackSession_IsSessionRunning() {
+    return s_active && s_sessionRunning;
+}
+
 float RollbackSession_FramesAhead() {
     if (!s_active || !s_session) return 0.0f;
     return gekko_frames_ahead(s_session);
@@ -850,6 +894,10 @@ int RollbackSession_GetRollbackBudget() {
 
 bool RollbackSession_ShouldSuppressSideEffects() {
     return s_rollingBack;
+}
+
+const char* RollbackSession_GetErrorReason() {
+    return s_sessionError;
 }
 
 // ============================================================================

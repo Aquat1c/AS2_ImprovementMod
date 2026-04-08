@@ -864,7 +864,8 @@ static void OpenDisconnectError(const char* why) {
 // ============================================================================
 
 static void SyncSessionState() {
-    // Always pump session - keeps connections alive during gameplay
+    // Always drain session events on the game thread.
+    // The ENet transport itself is serviced independently on the network worker.
     Net::Session_Update();
 
     Net::SessionSnapshot snap{};

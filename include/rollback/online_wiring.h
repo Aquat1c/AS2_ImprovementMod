@@ -35,6 +35,14 @@ void OnlineWiring_FrameUpdate();
 /// Returns true if the rollback session is active and match runtime should advance.
 bool OnlineWiring_IsGameplayActive();
 
+/// Returns true once startup gameplay-entry barrier release is complete
+/// (both peers reached PlayableGameplay and mutually acknowledged readiness).
+bool OnlineWiring_IsStartupReleased();
+
+/// Returns true when local PlayableGameplay advancement must still be held by
+/// the startup gameplay-entry barrier (mutual ready+ack not complete yet).
+bool OnlineWiring_IsGameplayEntryAdvanceBlocked();
+
 // ============================================================================
 // Events
 // ============================================================================

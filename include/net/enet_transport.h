@@ -6,7 +6,8 @@
  * send, and event polling. Does NOT own session state—that belongs
  * to session_manager.
  *
- * Thread safety: all calls must be made from the game thread.
+ * Thread safety: calls must be serialized on the owning transport thread.
+ * Current architecture: Session's dedicated network worker thread owns these.
  */
 
 #pragma once

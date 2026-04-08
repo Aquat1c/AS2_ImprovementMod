@@ -410,10 +410,9 @@ __declspec(dllexport) void ModOnFrame() {
     Net::SyncPolicy_FrameUpdate();
     Net::DelayPolicy_FrameUpdate();
 
-    // Refresh network and SDL input immediately before rollback/pregame
-    // decisions so gameplay uses the newest packets and local sample.
-    // NetMenu also pumps the session earlier for menu state, but that can
-    // still miss packets that arrive in the same frame before simulation.
+    // Drain queued transport events and SDL input immediately before
+    // rollback/pregame decisions so gameplay uses the newest packets and
+    // local sample. ENet servicing itself runs on the dedicated network thread.
     Net::Session_Update();
 
     // Process savestate hotkeys (F5 save, F6 load)

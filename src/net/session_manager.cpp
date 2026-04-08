@@ -6,11 +6,10 @@
 #include <windows.h>
 
 #include "net/session_manager.h"
-#include "net/enet_transport.h"
+#include "net/network_thread.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
 
-#include <enet/enet.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -25,13 +24,31 @@ static SessionRole    s_role  = SessionRole::None;
 static SessionConfig  s_config;
 static PeerInfo       s_remotePeer;
 static ConnectionStats s_stats;
-static ENetPeer*      s_peer = nullptr;
+static uintptr_t      s_peerToken = 0;
 static char           s_statusText[128] = "";
 static char           s_errorText[128]  = "";
 static PacketCallback s_packetCallback  = nullptr;
 static bool           s_localReady      = false;
 static bool           s_remoteReady     = false;
 static DWORD          s_stateEnteredAt  = 0;  // GetTickCount when state entered
+static uint32_t       s_activeSessionToken = 0;
+
+static uint32_t       s_lastInboundDropCount  = 0;
+static uint32_t       s_lastOutboundDropCount = 0;
+static DWORD          s_lastQueueSpikeLogAt   = 0;
+static DWORD          s_lastDrainLagLogAt     = 0;
+
+constexpr int MAX_DEFERRED_CONTROL_PACKETS = 64;
+
+struct DeferredControlPacket {
+    PacketType type;
+    uint8_t    channel_id;
+    size_t     payload_len;
+    uint8_t    payload[MAX_PAYLOAD_SIZE];
+};
+
+static DeferredControlPacket s_deferredControlPackets[MAX_DEFERRED_CONTROL_PACKETS];
+static int                  s_deferredControlCount = 0;
 
 // ============================================================================
 // Helpers
@@ -63,12 +80,91 @@ static void ResetState() {
     s_role  = SessionRole::None;
     memset(&s_remotePeer, 0, sizeof(s_remotePeer));
     memset(&s_stats, 0, sizeof(s_stats));
-    s_peer = nullptr;
+    s_peerToken = 0;
     s_statusText[0] = '\0';
     s_errorText[0]  = '\0';
     s_localReady  = false;
     s_remoteReady = false;
     s_stateEnteredAt = 0;
+    s_deferredControlCount = 0;
+    s_lastInboundDropCount = 0;
+    s_lastOutboundDropCount = 0;
+    s_lastQueueSpikeLogAt = 0;
+    s_lastDrainLagLogAt = 0;
+}
+
+static bool DeferControlPacket(uint8_t channelID, PacketType type,
+                               const void* payload, size_t payloadLen) {
+    if (channelID != CHANNEL_CONTROL) {
+        return false;
+    }
+    if (payloadLen > MAX_PAYLOAD_SIZE) {
+        return false;
+    }
+    if (s_deferredControlCount >= MAX_DEFERRED_CONTROL_PACKETS) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Deferred control packet queue full: type=%s ch=%u payload=%zu state=%s role=%s",
+            PacketTypeName(type),
+            channelID,
+            payloadLen,
+            SessionStateName(s_state),
+            SessionRoleName(s_role));
+        Rollback::NetplayLog_Flush();
+        return false;
+    }
+
+    DeferredControlPacket* slot = &s_deferredControlPackets[s_deferredControlCount++];
+    slot->type = type;
+    slot->channel_id = channelID;
+    slot->payload_len = payloadLen;
+    if (payloadLen > 0 && payload) {
+        memcpy(slot->payload, payload, payloadLen);
+    }
+
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Deferred control packet awaiting callback: type=%s ch=%u payload=%zu queued=%d state=%s role=%s",
+        PacketTypeName(type),
+        channelID,
+        payloadLen,
+        s_deferredControlCount,
+        SessionStateName(s_state),
+        SessionRoleName(s_role));
+    Rollback::NetplayLog_Flush();
+    return true;
+}
+
+static void FlushDeferredControlPackets() {
+    if (!s_packetCallback || s_deferredControlCount <= 0) {
+        return;
+    }
+
+    const int queued = s_deferredControlCount;
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Flushing %d deferred control packets to callback 0x%llX",
+        queued,
+        (unsigned long long)(uintptr_t)s_packetCallback);
+    Rollback::NetplayLog_Flush();
+
+    s_deferredControlCount = 0;
+    for (int i = 0; i < queued; i++) {
+        const DeferredControlPacket* packet = &s_deferredControlPackets[i];
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Dispatching deferred packet to callback: cb=0x%llX type=%s ch=%u payload=%zu state=%s role=%s",
+            (unsigned long long)(uintptr_t)s_packetCallback,
+            PacketTypeName(packet->type),
+            packet->channel_id,
+            packet->payload_len,
+            SessionStateName(s_state),
+            SessionRoleName(s_role));
+        Rollback::NetplayLog_Flush();
+        s_packetCallback(packet->type, packet->payload, packet->payload_len);
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Deferred packet callback returned: cb=0x%llX type=%s ch=%u",
+            (unsigned long long)(uintptr_t)s_packetCallback,
+            PacketTypeName(packet->type),
+            packet->channel_id);
+        Rollback::NetplayLog_Flush();
+    }
 }
 
 static void UpdateStatusText() {
@@ -127,6 +223,49 @@ static void NotePacketReceived(uint8_t channel, PacketType type, size_t payloadL
         SessionStateName(s_state));
 }
 
+static uint32_t NextSessionToken() {
+    s_activeSessionToken++;
+    if (s_activeSessionToken == 0) {
+        s_activeSessionToken = 1;
+    }
+    return s_activeSessionToken;
+}
+
+static bool QueueTypedPacket(uint8_t channel, PacketType type,
+                             const void* payload, size_t payloadLen,
+                             bool reliable, const char* context) {
+    if (s_activeSessionToken == 0) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "DROP send (no active session token): ch=%u type=%s payload=%zu reliable=%d state=%s",
+            channel,
+            PacketTypeName(type),
+            payloadLen,
+            reliable ? 1 : 0,
+            SessionStateName(s_state));
+        return false;
+    }
+
+    const bool queued = NetworkThread_SendPacket(
+        s_activeSessionToken,
+        channel,
+        type,
+        payload,
+        payloadLen,
+        reliable);
+    if (queued) {
+        NotePacketSent(channel, type, payloadLen, reliable, context);
+    } else {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "ERROR: outbound queue rejected send ch=%u type=%s payload=%zu reliable=%d token=%u",
+            channel,
+            PacketTypeName(type),
+            payloadLen,
+            reliable ? 1 : 0,
+            s_activeSessionToken);
+    }
+    return queued;
+}
+
 // ============================================================================
 // Handshake
 // ============================================================================
@@ -139,12 +278,11 @@ static void SendHello() {
     memset(hello.nickname, 0, sizeof(hello.nickname));
     strncpy(hello.nickname, s_config.nickname, sizeof(hello.nickname) - 1);
 
-    if (!Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Hello,
-                             &hello, sizeof(hello), true)) {
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::Hello,
+                          &hello, sizeof(hello), true, "hello")) {
         SetError("Failed to send Hello");
         return;
     }
-    NotePacketSent(CHANNEL_CONTROL, PacketType::Hello, sizeof(hello), true, "hello");
     LOG_INFO("[Session] Sent Hello (nick=%s, ver=%u, hash=0x%08X)",
              hello.nickname, hello.protocol_version, hello.build_hash);
     Rollback::NetplayLog_Write("SESSION", -1,
@@ -160,12 +298,11 @@ static void SendHelloAck() {
     memset(ack.nickname, 0, sizeof(ack.nickname));
     strncpy(ack.nickname, s_config.nickname, sizeof(ack.nickname) - 1);
 
-    if (!Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::HelloAck,
-                             &ack, sizeof(ack), true)) {
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::HelloAck,
+                          &ack, sizeof(ack), true, "hello-ack")) {
         SetError("Failed to send HelloAck");
         return;
     }
-    NotePacketSent(CHANNEL_CONTROL, PacketType::HelloAck, sizeof(ack), true, "hello-ack");
     LOG_INFO("[Session] Sent HelloAck");
     Rollback::NetplayLog_Write("SESSION", -1,
         "Sent HelloAck: nick=%s ver=%u hash=0x%08X listen_port=%u",
@@ -174,6 +311,9 @@ static void SendHelloAck() {
 
 static bool ProcessHelloPayload(const void* payload, size_t len) {
     if (len < sizeof(HelloPayload)) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Hello payload too small: got=%zu expected=%zu state=%s role=%s",
+            len, sizeof(HelloPayload), SessionStateName(s_state), SessionRoleName(s_role));
         SetError("Hello payload too small");
         return false;
     }
@@ -217,6 +357,9 @@ static bool ProcessHelloPayload(const void* payload, size_t len) {
 
 static bool ProcessHelloAckPayload(const void* payload, size_t len) {
     if (len < sizeof(HelloAckPayload)) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "HelloAck payload too small: got=%zu expected=%zu state=%s role=%s",
+            len, sizeof(HelloAckPayload), SessionStateName(s_state), SessionRoleName(s_role));
         SetError("HelloAck payload too small");
         return false;
     }
@@ -236,11 +379,14 @@ static bool ProcessHelloAckPayload(const void* payload, size_t len) {
 // Event handlers
 // ============================================================================
 
-static void OnENetConnect(ENetPeer* peer) {
-    s_peer = peer;
-    LOG_INFO("[Session] ENet connected (peer %p)", peer);
+static void OnTransportConnected(uintptr_t peerToken) {
+    s_peerToken = peerToken;
+    LOG_INFO("[Session] ENet connected (peer 0x%llX)", (unsigned long long)peerToken);
     Rollback::NetplayLog_Write("SESSION", -1,
-        "ENet connected: peer=%p role=%s", peer, SessionRoleName(s_role));
+        "ENet connected: peer=0x%llX role=%s token=%u",
+        (unsigned long long)peerToken,
+        SessionRoleName(s_role),
+        s_activeSessionToken);
 
     if (s_state == SessionState::Connecting) {
         SetState(SessionState::Handshaking);
@@ -251,12 +397,19 @@ static void OnENetConnect(ENetPeer* peer) {
     }
 }
 
-static void OnENetDisconnect(ENetPeer* peer, uint32_t data) {
-    LOG_INFO("[Session] ENet disconnected (peer %p, data=%u)", peer, data);
+static void OnTransportDisconnect(uintptr_t peerToken, uint32_t data, DWORD transportTickMs) {
+    const DWORD now = GetTickCount();
+    const DWORD consumeLagMs = now - transportTickMs;
+    LOG_INFO("[Session] ENet disconnected (peer 0x%llX, data=%u, lag=%lums)",
+             (unsigned long long)peerToken, data, (unsigned long)consumeLagMs);
     Rollback::NetplayLog_Write("SESSION", -1,
-        "ENet disconnected: peer=%p data=%u state=%s",
-        peer, data, SessionStateName(s_state));
-    s_peer = nullptr;
+        "ENet disconnected: peer=0x%llX data=%u state=%s token=%u consume_lag=%lums",
+        (unsigned long long)peerToken,
+        data,
+        SessionStateName(s_state),
+        s_activeSessionToken,
+        (unsigned long)consumeLagMs);
+    s_peerToken = 0;
 
     if (s_state == SessionState::Disconnecting) {
         ResetState();
@@ -265,11 +418,33 @@ static void OnENetDisconnect(ENetPeer* peer, uint32_t data) {
     }
 }
 
-static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
-                             const void* data, size_t length) {
+static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
+                             const void* data, size_t length,
+                             DWORD transportTickMs) {
     if (!ValidatePacketSize(data, length)) {
         LOG_WARN("[Session] Received too-small packet (len=%zu)", length);
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "DROP recv too-small: peer=0x%llX ch=%u len=%zu state=%s role=%s token=%u",
+            (unsigned long long)peerToken,
+            channelID,
+            length,
+            SessionStateName(s_state),
+            SessionRoleName(s_role),
+            s_activeSessionToken);
         return;
+    }
+
+    const DWORD now = GetTickCount();
+    const DWORD consumeLagMs = now - transportTickMs;
+    if (consumeLagMs >= 50 && (now - s_lastDrainLagLogAt) >= 250) {
+        s_lastDrainLagLogAt = now;
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Inbound packet consume lag: %lums peer=0x%llX ch=%u len=%zu token=%u",
+            (unsigned long)consumeLagMs,
+            (unsigned long long)peerToken,
+            channelID,
+            length,
+            s_activeSessionToken);
     }
 
     PacketType type = ReadPacketType(data);
@@ -283,7 +458,7 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
             if (s_state == SessionState::Handshaking || s_state == SessionState::Connecting) {
                 if (s_state == SessionState::Connecting) {
                     // Host received Hello before we noticed the connect event
-                    s_peer = peer;
+                    s_peerToken = peerToken;
                     SetState(SessionState::Handshaking);
                 }
                 if (ProcessHelloPayload(payload, payloadLen)) {
@@ -323,10 +498,12 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
             LOG_INFO("[Session] Received Disconnect: %s", reason);
             Rollback::NetplayLog_Write("SESSION", -1,
                 "Remote Disconnect received: %s", reason);
-            if (s_peer) {
-                Transport_ForceDisconnectPeer(s_peer);
-                s_peer = nullptr;
+            if (s_activeSessionToken != 0) {
+                NetworkThread_RequestDisconnect(s_activeSessionToken, 0, true);
+                NetworkThread_RequestDestroyHost(s_activeSessionToken);
+                NetworkThread_ClearQueues(s_activeSessionToken);
             }
+            s_peerToken = 0;
             ResetState();
             break;
         }
@@ -335,14 +512,14 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
             // Forward to external callback
             if (s_packetCallback) {
                 Rollback::NetplayLog_Write("SESSION", -1,
-                    "Dispatching packet to callback: cb=0x%llX type=%s ch=%u payload=%zu state=%s role=%s peer=%p",
+                    "Dispatching packet to callback: cb=0x%llX type=%s ch=%u payload=%zu state=%s role=%s peer=0x%llX",
                     (unsigned long long)(uintptr_t)s_packetCallback,
                     PacketTypeName(type),
                     channelID,
                     payloadLen,
                     SessionStateName(s_state),
                     SessionRoleName(s_role),
-                    peer);
+                    (unsigned long long)peerToken);
                 Rollback::NetplayLog_Flush();
                 s_packetCallback(type, payload, payloadLen);
                 Rollback::NetplayLog_Write("SESSION", -1,
@@ -352,11 +529,14 @@ static void OnPacketReceived(ENetPeer* peer, uint8_t channelID,
                     channelID);
                 Rollback::NetplayLog_Flush();
             } else {
-                Rollback::NetplayLog_Write("SESSION", -1,
-                    "Unhandled packet with no callback: type=%s ch=%u payload=%zu state=%s role=%s peer=%p",
-                    PacketTypeName(type), channelID, payloadLen,
-                    SessionStateName(s_state), SessionRoleName(s_role), peer);
-                Rollback::NetplayLog_Flush();
+                if (!DeferControlPacket(channelID, type, payload, payloadLen)) {
+                    Rollback::NetplayLog_Write("SESSION", -1,
+                        "Unhandled packet with no callback: type=%s ch=%u payload=%zu state=%s role=%s peer=0x%llX",
+                        PacketTypeName(type), channelID, payloadLen,
+                        SessionStateName(s_state), SessionRoleName(s_role),
+                        (unsigned long long)peerToken);
+                    Rollback::NetplayLog_Flush();
+                }
             }
             break;
     }
@@ -396,11 +576,108 @@ static void CheckTimeouts() {
 // ============================================================================
 
 static void UpdateStats() {
-    if (!s_peer) return;
-    s_stats.rtt_ms = Transport_GetPeerRTT(s_peer);
-    s_stats.rtt_variance_ms = (float)s_peer->roundTripTimeVariance;
-    s_stats.packets_sent = s_peer->packetsSent;
-    s_stats.packets_lost = s_peer->packetsLost;
+    NetworkThreadStats netStats{};
+    NetworkThread_GetStats(&netStats);
+
+    s_stats.rtt_ms = netStats.rtt_ms;
+    s_stats.rtt_variance_ms = netStats.rtt_variance_ms;
+    s_stats.packets_sent = netStats.packets_sent;
+    s_stats.packets_lost = netStats.packets_lost;
+
+    const DWORD now = GetTickCount();
+    if ((netStats.inbound_queue_depth >= 128 || netStats.outbound_queue_depth >= 128) &&
+        (now - s_lastQueueSpikeLogAt) >= 250) {
+        s_lastQueueSpikeLogAt = now;
+        Rollback::NetplayLog_Write("NTHREAD", -1,
+            "Queue depth spike: inbound=%u outbound=%u state=%s role=%s token=%u",
+            netStats.inbound_queue_depth,
+            netStats.outbound_queue_depth,
+            SessionStateName(s_state),
+            SessionRoleName(s_role),
+            s_activeSessionToken);
+    }
+
+    if (netStats.inbound_drop_count != s_lastInboundDropCount) {
+        Rollback::NetplayLog_Write("NTHREAD", -1,
+            "Inbound queue drops: old=%u new=%u state=%s token=%u",
+            s_lastInboundDropCount,
+            netStats.inbound_drop_count,
+            SessionStateName(s_state),
+            s_activeSessionToken);
+        s_lastInboundDropCount = netStats.inbound_drop_count;
+    }
+
+    if (netStats.outbound_drop_count != s_lastOutboundDropCount) {
+        Rollback::NetplayLog_Write("NTHREAD", -1,
+            "Outbound queue drops: old=%u new=%u state=%s token=%u",
+            s_lastOutboundDropCount,
+            netStats.outbound_drop_count,
+            SessionStateName(s_state),
+            s_activeSessionToken);
+        s_lastOutboundDropCount = netStats.outbound_drop_count;
+    }
+}
+
+static void DrainNetworkEvents() {
+    NetworkThreadEvent ev{};
+    int drained = 0;
+    int staleDropped = 0;
+
+    while (NetworkThread_TryPopEvent(&ev)) {
+        drained++;
+
+        if ((ev.session_token == 0 && s_activeSessionToken != 0) ||
+            (ev.session_token != 0 && ev.session_token != s_activeSessionToken)) {
+            staleDropped++;
+            continue;
+        }
+
+        switch (ev.type) {
+            case NetworkThreadEventType::Connected:
+                OnTransportConnected(ev.peer_token);
+                break;
+
+            case NetworkThreadEventType::Disconnected:
+                OnTransportDisconnect(ev.peer_token, ev.disconnect_data, ev.transport_tick_ms);
+                break;
+
+            case NetworkThreadEventType::PacketReceived:
+                OnPacketReceived(ev.peer_token,
+                                 ev.channel_id,
+                                 ev.packet_data,
+                                 ev.packet_len,
+                                 ev.transport_tick_ms);
+                break;
+
+            case NetworkThreadEventType::WorkerError:
+                Rollback::NetplayLog_Write("NTHREAD", -1,
+                    "Worker error event: token=%u msg=%s state=%s role=%s",
+                    ev.session_token,
+                    ev.error_text,
+                    SessionStateName(s_state),
+                    SessionRoleName(s_role));
+                if (s_state != SessionState::Idle && s_state != SessionState::Failed) {
+                    SetError(ev.error_text[0] ? ev.error_text : "Network worker error");
+                }
+                break;
+        }
+    }
+
+    if (staleDropped > 0) {
+        Rollback::NetplayLog_Write("NTHREAD", -1,
+            "Dropped %d stale network events (active_token=%u)",
+            staleDropped,
+            s_activeSessionToken);
+    }
+
+    if (drained > 0) {
+        Rollback::NetplayLog_Verbose("NTHREAD", -1,
+            "Drained network events on game thread: count=%d state=%s role=%s token=%u",
+            drained,
+            SessionStateName(s_state),
+            SessionRoleName(s_role),
+            s_activeSessionToken);
+    }
 }
 
 // ============================================================================
@@ -409,6 +686,11 @@ static void UpdateStats() {
 
 void Session_Init() {
     ResetState();
+    s_activeSessionToken = 0;
+    if (!NetworkThread_Init()) {
+        LOG_ERROR("[Session] Failed to initialize network service thread");
+        Rollback::NetplayLog_Write("NTHREAD", -1, "ERROR: network service thread init failed");
+    }
     LOG_INFO("[Session] Session manager initialized");
 }
 
@@ -416,10 +698,14 @@ void Session_Shutdown() {
     if (s_state != SessionState::Idle) {
         Session_Cancel();
     }
+    NetworkThread_Shutdown();
+    s_activeSessionToken = 0;
+    ResetState();
     LOG_INFO("[Session] Session manager shut down");
 }
 
 bool Session_StartHost(const SessionConfig* config) {
+    if (!config) return false;
     if (s_state != SessionState::Idle) {
         LOG_WARN("[Session] Cannot start host: session already active (state=%s)",
                  SessionStateName(s_state));
@@ -437,17 +723,29 @@ bool Session_StartHost(const SessionConfig* config) {
         config->connect_timeout_ms,
         config->handshake_timeout_ms);
 
-    if (!Transport_CreateHost(config->listen_port)) {
-        SetError("Failed to create host");
+    if (!NetworkThread_Init()) {
+        SetError("Failed to initialize network worker");
+        return false;
+    }
+
+    NextSessionToken();
+    NetworkThread_ClearQueues(0);
+    if (!NetworkThread_StartHost(s_activeSessionToken, config->listen_port)) {
+        SetError("Failed to start network host thread command");
         return false;
     }
 
     SetState(SessionState::Connecting);
-    LOG_INFO("[Session] Hosting on port %u, waiting for peer...", config->listen_port);
+    LOG_INFO("[Session] Hosting on port %u, waiting for peer... (token=%u)",
+             config->listen_port, s_activeSessionToken);
+    Rollback::NetplayLog_Write("NTHREAD", -1,
+        "Session attached to network thread: role=Host token=%u",
+        s_activeSessionToken);
     return true;
 }
 
 bool Session_StartJoin(const SessionConfig* config) {
+    if (!config) return false;
     if (s_state != SessionState::Idle) {
         LOG_WARN("[Session] Cannot start join: session already active (state=%s)",
                  SessionStateName(s_state));
@@ -469,20 +767,25 @@ bool Session_StartJoin(const SessionConfig* config) {
         config->connect_timeout_ms,
         config->handshake_timeout_ms);
 
-    // Joiner creates a host on an ephemeral port, then connects out
-    if (!Transport_CreateHost(0)) {
-        SetError("Failed to create host for joining");
+    if (!NetworkThread_Init()) {
+        SetError("Failed to initialize network worker");
         return false;
     }
 
-    ENetPeer* peer = Transport_Connect(config->target_ip, config->target_port);
-    if (!peer) {
-        SetError("Failed to initiate connection");
-        Transport_DestroyHost();
+    NextSessionToken();
+    NetworkThread_ClearQueues(0);
+    if (!NetworkThread_StartJoin(s_activeSessionToken,
+                                 config->listen_port,
+                                 config->target_ip,
+                                 config->target_port)) {
+        SetError("Failed to start network join thread command");
         return false;
     }
 
     SetState(SessionState::Connecting);
+    Rollback::NetplayLog_Write("NTHREAD", -1,
+        "Session attached to network thread: role=Join token=%u",
+        s_activeSessionToken);
     return true;
 }
 
@@ -493,23 +796,33 @@ void Session_Cancel() {
     Rollback::NetplayLog_Write("SESSION", -1,
         "Cancel requested from state=%s", SessionStateName(s_state));
 
+    const uint32_t cancelToken = s_activeSessionToken;
+
     // Send a disconnect packet if we have a peer
-    if (s_peer && (s_state == SessionState::Connected ||
-                   s_state == SessionState::Ready ||
-                   s_state == SessionState::Handshaking)) {
+    if (cancelToken != 0 &&
+        (s_state == SessionState::Connected ||
+         s_state == SessionState::Ready ||
+         s_state == SessionState::Handshaking)) {
         DisconnectPayload dp;
         dp.reason_code = static_cast<uint16_t>(DisconnectReason::UserCancel);
         strncpy(dp.message, "Session canceled", sizeof(dp.message) - 1);
         dp.message[sizeof(dp.message) - 1] = '\0';
-        if (Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Disconnect,
-                                &dp, sizeof(dp), true)) {
-            NotePacketSent(CHANNEL_CONTROL, PacketType::Disconnect, sizeof(dp), true, "cancel");
-        }
-        Transport_Flush();
-        Transport_DisconnectPeer(s_peer);
+        QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect, &dp, sizeof(dp), true, "cancel");
+        NetworkThread_RequestDisconnect(cancelToken, 0, false);
     }
 
-    Transport_DestroyHost();
+    if (cancelToken != 0) {
+        NetworkThread_RequestDestroyHost(cancelToken);
+        NetworkThread_ClearQueues(cancelToken);
+    } else {
+        NetworkThread_RequestDestroyHost(0);
+        NetworkThread_ClearQueues(0);
+    }
+    Rollback::NetplayLog_Write("NTHREAD", -1,
+        "Session detached from network thread: token=%u",
+        cancelToken);
+
+    s_activeSessionToken = 0;
     ResetState();
 }
 
@@ -520,14 +833,13 @@ void Session_SignalReady() {
     }
 
     s_localReady = true;
-    if (!Transport_SendTyped(s_peer, CHANNEL_CONTROL, PacketType::Ready,
-                             nullptr, 0, true)) {
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::Ready,
+                          nullptr, 0, true, "ready")) {
         LOG_WARN("[Session] Failed to send Ready packet");
         Rollback::NetplayLog_Write("SESSION", -1,
             "ERROR: failed to send Ready packet");
         return;
     }
-    NotePacketSent(CHANNEL_CONTROL, PacketType::Ready, 0, true, "ready");
     LOG_INFO("[Session] Signaled Ready (local)");
     Rollback::NetplayLog_Write("SESSION", -1,
         "Local Ready sent: remote_ready=%d", s_remoteReady ? 1 : 0);
@@ -538,70 +850,37 @@ void Session_SignalReady() {
 }
 
 void Session_Update() {
-    if (s_state == SessionState::Idle || s_state == SessionState::Failed) {
-        UpdateStatusText();
-        return;
+    // Game thread owns packet interpretation and callback dispatch. Network
+    // thread only enqueues transport events.
+    DrainNetworkEvents();
+
+    if (s_state != SessionState::Idle && s_state != SessionState::Failed) {
+        CheckTimeouts();
     }
 
-    // Poll ENet (non-blocking)
-    ENetEvent event;
-    while (Transport_Service(0, &event) > 0) {
-        switch (event.type) {
-            case ENET_EVENT_TYPE_CONNECT:
-                OnENetConnect(event.peer);
-                // Host receives connect -> transition to Handshaking, wait for Hello
-                if (s_role == SessionRole::Host && s_state == SessionState::Connecting) {
-                    s_peer = event.peer;
-                    SetState(SessionState::Handshaking);
-                }
-                break;
-
-            case ENET_EVENT_TYPE_RECEIVE:
-                OnPacketReceived(event.peer, event.channelID,
-                                 event.packet->data, event.packet->dataLength);
-                enet_packet_destroy(event.packet);
-                break;
-
-            case ENET_EVENT_TYPE_DISCONNECT:
-                OnENetDisconnect(event.peer, event.data);
-                break;
-
-            case ENET_EVENT_TYPE_NONE:
-                break;
-        }
-    }
-
-    CheckTimeouts();
     UpdateStats();
     UpdateStatusText();
 }
 
 bool Session_SendPacket(uint8_t channel, PacketType type,
                         const void* payload, size_t payloadLen, bool reliable) {
-    if (!s_peer || (s_state != SessionState::Connected && s_state != SessionState::Ready)) {
-        Rollback::NetplayLog_Verbose("SESSION", -1,
-            "DROP send ch=%u type=%s payload=%zu reliable=%d state=%s peer=%p",
+    if (s_activeSessionToken == 0 ||
+        s_peerToken == 0 ||
+        (s_state != SessionState::Connected && s_state != SessionState::Ready)) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "DROP send: ch=%u type=%s payload=%zu reliable=%d state=%s role=%s peer=0x%llX token=%u",
             channel,
             PacketTypeName(type),
             payloadLen,
             reliable ? 1 : 0,
             SessionStateName(s_state),
-            s_peer);
+            SessionRoleName(s_role),
+            (unsigned long long)s_peerToken,
+            s_activeSessionToken);
         return false;
     }
 
-    const bool sent = Transport_SendTyped(s_peer, channel, type, payload, payloadLen, reliable);
-    if (sent) {
-        NotePacketSent(channel, type, payloadLen, reliable, "session-send");
-    } else {
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "ERROR: send failed ch=%u type=%s payload=%zu reliable=%d",
-            channel,
-            PacketTypeName(type),
-            payloadLen,
-            reliable ? 1 : 0);
-    }
-    return sent;
+    return QueueTypedPacket(channel, type, payload, payloadLen, reliable, "session-send");
 }
 
 void Session_SetPacketCallback(PacketCallback cb) {
@@ -613,6 +892,7 @@ void Session_SetPacketCallback(PacketCallback cb) {
         SessionRoleName(s_role));
     Rollback::NetplayLog_Flush();
     s_packetCallback = cb;
+    FlushDeferredControlPackets();
 }
 
 void Session_GetSnapshot(SessionSnapshot* out) {

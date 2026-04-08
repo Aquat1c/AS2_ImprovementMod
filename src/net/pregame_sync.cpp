@@ -200,6 +200,26 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
         p->session_id, p->assigned_side, p->confirmed);
 }
 
+static void LogPregamePacketAnomaly(const char* reason,
+                                    PacketType type,
+                                    size_t payloadLen,
+                                    size_t expectedLen) {
+    Rollback::NetplayLog_Write(
+        "PREGAME", -1,
+        "%s: type=%s payload=%zu expected=%zu phase=%s session=0x%08X remoteSession=0x%08X role=%s mode=%u sub=%u",
+        reason ? reason : "packet anomaly",
+        PacketTypeName(type),
+        payloadLen,
+        expectedLen,
+        PregamePhaseName(s_phase),
+        s_sessionId,
+        s_remoteSessionId,
+        SessionRoleName(Session_GetRole()),
+        GetGameMode(),
+        GetSubstate());
+    Rollback::NetplayLog_Flush();
+}
+
 // ============================================================================
 // Packet handler (registered with Session_SetPacketCallback)
 // ============================================================================
@@ -220,12 +240,16 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
         case PacketType::SyncAnnounce:
             if (payloadLen >= sizeof(SyncAnnouncePayload)) {
                 HandleSyncAnnounce(static_cast<const SyncAnnouncePayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short SyncAnnounce", type, payloadLen, sizeof(SyncAnnouncePayload));
             }
             break;
 
         case PacketType::SyncConfirm:
             if (payloadLen >= sizeof(SyncConfirmPayload)) {
                 HandleSyncConfirm(static_cast<const SyncConfirmPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short SyncConfirm", type, payloadLen, sizeof(SyncConfirmPayload));
             }
             break;
 
@@ -237,6 +261,8 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
         case PacketType::CharSelFrameInput:
             if (payloadLen >= sizeof(CharSelFrameInputPayload)) {
                 CharSelSync_OnRemoteFrameInput(static_cast<const CharSelFrameInputPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short CharSelFrameInput", type, payloadLen, sizeof(CharSelFrameInputPayload));
             }
             break;
 
@@ -244,6 +270,8 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             if (payloadLen >= sizeof(CharSelLockPayload)) {
                 CharSelSync_OnRemoteLock(static_cast<const CharSelLockPayload*>(payload));
                 s_remoteCharSelLocked = true;
+            } else {
+                LogPregamePacketAnomaly("Short CharSelLock", type, payloadLen, sizeof(CharSelLockPayload));
             }
             break;
 
@@ -252,42 +280,56 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
                 CharSelSync_OnRemoteStage(static_cast<const StageSyncPayload*>(payload));
                 auto* sp = static_cast<const StageSyncPayload*>(payload);
                 if (sp->confirmed) s_remoteStageLocked = true;
+            } else {
+                LogPregamePacketAnomaly("Short StageSync", type, payloadLen, sizeof(StageSyncPayload));
             }
             break;
 
         case PacketType::ConfigExchange:
             if (payloadLen >= sizeof(ConfigExchangePayload)) {
                 MatchBootstrap_OnConfigExchange(static_cast<const ConfigExchangePayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short ConfigExchange", type, payloadLen, sizeof(ConfigExchangePayload));
             }
             break;
 
         case PacketType::ConfigAck:
             if (payloadLen >= sizeof(ConfigAckPayload)) {
                 MatchBootstrap_OnConfigAck(static_cast<const ConfigAckPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short ConfigAck", type, payloadLen, sizeof(ConfigAckPayload));
             }
             break;
 
         case PacketType::LoadBarrier:
             if (payloadLen >= sizeof(LoadBarrierPayload)) {
                 MatchBootstrap_OnLoadBarrier(static_cast<const LoadBarrierPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short LoadBarrier", type, payloadLen, sizeof(LoadBarrierPayload));
             }
             break;
 
         case PacketType::BaselineReady:
             if (payloadLen >= sizeof(BaselineReadyPayload)) {
                 MatchBootstrap_OnBaselineReady(static_cast<const BaselineReadyPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short BaselineReady", type, payloadLen, sizeof(BaselineReadyPayload));
             }
             break;
 
         case PacketType::BaselineDigest:
             if (payloadLen >= sizeof(BaselineDigestPayload)) {
                 MatchBootstrap_OnBaselineDigest(static_cast<const BaselineDigestPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short BaselineDigest", type, payloadLen, sizeof(BaselineDigestPayload));
             }
             break;
 
         case PacketType::GameplayStart:
             if (payloadLen >= sizeof(GameplayStartPayload)) {
                 MatchBootstrap_OnGameplayStart(static_cast<const GameplayStartPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short GameplayStart", type, payloadLen, sizeof(GameplayStartPayload));
             }
             break;
 
@@ -307,10 +349,31 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
                 type == PacketType::FrameSyncStatus ||
                 type == PacketType::StateDigest ||
                 type == PacketType::Ping ||
-                type == PacketType::Pong) {
+                type == PacketType::Pong ||
+                // GekkoData / GekkoReady can race in on the same tick that
+                // TryStartRollbackSession() switches the callback to OnGameplayPacket.
+                // If OnPregamePacket still handles the packet, ignore silently;
+                // OnlineWiring's startup barrier resend path will re-assert READY.
+                type == PacketType::GekkoData ||
+                type == PacketType::GekkoReady) {
+                Rollback::NetplayLog_Verbose(
+                    "PREGAME", -1,
+                    "Ignoring cross-phase packet during pregame: type=%s payload=%zu phase=%s",
+                    PacketTypeName(type),
+                    payloadLen,
+                    PregamePhaseName(s_phase));
                 break;
             }
             LOG_NETPLAY(LOG_WARNING, "[PregameSync] Unhandled packet type %u", (unsigned)type);
+            Rollback::NetplayLog_Write(
+                "PREGAME", -1,
+                "Unhandled packet: type=%s(%u) payload=%zu phase=%s session=0x%08X remoteSession=0x%08X",
+                PacketTypeName(type),
+                (unsigned)type,
+                payloadLen,
+                PregamePhaseName(s_phase),
+                s_sessionId,
+                s_remoteSessionId);
             break;
     }
 }

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include <windows.h>
+#include <mutex>
 
 namespace Rollback {
 
@@ -20,6 +21,7 @@ static FILE*    s_logFile    = nullptr;
 static bool     s_verbose   = false;
 static char     s_logDir[MAX_PATH] = {};
 static unsigned s_linesSinceFlush = 0;
+static std::mutex s_logMutex;
 
 // ============================================================================
 // Helpers
@@ -46,12 +48,14 @@ static void FlushIfNeeded() {
 // ============================================================================
 
 void NetplayLog_Init() {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     // File will be opened when SetLogDir is called
     s_verbose = false;
     s_linesSinceFlush = 0;
 }
 
 void NetplayLog_Shutdown() {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     if (s_logFile) {
         fprintf(s_logFile, "=== NETPLAY LOG CLOSED ===\n");
         fflush(s_logFile);
@@ -61,6 +65,7 @@ void NetplayLog_Shutdown() {
 }
 
 void NetplayLog_SetLogDir(const char* dir) {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     if (!dir || !dir[0]) return;
     strncpy_s(s_logDir, sizeof(s_logDir), dir, _TRUNCATE);
 
@@ -93,6 +98,7 @@ void NetplayLog_SetLogDir(const char* dir) {
 // ============================================================================
 
 void NetplayLog_SetVerbose(bool verbose) {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     s_verbose = verbose;
     if (s_logFile) {
         WriteTimestamp(s_logFile);
@@ -102,6 +108,7 @@ void NetplayLog_SetVerbose(bool verbose) {
 }
 
 bool NetplayLog_IsVerbose() {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     return s_verbose;
 }
 
@@ -110,6 +117,7 @@ bool NetplayLog_IsVerbose() {
 // ============================================================================
 
 void NetplayLog_Write(const char* tag, int32_t frame, const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     if (!s_logFile) return;
 
     WriteTimestamp(s_logFile);
@@ -135,6 +143,7 @@ void NetplayLog_Write(const char* tag, int32_t frame, const char* fmt, ...) {
 }
 
 void NetplayLog_Verbose(const char* tag, int32_t frame, const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     if (!s_logFile || !s_verbose) return;
 
     WriteTimestamp(s_logFile);
@@ -159,6 +168,7 @@ void NetplayLog_StateChange(const char* tag, int32_t frame,
                             const char* field,
                             const char* before, const char* after,
                             const char* reason) {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     if (!s_logFile) return;
 
     WriteTimestamp(s_logFile);
@@ -181,6 +191,7 @@ void NetplayLog_ValueChange(const char* tag, int32_t frame,
                             const char* field,
                             int before, int after,
                             const char* reason) {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     if (!s_logFile) return;
 
     WriteTimestamp(s_logFile);
@@ -199,6 +210,7 @@ void NetplayLog_ValueChange(const char* tag, int32_t frame,
 }
 
 void NetplayLog_Flush() {
+    std::lock_guard<std::mutex> lock(s_logMutex);
     if (s_logFile) {
         fflush(s_logFile);
         s_linesSinceFlush = 0;

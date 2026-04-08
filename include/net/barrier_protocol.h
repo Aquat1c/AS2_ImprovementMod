@@ -83,6 +83,9 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         case PacketType::BaselineReady:
         case PacketType::BaselineDigest:
         case PacketType::GameplayStart:
+
+        // Startup gameplay-entry barrier — reliable
+        case PacketType::GekkoReady:
             return true;
 
         // Gameplay stream — unreliable (redundancy handles loss)
@@ -112,6 +115,10 @@ inline uint8_t BarrierProtocol_GetChannel(PacketType type) {
         case PacketType::Pong:
         case PacketType::StateDigest:
             return CHANNEL_DEBUG;
+
+        // Startup gameplay-entry barrier — control channel, same as GameplayStart
+        case PacketType::GekkoReady:
+            return CHANNEL_CONTROL;
 
         default:
             return CHANNEL_CONTROL;

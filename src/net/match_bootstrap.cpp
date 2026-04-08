@@ -12,6 +12,7 @@
 #include "net/protocol.h"
 #include "net/locked_match_config.h"
 #include "net/delay_policy.h"
+#include "rollback/netplay_log.h"
 #include "rollback/savestate.h"
 #include "rollback/determinism_verify.h"
 #include "core/game_state.h"
@@ -43,6 +44,19 @@ enum class BootPhase : uint8_t {
     Done,
     Error,
 };
+
+static const char* BootPhaseName(BootPhase phase) {
+    switch (phase) {
+        case BootPhase::Idle:           return "Idle";
+        case BootPhase::ConfigExchange: return "ConfigExchange";
+        case BootPhase::Loading:        return "Loading";
+        case BootPhase::Baseline:       return "Baseline";
+        case BootPhase::Ready:          return "Ready";
+        case BootPhase::Done:           return "Done";
+        case BootPhase::Error:          return "Error";
+        default:                        return "Unknown";
+    }
+}
 
 // ============================================================================
 // Internal state
@@ -137,6 +151,105 @@ static void CaptureGameplayContext(uint8_t* mode, uint8_t* substate, int32_t* si
     }
 }
 
+constexpr size_t kBaselineHashMainSize = (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE;
+constexpr size_t kBaselineHashHeaderSize = 16;
+constexpr size_t kBaselineHashContextSize = ADDR_EFFECT_ARRAY - (ADDR_MATCH_BASE + kBaselineHashHeaderSize);
+constexpr size_t kBaselineHashEffectSize = ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY;
+constexpr size_t kBaselineHashSummonSize = ADDR_P1_ENTITY_BASE - ADDR_SUMMON_ARRAY;
+
+struct BaselineHashBreakdown {
+    uint32_t main_crc;
+    uint32_t header_crc;
+    uint32_t context_crc;
+    uint32_t effect_crc;
+    uint32_t summon_crc;
+    uint32_t p1_entity_crc;
+    uint32_t p2_entity_crc;
+    uint32_t pre_match_gap_crc;
+    uint32_t p1_input_crc;
+    uint32_t p2_input_crc;
+    uint32_t per_frame_temp_crc;
+    uint32_t rng_seed;
+    uint32_t sim_frame;
+    uint32_t display_frame;
+    uint32_t game_mode;
+    uint32_t substate;
+    uint32_t game_type;
+    uint32_t match_phase_timer;
+};
+
+static uint32_t SafeRegionCRC(uintptr_t address, size_t size) {
+    __try {
+        return CalcCRC32(reinterpret_cast<const void*>(address), size);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0xDEADDEAD;
+    }
+}
+
+static BaselineHashBreakdown CaptureBaselineHashBreakdown() {
+    BaselineHashBreakdown out{};
+    out.main_crc = SafeRegionCRC(ADDR_MATCH_BASE, kBaselineHashMainSize);
+    out.header_crc = SafeRegionCRC(ADDR_MATCH_BASE, kBaselineHashHeaderSize);
+    out.context_crc = SafeRegionCRC(ADDR_MATCH_BASE + kBaselineHashHeaderSize, kBaselineHashContextSize);
+    out.effect_crc = SafeRegionCRC(ADDR_EFFECT_ARRAY, kBaselineHashEffectSize);
+    out.summon_crc = SafeRegionCRC(ADDR_SUMMON_ARRAY, kBaselineHashSummonSize);
+    out.p1_entity_crc = SafeRegionCRC(ADDR_P1_ENTITY_BASE, ENTITY_SIZE);
+    out.p2_entity_crc = SafeRegionCRC(ADDR_P2_ENTITY_BASE, ENTITY_SIZE);
+    out.pre_match_gap_crc = SafeRegionCRC(ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE);
+    out.p1_input_crc = SafeRegionCRC(ADDR_P1_INPUT_BUFFER, INPUT_BUFFER_SIZE);
+    out.p2_input_crc = SafeRegionCRC(ADDR_P2_INPUT_BUFFER, INPUT_BUFFER_SIZE);
+    out.per_frame_temp_crc = SafeRegionCRC(ADDR_MATCH_PER_FRAME_TEMP, MATCH_PER_FRAME_TEMP_SIZE);
+    out.rng_seed = DetVer_GetRngSeed();
+    out.sim_frame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    out.display_frame = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
+    out.game_mode = ReadMemory<uint32_t>(ADDR_GAME_MODE);
+    out.substate = ReadMemory<uint32_t>(ADDR_SUB_STATE);
+    out.game_type = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
+    out.match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
+    return out;
+}
+
+static void LogBaselineHashBreakdown(const char* label, uint32_t referenceCrc) {
+    const BaselineHashBreakdown breakdown = CaptureBaselineHashBreakdown();
+    const int32_t frame = (int32_t)breakdown.sim_frame;
+    const bool matchesReference = (referenceCrc != 0 && breakdown.main_crc == referenceCrc);
+
+    Rollback::NetplayLog_Write(
+        "BASELINE", frame,
+        "%s checked: phase=%s main=0x%08X header=0x%08X context=0x%08X effects=0x%08X summons=0x%08X p1=0x%08X p2=0x%08X ref=0x%08X ref_match=%d",
+        label ? label : "Baseline",
+        BootPhaseName(s_phase),
+        breakdown.main_crc,
+        breakdown.header_crc,
+        breakdown.context_crc,
+        breakdown.effect_crc,
+        breakdown.summon_crc,
+        breakdown.p1_entity_crc,
+        breakdown.p2_entity_crc,
+        referenceCrc,
+        matchesReference ? 1 : 0);
+
+    Rollback::NetplayLog_Write(
+        "BASELINE", frame,
+        "%s adjacent: pre_gap=0x%08X p1_input=0x%08X p2_input=0x%08X temp=0x%08X rng=0x%08X sim=%u display=%u mode=%u sub=%u type=%u phase_timer=%u localLoad=%d remoteLoad=%d localBase=%d remoteBase=%d",
+        label ? label : "Baseline",
+        breakdown.pre_match_gap_crc,
+        breakdown.p1_input_crc,
+        breakdown.p2_input_crc,
+        breakdown.per_frame_temp_crc,
+        breakdown.rng_seed,
+        breakdown.sim_frame,
+        breakdown.display_frame,
+        breakdown.game_mode,
+        breakdown.substate,
+        breakdown.game_type,
+        breakdown.match_phase_timer,
+        s_localLoaded ? 1 : 0,
+        s_remoteLoaded ? 1 : 0,
+        s_localBaselineReady ? 1 : 0,
+        s_remoteBaselineReady ? 1 : 0);
+}
+
 static void SendConfig() {
     ConfigExchangePayload payload{};
     payload.p1_character = s_config.p1_character;
@@ -205,6 +318,18 @@ static void SendLoadBarrier() {
     s_loadBarrierSent = true;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent LoadBarrier: mode=%u sub=%u simFrame=%d",
         payload.mode, payload.substate, s_localLoadSimFrame);
+    Rollback::NetplayLog_Write(
+        "BARRIER", s_localLoadSimFrame,
+        "Local LoadBarrier sent: phase=%s local=%u/%u/%d remote=%u/%u/%d local_loaded=%d remote_loaded=%d",
+        BootPhaseName(s_phase),
+        s_localLoadMode,
+        s_localLoadSubstate,
+        s_localLoadSimFrame,
+        s_remoteLoadMode,
+        s_remoteLoadSubstate,
+        s_remoteLoadSimFrame,
+        s_localLoaded ? 1 : 0,
+        s_remoteLoaded ? 1 : 0);
 }
 
 static void SendBaselineReady() {
@@ -380,6 +505,7 @@ static void UpdateBaseline() {
                     SendBaselineDigest(s_localBaselineCRC);
                     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline captured: crc=0x%08X frame=%u rng=0x%08X",
                         s_localBaselineCRC, info->frame, info->rng_seed);
+                    LogBaselineHashBreakdown("LocalBaselineCaptured", s_localBaselineCRC);
                 } else {
                     SetError("Failed to capture baseline savestate");
                 }
@@ -394,6 +520,19 @@ static void UpdateBaseline() {
             s_phase = BootPhase::Ready;
             LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline agreed: crc=0x%08X -> Ready phase", s_localBaselineCRC);
         } else {
+            Rollback::NetplayLog_Write(
+                "BASELINE", s_localBaselineSimFrame,
+                "Baseline mismatch: local_crc=0x%08X remote_crc=0x%08X local=%u/%u/%d remote=%u/%u/%d phase=%s",
+                s_localBaselineCRC,
+                s_remoteBaselineCRC,
+                s_localBaselineMode,
+                s_localBaselineSubstate,
+                s_localBaselineSimFrame,
+                s_remoteBaselineMode,
+                s_remoteBaselineSubstate,
+                s_remoteBaselineSimFrame,
+                BootPhaseName(s_phase));
+            LogBaselineHashBreakdown("LocalBaselineMismatch", s_localBaselineCRC);
             SetError("Baseline CRC mismatch: local=0x%08X remote=0x%08X",
                 s_localBaselineCRC, s_remoteBaselineCRC);
         }
@@ -486,6 +625,14 @@ void MatchBootstrap_BeginLoading() {
     s_phase = BootPhase::Loading;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin loading barrier (remote_already=%s)",
         s_remoteLoaded ? "yes" : "no");
+    Rollback::NetplayLog_Write(
+        "BARRIER", -1,
+        "Begin loading barrier: phase=%s remote_already=%d remote_mode=%u remote_sub=%u remote_sim=%d",
+        BootPhaseName(s_phase),
+        s_remoteLoaded ? 1 : 0,
+        s_remoteLoadMode,
+        s_remoteLoadSubstate,
+        s_remoteLoadSimFrame);
 }
 
 void MatchBootstrap_BeginBaseline() {
@@ -509,6 +656,17 @@ void MatchBootstrap_BeginBaseline() {
     s_phase = BootPhase::Baseline;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin baseline capture (remote_baseline_already=%s crc=0x%08X)",
         s_remoteBaselineReady ? "yes" : "no", s_remoteBaselineCRC);
+    Rollback::NetplayLog_Write(
+        "BASELINE", -1,
+        "Begin baseline: phase=%s remote_ready=%d remote_crc=0x%08X remote_mode=%u remote_sub=%u remote_sim=%d checked_scope=[0x%08X,+0x%zX] unchecked=pre_gap+p1_input+p2_input+temp+misc_globals",
+        BootPhaseName(s_phase),
+        s_remoteBaselineReady ? 1 : 0,
+        s_remoteBaselineCRC,
+        s_remoteBaselineMode,
+        s_remoteBaselineSubstate,
+        s_remoteBaselineSimFrame,
+        (uint32_t)ADDR_MATCH_BASE,
+        kBaselineHashMainSize);
 }
 
 void MatchBootstrap_Abort() {
@@ -655,6 +813,17 @@ void MatchBootstrap_OnLoadBarrier(const LoadBarrierPayload* p) {
         LOG_NETPLAY(LOG_INFO,
             "[MatchBoot] Remote loading complete: mode=%u sub=%u simFrame=%d",
             s_remoteLoadMode, s_remoteLoadSubstate, s_remoteLoadSimFrame);
+        if (s_phase != BootPhase::Loading) {
+            Rollback::NetplayLog_Write(
+                "BARRIER", s_remoteLoadSimFrame,
+                "Remote LoadBarrier arrived out-of-phase: phase=%s local_loaded=%d remote_loaded=%d remote=%u/%u/%d",
+                BootPhaseName(s_phase),
+                s_localLoaded ? 1 : 0,
+                s_remoteLoaded ? 1 : 0,
+                s_remoteLoadMode,
+                s_remoteLoadSubstate,
+                s_remoteLoadSimFrame);
+        }
     }
 }
 
@@ -669,6 +838,17 @@ void MatchBootstrap_OnBaselineReady(const BaselineReadyPayload* p) {
         LOG_NETPLAY(LOG_INFO,
             "[MatchBoot] Remote baseline ready: mode=%u sub=%u simFrame=%d",
             s_remoteBaselineMode, s_remoteBaselineSubstate, s_remoteBaselineSimFrame);
+        if (s_phase != BootPhase::Baseline) {
+            Rollback::NetplayLog_Write(
+                "BASELINE", s_remoteBaselineSimFrame,
+                "Remote BaselineReady arrived out-of-phase: phase=%s local_ready=%d remote_ready=%d remote=%u/%u/%d",
+                BootPhaseName(s_phase),
+                s_localBaselineReady ? 1 : 0,
+                s_remoteBaselineReady ? 1 : 0,
+                s_remoteBaselineMode,
+                s_remoteBaselineSubstate,
+                s_remoteBaselineSimFrame);
+        }
 
         // Implicit LoadBarrierReady: if we're still in Loading phase and
         // receive BaselineReady, the remote peer is obviously past loading.
@@ -687,6 +867,15 @@ void MatchBootstrap_OnBaselineDigest(const BaselineDigestPayload* p) {
 
     s_remoteBaselineCRC = p->crc32;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Remote baseline digest: crc=0x%08X", p->crc32);
+    Rollback::NetplayLog_Write(
+        "BASELINE", s_remoteBaselineSimFrame,
+        "Remote BaselineDigest: crc=0x%08X phase=%s remote_ready=%d remote=%u/%u/%d",
+        p->crc32,
+        BootPhaseName(s_phase),
+        s_remoteBaselineReady ? 1 : 0,
+        s_remoteBaselineMode,
+        s_remoteBaselineSubstate,
+        s_remoteBaselineSimFrame);
 }
 
 void MatchBootstrap_OnGameplayStart(const GameplayStartPayload* p) {

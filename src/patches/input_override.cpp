@@ -7,13 +7,17 @@
 #include "net/netplay_menu_controller.h"
 #include "net/session_manager.h"
 #include "net/charsel_sync.h"
+#include "net/match_lifecycle.h"
 #include "net/pregame_sync.h"
 #include "net/stagesel_sync.h"
 #include "net/player_side_mapping.h"
 #include "core/game_state.h"
 #include "rollback/rollback_session.h"
+#include "rollback/online_wiring.h"
 #include "rollback/netplay_log.h"
 #include "imgui.h"
+
+#include <algorithm>
 
 // ============================================================================
 // Original function pointer storage (populated by hook_installer)
@@ -38,6 +42,39 @@ extern bool ModConfig_VerboseLogging();
 // ============================================================================
 // Internal state
 // ============================================================================
+
+// Per-session startup tracking — reset when a new rollback session begins.
+// Must be declared before AbortRollbackDispatcher which references it.
+static bool s_rollbackSessionWasActive = false;
+
+static int AbortRollbackDispatcher(const char* fallbackReason) {
+    const char* reason = Rollback::RollbackSession_GetErrorReason();
+    if (!reason || !reason[0]) {
+        reason = fallbackReason ? fallbackReason : "Rollback session failure";
+    }
+
+    Rollback::NetplayLog_Write("DISCONNECT",
+        Rollback::RollbackSession_GetCurrentFrame(),
+        "Dispatcher abort: %s", reason);
+
+    InputSyncHooks_SetTimesyncFreeze(false);
+    s_rollbackSessionWasActive = false;  // force re-init on next session
+
+    // End the GekkoNet session immediately so subsequent dispatcher calls
+    // cannot re-enter this path through RollbackSession_IsActive().
+    Rollback::RollbackSession_End();
+
+    // Route to the netplay menu disconnect error screen. HandleDisconnection
+    // forces the game back to MODE_MENU, cancels the ENet session, and shows
+    // the DisconnectError overlay with the reason string.
+    // The guard prevents double-firing if the lifecycle was already moved to
+    // DisconnectRecovery by another codepath before this abort fires.
+    if (Net::MatchLifecycle_GetPhase() != Net::MatchLifecyclePhase::DisconnectRecovery) {
+        NetMenu::HandleDisconnection(reason);
+    }
+
+    return -1;
+}
 
 static int g_hookCallCount = 0;
 static int g_lastInputUpdateFrame = -1;
@@ -71,6 +108,21 @@ static void EnsureInputUpdated() {
         InputSystem_Update();
         g_lastInputUpdateFrame = currentFrame;
     }
+}
+
+static float GetTimesyncFreezeEnterThreshold() {
+    const float rollbackBudget = (float)(std::max)(Rollback::RollbackSession_GetRollbackBudget(), 1);
+    return (std::max)(1.0f, rollbackBudget * 0.5f);
+}
+
+static int GetCatchupCooldown(float framesBehind) {
+    if (framesBehind >= 3.0f) {
+        return 0;
+    }
+    if (framesBehind >= 2.0f) {
+        return 1;
+    }
+    return 2;
 }
 
 // ============================================================================
@@ -644,36 +696,145 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     // Two-phase event processing: BeginFrame once, then ProcessNextEvent
     // until all events are consumed. Each AdvanceEvent = one game frame.
     if (Rollback::RollbackSession_IsActive()) {
-        // Timesync — 3sx-style double-tick catch-up.
-        // gekko_frames_ahead() > 0 means we're AHEAD (should slow down).
-        // gekko_frames_ahead() < 0 means we're BEHIND (should catch up).
-        // We skip our own frame when too far ahead (return -1),
-        // and run an extra tick when behind (double-tick).
-        static int s_frameSkipTimer = 0;
+        // GekkoNet frames_ahead semantics:
+        //   positive => local is AHEAD (prediction pressure increasing)
+        //   negative => local is BEHIND (local can catch up)
+        static int s_catchupCooldown = 0;
         static bool s_doDoubleTick = false;
-        float framesAhead = Rollback::RollbackSession_FramesAhead();
+        static bool s_loggedTimesyncEnabled = false;
+        static bool s_timesyncCatchupArmed = false;
+        static bool s_lastDispatcherCallAdvanced = false;
+        static bool s_loggedFirstBeginAfterRelease = false;
+        static bool s_loggedFirstAdvanceAfterRelease = false;
+        static uint32_t s_startupGateLogCount = 0;
+        static uint32_t s_timesyncSuppressedLogCount = 0;
+        static uint32_t s_timesyncAheadPressureLogCount = 0;
 
-        if (framesAhead > 2.0f) {
-            // Too far ahead — skip frame advancement, just poll network
+        // Detect new session: reset per-session state
+        if (!s_rollbackSessionWasActive) {
+            s_rollbackSessionWasActive = true;
+            s_loggedTimesyncEnabled = false;
+            s_timesyncCatchupArmed = false;
+            s_catchupCooldown = 0;
+            s_doDoubleTick = false;
+            s_lastDispatcherCallAdvanced = false;
+            s_loggedFirstBeginAfterRelease = false;
+            s_loggedFirstAdvanceAfterRelease = false;
+            s_startupGateLogCount = 0;
+            s_timesyncSuppressedLogCount = 0;
+            s_timesyncAheadPressureLogCount = 0;
+            // Clear any stale global freeze state from prior sessions. Runtime
+            // drift control below is dispatcher-local and does not use hard
+            // frame suppression hooks.
+            InputSyncHooks_SetTimesyncFreeze(false);
             Rollback::NetplayLog_Write("TIMESYNC", -1,
-                "Skip frame: framesAhead=%.2f (too far ahead)", framesAhead);
+                "Session started: timesync=startup phase=%s",
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+        }
+
+        // Gameplay-entry barrier: once PlayableGameplay is reached, hold local
+        // BeginFrame until OnlineWiring confirms the mutual startup release.
+        // Packet/session pumping must continue while held.
+        if (Rollback::OnlineWiring_IsGameplayEntryAdvanceBlocked()) {
+            s_lastDispatcherCallAdvanced = false;
+            s_startupGateLogCount++;
+            if (s_startupGateLogCount <= 5 || (s_startupGateLogCount % 120) == 0) {
+                Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
+                    "Session running but gameplay advance GATED at PlayableGameplay "
+                    "(release pending): phase=%s session_running=%d",
+                    Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+                    Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
+            }
             Net::Session_Update();
+            if (!Rollback::RollbackSession_PollSession()) {
+                return AbortRollbackDispatcher("Peer disconnected during startup barrier");
+            }
             return -1;
         }
+        s_startupGateLogCount = 0;
 
-        // If we're behind (frames_ahead < -1.0), schedule a double-tick.
-        // Rate-limited to once per 60 frames to prevent jitter.
-        // The double-tick flag causes a second BeginFrame after the first
-        // batch of events is fully processed, letting the game's match handler
-        // run for each advance event (unlike the old approach which drained
-        // events internally and skipped simulation).
-        if (framesAhead < -1.0f && s_frameSkipTimer <= 0 && !s_doDoubleTick) {
-            s_doDoubleTick = true;
-            s_frameSkipTimer = 60;
+        float framesAhead = Rollback::RollbackSession_FramesAhead();
+        const float freezeEnter = GetTimesyncFreezeEnterThreshold();
+        const int rollbackBudget = Rollback::RollbackSession_GetRollbackBudget();
+
+        // Timesync drift control belongs only to live gameplay after the
+        // startup release barrier has completed.
+        const bool inPlayableGameplay = Net::MatchLifecycle_IsGameplayPlayable();
+        const bool startupReleased = Rollback::OnlineWiring_IsStartupReleased();
+        const bool liveGameplayTimesync = inPlayableGameplay && startupReleased;
+
+        if (!s_loggedTimesyncEnabled && liveGameplayTimesync) {
+            s_loggedTimesyncEnabled = true;
             Rollback::NetplayLog_Write("TIMESYNC", -1,
-                "Scheduling double-tick: framesAhead=%.2f", framesAhead);
+                "Gameplay timesync ENABLED (PlayableGameplay + startup released): "
+                "framesAhead=%.2f ahead_enter=%.2f budget=%d",
+                framesAhead, freezeEnter, rollbackBudget);
         }
-        if (s_frameSkipTimer > 0) s_frameSkipTimer--;
+
+        if (liveGameplayTimesync) {
+            if (!s_timesyncCatchupArmed) {
+                if (s_loggedFirstAdvanceAfterRelease) {
+                    s_timesyncCatchupArmed = true;
+                    Rollback::NetplayLog_Write("TIMESYNC", -1,
+                        "Gameplay timesync CATCH-UP armed after first post-release "
+                        "Advance: framesAhead=%.2f",
+                        framesAhead);
+                } else {
+                    s_timesyncSuppressedLogCount++;
+                    if (s_timesyncSuppressedLogCount <= 5 ||
+                        (s_timesyncSuppressedLogCount % 120) == 0) {
+                        Rollback::NetplayLog_Write("TIMESYNC", -1,
+                            "Gameplay timesync catch-up SUPPRESSED until first "
+                            "post-release Advance: framesAhead=%.2f",
+                            framesAhead);
+                    }
+                }
+            }
+
+            if (framesAhead >= freezeEnter) {
+                s_timesyncAheadPressureLogCount++;
+                if (s_timesyncAheadPressureLogCount <= 5 ||
+                    (s_timesyncAheadPressureLogCount % 120) == 0) {
+                    Rollback::NetplayLog_Write("TIMESYNC", -1,
+                        "Local ahead pressure observed: ahead=%.2f raw=%.2f "
+                        "enter=%.2f budget=%d (hard freeze path suppressed)",
+                        framesAhead, framesAhead, freezeEnter, rollbackBudget);
+                }
+            } else {
+                s_timesyncAheadPressureLogCount = 0;
+            }
+        } else {
+            s_timesyncSuppressedLogCount = 0;
+            s_timesyncAheadPressureLogCount = 0;
+            s_timesyncCatchupArmed = false;
+            if (inPlayableGameplay && !startupReleased) {
+                Rollback::NetplayLog_Write("TIMESYNC", -1,
+                    "Gameplay timesync SUPPRESSED by startup barrier: phase=%s "
+                    "released=%d",
+                    Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+            }
+        }
+
+        if (s_catchupCooldown > 0) {
+            s_catchupCooldown--;
+        }
+
+        // If the local peer is behind, schedule an extra tick to catch up.
+        // Only applies during live gameplay — not during startup/intro where
+        // GekkoNet drives deterministic progression on its own.
+        if (liveGameplayTimesync &&
+            s_timesyncCatchupArmed &&
+            s_lastDispatcherCallAdvanced &&
+            framesAhead <= -1.0f &&
+            s_catchupCooldown <= 0 &&
+            !s_doDoubleTick) {
+            const float framesBehind = -framesAhead;
+            s_doDoubleTick = true;
+            s_catchupCooldown = GetCatchupCooldown(framesBehind);
+            Rollback::NetplayLog_Write("TIMESYNC", -1,
+                "Scheduling catch-up tick: local behind by %.2f (raw=%.2f cooldown=%d)",
+                framesBehind, framesAhead, s_catchupCooldown);
+        }
 
         // State: track whether we've started this frame's event batch
         static bool s_gekkoFrameStarted = false;
@@ -683,9 +844,27 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             InputSystem_Update();
             uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
 
+            if (!s_loggedFirstBeginAfterRelease &&
+                Rollback::OnlineWiring_IsStartupReleased() &&
+                inPlayableGameplay) {
+                s_loggedFirstBeginAfterRelease = true;
+                Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
+                    "First BeginFrame allowed after startup release");
+            }
+
+            const char* timesyncMode = "startup";
+            if (liveGameplayTimesync) {
+                timesyncMode = s_timesyncCatchupArmed ? "live" : "release-handoff";
+            } else if (inPlayableGameplay && !startupReleased) {
+                timesyncMode = "startup-gated";
+            }
+
             Rollback::NetplayLog_Write("INPUT", -1,
-                "Dispatcher: starting new frame, local_input=0x%04X framesAhead=%.2f",
-                localInput, framesAhead);
+                "Dispatcher: starting new frame, local_input=0x%04X framesAhead=%.2f "
+                "phase=%s tsync=%s",
+                localInput, framesAhead,
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+                timesyncMode);
 
             Rollback::RollbackSession_BeginFrame(localInput);
             s_gekkoFrameStarted = true;
@@ -693,6 +872,12 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
 
         // Phase 2: Process next GekkoNet event
         Rollback::EventResult result = Rollback::RollbackSession_ProcessNextEvent();
+
+        if (result == Rollback::EventResult::Error) {
+            s_gekkoFrameStarted = false;
+            s_lastDispatcherCallAdvanced = false;
+            return AbortRollbackDispatcher("Rollback session failed");
+        }
 
         if (result == Rollback::EventResult::Advance) {
             // GekkoNet wants one frame advanced (normal or rollback).
@@ -716,10 +901,27 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 "Dispatcher: Advance → P1=0x%04X P2=0x%04X writeIdx=%u->%u rb=%d",
                 p1, p2, writeIdx, writeIdx + 1, Rollback::RollbackSession_IsRollingBack() ? 1 : 0);
 
+            s_lastDispatcherCallAdvanced = true;
+            if (!s_loggedFirstAdvanceAfterRelease &&
+                startupReleased &&
+                inPlayableGameplay) {
+                s_loggedFirstAdvanceAfterRelease = true;
+                Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
+                    "First Advance allowed after startup release");
+                if (!s_timesyncCatchupArmed) {
+                    s_timesyncCatchupArmed = true;
+                    Rollback::NetplayLog_Write("TIMESYNC", -1,
+                        "Gameplay timesync CATCH-UP armed by first post-release Advance: "
+                        "framesAhead=%.2f",
+                        Rollback::RollbackSession_FramesAhead());
+                }
+            }
+
             return 0;  // Game's loop runs one full tick (InputProcess + matchHandler)
         } else {
             // No more events (Done) — frame batch complete
             s_gekkoFrameStarted = false;
+            s_lastDispatcherCallAdvanced = false;
 
             // Double-tick: if scheduled, start another BeginFrame cycle
             // so the game runs a second full tick through the match handler
@@ -730,7 +932,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 uint16_t localInput2 = Net::PlayerMapping_ReadLocalInput();
 
                 Rollback::NetplayLog_Write("TIMESYNC", -1,
-                    "Double-tick: starting second BeginFrame, local_input=0x%04X", localInput2);
+                    "Catch-up tick: starting second BeginFrame, local_input=0x%04X", localInput2);
 
                 Rollback::RollbackSession_BeginFrame(localInput2);
                 s_gekkoFrameStarted = true;
@@ -738,6 +940,12 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 // Continue processing — the game's while loop will call us
                 // again for each Advance event from GekkoNet
                 Rollback::EventResult result2 = Rollback::RollbackSession_ProcessNextEvent();
+                if (result2 == Rollback::EventResult::Error) {
+                    s_gekkoFrameStarted = false;
+                    s_lastDispatcherCallAdvanced = false;
+                    return AbortRollbackDispatcher("Rollback session failed during double-tick");
+                }
+
                 if (result2 == Rollback::EventResult::Advance) {
                     uint16_t p1 = 0, p2 = 0;
                     Rollback::RollbackSession_GetAdvanceInputs(&p1, &p2);
@@ -753,13 +961,30 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     *pFrameWrite2 = (int32_t)(writeIdx2 + 1);
 
                     Rollback::NetplayLog_Write("TIMESYNC", -1,
-                        "Double-tick Advance → P1=0x%04X P2=0x%04X writeIdx=%u->%u",
+                        "Catch-up Advance → P1=0x%04X P2=0x%04X writeIdx=%u->%u",
                         p1, p2, writeIdx2, writeIdx2 + 1);
+
+                    s_lastDispatcherCallAdvanced = true;
+                    if (!s_loggedFirstAdvanceAfterRelease &&
+                        startupReleased &&
+                        inPlayableGameplay) {
+                        s_loggedFirstAdvanceAfterRelease = true;
+                        Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
+                            "First Advance allowed after startup release");
+                        if (!s_timesyncCatchupArmed) {
+                            s_timesyncCatchupArmed = true;
+                            Rollback::NetplayLog_Write("TIMESYNC", -1,
+                                "Gameplay timesync CATCH-UP armed by first post-release Advance: "
+                                "framesAhead=%.2f",
+                                Rollback::RollbackSession_FramesAhead());
+                        }
+                    }
 
                     return 0;  // Game processes this tick normally
                 }
                 // If Done immediately (no advance needed), fall through
                 s_gekkoFrameStarted = false;
+                s_lastDispatcherCallAdvanced = false;
             }
 
             Rollback::NetplayLog_Write("INPUT", -1,
@@ -776,6 +1001,8 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         s_dispatchCount = 0;
         s_dispatchWaitCount = 0;
     }
+    // Reset per-session startup tracking so it re-fires on the next session
+    s_rollbackSessionWasActive = false;
     return g_origInputDispatcher(outputInputs);
 }
 

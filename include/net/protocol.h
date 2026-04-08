@@ -69,8 +69,12 @@ enum class PacketType : uint16_t {
     PauseQuit        = 42,  // Pause menu quit signal
 
     // Gameplay (unreliable, channel 1)
-    GameplayInput   = 20,   // Legacy mod-owned rollback input sync
+    GameplayInput   = 20,   // Legacy mod-owned rollback input sync (DEAD — no send site)
     GekkoData       = 23,   // Raw GekkoNet internal protocol data
+
+    // Startup gameplay-entry barrier (reliable, channel 0)
+    // Sent at PlayableGameplay entry while held; release requires mutual ready+ack.
+    GekkoReady      = 24,   // Startup barrier control (ready/ack)
 
     // Mid-match delay changes (reliable, channel 0)
     DelayChangeReq  = 21,   // Request to change input delay
@@ -222,6 +226,13 @@ struct GameplayStartPayload {
     uint32_t host_sim_frame;     // Host native sim frame when start was sent
 };
 
+struct GekkoReadyPayload {
+    uint8_t  flags;              // GEKKO_READY_FLAG_*
+    uint8_t  phase;              // Sender MatchLifecyclePhase at send time
+    uint16_t _pad;
+    int32_t  rollback_frame;     // Sender rollback frame at send time
+};
+
 struct CharSelFrameInputPayload {
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
@@ -242,6 +253,10 @@ struct DelayChangeAckPayload {
 };
 
 #pragma pack(pop)
+
+// GekkoReadyPayload flags
+constexpr uint8_t GEKKO_READY_FLAG_READY = 1 << 0;  // Local reached gameplay-entry boundary
+constexpr uint8_t GEKKO_READY_FLAG_ACK   = 1 << 1;  // Local has observed peer READY
 
 // ============================================================================
 // Helpers
@@ -266,6 +281,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::BaselineReady:  return "BaselineReady";
         case PacketType::BaselineDigest: return "BaselineDigest";
         case PacketType::GameplayStart:  return "GameplayStart";
+        case PacketType::GekkoReady:     return "GekkoReady";
         case PacketType::GameplayInput:      return "GameplayInput";
         case PacketType::CharSelFrameInput:  return "CharSelFrameInput";
         case PacketType::WinScreenConfirm:   return "WinScreenConfirm";

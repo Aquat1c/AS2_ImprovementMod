@@ -67,6 +67,8 @@ void Session_SignalReady();
 // ============================================================================
 
 /// Poll ENet, process events, advance state machine. Call once per game frame.
+/// ENet servicing runs on a dedicated network thread; this drains queued
+/// transport events and runs game-thread packet callbacks safely.
 void Session_Update();
 
 // ============================================================================
@@ -88,6 +90,8 @@ typedef void (*PacketCallback)(PacketType type, const void* payload, size_t payl
 
 /// Register a callback for packets not handled by the session layer.
 /// Only one callback can be active at a time.
+/// Reliable control packets received before a callback is installed are
+/// deferred and flushed in order when a callback becomes available.
 void Session_SetPacketCallback(PacketCallback cb);
 
 // ============================================================================
