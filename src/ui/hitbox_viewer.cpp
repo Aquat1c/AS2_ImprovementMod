@@ -176,13 +176,13 @@ static int ReadAnimBoxes(uintptr_t entity, int frameOffset, BoxEntry* out, int c
 }
 
 static void RenderHurtboxes(ImDrawList* dl, uintptr_t entity,
-                             const char* label, bool animChanged,
+                             const char* label,
                              const ScreenTransform& t) {
     int16_t posX   = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
     int16_t posY   = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
     int8_t  facing = ReadMemory<int8_t>(entity + ENTITY_OFF_FACING);
 
-    bool doLog = animChanged || g_logPerFrame;
+    bool doLog = g_logPerFrame;
 
     BoxEntry boxes[4];
     ReadAnimBoxes(entity, ANIM_HURTBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME, doLog, label);
@@ -226,7 +226,7 @@ static void RenderHurtboxes(ImDrawList* dl, uintptr_t entity,
 // ============================================================================
 
 static void RenderEntityHitboxes(ImDrawList* dl, uintptr_t entity,
-                                  const char* label, bool animChanged,
+                                  const char* label,
                                   const ScreenTransform& t) {
     int16_t posX   = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
     int16_t posY   = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
@@ -234,7 +234,7 @@ static void RenderEntityHitboxes(ImDrawList* dl, uintptr_t entity,
 
     BoxEntry boxes[4];
     ReadAnimBoxes(entity, ANIM_HITBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
-                  animChanged || g_logPerFrame, label);
+                  g_logPerFrame, label);
 
     float ex = (float)(posX / 10);
     float ey = (float)(posY / 10);
@@ -266,10 +266,15 @@ static void RenderHitDefs(ImDrawList* dl, const ScreenTransform& t) {
     for (int i = 0; i < SUMMON_MAX_SLOTS; i++) {
         uintptr_t entry = ADDR_SUMMON_ARRAY + (uintptr_t)i * SUMMON_ENTRY_SIZE;
 
-        uint32_t id     = ReadMemory<uint32_t>(entry + HITDEF_OFF_ID);
+        uint32_t id = ReadMemory<uint32_t>(entry + HITDEF_OFF_ID);
         if (id == 0) continue;                          // free slot
-        uint8_t  active = ReadMemory<uint8_t>(entry + HITDEF_OFF_ACTIVE);
-        if (active != 1) continue;                      // not active
+
+        uint8_t owner = ReadMemory<uint8_t>(entry + HITDEF_OFF_OWNER);
+        if (owner == 0xFF) continue;                    // invalid owner
+
+        // Skip entries with no visual/anim assignment yet (freshly created)
+        uint16_t summonAnimIdx = ReadMemory<uint16_t>(entry + HITDEF_OFF_ANIM_FRAME_IDX);
+        if (summonAnimIdx == 0xFFFF) continue;
 
         activeCount++;
 
@@ -284,43 +289,70 @@ static void RenderHitDefs(ImDrawList* dl, const ScreenTransform& t) {
             : (uintptr_t)ADDR_P2_ENTITY_BASE;
 
         if (g_logPerFrame) {
-            uint8_t owner = ReadMemory<uint8_t>(entry + HITDEF_OFF_OWNER);
             uint8_t type = ReadMemory<uint8_t>(entry + HITDEF_OFF_TYPE);
+            uint8_t invuln = ReadMemory<uint8_t>(entry + HITDEF_OFF_ACTIVE);
             uint8_t flag = ReadMemory<uint8_t>(entry + HITDEF_OFF_ACTIVE_FLAG);
             uint32_t dmg = ReadMemory<uint32_t>(entry + HITDEF_OFF_DAMAGE);
-            LOG_INFO("[HBV] HitDef[%d] id=%u owner=%u animOwner=%u type=%u active=%u flag=%d pos=(%d,%d) face=%d dmg=%u",
-                     i, id, owner, animOwner, type, active, (int)(int8_t)flag, wx, wy, facing, dmg);
+            LOG_INFO("[HBV] HitDef[%d] id=%u owner=%u animOwner=%u type=%u invuln=%u flag=%d pos=(%d,%d) face=%d dmg=%u animIdx=%u",
+                     i, id, owner, animOwner, type, invuln, (int)(int8_t)flag, wx, wy, facing, dmg, summonAnimIdx);
         }
 
-        // Use summon's own animation frame index, not owner's current anim
-        uint16_t summonAnimIdx = ReadMemory<uint16_t>(entry + HITDEF_OFF_ANIM_FRAME_IDX);
-        BoxEntry boxes[4];
-        char lbl[32];
-        snprintf(lbl, sizeof(lbl), "HitDef[%d]", i);
-        ReadAnimBoxes(ownerEntity, ANIM_HITBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
-                      g_logPerFrame, lbl, (int)summonAnimIdx);
-
-        // Position the owner's animation boxes at the HitDef's world location
         float hx = (float)(wx / 10);
         float hy = (float)(wy / 10);
         bool anyDrawn = false;
 
-        for (int j = 0; j < HURTBOX_COUNT_PER_FRAME; j++) {
-            const BoxEntry& b = boxes[j];
-            if (b.halfW <= 0 || b.halfH <= 0) continue;
+        // Render summon hitboxes (attack boxes, red) at frame offset 8
+        {
+            BoxEntry boxes[4];
+            char lbl[32];
+            snprintf(lbl, sizeof(lbl), "HitDef[%d].hit", i);
+            ReadAnimBoxes(ownerEntity, ANIM_HITBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
+                          g_logPerFrame, lbl, (int)summonAnimIdx);
 
-            float cx = hx + 2.0f * b.xOff * facing;
-            float cy = hy + 2.0f * b.yOff;
-            float hw = 2.0f * b.halfW;
-            float hh = 2.0f * b.halfH;
+            for (int j = 0; j < HURTBOX_COUNT_PER_FRAME; j++) {
+                const BoxEntry& b = boxes[j];
+                if (b.halfW <= 0 || b.halfH <= 0) continue;
 
-            float left  = cx - hw - t.scrollX;
-            float right = cx + hw - t.scrollX;
-            float top   = cy - hh - t.scrollY;
-            float bot   = cy + hh - t.scrollY;
+                float cx = hx + 2.0f * b.xOff * facing;
+                float cy = hy + 2.0f * b.yOff;
+                float hw = 2.0f * b.halfW;
+                float hh = 2.0f * b.halfH;
 
-            DrawBox(dl, left, top, right, bot, COL_HITBOX, g_fillAlpha, t);
-            anyDrawn = true;
+                float left  = cx - hw - t.scrollX;
+                float right = cx + hw - t.scrollX;
+                float top   = cy - hh - t.scrollY;
+                float bot   = cy + hh - t.scrollY;
+
+                DrawBox(dl, left, top, right, bot, COL_HITBOX, g_fillAlpha, t);
+                anyDrawn = true;
+            }
+        }
+
+        // Render summon hurtboxes (vulnerable boxes, green) at frame offset 40
+        if (g_showHurtboxes) {
+            BoxEntry boxes[4];
+            char lbl[32];
+            snprintf(lbl, sizeof(lbl), "HitDef[%d].hurt", i);
+            ReadAnimBoxes(ownerEntity, ANIM_HURTBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
+                          g_logPerFrame, lbl, (int)summonAnimIdx);
+
+            for (int j = 0; j < HURTBOX_COUNT_PER_FRAME; j++) {
+                const BoxEntry& b = boxes[j];
+                if (b.halfW <= 0 || b.halfH <= 0) continue;
+
+                float cx = hx + 2.0f * b.xOff * facing;
+                float cy = hy + 2.0f * b.yOff;
+                float hw = 2.0f * b.halfW;
+                float hh = 2.0f * b.halfH;
+
+                float left  = cx - hw - t.scrollX;
+                float right = cx + hw - t.scrollX;
+                float top   = cy - hh - t.scrollY;
+                float bot   = cy + hh - t.scrollY;
+
+                DrawBox(dl, left, top, right, bot, COL_HURTBOX, g_fillAlpha, t);
+                anyDrawn = true;
+            }
         }
 
         // Always draw a position marker for the HitDef
@@ -340,12 +372,12 @@ static void RenderHitDefs(ImDrawList* dl, const ScreenTransform& t) {
 // ============================================================================
 
 static void RenderPushbox(ImDrawList* dl, uintptr_t entity,
-                          const char* label, bool animChanged,
+                          const char* label,
                           const ScreenTransform& t) {
     // Collision box is the single entry at frame offset 0
     BoxEntry box;
     ReadAnimBoxes(entity, ANIM_COLLISION_OFFSET, &box, 1,
-                  animChanged || g_logPerFrame, label);
+                  g_logPerFrame, label);
 
     if (box.halfW <= 0 || box.halfH <= 0) return;
 
@@ -534,34 +566,35 @@ void HitboxViewer_Render() {
     uint32_t p1Action = ReadMemory<uint32_t>(p1 + ENTITY_OFF_ACTION_ID);
     uint32_t p2Action = ReadMemory<uint32_t>(p2 + ENTITY_OFF_ACTION_ID);
 
-    bool p1AnimChanged = (p1Anim != s_lastP1Anim);
-    bool p2AnimChanged = (p2Anim != s_lastP2Anim);
-
     if (p1Action != s_lastP1Action) {
-        LOG_INFO("[HBV] P1 action %u -> %u  anim %u -> %u",
-                 s_lastP1Action, p1Action, s_lastP1Anim, p1Anim);
+        if (g_logPerFrame) {
+            LOG_INFO("[HBV] P1 action %u -> %u  anim %u -> %u",
+                     s_lastP1Action, p1Action, s_lastP1Anim, p1Anim);
+        }
         s_lastP1Action = p1Action;
     }
     if (p2Action != s_lastP2Action) {
-        LOG_INFO("[HBV] P2 action %u -> %u  anim %u -> %u",
-                 s_lastP2Action, p2Action, s_lastP2Anim, p2Anim);
+        if (g_logPerFrame) {
+            LOG_INFO("[HBV] P2 action %u -> %u  anim %u -> %u",
+                     s_lastP2Action, p2Action, s_lastP2Anim, p2Anim);
+        }
         s_lastP2Action = p2Action;
     }
     s_lastP1Anim = p1Anim;
     s_lastP2Anim = p2Anim;
 
     if (g_showHurtboxes) {
-        RenderHurtboxes(dl, p1, "P1", p1AnimChanged, t);
-        RenderHurtboxes(dl, p2, "P2", p2AnimChanged, t);
+        RenderHurtboxes(dl, p1, "P1", t);
+        RenderHurtboxes(dl, p2, "P2", t);
     }
     if (g_showHitboxes) {
-        RenderEntityHitboxes(dl, p1, "P1", p1AnimChanged, t);
-        RenderEntityHitboxes(dl, p2, "P2", p2AnimChanged, t);
+        RenderEntityHitboxes(dl, p1, "P1", t);
+        RenderEntityHitboxes(dl, p2, "P2", t);
         RenderHitDefs(dl, t);
     }
     if (g_showPushboxes) {
-        RenderPushbox(dl, p1, "P1", p1AnimChanged, t);
-        RenderPushbox(dl, p2, "P2", p2AnimChanged, t);
+        RenderPushbox(dl, p1, "P1", t);
+        RenderPushbox(dl, p2, "P2", t);
     }
     if (g_showPositions) {
         RenderPosition(dl, p1, COL_P1_CROSS, t);

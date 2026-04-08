@@ -2,8 +2,8 @@
  * Alice Senki 2 - Practice Mode Tools
  *
  * Pause/unpause, single-frame advance, controller swap with CPU flag
- * management.  All features are gated to practice mode only
- * (GAMETYPE_VS_CPU in MODE_MATCH).
+ * management.  All features are gated to training mode only
+ * (GAMETYPE_TRAINING in MODE_MATCH).
  *
  * Hotkeys:
  *   F7  = Toggle pause / unpause
@@ -40,11 +40,10 @@ static bool s_f9WasDown = false;
 // Practice-mode detection
 // ============================================================================
 
-// Practice mode = GAMETYPE_VS_CPU while in MODE_MATCH.
-// The game has no dedicated training game type; the menu launches
-// "Training" as VS CPU with the P2 CPU flag set.
+// Training mode = GAMETYPE_TRAINING (4) in MODE_MATCH.
+// The 5th main-menu option ("Training") sets dword_816410 = 4.
 static bool IsPracticeModeNow() {
-    return GetGameType() == GAMETYPE_VS_CPU
+    return GetGameType() == GAMETYPE_TRAINING
         && GetGameMode() == MODE_MATCH;
 }
 
@@ -193,8 +192,8 @@ void PracticeTools_RenderImGui() {
     bool active = PracticeTools_IsPracticeModeActive();
 
     if (!active) {
-        ImGui::TextDisabled("Practice tools are only available in VS CPU mode.");
-        ImGui::TextDisabled("Start a match via Training or VS CPU from the main menu.");
+        ImGui::TextDisabled("Practice tools are only available in Training mode.");
+        ImGui::TextDisabled("Select Training (5th option) from the main menu.");
         return;
     }
 

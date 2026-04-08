@@ -285,7 +285,7 @@
 #define HITDEF_OFF_OWNER        0         // byte  — owning player index
 #define HITDEF_OFF_ID           4         // DWORD — unique ID (0 = free slot)
 #define HITDEF_OFF_TYPE         8         // byte  — hitbox type
-#define HITDEF_OFF_ACTIVE       9         // byte  — 1 = active
+#define HITDEF_OFF_ACTIVE       9         // byte  — invulnerability countdown (starts 1, decrements to 0)
 #define HITDEF_OFF_ACTIVE_FLAG  24        // byte  — active hitbox flag (-1 = inactive)
 #define HITDEF_OFF_DAMAGE       16        // DWORD — damage value
 #define HITDEF_OFF_ATK_LEVEL    20        // DWORD — attack level

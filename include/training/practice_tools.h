@@ -2,8 +2,8 @@
  * Alice Senki 2 - Practice Mode Tools
  *
  * Pause/unpause, single-frame advance, controller swap with CPU flag
- * management.  All features are gated to practice mode only
- * (GAMETYPE_VS_CPU in MODE_MATCH).
+ * management.  All features are gated to training mode only
+ * (GAMETYPE_TRAINING in MODE_MATCH).
  *
  * Integration points:
  *   - input_sync_hooks.cpp: ShouldSuppressAdvanceFrame checks PracticeTools_ShouldFreezeFrame

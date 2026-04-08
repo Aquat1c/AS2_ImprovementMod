@@ -279,7 +279,7 @@
 #define GAMETYPE_VS_CPU    1   // VS CPU - human picks both chars, P2 AI in match
 #define GAMETYPE_VS_HUMAN  2   // VS Human (2P local) - each player has own input
 #define GAMETYPE_NETPLAY   3   // Network play - online versus
-#define GAMETYPE_WATCH     4   // Watch/Spectate mode
+#define GAMETYPE_TRAINING  4   // Training mode (5th main-menu option)
 #define GAMETYPE_REPLAY    5   // Replay playback
 #define GAMETYPE_DEMO     10   // Demo/attract mode (shown on title screen)
 
