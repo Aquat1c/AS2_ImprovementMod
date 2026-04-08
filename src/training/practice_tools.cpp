@@ -28,7 +28,7 @@
 
 static bool s_initialized = false;
 static bool s_paused = false;
-static bool s_stepRequested = false;   // Allow exactly one frame through
+static int  s_stepsAllowed = 0;        // Frames to let through while paused
 static bool s_wasActive = false;       // Previous frame's practice-mode status
 
 // Edge detection for hotkeys (GetAsyncKeyState)
@@ -75,7 +75,7 @@ static void ResetPracticeState() {
     }
 
     s_paused = false;
-    s_stepRequested = false;
+    s_stepsAllowed = 0;
 
     // Restore default control mapping if swapped
     if (InputSystem_GetControlSwap()) {
@@ -90,7 +90,7 @@ static void ResetPracticeState() {
 void PracticeTools_Init() {
     s_initialized = true;
     s_paused = false;
-    s_stepRequested = false;
+    s_stepsAllowed = 0;
     s_wasActive = false;
     s_f7WasDown = false;
     s_f8WasDown = false;
@@ -128,13 +128,14 @@ void PracticeTools_FrameUpdate() {
     // F7: Toggle pause
     if (f7Down && !s_f7WasDown) {
         s_paused = !s_paused;
-        s_stepRequested = false;
+        s_stepsAllowed = 0;
         LOG_INFO("[Practice] %s", s_paused ? "PAUSED" : "UNPAUSED");
     }
 
-    // F8: Single-frame step (only while paused)
-    if (f8Down && !s_f8WasDown && s_paused) {
-        s_stepRequested = true;
+    // F8: Frame step (while paused)
+    // Edge press = advance 1 frame.  Holding = advance every frame.
+    if (f8Down && s_paused) {
+        s_stepsAllowed++;
     }
 
     // F9: Toggle controller swap
@@ -159,9 +160,9 @@ bool PracticeTools_ShouldFreezeFrame() {
     if (!s_initialized || !s_paused) return false;
     if (!IsPracticeModeNow()) return false;
 
-    // If a single-frame step was requested, allow one frame through
-    if (s_stepRequested) {
-        s_stepRequested = false;
+    // If steps are banked, allow one frame through and decrement
+    if (s_stepsAllowed > 0) {
+        s_stepsAllowed--;
         return false;
     }
 
@@ -206,13 +207,13 @@ void PracticeTools_RenderImGui() {
     bool paused = s_paused;
     if (ImGui::Checkbox("Paused (F7)", &paused)) {
         s_paused = paused;
-        s_stepRequested = false;
+        s_stepsAllowed = 0;
     }
 
     ImGui::SameLine();
     if (ImGui::Button("Step (F8)")) {
         if (s_paused) {
-            s_stepRequested = true;
+            s_stepsAllowed++;
         }
     }
     if (!s_paused) {

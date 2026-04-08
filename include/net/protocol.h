@@ -224,9 +224,9 @@ struct GameplayStartPayload {
 
 struct CharSelFrameInputPayload {
     uint32_t frame;              // Lockstep frame number
-    uint32_t ack_frame;          // Latest remote frame we received
-    uint16_t inputs[4];          // Redundant history: [frame, frame-1, frame-2, frame-3]
-    uint16_t input_count;        // Number of valid entries in inputs[] (1-4)
+    uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
+    uint16_t inputs[8];          // Redundant history: [frame, frame-1, ..., frame-7]
+    uint16_t input_count;        // Number of valid entries in inputs[] (1-8)
     uint16_t _pad;
 };
 

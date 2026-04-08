@@ -107,6 +107,7 @@ static bool     s_inStagePhase       = false;
 // --- Lockstep timeout / resend ---
 static DWORD    s_lastRemoteInputTime = 0;   // GetTickCount() of last new remote input
 static DWORD    s_lastResendTime      = 0;   // GetTickCount() of last resend
+static DWORD    s_lastTargetedResendTime = 0; // GetTickCount() of last targeted resend burst
 static bool     s_timedOut            = false;
 
 // --- Confirm detection (polled from game memory) ---
@@ -114,6 +115,12 @@ static bool     s_bothCharsLocked    = false;
 static bool     s_bothStageLocked    = false;
 static bool     s_localCharConfirmed = false;
 static bool     s_remoteCharLocked   = false;
+
+// Cached character IDs — captured at lock time, safe from mode transitions
+static uint8_t  s_localChar          = 0;
+static uint8_t  s_localPalette       = 0;
+static uint8_t  s_remoteChar         = 0;
+static uint8_t  s_remotePalette      = 0;
 
 // Stage tracking
 static uint8_t  s_localStage         = 0;
@@ -142,7 +149,7 @@ static uint8_t LookupCharId(uint8_t gridIndex) {
 static void SendFrameInputPacket(uint32_t frame) {
     CharSelFrameInputPayload payload{};
     payload.frame = frame;
-    payload.ack_frame = s_remoteLatestFrame;
+    payload.ack_frame = s_consumeFrame;  // Tell remote what frame we need from them
 
     int count = 0;
     for (int i = 0; i < INPUT_REDUNDANCY; i++) {
@@ -191,6 +198,10 @@ static void SendCharSelLock() {
     uint8_t cursor = ReadU8(cursorAddr, 0);
     uint8_t charId = LookupCharId(cursor);
     uint8_t palette = ReadU8(paletteAddr, 0);
+
+    // Cache locally — game memory may be stale by the time snapshot is read
+    s_localChar = charId;
+    s_localPalette = palette;
 
     CharSelLockPayload payload{};
     payload.character_id = charId;
@@ -260,6 +271,7 @@ void CharSelSync_Begin() {
     // Reset timeout / resend state
     s_lastRemoteInputTime = GetTickCount();
     s_lastResendTime = 0;
+    s_lastTargetedResendTime = 0;
     s_timedOut = false;
 
     // Reset confirm/lock state
@@ -268,6 +280,10 @@ void CharSelSync_Begin() {
     s_localCharConfirmed = false;
     s_remoteCharLocked = false;
     s_localLockSent = false;
+    s_localChar = 0;
+    s_localPalette = 0;
+    s_remoteChar = 0;
+    s_remotePalette = 0;
 
     s_localStage = 0;
     s_localStageLocked = false;
@@ -289,10 +305,38 @@ void CharSelSync_BeginStagePhase() {
     s_remoteStageLocked = false;
     s_bothStageLocked = false;
 
+    // ── Lockstep reset ──────────────────────────────────────────────
+    // Both sides accumulated different consumeFrame totals during charsel
+    // (host=1748, client=1732 in test logs — 16-frame drift).
+    // After both characters lock, the remaining subs (4→5→6) are
+    // non-interactive animation (96 frames). No input capture or
+    // consumption happens until sub=7 (stage grid).
+    // Resetting here gives both sides a clean, aligned start.
+    uint32_t oldConsume = s_consumeFrame;
+    uint32_t oldLocal   = s_localInputFrame;
+
+    s_consumeFrame      = 0;
+    s_localInputFrame   = 0;
+    s_remoteLatestFrame = 0;
+    s_delayLocked       = false;   // re-derive from current RTT
+
+    memset(s_hasLocalInput,  0, sizeof(s_hasLocalInput));
+    memset(s_hasRemoteInput, 0, sizeof(s_hasRemoteInput));
+
+    s_lastRemoteInputTime    = GetTickCount();
+    s_lastResendTime         = 0;
+    s_lastTargetedResendTime = 0;
+
     // Activate the stage select input merge module
     StageSelSync_Begin();
 
-    LOG_NETPLAY(LOG_INFO, "[CharSelSync] Stage phase begin");
+    LOG_NETPLAY(LOG_INFO,
+        "[CharSelSync] Stage phase begin (lockstep reset: consume %u->0, local %u->0)",
+        oldConsume, oldLocal);
+    Rollback::NetplayLog_Write("CHARSEL", -1,
+        "BeginStagePhase: lockstep RESET consume=%u->0 localFrame=%u->0 delay will re-derive",
+        oldConsume, oldLocal);
+    Rollback::NetplayLog_Flush();
 }
 
 void CharSelSync_Abort() {
@@ -539,10 +583,12 @@ void CharSelSync_FrameUpdate() {
 
     if (s_localCharConfirmed && s_remoteCharLocked && !s_bothCharsLocked) {
         s_bothCharsLocked = true;
-        uint8_t p1Char = (uint8_t)ReadU32(ADDR_CHARSEL_P1_CHAR_ID, 0);
-        uint8_t p2Char = (uint8_t)ReadU32(ADDR_CHARSEL_P2_CHAR_ID, 0);
+        // Use cached values — game memory may already be stale
+        uint8_t p1Char = s_isHost ? s_localChar : s_remoteChar;
+        uint8_t p2Char = s_isHost ? s_remoteChar : s_localChar;
         Rollback::NetplayLog_Write("CHARSEL", -1,
-            "=== BOTH CHARACTERS LOCKED: P1=%u P2=%u ===", p1Char, p2Char);
+            "=== BOTH CHARACTERS LOCKED: P1=%u P2=%u (local=%u remote=%u) ===",
+            p1Char, p2Char, s_localChar, s_remoteChar);
         LOG_NETPLAY(LOG_INFO, "[CharSelSync] Both characters locked: P1=%u P2=%u",
             p1Char, p2Char);
     }
@@ -620,12 +666,37 @@ void CharSelSync_OnRemoteFrameInput(const CharSelFrameInputPayload* p) {
         LOG_NETPLAY(LOG_INFO, "[CharSelSync] First remote frame received: frame=%u count=%d input=0x%04X",
             frame, count, p->inputs[0]);
     }
+
+    // Targeted resend: if remote is stuck waiting for frames we already sent,
+    // resend a burst covering their consumeFrame (carried in ack_frame).
+    // This recovers from dropped packets beyond the redundancy window.
+    uint32_t remoteConsume = p->ack_frame;
+    if (remoteConsume < s_localInputFrame && 
+        (s_localInputFrame - remoteConsume) > (uint32_t)INPUT_REDUNDANCY) {
+        DWORD now = GetTickCount();
+        if ((now - s_lastTargetedResendTime) >= (DWORD)RESEND_INTERVAL_MS) {
+            s_lastTargetedResendTime = now;
+            // Send one packet whose redundancy window covers remoteConsume
+            uint32_t resendFrame = remoteConsume + (uint32_t)INPUT_REDUNDANCY - 1;
+            if (resendFrame >= s_localInputFrame)
+                resendFrame = s_localInputFrame - 1;
+            if (s_hasLocalInput[resendFrame & RING_MASK]) {
+                Rollback::NetplayLog_Write("CHARSEL", -1,
+                    "Targeted resend: remote stuck at consume=%u, resending frame=%u (our local=%u)",
+                    remoteConsume, resendFrame, s_localInputFrame);
+                Rollback::NetplayLog_Flush();
+                SendFrameInputPacket(resendFrame);
+            }
+        }
+    }
 }
 
 void CharSelSync_OnRemoteLock(const CharSelLockPayload* p) {
     if (!s_active || !p) return;
 
     s_remoteCharLocked = true;
+    s_remoteChar = p->character_id;
+    s_remotePalette = p->palette;
 
     Rollback::NetplayLog_Write("CHARSEL", -1,
         "Remote character LOCKED: char=%u palette=%u",
@@ -664,11 +735,20 @@ void CharSelSync_GetSnapshot(CharSelSyncSnapshot* out) {
     out->remote_confirmed = ReadU8(ADDR_CHARSEL_P2_CONFIRM, 0);
     out->both_characters_locked = s_bothCharsLocked;
 
-    // P1/P2 character IDs from game memory (already correct from lockstep)
-    out->p1_character = (uint8_t)ReadU32(ADDR_CHARSEL_P1_CHAR_ID, 0);
-    out->p1_palette = ReadU8(ADDR_CHARSEL_P1_PALETTE, 0);
-    out->p2_character = (uint8_t)ReadU32(ADDR_CHARSEL_P2_CHAR_ID, 0);
-    out->p2_palette = ReadU8(ADDR_CHARSEL_P2_PALETTE, 0);
+    // P1/P2 character IDs from cached lock-time values (game memory may be
+    // stale if the game transitioned out of charsel before this snapshot).
+    // Host controls P1 (local), Join controls P2 (local).
+    if (s_isHost) {
+        out->p1_character = s_localChar;
+        out->p1_palette   = s_localPalette;
+        out->p2_character = s_remoteChar;
+        out->p2_palette   = s_remotePalette;
+    } else {
+        out->p1_character = s_remoteChar;
+        out->p1_palette   = s_remotePalette;
+        out->p2_character = s_localChar;
+        out->p2_palette   = s_localPalette;
+    }
 
     // Stage
     out->local_stage = s_localStage;
