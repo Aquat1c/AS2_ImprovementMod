@@ -7,6 +7,7 @@
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
+#include "rollback/desync_dump.h"
 #include "net/delay_policy.h"
 #include "net/sync_policy.h"
 #include "net/session_manager.h"
@@ -59,6 +60,9 @@ static uint32_t s_remoteStatusChecksum       = 0;
 
 // Current frame checksum (cached)
 static uint32_t s_currentChecksum   = 0;
+
+// Forward declarations
+static bool TryGetChecksumForFrame(int32_t frame, uint32_t* checksum);
 
 static void ResetChecksumHistory() {
     for (int i = 0; i < kChecksumHistorySize; ++i) {
@@ -113,6 +117,7 @@ void RollbackDebug_Init() {
     s_remoteStatusChecksum = 0;
     s_currentChecksum = 0;
     ResetChecksumHistory();
+    DesyncDump_Reset();
     s_initialized = true;
     LOG_INFO("[RollbackDebug] Initialized");
 }
@@ -142,6 +147,7 @@ void RollbackDebug_FrameUpdate() {
     }
 
     StoreChecksumForFrame(frame, s_currentChecksum);
+    DesyncDump_StoreChecksum(frame, s_currentChecksum);
 
     // Send state digest at configured interval
     if (s_digestEnabled && s_digestInterval > 0 &&
@@ -256,6 +262,9 @@ void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc) {
                 s_digestsMatched, s_digestsMismatched);
             NetplayLog_Flush();
         }
+
+        // Dump full state on desync (first occurrence + 10s cooldown)
+        DesyncDump_TryDump(frame, local_crc, remote_crc);
     }
 }
 

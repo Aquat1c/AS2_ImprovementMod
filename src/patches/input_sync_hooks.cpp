@@ -19,6 +19,7 @@
 #include "net/session_manager.h"
 #include "net/charsel_sync.h"
 #include "core/game_state.h"
+#include "training/practice_tools.h"
 #include "MinHook.h"
 
 #include <stdint.h>
@@ -69,7 +70,7 @@ static inline void ResetVanillaTimeouts() {
 }
 
 static inline bool IsGameplayFreezeActiveInternal() {
-    return s_load_barrier_freeze || s_timesync_freeze;
+    return s_load_barrier_freeze || s_timesync_freeze || PracticeTools_ShouldFreezeFrame();
 }
 
 static inline bool ShouldSuppressAdvanceFrame() {

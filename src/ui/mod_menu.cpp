@@ -4,16 +4,17 @@
  */
 
 #include "mod_menu.h"
+#include "hitbox_viewer.h"
 #include "input_system.h"
 #include "log_window.h"
 #include "mod_main.h"
 #include "patches/input_override.h"
 #include "patches/tick_hooks.h"
 #include "game_console.h"
-#include "hitbox_display.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/savestate.h"
 #include "testing/scripted_input_runner.h"
+#include "training/practice_tools.h"
 #include "imgui.h"
 #include <stdio.h>
 #include <string.h>
@@ -313,10 +314,6 @@ static void TabAdvancedDebug() {
         }
     }
 
-    if (ImGui::CollapsingHeader("Hitbox Display")) {
-        HitboxDisplay_RenderControls();
-    }
-
     if (ImGui::CollapsingHeader("Input Debug")) {
         RenderInputDebugContent();
     }
@@ -369,7 +366,6 @@ static void TabLog() {
 void ModMenu_Init() {
     g_menuOpen = true;
     g_currentTab = 0;
-    HitboxDisplay_Init();
 }
 
 void ModMenu_Toggle() {
@@ -381,9 +377,6 @@ bool ModMenu_IsOpen() {
 }
 
 void ModMenu_Render() {
-    // Always render hitbox display (even if menu is closed)
-    HitboxDisplay_Render();
-
     if (!ProxyMenuVisible() || !g_menuOpen) return;
     
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
@@ -447,6 +440,14 @@ void ModMenu_Render() {
                 SIR_RenderImGui();
                 ImGui::EndTabItem();
             }
+        }
+        if (ImGui::BeginTabItem("Hitbox")) {
+            HitboxViewer_RenderControls();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Practice")) {
+            PracticeTools_RenderImGui();
+            ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
     }

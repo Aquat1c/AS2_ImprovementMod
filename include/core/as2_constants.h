@@ -139,6 +139,15 @@
 #define ADDR_MATCH_CONTEXT      (ADDR_MATCH_BASE + 16)   // 0x76C608
 #define MATCH_CONTEXT_SIZE      (ADDR_EFFECT_ARRAY - ADDR_MATCH_CONTEXT)  // 7456 bytes (0x1D20)
 
+// Camera scroll (offsets from ADDR_MATCH_BASE, NOT match_context).
+// Weather_UpdateScroll (sub_4C4230) receives gameState = match_base.
+// scrollX: clamped [0, 959], scrollY: clamped [0, 319].
+// World-to-screen: screenX = worldX/10 - scrollX, screenY = worldY/10 - scrollY.
+#define MATCH_OFF_SCROLL_X      0x744                     // int16; match_base + 0x744
+#define MATCH_OFF_SCROLL_Y      0x746                     // int16; match_base + 0x746
+#define ADDR_SCROLL_X           (ADDR_MATCH_BASE + MATCH_OFF_SCROLL_X)  // 0x76CD3C
+#define ADDR_SCROLL_Y           (ADDR_MATCH_BASE + MATCH_OFF_SCROLL_Y)  // 0x76CD3E
+
 // ============================================================================
 // Netplay state addresses (vanilla)
 // ============================================================================
@@ -271,6 +280,48 @@
 #define SUMMON_MAX_SLOTS        100       // Maximum summons
 #define SUMMON_ENTRY_SIZE       272       // 272 bytes per summon
 
+// HitDef entry layout (within ADDR_SUMMON_ARRAY, 272 bytes per entry).
+// Created by HitDef_Create (sub_4BE100 area), used by Entity_UpdateHitDetection.
+#define HITDEF_OFF_OWNER        0         // byte  — owning player index
+#define HITDEF_OFF_ID           4         // DWORD — unique ID (0 = free slot)
+#define HITDEF_OFF_TYPE         8         // byte  — hitbox type
+#define HITDEF_OFF_ACTIVE       9         // byte  — 1 = active
+#define HITDEF_OFF_ACTIVE_FLAG  24        // byte  — active hitbox flag (-1 = inactive)
+#define HITDEF_OFF_DAMAGE       16        // DWORD — damage value
+#define HITDEF_OFF_ATK_LEVEL    20        // DWORD — attack level
+#define HITDEF_OFF_BLOCKSTUN    26        // WORD  — blockstun frames
+#define HITDEF_OFF_HITSTUN      28        // WORD  — hitstun frames
+#define HITDEF_OFF_KNOCKBACK    30        // WORD  — knockback force (init 10000)
+#define HITDEF_OFF_X            196       // int16 — world X position (×10)
+#define HITDEF_OFF_Y            198       // int16 — world Y position (×10)
+#define HITDEF_OFF_FACING       200       // int8  — facing direction
+#define HITDEF_OFF_ANIM_OWNER   201       // byte  — player index whose anim data to use
+#define HITDEF_OFF_ANIM_FRAME_IDX 228     // WORD  — animation frame index for box lookup
+
+// Per-animation box system (within animation frame data, 104 bytes per frame).
+// Frame layout (each entry = int16 xOff, yOff, halfW, halfH = 8 bytes):
+//   Offset  0-7:   Collision/push box (1 entry)
+//   Offset  8-39:  Hitboxes / attack boxes (4 entries)
+//   Offset 40-71:  Hurtboxes / vulnerable boxes (4 entries)
+//   Offset 72-103: Extended box set (4 entries, purpose TBD)
+// Screen-space: center = entityPos/10 + 2*offset*facing; extent = halfExtent.
+// Verified from Entity_UpdateHitDetection:
+//   Attack boxes at entity+4104+8, hurtboxes at entity+4104+40.
+#define ANIM_COLLISION_OFFSET   0         // frame offset: collision/push box (1 entry)
+#define ANIM_HITBOX_OFFSET      8         // frame offset: attack/hitbox set (4 entries)
+#define ANIM_HURTBOX_OFFSET     40        // frame offset: hurtbox/vulnerable set (4 entries)
+#define HURTBOX_ENTRY_SIZE      8         // 4 × int16 per box entry
+#define HURTBOX_COUNT_PER_FRAME 4         // 4 box entries per set
+
+// Active rect / pushbox (entity-relative single rects).
+// Managed by Input_SetNextRect / Input_ApplyNextRect.
+#define ENTITY_OFF_PENDING_RECT 0x0690    // +1680: pending rect (x,y,w,h,unk,type) 12 bytes
+#define ENTITY_OFF_ACTIVE_RECT  0x06A0    // +1696: active rect  (x,y,w,h,unk,type) 12 bytes
+#define ENTITY_OFF_PENDING2_RECT 0x06B0   // +1712: pending rect 2
+#define ENTITY_OFF_GLOBAL_X     0x06C0    // +1728: global X (int16)
+#define ENTITY_OFF_GLOBAL_Y     0x06C2    // +1730: global Y (int16)
+#define ACTIVE_RECT_TYPE_INACTIVE 12      // type value meaning rect is inactive
+
 // Key effect functions
 #define ADDR_EFFECT_SPAWN       (GAME_BASE + 0x0A92C0)  // sub_4A92C0 - Spawn effect
 #define ADDR_EFFECT_CLEAR       (GAME_BASE + 0x0A92A0)  // sub_4A92A0 - Clear all effects
@@ -323,6 +374,42 @@
 #define ENTITY_OFF_COMBO        0x078C  // +1932, combo tracking
 #define ENTITY_OFF_FLAG_CE      0x00B6  // +182, flag used in AI calculations
 #define ENTITY_OFF_HITSTUN      0x1A7F0 // +108528, hitstun array (sub_4C1F60)
+
+// Physics / velocity (suspected from entity core range 0xBE-0xD0)
+#define ENTITY_OFF_X_VEL        0x00BE  // +190, int16 — X velocity/speed component
+#define ENTITY_OFF_Y_VEL        0x00C0  // +192, int16 — Y velocity/speed component
+#define ENTITY_OFF_X_ACCEL      0x00C2  // +194, int16 — X acceleration
+#define ENTITY_OFF_Y_ACCEL      0x00C4  // +196, int16 — Y acceleration (gravity)
+#define ENTITY_OFF_CORE_C6      0x00C6  // +198, int16 — unknown core field
+#define ENTITY_OFF_CORE_C8      0x00C8  // +200, int16 — unknown core field
+#define ENTITY_OFF_CORE_CA      0x00CA  // +202, int16 — unknown core field
+#define ENTITY_OFF_CORE_CC      0x00CC  // +204, int16 — unknown core field
+#define ENTITY_OFF_CORE_CE      0x00CE  // +206, int16 — unknown core field
+
+// Action state buffer offsets (relative to entity base)
+#define ENTITY_OFF_ACTION_PHASE 0x0498  // +1176, current phase within action (WORD)
+#define ENTITY_OFF_ACTION_FRAME 0x04A4  // +1188, current frame within action phase (WORD)
+#define ENTITY_OFF_ACTION_PRIORITY 0x04DC // +1244, attack priority (DWORD)
+
+// Combat hitstun/blockstun (within state-B / combat block)
+#define ENTITY_OFF_CHIP_DAMAGE  0x06D8  // +1752, WORD — chip/block damage
+#define ENTITY_OFF_KNOCKBACK_FORCE 0x06DA // +1754, WORD — knockback force init (10000)
+#define ENTITY_OFF_KNOCKBACK_TIMER 0x06DC // +1756, WORD — knockback timer (20 * hitstun)
+#define ENTITY_OFF_HIT_TIMER_BASE 0x06DE // +1758, WORD — hit timer base (init=20)
+#define ENTITY_OFF_HITSTUN_DURATION 0x06E0 // +1760, BYTE — hitstun duration
+#define ENTITY_OFF_HIT_RECOVERY 0x06E1  // +1761, BYTE — hit recovery rate
+#define ENTITY_OFF_HITSTUN_PRIMARY 0x06E2 // +1762, BYTE — primary hitstun value
+#define ENTITY_OFF_CURRENT_DAMAGE 0x06E4 // +1764, WORD — current damage copy
+#define ENTITY_OFF_HIT_EFFECT   0x06E8  // +1768, DWORD — hit effect flag (init=8)
+#define ENTITY_OFF_BLOCKSTUN    0x06FC  // +1788, BYTE — blockstun counter
+#define ENTITY_OFF_BLOCKSTUN2   0x06FD  // +1789, BYTE — blockstun copy
+#define ENTITY_OFF_HIT_REACTION 0x070C  // +1804, BYTE — extended hit reaction time
+
+// Combo scaling (within action block)
+#define ENTITY_OFF_COMBO_SCALE1 0x04D5  // +1237, BYTE — combo multiplier 1
+#define ENTITY_OFF_COMBO_SCALE2 0x04D7  // +1239, BYTE — combo multiplier 2
+#define ENTITY_OFF_COMBO_SCALE3 0x04D9  // +1241, BYTE — combo multiplier 3
+#define ENTITY_OFF_COMBO_SCALE4 0x04DB  // +1243, BYTE — combo special stat
 
 // Box system offsets
 #define ENTITY_OFF_BOX_FLAGS    0x0674  // +1652, 24 bytes

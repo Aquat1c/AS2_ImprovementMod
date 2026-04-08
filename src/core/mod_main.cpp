@@ -10,6 +10,7 @@
 #include "input_system.h"
 #include "log_window.h"
 #include "mod_menu.h"
+#include "hitbox_viewer.h"
 #include "game_console.h"
 #include "patches/memory_utils.h"
 #include "patches/unlock_patch.h"
@@ -35,6 +36,7 @@
 #include "net/set_tracker.h"
 #include "net/player_side_mapping.h"
 #include "testing/scripted_input_runner.h"
+#include "training/practice_tools.h"
 #include "imgui.h"
 #include <stdio.h>
 #include <string.h>
@@ -274,6 +276,9 @@ static void DeferredInit() {
     // Initialize scripted input runner
     SIR_Init();
 
+    // Initialize practice mode tools
+    PracticeTools_Init();
+
     LOG_INFO("Frame Counter: 0x%08X = %d", ADDR_SIM_FRAME_COUNTER, AS2_GetFrameNumber());
     LOG_INFO("Game Mode: 0x%08X = %d", ADDR_GAME_MODE, GetGameMode());
     LOG_INFO("P1 HP: 0x%08X = %d", ADDR_P1_HP_DIRECT, GetP1HP());
@@ -282,10 +287,11 @@ static void DeferredInit() {
     g_initialized = true;
 
     ModMenu_Init();
+    HitboxViewer_Init();
 
     LOG_INFO("========================================");
     LOG_INFO("Initialization complete!");
-    LOG_INFO("Hotkeys: F1=Menu  F5=SaveState  F6=LoadState");
+    LOG_INFO("Hotkeys: F1=Menu  F5=SaveState  F6=LoadState  F7=Pause  F8=Step  F9=Swap");
     LOG_INFO("========================================");
 }
 
@@ -333,6 +339,7 @@ __declspec(dllexport) void ModShutdown() {
     LOG_INFO("Mod shutdown...");
 
     if (g_initialized) {
+        PracticeTools_Shutdown();
         SIR_Shutdown();
         Rollback::OnlineWiring_Shutdown();
         Rollback::StressHooks_Shutdown();
@@ -410,6 +417,9 @@ __declspec(dllexport) void ModOnFrame() {
 
     // Process savestate hotkeys (F5 save, F6 load)
     Savestate_ProcessHotkeys();
+
+    // Process practice mode hotkeys and state
+    PracticeTools_FrameUpdate();
 
     // Run scripted input runner (injects overrides before SDL update)
     SIR_OnFrame();
@@ -509,6 +519,7 @@ __declspec(dllexport) void ModOnFrame() {
 
 __declspec(dllexport) void ModOnPresent(void* pDevice) {
     if (!g_initialized) return;
+    HitboxViewer_Render();
     ModMenu_Render();
 }
 
