@@ -23,6 +23,7 @@
 #include "core/as2_constants.h"
 #include "patches/input_sync_hooks.h"
 #include "patches/memory_utils.h"
+#include "rollback/online_wiring.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
@@ -679,6 +680,12 @@ static void UpdateBootstrapReady() {
 
         // Notify match lifecycle layer — it now owns the match flow
         MatchLifecycle_OnMatchEnter();
+
+        // Start rollback from the captured bootstrap baseline immediately.
+        // Waiting for the later PlayableGameplay edge lets the local game run
+        // ahead through intro frames, then rewinds back to frame 0 at session
+        // begin, which destabilizes lifecycle classification across peers.
+        Rollback::OnlineWiring_OnGameplayStart();
     }
 
     if (bSnap.error[0]) {

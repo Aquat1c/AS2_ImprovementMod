@@ -32,15 +32,15 @@ void OnlineWiring_Shutdown();
 
 void OnlineWiring_FrameUpdate();
 
-/// Returns true if we are in playable gameplay and rollback should advance.
+/// Returns true if the rollback session is active and match runtime should advance.
 bool OnlineWiring_IsGameplayActive();
 
 // ============================================================================
 // Events
 // ============================================================================
 
-/// Called when MatchLifecycle reaches PlayableGameplay from a non-gameplay state.
-/// Starts the rollback session if not already active.
+/// Called when pregame bootstrap hands the match to the lifecycle layer.
+/// Starts the rollback session from the agreed baseline if not already active.
 void OnlineWiring_OnGameplayStart();
 
 /// Called when MatchLifecycle leaves PlayableGameplay.

@@ -522,6 +522,80 @@ static char g_dllDir[MAX_PATH] = {0};
 static char g_logDir[MAX_PATH] = {0};
 
 // ============================================================================
+// Display Config — persist window mode + size to as2_display.cfg
+// ============================================================================
+
+// Forward declaration — ProxyLog is defined later in the file
+void ProxyLog(const char* fmt, ...);
+
+static void DisplayConfig_GetPath(char* out, int cap) {
+    snprintf(out, cap, "%s\\as2_display.cfg", g_dllDir);
+}
+
+static void DisplayConfig_Load() {
+    char path[MAX_PATH];
+    DisplayConfig_GetPath(path, MAX_PATH);
+
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        ProxyLog("[CONFIG] No display config found (%s) — using defaults", path);
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        // Skip comments and section headers
+        if (line[0] == '#' || line[0] == '[' || line[0] == '\n' || line[0] == '\r')
+            continue;
+
+        char key[64] = {0};
+        char val[128] = {0};
+        if (sscanf(line, "%63[^=]=%127[^\r\n]", key, val) == 2) {
+            if (strcmp(key, "borderless") == 0) {
+                int v = atoi(val);
+                g_useBorderlessFullscreen = (v != 0);
+                g_isCurrentlyBorderless = g_useBorderlessFullscreen;
+            } else if (strcmp(key, "windowed_width") == 0) {
+                int v = atoi(val);
+                if (v >= 640) g_windowedWidth = v;
+            } else if (strcmp(key, "windowed_height") == 0) {
+                int v = atoi(val);
+                if (v >= 480) g_windowedHeight = v;
+            } else if (strcmp(key, "keep_aspect") == 0) {
+                g_keepAspectRatio = (atoi(val) != 0);
+            }
+        }
+    }
+    fclose(f);
+
+    ProxyLog("[CONFIG] Loaded display config: borderless=%d, windowed=%dx%d, aspect=%d",
+             g_useBorderlessFullscreen, g_windowedWidth, g_windowedHeight, g_keepAspectRatio);
+}
+
+static void DisplayConfig_Save() {
+    char path[MAX_PATH];
+    DisplayConfig_GetPath(path, MAX_PATH);
+
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        ProxyLog("[CONFIG] ERROR: Failed to write display config: %s", path);
+        return;
+    }
+
+    fprintf(f, "# Alice Senki 2 — Display Settings\n");
+    fprintf(f, "# Auto-saved by the mod. Edit at your own risk.\n");
+    fprintf(f, "[display]\n");
+    fprintf(f, "borderless=%d\n", g_isCurrentlyBorderless ? 1 : 0);
+    fprintf(f, "windowed_width=%d\n", g_currentWindowWidth > 0 ? g_currentWindowWidth : 640);
+    fprintf(f, "windowed_height=%d\n", g_currentWindowHeight > 0 ? g_currentWindowHeight : 480);
+    fprintf(f, "keep_aspect=%d\n", g_keepAspectRatio ? 1 : 0);
+
+    fclose(f);
+    ProxyLog("[CONFIG] Saved display config: borderless=%d, windowed=%dx%d, aspect=%d",
+             g_isCurrentlyBorderless, g_currentWindowWidth, g_currentWindowHeight, g_keepAspectRatio);
+}
+
+// ============================================================================
 // Window Title Override
 // ============================================================================
 
@@ -604,7 +678,7 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
     GetLocalTime(&st);
     
     // Build crash message
-    char msg[8192];
+    char msg[16384];
     int len = 0;
     
     len += snprintf(msg + len, sizeof(msg) - len,
@@ -858,6 +932,86 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
             modName, hMod, (unsigned int)offset);
     }
     
+    // ========================================================================
+    // Enhanced diagnostics: EIP region, instruction bytes, raw stack dump
+    // ========================================================================
+    {
+        // Classify EIP region
+        DWORD eip = pContext->Eip;
+        DWORD esp = pContext->Esp;
+        NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+        DWORD stackBase = (DWORD)tib->StackBase;
+        DWORD stackLimit = (DWORD)tib->StackLimit;
+
+        const char* eipRegion = "UNKNOWN";
+        if (eip >= stackLimit && eip < stackBase)
+            eipRegion = "*** STACK (corrupted control flow!) ***";
+        else {
+            HMODULE hEipMod = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)eip, &hEipMod))
+                eipRegion = "CODE (module)";
+            else
+                eipRegion = "HEAP/OTHER (possible vtable corruption)";
+        }
+        len += snprintf(msg + len, sizeof(msg) - len,
+            "\nEIP Region: %s\n"
+            "Thread Stack: 0x%08X - 0x%08X (limit - base)\n",
+            eipRegion, stackLimit, stackBase);
+
+        // Dump bytes at EIP (the "instruction" the CPU tried to execute)
+        len += snprintf(msg + len, sizeof(msg) - len, "\nBytes at EIP (0x%08X):", eip);
+        __try {
+            unsigned char* p = (unsigned char*)eip;
+            for (int b = 0; b < 16 && len < sizeof(msg) - 10; b++) {
+                len += snprintf(msg + len, sizeof(msg) - len, " %02X", p[b]);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            len += snprintf(msg + len, sizeof(msg) - len, " <UNREADABLE>");
+        }
+        len += snprintf(msg + len, sizeof(msg) - len, "\n");
+
+        // Raw stack hex dump (16 DWORDs from ESP upward)
+        len += snprintf(msg + len, sizeof(msg) - len, "\nRaw Stack Dump (ESP=0x%08X, 16 DWORDs):\n", esp);
+        __try {
+            DWORD* sp = (DWORD*)esp;
+            for (int row = 0; row < 4 && len < sizeof(msg) - 80; row++) {
+                len += snprintf(msg + len, sizeof(msg) - len, "  +%02X:", row * 16);
+                for (int col = 0; col < 4; col++) {
+                    len += snprintf(msg + len, sizeof(msg) - len, " %08X", sp[row * 4 + col]);
+                }
+                len += snprintf(msg + len, sizeof(msg) - len, "\n");
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            len += snprintf(msg + len, sizeof(msg) - len, "  <UNREADABLE>\n");
+        }
+
+        // Entity state dump — entity animation indices and key offsets
+        // Entity base addresses from as2_constants.h
+        len += snprintf(msg + len, sizeof(msg) - len, "\nEntity State Snapshot:\n");
+        const DWORD p1Entity = 0x776668;  // ADDR_P1_ENTITY_BASE
+        const DWORD p2Entity = 0x790F74;  // ADDR_P2_ENTITY_BASE
+        for (int p = 0; p < 2; p++) {
+            DWORD entBase = (p == 0) ? p1Entity : p2Entity;
+            len += snprintf(msg + len, sizeof(msg) - len, "  P%d (0x%08X):", p + 1, entBase);
+            __try {
+                DWORD animIdx    = *(DWORD*)(entBase + 0x1004);
+                DWORD animFrames = *(DWORD*)(entBase + 0x100C);
+                BYTE  atkState   = *(BYTE*)(entBase + 0x6C8);
+                DWORD atkType    = *(DWORD*)(entBase + 0x6CC);
+                BYTE  hitActive  = *(BYTE*)(entBase + 0x6D4);
+                short posX       = *(short*)(entBase + 0xB8);
+                short posY       = *(short*)(entBase + 0xBA);
+                len += snprintf(msg + len, sizeof(msg) - len,
+                    " animIdx=%u/%u atk=%d type=0x%X hit=%d pos=(%d,%d)\n",
+                    animIdx, animFrames, atkState, atkType, hitActive,
+                    (int)posX, (int)posY);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                len += snprintf(msg + len, sizeof(msg) - len, " <UNREADABLE>\n");
+            }
+        }
+    }
+
     // Simple stack walk (no symbols, just addresses)
     len += snprintf(msg + len, sizeof(msg) - len, "\nStack Trace (addresses only):\n");
     DWORD* pStack = (DWORD*)pContext->Esp;
@@ -1713,8 +1867,9 @@ void SetBorderlessState(HWND hWnd, bool enable) {
         SetWindowLong(hRoot, GWL_STYLE, style);
         SetWindowLong(hRoot, GWL_EXSTYLE, exStyle);
         
-        int w = g_nativeWidth;
-        int h = g_nativeHeight;
+        // Use saved windowed dimensions if available, otherwise native size
+        int w = (g_windowedWidth >= g_nativeWidth) ? g_windowedWidth : g_nativeWidth;
+        int h = (g_windowedHeight >= g_nativeHeight) ? g_windowedHeight : g_nativeHeight;
         
         RECT rc = {0, 0, w, h};
         AdjustWindowRectEx(&rc, style, FALSE, exStyle);
@@ -1784,6 +1939,9 @@ void ToggleBorderlessFullscreen(HWND hWnd) {
     // Keep the "use" flag in sync so scaling initialization paths remain enabled.
     g_useBorderlessFullscreen = newState;
     SetBorderlessState(hWnd, newState);
+    
+    // Persist window state change
+    DisplayConfig_Save();
     
     // Scaling swap chain will be (re)initialized automatically in HookedSwapChainPresent
     // when it detects g_scalingInitialized is false and borderless is enabled
@@ -1947,6 +2105,13 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
                 }
             }
         }
+    }
+    
+    // Save display config after user finishes resizing the window
+    if (msg == WM_EXITSIZEMOVE && !g_isCurrentlyBorderless) {
+        ProxyLog("[RESIZE] Drag/move complete, saving display config (%dx%d)", 
+                 g_currentWindowWidth, g_currentWindowHeight);
+        DisplayConfig_Save();
     }
     
     // Handle WM_GETMINMAXINFO for minimum size
@@ -2324,105 +2489,10 @@ HRESULT WINAPI HookedEndScene(IDirect3DDevice9* pDevice) {
         RenderImGui();
     }
 
-    // === HUD rendering (single state save / restore for all draws) ===
-    bool hudBatchStarted = false;
-
-    // Render match HUD (player names, ping, delay, rollback) during gameplay
-    if (g_showHud && g_pModGetMatchHudData) {
-        MatchHudData matchHud = {};
-        if (g_pModGetMatchHudData(&matchHud) && matchHud.active) {
-            if (!hudBatchStarted) { Hud_BeginBatch(pDevice); hudBatchStarted = true; }
-
-            // 640x480 backbuffer space
-            const float scale = 1.0f;
-            const float charW = 8.0f * scale;
-            const float lineH = 8.0f * scale;
-            const float pad = 4.0f;
-
-            // === TOP: Player names with win counts above HP bars ===
-            {
-                const float topY = 2.0f;  // above HP bars (~Y=18)
-
-                // P1: "NAME (W)" — left-aligned
-                char p1text[40];
-                _snprintf_s(p1text, sizeof(p1text), _TRUNCATE, "%s (%d)", matchHud.p1_name, matchHud.p1_wins);
-                int p1len = 0;
-                for (const char* p = p1text; *p; p++) p1len++;
-                // Shadow
-                Hud_DrawText(pDevice, pad + 3.0f, topY + 1.0f, scale,
-                             D3DCOLOR_ARGB(180, 0, 0, 0), p1text);
-                Hud_DrawText(pDevice, pad + 2.0f, topY, scale,
-                             D3DCOLOR_ARGB(255, 100, 200, 255), p1text);
-
-                // P2: "NAME (W)" — right-aligned
-                char p2text[40];
-                _snprintf_s(p2text, sizeof(p2text), _TRUNCATE, "%s (%d)", matchHud.p2_name, matchHud.p2_wins);
-                int p2len = 0;
-                for (const char* p = p2text; *p; p++) p2len++;
-                float p2x = 640.0f - pad - 2.0f - (float)p2len * charW;
-                // Shadow
-                Hud_DrawText(pDevice, p2x + 1.0f, topY + 1.0f, scale,
-                             D3DCOLOR_ARGB(180, 0, 0, 0), p2text);
-                Hud_DrawText(pDevice, p2x, topY, scale,
-                             D3DCOLOR_ARGB(255, 255, 130, 130), p2text);
-            }
-
-            // === BOTTOM: Connection stats bar ===
-            {
-                const float barH = lineH + pad * 2.0f;
-                const float barY = 480.0f - barH;  // bottom edge at screen bottom
-
-                char stats[64];
-                if (matchHud.ping_ms >= 0.0f) {
-                    _snprintf_s(stats, sizeof(stats), _TRUNCATE,
-                               "PING:%dms  D:%d  RB:%d",
-                               (int)(matchHud.ping_ms + 0.5f),
-                               matchHud.delay_frames,
-                               matchHud.rollback_frames);
-                } else {
-                    _snprintf_s(stats, sizeof(stats), _TRUNCATE,
-                               "PING:--  D:%d  RB:%d",
-                               matchHud.delay_frames,
-                               matchHud.rollback_frames);
-                }
-                int slen = 0;
-                for (const char* p = stats; *p; p++) slen++;
-                float textW = (float)slen * charW;
-                float barW = textW + pad * 2.0f;
-                float barX = (640.0f - barW) * 0.5f;
-
-                Hud_DrawRect(pDevice, barX, barY, barW, barH, D3DCOLOR_ARGB(160, 0, 0, 0));
-
-                const float textY = barY + pad;
-                float sx = barX + pad;
-                Hud_DrawText(pDevice, sx, textY, scale,
-                             D3DCOLOR_ARGB(230, 255, 255, 255), stats);
-            }
-        }
-    }
-
-    // Render always-on status HUD (no ImGui dependency) — only when match HUD isn't active
-    if (g_showHud && g_pModGetNetplayHudText) {
-        // Skip the simple text HUD if match HUD is already showing
-        MatchHudData checkHud = {};
-        bool matchHudActive = g_pModGetMatchHudData && g_pModGetMatchHudData(&checkHud) && checkHud.active;
-
-        if (!matchHudActive) {
-            char hudText[256] = {0};
-            if (g_pModGetNetplayHudText(hudText, (int)sizeof(hudText)) && hudText[0] != '\0') {
-                if (!hudBatchStarted) { Hud_BeginBatch(pDevice); hudBatchStarted = true; }
-
-                const float scale = 1.0f;
-                const float margin = 6.0f;
-                const float lineH = 8.0f * scale;
-                const float x = margin;
-                const float y = (480.0f > (lineH + margin)) ? (480.0f - lineH - margin) : margin;
-                Hud_DrawText(pDevice, x, y, scale, D3DCOLOR_ARGB(220, 255, 255, 255), hudText);
-            }
-        }
-    }
-
-    if (hudBatchStarted) { Hud_EndBatch(); }
+    // === HUD rendering ===
+    // Match HUD (names, ping, delay, rollback) is now rendered via ImGui in
+    // the mod DLL (NetplayHud_Render called from ModOnPresent).
+    // The old D3D9 bitmap font HUD has been retired.
     
     // Log every 600 frames (roughly every 10 seconds at 60fps)
     frameCount++;
@@ -3747,6 +3817,10 @@ public:
                     // We use the scaling swap chain approach instead (initialized in Present hook)
                     // The LetterboxScaler conflicts with the swap chain approach
                     ProxyLog("[CREATEDEVICE] Scaling swap chain will be initialized in first Present");
+                } else if (g_windowedWidth > 0 && g_windowedHeight > 0) {
+                    // Apply saved windowed dimensions
+                    SetBorderlessState(hFocusWindow, false);
+                    ProxyLog("[CREATEDEVICE] Applied saved windowed size: %dx%d", g_windowedWidth, g_windowedHeight);
                 }
             } else {
                 // Just set borderless state without WndProc hook
@@ -3758,6 +3832,9 @@ public:
                     SetBorderlessState(hFocusWindow, true);
                     // NOTE: Scaling swap chain initialized in first Present
                     ProxyLog("[CREATEDEVICE] Scaling swap chain will be initialized in first Present (no WndProc hook)");
+                } else if (g_windowedWidth > 0 && g_windowedHeight > 0 && hFocusWindow) {
+                    SetBorderlessState(hFocusWindow, false);
+                    ProxyLog("[CREATEDEVICE] Applied saved windowed size (no WndProc hook): %dx%d", g_windowedWidth, g_windowedHeight);
                 }
             }
             
@@ -3766,6 +3843,13 @@ public:
             if (SUCCEEDED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBackBuffer))) {
                 LogSurfaceInfo(pBackBuffer, "[CREATEDEVICE] BackBuffer");
                 pBackBuffer->Release();
+            }
+            
+            // Reclaim focus for the game window (console may have stolen it)
+            if (hFocusWindow) {
+                SetForegroundWindow(hFocusWindow);
+                SetFocus(hFocusWindow);
+                ProxyLog("[CREATEDEVICE] Reclaimed focus for game window");
             }
             
         } else {
@@ -3902,6 +3986,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             
             // Load mod DLL
             LoadModDLL();
+            
+            // Load persistent display settings (borderless, window size, aspect)
+            DisplayConfig_Load();
             
             // Call mod init
             if (g_pModInit) {

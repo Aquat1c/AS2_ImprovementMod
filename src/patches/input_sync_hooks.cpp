@@ -146,7 +146,9 @@ static int __cdecl Hook_AdvanceFrame() {
         }
         return 0;
     }
-    return g_origAdvanceFrame ? g_origAdvanceFrame() : 0;
+    int result = g_origAdvanceFrame ? g_origAdvanceFrame() : 0;
+    PracticeTools_OnFrameAdvanced();
+    return result;
 }
 
 /**

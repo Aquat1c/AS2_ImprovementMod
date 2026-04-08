@@ -7,6 +7,7 @@
 #include "net/netplay_menu_controller.h"
 #include "net/session_manager.h"
 #include "net/charsel_sync.h"
+#include "net/pregame_sync.h"
 #include "net/stagesel_sync.h"
 #include "net/player_side_mapping.h"
 #include "core/game_state.h"
@@ -51,6 +52,13 @@ static inline bool IsCharSelDispatcherLockstepSubstate(uint32_t substate) {
 static inline bool IsStageSelRawLockstepSubstate(uint32_t substate) {
     return substate == CHARSEL_SUB_STAGESEL_GRID ||
            substate == CHARSEL_SUB_STAGESEL_CONFIRM;
+}
+
+static inline bool ShouldHoldCharSelUntilLockstep(uint32_t mode, uint32_t substate) {
+    return mode == MODE_CHARSEL &&
+           IsCharSelDispatcherLockstepSubstate(substate) &&
+           Net::PregameSync_IsActive() &&
+           !Net::CharSelSync_IsLockstepActive();
 }
 
 // ============================================================================
@@ -417,11 +425,33 @@ static bool s_charsel_produced_this_loop = false;
 int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     if (!outputInputs) return -1;
 
+    const uint32_t gameMode = GetGameMode();
+    const uint32_t subState = GetSubstate();
+
     // ── Load barrier freeze ─────────────────────────────────────────
     // Game reached match loading but bootstrap hasn't completed.
     // Freeze gameplay (return -1) while keeping game loop alive for
     // SessionManager updates, packet exchange, and ImGui rendering.
     if (InputSyncHooks_IsGameplayFreezeActive()) {
+        return -1;
+    }
+
+    // LaunchNetplayCharSel enters Mode 6 before the announce/confirm
+    // handshake has promoted pregame into frontend lockstep. Hold the live
+    // selection substates inert so an early-arriving peer cannot move or
+    // confirm locally before CharSelSync takes ownership.
+    if (ShouldHoldCharSelUntilLockstep(gameMode, subState)) {
+        static uint32_t s_charselHoldCount = 0;
+        s_charselHoldCount++;
+        if (s_charselHoldCount <= 5 || (s_charselHoldCount % 120) == 0) {
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "CharSel HOLD (#%u): phase=%s mode=%u sub=%u",
+                s_charselHoldCount,
+                Net::PregamePhaseName(Net::PregameSync_GetPhase()),
+                gameMode,
+                subState);
+            Rollback::NetplayLog_Flush();
+        }
         return -1;
     }
 
@@ -442,9 +472,6 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     // Both sides exchange inputs frame-by-frame. Game only advances
     // when BOTH local and remote inputs are available.
     if (Net::CharSelSync_IsLockstepActive()) {
-        const uint32_t gameMode = GetGameMode();
-        const uint32_t subState = GetSubstate();
-
         // Only run lockstep during active selection substates
         if (gameMode != MODE_CHARSEL || !IsCharSelDispatcherLockstepSubstate(subState)) {
             // Not in a lockstep substate — freeze and suppress vanilla
@@ -623,6 +650,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         // We skip our own frame when too far ahead (return -1),
         // and run an extra tick when behind (double-tick).
         static int s_frameSkipTimer = 0;
+        static bool s_doDoubleTick = false;
         float framesAhead = Rollback::RollbackSession_FramesAhead();
 
         if (framesAhead > 2.0f) {
@@ -633,35 +661,17 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             return -1;
         }
 
-        // If we're behind (frames_ahead < -1.0), run an extra catch-up tick
-        // Rate-limited to once per 60 frames to prevent jitter
-        if (framesAhead < -1.0f && s_frameSkipTimer <= 0) {
+        // If we're behind (frames_ahead < -1.0), schedule a double-tick.
+        // Rate-limited to once per 60 frames to prevent jitter.
+        // The double-tick flag causes a second BeginFrame after the first
+        // batch of events is fully processed, letting the game's match handler
+        // run for each advance event (unlike the old approach which drained
+        // events internally and skipped simulation).
+        if (framesAhead < -1.0f && s_frameSkipTimer <= 0 && !s_doDoubleTick) {
+            s_doDoubleTick = true;
             s_frameSkipTimer = 60;
-            // Extra tick: run a full BeginFrame + drain events
-            InputSystem_Update();
-            uint16_t catchUpInput = Net::PlayerMapping_ReadLocalInput();
-            Rollback::RollbackSession_BeginFrame(catchUpInput);
-
-            // Drain all events from the extra tick internally
-            Rollback::EventResult extra;
-            do {
-                extra = Rollback::RollbackSession_ProcessNextEvent();
-                if (extra == Rollback::EventResult::Advance) {
-                    // Advance from catch-up — write to history + increment write index
-                    uint16_t cp1 = 0, cp2 = 0;
-                    Rollback::RollbackSession_GetAdvanceInputs(&cp1, &cp2);
-                    volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
-                    const uint32_t wi = (uint32_t)*pFrameWrite;
-                    if (wi < INPUT_HISTORY_MAX) {
-                        *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (wi * sizeof(uint16_t))) = cp1;
-                        *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (wi * sizeof(uint16_t))) = cp2;
-                    }
-                    *pFrameWrite = (int32_t)(wi + 1);
-                }
-            } while (extra != Rollback::EventResult::Done);
-
             Rollback::NetplayLog_Write("TIMESYNC", -1,
-                "Catch-up tick complete: framesAhead=%.2f input=0x%04X", framesAhead, catchUpInput);
+                "Scheduling double-tick: framesAhead=%.2f", framesAhead);
         }
         if (s_frameSkipTimer > 0) s_frameSkipTimer--;
 
@@ -711,6 +721,47 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             // No more events (Done) — frame batch complete
             s_gekkoFrameStarted = false;
 
+            // Double-tick: if scheduled, start another BeginFrame cycle
+            // so the game runs a second full tick through the match handler
+            if (s_doDoubleTick) {
+                s_doDoubleTick = false;
+
+                InputSystem_Update();
+                uint16_t localInput2 = Net::PlayerMapping_ReadLocalInput();
+
+                Rollback::NetplayLog_Write("TIMESYNC", -1,
+                    "Double-tick: starting second BeginFrame, local_input=0x%04X", localInput2);
+
+                Rollback::RollbackSession_BeginFrame(localInput2);
+                s_gekkoFrameStarted = true;
+
+                // Continue processing — the game's while loop will call us
+                // again for each Advance event from GekkoNet
+                Rollback::EventResult result2 = Rollback::RollbackSession_ProcessNextEvent();
+                if (result2 == Rollback::EventResult::Advance) {
+                    uint16_t p1 = 0, p2 = 0;
+                    Rollback::RollbackSession_GetAdvanceInputs(&p1, &p2);
+                    outputInputs[0] = (__int16)p1;
+                    outputInputs[1] = (__int16)p2;
+
+                    volatile int32_t* pFrameWrite2 = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
+                    const uint32_t writeIdx2 = (uint32_t)*pFrameWrite2;
+                    if (writeIdx2 < INPUT_HISTORY_MAX) {
+                        *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (writeIdx2 * sizeof(uint16_t))) = p1;
+                        *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (writeIdx2 * sizeof(uint16_t))) = p2;
+                    }
+                    *pFrameWrite2 = (int32_t)(writeIdx2 + 1);
+
+                    Rollback::NetplayLog_Write("TIMESYNC", -1,
+                        "Double-tick Advance → P1=0x%04X P2=0x%04X writeIdx=%u->%u",
+                        p1, p2, writeIdx2, writeIdx2 + 1);
+
+                    return 0;  // Game processes this tick normally
+                }
+                // If Done immediately (no advance needed), fall through
+                s_gekkoFrameStarted = false;
+            }
+
             Rollback::NetplayLog_Write("INPUT", -1,
                 "Dispatcher: Done, breaking dispatcher loop");
 
@@ -759,6 +810,15 @@ static uint16_t ReadHeldMaskFromAltBuffer(uintptr_t altBufferAddr) {
 
 int __cdecl Hook_InputProcess(int gameState) {
     const bool consumeForCustomMenu = InputSystem_IsBindingActive() || NetMenu::ConsumesGameInput();
+    const uint32_t gameMode = GetGameMode();
+    const uint32_t subState = GetSubstate();
+
+    constexpr size_t FRONTEND_INPUT_BUFFER_CLEAR_SIZE =
+        JUST_PRESSED_OFFSET_WORDS * sizeof(uint16_t);
+    static_assert(ADDR_P1_INPUT_STATE - ADDR_P1_INPUT_BUFFER == FRONTEND_INPUT_BUFFER_CLEAR_SIZE,
+        "P1 input state must immediately follow the live input buffer");
+    static_assert(ADDR_P2_INPUT_STATE - ADDR_P2_INPUT_BUFFER == FRONTEND_INPUT_BUFFER_CLEAR_SIZE,
+        "P2 input state must immediately follow the live input buffer");
 
     if (ModConfig_UseSDLInput()) {
         EnsureInputUpdated();
@@ -770,7 +830,10 @@ int __cdecl Hook_InputProcess(int gameState) {
     int result = g_origInputProcess(gameState);
 
     auto clearLiveInputBuffers = []() {
-        static const uint8_t zeroBuffer[INPUT_BUFFER_SIZE] = {};
+        // The frontend "input buffers" share the surrounding block with
+        // charsel player data. Clearing the full 208-byte match-era span here
+        // wipes the committed character IDs after selection.
+        static const uint8_t zeroBuffer[FRONTEND_INPUT_BUFFER_CLEAR_SIZE] = {};
         static const uint8_t zeroState[INPUT_STATE_SIZE] = {};
         WriteMemoryBlockSafe((void*)ADDR_P1_INPUT_BUFFER, zeroBuffer, sizeof(zeroBuffer));
         WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_BUFFER, zeroBuffer, sizeof(zeroBuffer));
@@ -783,11 +846,22 @@ int __cdecl Hook_InputProcess(int gameState) {
         return result;
     }
 
-    if (Net::CharSelSync_IsLockstepActive()) {
-        const uint32_t gameMode = GetGameMode();
-        const uint32_t subState = GetSubstate();
+    if (ShouldHoldCharSelUntilLockstep(gameMode, subState)) {
+        clearLiveInputBuffers();
+        return result;
+    }
 
+    if (Net::CharSelSync_IsLockstepActive()) {
         if (gameMode == MODE_CHARSEL && IsStageSelRawLockstepSubstate(subState)) {
+            // On phase entry, reset edge detection baseline.
+            // During subs 5-6 (non-interactive animation), the SDL path wrote
+            // each player's LOCAL physical input to the P1 buffer. That state
+            // is unsynchronized — if host held A but client didn't, their
+            // just-pressed computations diverge even though merged held is
+            // identical. Forcing prevHeld=0 on the first stage frame ensures
+            // both sides compute the same just-pressed from the same baseline.
+            const bool edgeReset = Net::StageSelSync_ConsumeEdgeReset();
+
             InputSystem_Update();
             const uint16_t localInput = InputSystem_GetInput(0);
             Net::CharSelSync_CaptureLocalInput(localInput);
@@ -806,7 +880,8 @@ int __cdecl Hook_InputProcess(int gameState) {
 
             const uint16_t merged = Net::StageSelSync_MergeConfirmed(
                 (uint32_t)ReadMemory<int>(ADDR_INPUT_WRITE_IDX), p1, p2);
-            const uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~prevHeldP1);
+            const uint16_t adjPrevHeld = edgeReset ? (uint16_t)0 : prevHeldP1;
+            const uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~adjPrevHeld);
 
             for (int i = 0; i < 10; i++) {
                 const uint16_t mask = g_buttonMasks[i];

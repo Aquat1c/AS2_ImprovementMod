@@ -25,6 +25,7 @@
 
 #include "rollback/savestate.h"
 #include "rollback/determinism_verify.h"
+#include "training/practice_tools.h"
 #include "as2_constants.h"
 #include "patches/memory_utils.h"
 #include "log_window.h"
@@ -412,12 +413,24 @@ void Savestate_ProcessHotkeys() {
 
     // F5: Save (on key-down edge)
     if (f5Down && !s_f5WasDown) {
-        Savestate_Save();
+        if (Savestate_Save()) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "State Saved (F%d)", g_slot.info.frame);
+            PracticeTools_Toast(buf, 0xFF64FF64);  // green
+        } else {
+            PracticeTools_Toast("Save Failed", 0xFF6464FF);  // red
+        }
     }
 
     // F6: Load (on key-down edge)
     if (f6Down && !s_f6WasDown) {
-        Savestate_Load();
+        if (Savestate_Load()) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "State Loaded (F%d)", g_slot.info.frame);
+            PracticeTools_Toast(buf, 0xFF64C8FF);  // cyan
+        } else {
+            PracticeTools_Toast("Load Failed", 0xFF6464FF);  // red
+        }
     }
 
     s_f5WasDown = f5Down;

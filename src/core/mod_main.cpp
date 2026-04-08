@@ -11,6 +11,7 @@
 #include "log_window.h"
 #include "mod_menu.h"
 #include "hitbox_viewer.h"
+#include "ui/netplay_hud.h"
 #include "game_console.h"
 #include "patches/memory_utils.h"
 #include "patches/unlock_patch.h"
@@ -291,7 +292,7 @@ static void DeferredInit() {
 
     LOG_INFO("========================================");
     LOG_INFO("Initialization complete!");
-    LOG_INFO("Hotkeys: F1=Menu  F5=SaveState  F6=LoadState  F7=Pause  F8=Step  F9=Swap");
+    LOG_INFO("Hotkeys: F1=Menu  F4=Hitbox  F5=SaveState  F6=LoadState  F7=Pause  F8=Step  F9=Swap");
     LOG_INFO("========================================");
 }
 
@@ -520,6 +521,8 @@ __declspec(dllexport) void ModOnFrame() {
 __declspec(dllexport) void ModOnPresent(void* pDevice) {
     if (!g_initialized) return;
     HitboxViewer_Render();
+    NetplayHud_Render();
+    PracticeTools_RenderHUD();
     ModMenu_Render();
 }
 

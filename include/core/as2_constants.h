@@ -301,17 +301,53 @@
 // Per-animation box system (within animation frame data, 104 bytes per frame).
 // Frame layout (each entry = int16 xOff, yOff, halfW, halfH = 8 bytes):
 //   Offset  0-7:   Collision/push box (1 entry)
-//   Offset  8-39:  Hitboxes / attack boxes (4 entries)
-//   Offset 40-71:  Hurtboxes / vulnerable boxes (4 entries)
-//   Offset 72-103: Extended box set (4 entries, purpose TBD)
+//                  — Entity_ResolveBodyCollision: body push
+//                  — Entity_ResolveAttackCollision: defender clash target
+//   Offset  8-39:  Attack hitboxes (4 entries)
+//                  — Entity_UpdateHitDetection: player melee vs summon hurtbox@40
+//                  — Entity_UpdateGrabAlignment: player melee vs player hurtbox@40
+//                  — Entity_UpdateDamageApplication: player melee vs player ext-hurtbox@72
+//                  — Entity_UpdateSummonCollision: summon-vs-summon
+//   Offset 40-71:  Hurtboxes / primary vulnerable boxes (4 entries)
+//                  — Entity_UpdateHitDetection: defender/summon target
+//                  — Entity_UpdateGrabAlignment: defender (player-vs-player melee)
+//                  — Entity_UpdateSummonHitDetection: defender (summon vs player)
+//                  Hit by ALL attack types (melee + projectiles/summons).
+//   Offset 72-103: Extended hurtboxes (4 entries)
+//                  — Entity_UpdateDamageApplication: defender (player-vs-player melee ONLY)
+//                  — Entity_UpdateThrowInteraction: both sides (mutual overlap = tech throw)
+//                  NOT hit by projectiles/summons (Entity_UpdateSummonHitDetection uses @40 only).
+//                  Provides additional melee-only vulnerability beyond primary hurtbox@40.
 // Screen-space: center = entityPos/10 + 2*offset*facing; extent = halfExtent.
-// Verified from Entity_UpdateHitDetection:
-//   Attack boxes at entity+4104+8, hurtboxes at entity+4104+40.
+// Verified pointer arithmetic from decompilation:
+//   animDataBase = entity + 4104; frame@N = animDataBase + 104*animIdx + N.
+//   Entity_UpdateGrabAlignment: attacker hitbox@8 vs defender hurtbox@40 (0x4A4950)
+//   Entity_UpdateDamageApplication: attacker hitbox@8 vs defender ext-hurtbox@72 (0x4A76F0)
+//   Both dispatch to same character-specific handler table (dword_73E070).
 #define ANIM_COLLISION_OFFSET   0         // frame offset: collision/push box (1 entry)
 #define ANIM_HITBOX_OFFSET      8         // frame offset: attack/hitbox set (4 entries)
 #define ANIM_HURTBOX_OFFSET     40        // frame offset: hurtbox/vulnerable set (4 entries)
+#define ANIM_EXT_HURTBOX_OFFSET 72        // frame offset: extended hurtbox set (4 entries, melee-only)
 #define HURTBOX_ENTRY_SIZE      8         // 4 × int16 per box entry
 #define HURTBOX_COUNT_PER_FRAME 4         // 4 box entries per set
+
+// Entity attack/hit state offsets (relative to entity base)
+// Set by Entity_SetAttackByte, Entity_InitHitData, Entity_SetCollisionData
+#define ENTITY_OFF_ATTACK_STATE  0x06C8   // +1736, BYTE — 0=inactive, 1=active attack
+#define ENTITY_OFF_ATTACK_TYPE   0x06CC   // +1740, DWORD — attack type flags
+#define ENTITY_OFF_HIT_ACTIVE    0x06D4   // +1748, BYTE — hit data active flag
+
+// Attack type flag bits (entity+1740)
+#define ATTACK_FLAG_LOW_HIT      0x00001  // Low hit type (stand vs crouch)
+#define ATTACK_FLAG_PROJ_IMMUNE  0x00800  // Projectile immunity / bypasses invincibility (entity+1932)
+#define ATTACK_FLAG_FORCE_ACTIVE 0x20000  // Force active / super armor (bypasses box dimension checks)
+
+// Invincibility flag (entity+1932 / +0x78C, WORD)
+// Non-zero = invincible to melee and summon attacks.
+// Bypassed by ATTACK_FLAG_PROJ_IMMUNE (0x800).
+// Checked by: Entity_UpdateGrabAlignment, Entity_UpdateDamageApplication,
+//             Entity_UpdateSummonHitDetection.
+#define ENTITY_OFF_INVINCIBILITY 0x078C   // +1932, WORD — invincibility flag
 
 // Active rect / pushbox (entity-relative single rects).
 // Managed by Input_SetNextRect / Input_ApplyNextRect.
@@ -559,3 +595,16 @@
 #define ADDR_P1_CPU_FLAG        0x8E9F0C
 // byte_8E9FDC: P2 CPU flag (1=AI-controlled, 0=human)
 #define ADDR_P2_CPU_FLAG        0x8E9FDC
+
+// ============================================================================
+// Command History (training mode input display)
+// ============================================================================
+
+// Input_UpdateGlobalCommandHistory — updates the global command history
+// display arrays (byte_8E93C2[], byte_8E93D6[], byte_8E93E9) from P1's
+// input state.  Reads a1[20540..20580] where a1 = match base as _WORD*.
+#define ADDR_CMD_HISTORY_UPDATE  0x4C8C50  // sub_4C8C50
+
+// byte_8E93C0: command history display toggle (1=show, 0=hide)
+// Toggled by pause menu option 8 in training mode.
+#define ADDR_CMD_HISTORY_DISPLAY 0x8E93C0

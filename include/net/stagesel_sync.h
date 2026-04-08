@@ -46,6 +46,11 @@ void StageSelSync_Abort();
 /// Is stage select sync currently active?
 bool StageSelSync_IsActive();
 
+/// Returns true once after StageSelSync_Begin(), then false.
+/// Used by Hook_InputProcess to reset edge detection on phase entry,
+/// preventing desync from unsynchronized physical input during animation subs 5-6.
+bool StageSelSync_ConsumeEdgeReset();
+
 // ============================================================================
 // Shared Input Merge (called from Hook_InputDispatcher)
 // ============================================================================

@@ -14,7 +14,9 @@
 #include "rollback/online_wiring.h"
 #include "rollback/rollback_session.h"
 #include "rollback/rollback_debug.h"
+#include "rollback/savestate.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rematch_cleanup.h"
 #include "rollback/stress_hooks.h"
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
@@ -218,6 +220,41 @@ static bool TryStartRollbackSession() {
         "Lifecycle phase at handoff: %s",
         Net::MatchLifecyclePhaseName(phase));
 
+    // ── Restore baseline savestate ──────────────────────────────────
+    // Between the baseline capture and this handoff point, the game ran
+    // uncontrolled frames through the vanilla dispatcher path (Match_ClearPerFrameTempData,
+    // Frame_AdvanceSimulation, and potentially render-side state writes all modify
+    // the main blob). The number of these frames differs between HOST and CLIENT
+    // due to timing, causing the main state to diverge BEFORE GekkoNet even starts.
+    // Restoring the agreed-upon baseline forces both sides to identical state.
+    {
+        uint32_t preRestoreCRC = CalcCRC32((const void*)ADDR_MATCH_BASE,
+            (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+        NetplayLog_Write("HANDOFF", s_handoffFrame,
+            "Pre-restore CRC=0x%08X (baseline was 0x%08X, delta=%s)",
+            preRestoreCRC, s_baselineCRC,
+            (preRestoreCRC == s_baselineCRC) ? "none" : "DIVERGED");
+
+        if (Savestate_Load()) {
+            // Force sim_frame=0 and writeIdx=0 for clean GekkoNet start
+            WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, 0);
+            WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, 0);
+            rbConfig.start_frame = 0;
+            s_handoffFrame = 0;
+
+            uint32_t postRestoreCRC = CalcCRC32((const void*)ADDR_MATCH_BASE,
+                (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+            NetplayLog_Write("HANDOFF", 0,
+                "Baseline RESTORED: CRC=0x%08X (match=%s) sim=0 writeIdx=0",
+                postRestoreCRC,
+                (postRestoreCRC == s_baselineCRC) ? "YES" : "NO");
+        } else {
+            NetplayLog_Write("HANDOFF", s_handoffFrame,
+                "WARNING: Baseline restore FAILED — starting from diverged state");
+            LOG_WARN("[OnlineWiring] Baseline restore failed at handoff");
+        }
+    }
+
     // Register gameplay packet callback
     NetplayLog_Write("HANDOFF", s_handoffFrame,
         "Registering gameplay packet callback");
@@ -342,14 +379,16 @@ static void CheckLifecyclePhase() {
 
         // === Handle phase transitions ===
 
-        // Entering PlayableGameplay — start rollback if not active
+        // Entering PlayableGameplay — usually means interactive control began.
+        // The normal rollback start now happens at GameplayStart handoff; this
+        // path remains as a fallback if bootstrap wiring failed to start it.
         if (curPhase == Net::MatchLifecyclePhase::PlayableGameplay) {
             if (!s_rollbackActive && s_rollbackStarted) {
                 // Resuming from pause/transition — session still alive
                 s_gameplayActive = true;
                 NetplayLog_Write("LIFE", -1, "Gameplay resumed (rollback session already started)");
             } else if (!s_rollbackStarted) {
-                // First time reaching gameplay — start rollback session
+                // Fallback: start rollback on first gameplay if handoff missed it.
                 s_rollbackBeginPending = true;
             }
         }
@@ -582,24 +621,61 @@ void OnlineWiring_OnRematch() {
         "=== REMATCH SELECTED — returning to CharSel ===");
     NetplayLog_Write("POSTMATCH", -1,
         "Clearing rollback state for next match");
+    NetplayLog_Write("POSTMATCH", -1,
+        "Pre-cleanup wiring state: started=%d active=%d gameplay=%d handoff=%d baseline=0x%08X config=0x%08X recv=%d dispatched=%d",
+        s_rollbackStarted ? 1 : 0,
+        s_rollbackActive ? 1 : 0,
+        s_gameplayActive ? 1 : 0,
+        s_handoffFrame,
+        s_baselineCRC,
+        s_configHash,
+        s_remoteInputsReceived,
+        s_packetsDispatched);
+
+    RematchCleanup_PrepareForNextMatch("post-match rematch");
 
     // Full reset for next match
     s_rollbackStarted = false;
+    s_rollbackActive = false;
+    s_gameplayActive = false;
     s_rollbackBeginPending = false;
     s_handoffFrame = -1;
+    s_baselineCRC = 0;
+    s_configHash = 0;
+    s_handoffDelay = 0;
+    s_handoffBudget = 0;
     s_remoteInputsReceived = 0;
     s_packetsDispatched = 0;
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
+
+    NetplayLog_Write("POSTMATCH", -1,
+        "Post-cleanup wiring state: started=%d active=%d gameplay=%d handoff=%d baseline=0x%08X config=0x%08X recv=%d dispatched=%d",
+        s_rollbackStarted ? 1 : 0,
+        s_rollbackActive ? 1 : 0,
+        s_gameplayActive ? 1 : 0,
+        s_handoffFrame,
+        s_baselineCRC,
+        s_configHash,
+        s_remoteInputsReceived,
+        s_packetsDispatched);
 }
 
 void OnlineWiring_OnReturnToSession() {
     NetplayLog_Write("POSTMATCH", -1,
         "=== RETURN TO SESSION — exiting match flow ===");
 
+    RematchCleanup_PrepareForNextMatch("post-match return to session");
+
     s_rollbackStarted = false;
+    s_rollbackActive = false;
+    s_gameplayActive = false;
     s_rollbackBeginPending = false;
     s_handoffFrame = -1;
+    s_baselineCRC = 0;
+    s_configHash = 0;
+    s_handoffDelay = 0;
+    s_handoffBudget = 0;
     s_remoteInputsReceived = 0;
     s_packetsDispatched = 0;
 }

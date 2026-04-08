@@ -4,6 +4,7 @@
 #include "patches/tick_hooks.h"
 #include "patches/locale_patch.h"
 #include "patches/filesystem_patch.h"
+#include "training/practice_tools.h"
 #include "as2_constants.h"
 #include "log_window.h"
 #include "MinHook.h"
@@ -183,6 +184,18 @@ bool InstallHooks() {
         LOG_WARN("Failed to hook GetTick (sub_635F80)! Status: %d (continuing anyway)", status);
     } else {
         LOG_INFO("Hooked sub_635F80 (tick/time source)");
+    }
+
+    // --- Command history hook (practice mode: redirect to P2 when swapped) ---
+
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_CMD_HISTORY_UPDATE),
+            reinterpret_cast<void*>(&Hook_CmdHistoryUpdate),
+            reinterpret_cast<void**>(&g_origCmdHistoryUpdate));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook CmdHistoryUpdate! Status: %d (continuing anyway)", status);
+    } else {
+        LOG_INFO("Hooked sub_4C8C50 (command history update - practice swap redirect)");
     }
     
     // --- Enable all hooks ---

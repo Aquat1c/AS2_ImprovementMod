@@ -37,12 +37,18 @@ static const uint16_t MASK_RIGHT = (1 << 3);
 static const uint16_t MASK_VERT  = MASK_UP | MASK_DOWN;
 static const uint16_t MASK_HORZ  = MASK_LEFT | MASK_RIGHT;
 
+// Select button — stripped during stage select to prevent roulette
+// (roulette uses rand() which is not synced during charsel → guaranteed desync).
+// B/D still available for cancel, Start for back.
+static const uint16_t MASK_SELECT = (1 << 9);  // 0x0200
+
 // ============================================================================
 // Internal state
 // ============================================================================
 
 static bool     s_initialized = false;
 static bool     s_active      = false;
+static bool     s_needsEdgeReset = false;
 
 // Confirmed frame audit ring (for desync diagnostics)
 static Net::StageSelConfirmedFrame s_auditRing[AUDIT_RING_SIZE] = {};
@@ -74,6 +80,7 @@ void StageSelSync_Shutdown() {
 
 void StageSelSync_Begin() {
     s_active = true;
+    s_needsEdgeReset = true;
     s_auditWriteIdx = 0;
     s_confirmedCount = 0;
     memset(s_auditRing, 0, sizeof(s_auditRing));
@@ -93,10 +100,25 @@ bool StageSelSync_IsActive() {
     return s_active;
 }
 
+bool StageSelSync_ConsumeEdgeReset() {
+    if (s_needsEdgeReset) {
+        s_needsEdgeReset = false;
+        return true;
+    }
+    return false;
+}
+
 uint16_t StageSelSync_MergeConfirmed(uint32_t frame, uint16_t p1, uint16_t p2) {
     // Pure function: OR all inputs, cancel opposing directions.
     // No internal state — identical (p1, p2) always yields identical result.
     uint16_t combined = p1 | p2;
+
+    // Strip Select button: stage select roulette (hidden feature activated by
+    // holding A/C + pressing Select during confirm) calls rand() which is NOT
+    // synced during charsel — guaranteed desync if triggered.
+    // B/D still available for cancel, Start for back. Select has no other
+    // legitimate use in stage select (sub=7) or confirm menu (sub=8).
+    combined &= ~MASK_SELECT;
 
     // Cancel opposing axes: both Left+Right → neither moves the cursor
     if ((combined & MASK_HORZ) == MASK_HORZ)

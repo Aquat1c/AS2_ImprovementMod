@@ -15,9 +15,12 @@
  *
  * Animation frame layout (104 bytes):
  *   Offset  0-7  : Collision/push box (1 entry × 8B)
- *   Offset  8-39 : Hitboxes / attack boxes (4 entries × 8B)
- *   Offset 40-71 : Hurtboxes / vulnerable boxes (4 entries × 8B)
- *   Offset 72-103: Extended box set (4 entries × 8B, TBD)
+ *   Offset  8-39 : Attack hitboxes (4 entries × 8B)
+ *   Offset 40-71 : Hurtboxes / primary vulnerable boxes (4 entries × 8B)
+ *   Offset 72-103: Extended hurtboxes / melee-only vulnerable area (4 entries × 8B)
+ *                  Checked by Entity_UpdateDamageApplication (player melee only),
+ *                  Entity_UpdateThrowInteraction (tech throw: mutual @72 overlap).
+ *                  NOT checked by Entity_UpdateSummonHitDetection (summons use @40).
  *   Game resolution : 640 × 480 logical.
  */
 
@@ -39,7 +42,9 @@ static bool  g_enabled         = false;
 static bool  g_showHurtboxes   = true;   // per-animation boxes (green)
 static bool  g_showHitboxes    = true;   // global HitDef entries (red)
 static bool  g_showPushboxes   = true;   // active rect (yellow)
+static bool  g_showThrowboxes  = true;   // extended hurtboxes (cyan)
 static bool  g_showPositions   = true;   // axis cross + facing arrow
+static bool  g_showStateFlags  = true;   // attack state / super armor / proj immunity indicators
 static bool  g_showInfo        = false;  // text overlay with box data
 static bool  g_showMatchState  = false;  // match context debug info
 static float g_fillAlpha       = 0.25f;  // fill transparency [0..1]
@@ -62,9 +67,12 @@ static ImU32 ColFill(ImU32 rgb, float a) {
 static const ImU32 COL_HURTBOX   = IM_COL32(0, 220, 0, 255);
 static const ImU32 COL_HITBOX    = IM_COL32(255, 40, 40, 255);
 static const ImU32 COL_PUSHBOX   = IM_COL32(255, 220, 0, 255);
-static const ImU32 COL_HITDEF_PT = IM_COL32(255, 80, 80, 255);  // HitDef position dot
+static const ImU32 COL_THROWBOX  = IM_COL32(0, 200, 255, 255);   // cyan — extended hurtbox (@72)
+static const ImU32 COL_HITDEF_PT = IM_COL32(255, 80, 80, 255);   // HitDef position dot
 static const ImU32 COL_P1_CROSS  = IM_COL32(255, 120, 120, 255);
 static const ImU32 COL_P2_CROSS  = IM_COL32(120, 120, 255, 255);
+static const ImU32 COL_ARMOR     = IM_COL32(255, 160, 0, 255);   // super armor indicator
+static const ImU32 COL_IMMUNE    = IM_COL32(180, 0, 255, 255);   // projectile immunity
 
 // ============================================================================
 // Helpers
@@ -258,6 +266,111 @@ static void RenderEntityHitboxes(ImDrawList* dl, uintptr_t entity,
 }
 
 // ============================================================================
+// Per-entity extended hurtboxes  (offset 72 in animation frame)
+// ============================================================================
+// Additional vulnerable area checked only by player melee attacks.
+// Entity_UpdateDamageApplication: attacker hitbox@8 vs defender ext-hurtbox@72.
+// Entity_UpdateThrowInteraction: mutual @72 overlap = tech throw.
+// NOT checked by Entity_UpdateSummonHitDetection (summons only use hurtbox@40).
+// Both Entity_UpdateGrabAlignment (@40) and Entity_UpdateDamageApplication (@72)
+// dispatch to the same character-specific handler table (dword_73E070).
+
+static void RenderThrowboxes(ImDrawList* dl, uintptr_t entity,
+                              const char* label,
+                              const ScreenTransform& t) {
+    int16_t posX   = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
+    int16_t posY   = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
+    int8_t  facing = ReadMemory<int8_t>(entity + ENTITY_OFF_FACING);
+
+    BoxEntry boxes[4];
+    char lbl[32];
+    snprintf(lbl, sizeof(lbl), "%s.ext", label);
+    ReadAnimBoxes(entity, ANIM_EXT_HURTBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
+                  g_logPerFrame, lbl);
+
+    float ex = (float)(posX / 10);
+    float ey = (float)(posY / 10);
+
+    for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
+        const BoxEntry& b = boxes[i];
+        if (b.halfW <= 0 || b.halfH <= 0) continue;
+
+        float cx = ex + 2.0f * b.xOff * facing;
+        float cy = ey + 2.0f * b.yOff;
+        float hw = 2.0f * b.halfW;
+        float hh = 2.0f * b.halfH;
+
+        float left  = cx - hw - t.scrollX;
+        float right = cx + hw - t.scrollX;
+        float top   = cy - hh - t.scrollY;
+        float bot   = cy + hh - t.scrollY;
+
+        DrawBox(dl, left, top, right, bot, COL_THROWBOX, g_fillAlpha, t);
+    }
+}
+
+// ============================================================================
+// Entity state flag indicators (attack state, super armor, proj immunity)
+// ============================================================================
+// Draws small text labels near the entity position to indicate active flags.
+// Verified from Entity_InitHitData (entity+1736, +1740, +1748).
+
+static void RenderStateFlags(ImDrawList* dl, uintptr_t entity,
+                              const char* playerLabel,
+                              const ScreenTransform& t) {
+    int16_t posX = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
+    int16_t posY = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
+    ImVec2 pos = WorldToDisplay(posX, posY, t);
+
+    uint8_t  atkState = ReadMemory<uint8_t>(entity + ENTITY_OFF_ATTACK_STATE);
+    uint32_t atkType  = ReadMemory<uint32_t>(entity + ENTITY_OFF_ATTACK_TYPE);
+    uint8_t  hitActive = ReadMemory<uint8_t>(entity + ENTITY_OFF_HIT_ACTIVE);
+    uint16_t invincibility = ReadMemory<uint16_t>(entity + ENTITY_OFF_INVINCIBILITY);
+
+    float yOff = -20.0f * t.scaleY;  // start above entity position
+
+    if (invincibility != 0) {
+        const char* txt = "INVINCIBLE";
+        ImVec2 sz = ImGui::CalcTextSize(txt);
+        float x = pos.x - sz.x * 0.5f;
+        float y = pos.y + yOff;
+        dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
+        dl->AddText(ImVec2(x, y), COL_THROWBOX, txt);
+        yOff -= (sz.y + 4.0f);
+    }
+
+    if (atkType & ATTACK_FLAG_FORCE_ACTIVE) {
+        const char* txt = "ARMOR";
+        ImVec2 sz = ImGui::CalcTextSize(txt);
+        float x = pos.x - sz.x * 0.5f;
+        float y = pos.y + yOff;
+        dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
+        dl->AddText(ImVec2(x, y), COL_ARMOR, txt);
+        yOff -= (sz.y + 4.0f);
+    }
+
+    if (atkType & ATTACK_FLAG_PROJ_IMMUNE) {
+        const char* txt = "PROJ IMMUNE";
+        ImVec2 sz = ImGui::CalcTextSize(txt);
+        float x = pos.x - sz.x * 0.5f;
+        float y = pos.y + yOff;
+        dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
+        dl->AddText(ImVec2(x, y), COL_IMMUNE, txt);
+        yOff -= (sz.y + 4.0f);
+    }
+
+    // Show active attack indicator (entity+1736 == 1 && entity+1748 != 0)
+    if (atkState == 1 && hitActive != 0) {
+        const char* txt = "ATK";
+        ImVec2 sz = ImGui::CalcTextSize(txt);
+        float x = pos.x - sz.x * 0.5f;
+        float y = pos.y + yOff;
+        dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
+        dl->AddText(ImVec2(x, y), COL_HITBOX, txt);
+    }
+}
+
+// ============================================================================
 // HitDef / projectile hitbox reader  (global array, 100 entries)
 // ============================================================================
 
@@ -442,19 +555,21 @@ static void RenderInfoOverlay(ImDrawList* dl, uintptr_t p1, uintptr_t p2,
     for (int pi = 0; pi < 2; pi++) {
         totalLines += 1; // P header
         uintptr_t ent = (pi == 0) ? p1 : p2;
-        BoxEntry hurtBoxes[4], hitBoxes[4];
+        BoxEntry hurtBoxes[4], hitBoxes[4], throwBoxes[4];
         BoxEntry collBox;
         ReadAnimBoxes(ent, ANIM_HURTBOX_OFFSET, hurtBoxes, HURTBOX_COUNT_PER_FRAME, false, nullptr);
         ReadAnimBoxes(ent, ANIM_HITBOX_OFFSET, hitBoxes, HURTBOX_COUNT_PER_FRAME, false, nullptr);
+        ReadAnimBoxes(ent, ANIM_EXT_HURTBOX_OFFSET, throwBoxes, HURTBOX_COUNT_PER_FRAME, false, nullptr);
         ReadAnimBoxes(ent, ANIM_COLLISION_OFFSET, &collBox, 1, false, nullptr);
         if (collBox.halfW > 0 && collBox.halfH > 0) totalLines++;
         for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
             if (hurtBoxes[i].halfW > 0 && hurtBoxes[i].halfH > 0) totalLines++;
             if (hitBoxes[i].halfW > 0 && hitBoxes[i].halfH > 0) totalLines++;
+            if (throwBoxes[i].halfW > 0 && throwBoxes[i].halfH > 0) totalLines++;
         }
     }
 
-    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 420, y + lineH * totalLines + 6), bg);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 500, y + lineH * totalLines + 6), bg);
 
     auto line = [&](ImU32 col, const char* fmt, ...) {
         va_list ap;
@@ -499,9 +614,9 @@ static void RenderInfoOverlay(ImDrawList* dl, uintptr_t p1, uintptr_t p2,
         line(dim, "P1Base:0x%08X P2Base:0x%08X Stride:%d",
              (uint32_t)ADDR_P1_ENTITY_BASE, (uint32_t)ADDR_P2_ENTITY_BASE,
              ENTITY_SIZE);
-        line(dim, "AnimData +0x%X  Stride:%d  Coll@%d Hit@%d Hurt@%d  %d\u00d7%dB",
+        line(dim, "AnimData +0x%X  Stride:%d  Coll@%d Hit@%d Hurt@%d Throw@%d  %d\u00d7%dB",
              ENTITY_OFF_ANIM_DATA, ANIM_DATA_STRIDE,
-             ANIM_COLLISION_OFFSET, ANIM_HITBOX_OFFSET, ANIM_HURTBOX_OFFSET,
+             ANIM_COLLISION_OFFSET, ANIM_HITBOX_OFFSET, ANIM_HURTBOX_OFFSET, ANIM_EXT_HURTBOX_OFFSET,
              HURTBOX_COUNT_PER_FRAME, HURTBOX_ENTRY_SIZE);
     }
 
@@ -515,14 +630,17 @@ static void RenderInfoOverlay(ImDrawList* dl, uintptr_t p1, uintptr_t p2,
         int16_t hp = ReadMemory<int16_t>(ent + ENTITY_OFF_HP);
         uint32_t animIdx  = ReadMemory<uint32_t>(ent + ENTITY_OFF_ANIM_INDEX);
         uint32_t actionId = ReadMemory<uint32_t>(ent + ENTITY_OFF_ACTION_ID);
+        uint8_t  atkState = ReadMemory<uint8_t>(ent + ENTITY_OFF_ATTACK_STATE);
+        uint32_t atkType  = ReadMemory<uint32_t>(ent + ENTITY_OFF_ATTACK_TYPE);
 
-        line(col, "P%d Pos:%d,%d Face:%d HP:%d Act:%u Anim:%u",
-             pi + 1, px, py, pf, hp, actionId, animIdx);
+        line(col, "P%d Pos:%d,%d Face:%d HP:%d Act:%u Anim:%u Atk:%u Flags:0x%X",
+             pi + 1, px, py, pf, hp, actionId, animIdx, atkState, atkType);
 
-        BoxEntry hurtB[4], hitB[4];
+        BoxEntry hurtB[4], hitB[4], throwB[4];
         BoxEntry collB;
         ReadAnimBoxes(ent, ANIM_HURTBOX_OFFSET, hurtB, HURTBOX_COUNT_PER_FRAME, false, nullptr);
         ReadAnimBoxes(ent, ANIM_HITBOX_OFFSET, hitB, HURTBOX_COUNT_PER_FRAME, false, nullptr);
+        ReadAnimBoxes(ent, ANIM_EXT_HURTBOX_OFFSET, throwB, HURTBOX_COUNT_PER_FRAME, false, nullptr);
         ReadAnimBoxes(ent, ANIM_COLLISION_OFFSET, &collB, 1, false, nullptr);
         if (collB.halfW > 0 && collB.halfH > 0)
             line(col, "  coll off(%d,%d) half(%d,%d)", collB.xOff, collB.yOff, collB.halfW, collB.halfH);
@@ -531,6 +649,8 @@ static void RenderInfoOverlay(ImDrawList* dl, uintptr_t p1, uintptr_t p2,
                 line(col, "  hurt%d off(%d,%d) half(%d,%d)", i, hurtB[i].xOff, hurtB[i].yOff, hurtB[i].halfW, hurtB[i].halfH);
             if (hitB[i].halfW > 0 && hitB[i].halfH > 0)
                 line(col, "  hit%d off(%d,%d) half(%d,%d)", i, hitB[i].xOff, hitB[i].yOff, hitB[i].halfW, hitB[i].halfH);
+            if (throwB[i].halfW > 0 && throwB[i].halfH > 0)
+                line(col, "  throw%d off(%d,%d) half(%d,%d)", i, throwB[i].xOff, throwB[i].yOff, throwB[i].halfW, throwB[i].halfH);
         }
     }
 }
@@ -592,6 +712,10 @@ void HitboxViewer_Render() {
         RenderEntityHitboxes(dl, p2, "P2", t);
         RenderHitDefs(dl, t);
     }
+    if (g_showThrowboxes) {
+        RenderThrowboxes(dl, p1, "P1", t);
+        RenderThrowboxes(dl, p2, "P2", t);
+    }
     if (g_showPushboxes) {
         RenderPushbox(dl, p1, "P1", t);
         RenderPushbox(dl, p2, "P2", t);
@@ -600,10 +724,18 @@ void HitboxViewer_Render() {
         RenderPosition(dl, p1, COL_P1_CROSS, t);
         RenderPosition(dl, p2, COL_P2_CROSS, t);
     }
+    if (g_showStateFlags) {
+        RenderStateFlags(dl, p1, "P1", t);
+        RenderStateFlags(dl, p2, "P2", t);
+    }
     if (g_showInfo) {
         RenderInfoOverlay(dl, p1, p2, t);
     }
 }
+
+void HitboxViewer_SetEnabled(bool enabled) { g_enabled = enabled; }
+bool HitboxViewer_IsEnabled() { return g_enabled; }
+void HitboxViewer_ToggleEnabled() { g_enabled = !g_enabled; }
 
 void HitboxViewer_RenderControls() {
     ImGui::Checkbox("Enable Hitbox Viewer", &g_enabled);
@@ -612,7 +744,9 @@ void HitboxViewer_RenderControls() {
     ImGui::Separator();
     ImGui::Checkbox("Hurtboxes (green, @40)", &g_showHurtboxes);
     ImGui::Checkbox("Hitboxes / attacks (red, @8)", &g_showHitboxes);
+    ImGui::Checkbox("Ext. hurtbox (cyan, @72)", &g_showThrowboxes);
     ImGui::Checkbox("Collision / pushbox (yellow, @0)", &g_showPushboxes);
+    ImGui::Checkbox("State flags (ATK / ARMOR / IMMUNE)", &g_showStateFlags);
     ImGui::Checkbox("Position markers", &g_showPositions);
     ImGui::Checkbox("Info overlay", &g_showInfo);
     ImGui::Checkbox("Match state debug", &g_showMatchState);

@@ -43,6 +43,8 @@ static bool g_pauseBlocked = false;
 static bool g_bindingMode = false;
 static int g_bindingPlayer = 0;
 static int g_bindingButton = 0;
+static int g_bindingCooldown = 0;  // Frames to suppress input after binding completes
+static const int BINDING_COOLDOWN_FRAMES = 30;  // ~0.5 seconds at 60fps
 
 // Netplay input storage
 static bool g_netplayInputActive[2] = {};
@@ -490,6 +492,9 @@ void InputSystem_Shutdown(void) {
 void InputSystem_Update(void) {
     if (!g_initialized) return;
 
+    // Tick down binding cooldown
+    if (g_bindingCooldown > 0) g_bindingCooldown--;
+
     // Process SDL events (gamepad hotplug + keyboard state pump)
     HandleGamepadEvents();
 
@@ -498,8 +503,8 @@ void InputSystem_Update(void) {
 
         if (g_overrideActive[p]) {
             g_inputState[p].current = g_overrideInput[p];
-        } else if (g_bindingMode) {
-            // Suppress game input while in binding capture mode
+        } else if (g_bindingMode || g_bindingCooldown > 0) {
+            // Suppress game input while in binding capture mode or cooldown
             g_inputState[p].current = 0;
         } else {
             uint16_t kbInput = ReadKeyboardPlayer(p);
@@ -674,12 +679,13 @@ bool InputSystem_IsPauseBlocked(void)          { return g_pauseBlocked; }
 
 void InputSystem_StartBinding(int player, int buttonIndex) {
     g_bindingMode = true;
+    g_bindingCooldown = 0;
     g_bindingPlayer = player;
     g_bindingButton = buttonIndex;
 }
 
 bool InputSystem_IsBindingActive(void) {
-    return g_bindingMode;
+    return g_bindingMode || g_bindingCooldown > 0;
 }
 
 bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
@@ -766,6 +772,7 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
             outBinding->axis_direction = 0;
             if (outSource) *outSource = 0;
             g_bindingMode = false;
+            g_bindingCooldown = BINDING_COOLDOWN_FRAMES;
             return true;
         }
     }
@@ -783,6 +790,7 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
                 outBinding->axis_direction = 0;
                 if (outSource) *outSource = 1;
                 g_bindingMode = false;
+                g_bindingCooldown = BINDING_COOLDOWN_FRAMES;
                 return true;
             }
         }
@@ -797,6 +805,7 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
                 outBinding->axis_direction = 1;
                 if (outSource) *outSource = 2;
                 g_bindingMode = false;
+                g_bindingCooldown = BINDING_COOLDOWN_FRAMES;
                 return true;
             }
             if (val < -BIND_THRESHOLD) {
@@ -806,6 +815,7 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
                 outBinding->axis_direction = -1;
                 if (outSource) *outSource = 2;
                 g_bindingMode = false;
+                g_bindingCooldown = BINDING_COOLDOWN_FRAMES;
                 return true;
             }
         }
@@ -816,6 +826,7 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
 
 void InputSystem_CancelBinding(void) {
     g_bindingMode = false;
+    g_bindingCooldown = BINDING_COOLDOWN_FRAMES;
 }
 
 // ============================================================================

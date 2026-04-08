@@ -17,6 +17,7 @@
 #include "net/sync_policy.h"
 #include "net/set_tracker.h"
 #include "net/delay_policy.h"
+#include "rollback/online_wiring.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "input/input_system.h"
@@ -81,6 +82,7 @@ enum class AutoConnectState : uint8_t {
     SelectingStage,
     WaitingForGameplay,
     InMatch,
+    ConfirmingWinScreen,
     Failed,
 };
 
@@ -106,6 +108,7 @@ static uint32_t         s_autoConnectMatchFrame = 0;
 static bool             s_autoConnectReleasePending = false;
 static bool             s_autoConnectStageGridPressed = false;
 static bool             s_autoConnectStageConfirmPressed = false;
+static bool             s_autoConnectWinScreenPressed = false;
 
 static const char* AutoConnectStateName(AutoConnectState state) {
     switch (state) {
@@ -117,6 +120,7 @@ static const char* AutoConnectStateName(AutoConnectState state) {
         case AutoConnectState::SelectingStage:      return "SelectingStage";
         case AutoConnectState::WaitingForGameplay:  return "WaitingForGameplay";
         case AutoConnectState::InMatch:             return "InMatch";
+        case AutoConnectState::ConfirmingWinScreen: return "ConfirmingWinScreen";
         case AutoConnectState::Failed:              return "Failed";
         default:                                    return "Unknown";
     }
@@ -290,6 +294,10 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
         AutoConnectStateName(next),
         why ? why : "?");
 
+    if (s_autoConnectState == AutoConnectState::InMatch && next != AutoConnectState::InMatch) {
+        InputSystem_ClearOverride(0);
+    }
+
     if (next == AutoConnectState::Disabled || next == AutoConnectState::Failed || next == AutoConnectState::InMatch) {
         ClearAutoConnectOverride();
     }
@@ -297,6 +305,10 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
     if (next == AutoConnectState::SelectingStage) {
         s_autoConnectStageGridPressed = false;
         s_autoConnectStageConfirmPressed = false;
+    }
+
+    if (next == AutoConnectState::ConfirmingWinScreen) {
+        s_autoConnectWinScreenPressed = false;
     }
 
     if (next == AutoConnectState::InMatch) {
@@ -660,6 +672,13 @@ static void HandleAutoConnect() {
                     s_autoConnectMatchFrame, input, mode, sub);
             }
 
+            if (mode == MODE_WINSCREEN) {
+                LOG_NETPLAY(LOG_INFO, "[AutoConnect] Match reached win screen after %u frames",
+                    s_autoConnectMatchFrame);
+                AutoConnectTransition(AutoConnectState::ConfirmingWinScreen, "entered win screen");
+                break;
+            }
+
             // Detect match end: mode changed away from match
             if (mode != MODE_MATCH) {
                 LOG_NETPLAY(LOG_INFO, "[AutoConnect] Match ended (mode=%u) after %u frames",
@@ -681,6 +700,42 @@ static void HandleAutoConnect() {
             }
             break;
         }
+
+        case AutoConnectState::ConfirmingWinScreen:
+            if (mode == MODE_CHARSEL || mode == MODE_MENU) {
+                LOG_NETPLAY(LOG_INFO, "[AutoConnect] Win screen complete (mode=%u sub=%u)",
+                    mode, sub);
+                if (AutoConnectHarness_IsActive()) {
+                    AutoConnectHarness_Shutdown();
+                }
+                AutoConnectTransition(AutoConnectState::Disabled, "winscreen complete");
+                break;
+            }
+
+            if (mode != MODE_WINSCREEN) {
+                LOG_NETPLAY(LOG_WARNING, "[AutoConnect] Left win screen unexpectedly (mode=%u sub=%u)",
+                    mode, sub);
+                if (AutoConnectHarness_IsActive()) {
+                    AutoConnectHarness_Shutdown();
+                }
+                AutoConnectTransition(AutoConnectState::Failed, "left winscreen unexpectedly");
+                break;
+            }
+
+            if (sub == 3 && (!s_autoConnectWinScreenPressed ||
+                             (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
+                AutoConnectInjectPress(INPUT_A, "confirm win screen");
+                s_autoConnectWinScreenPressed = true;
+            }
+
+            if (s_autoConnectStateFrames > 1800) {
+                LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Timed out during win screen confirm");
+                if (AutoConnectHarness_IsActive()) {
+                    AutoConnectHarness_Shutdown();
+                }
+                AutoConnectTransition(AutoConnectState::Failed, "winscreen timeout");
+            }
+            break;
 
         case AutoConnectState::Failed:
             // Shut down harness if still active when we reach Failed
@@ -1486,10 +1541,12 @@ static void ActivateCurrentSelection() {
             if (s_selectedIndex == 0) {
                 // Rematch
                 Net::MatchLifecycle_OnRematch();
+                Rollback::OnlineWiring_OnRematch();
                 LaunchNetplayCharSel();
             } else if (s_selectedIndex == 1) {
                 // Return to menu
                 Net::MatchLifecycle_OnReturnToSession();
+                Rollback::OnlineWiring_OnReturnToSession();
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::ConnectedSession, "post-match return");
             } else {
