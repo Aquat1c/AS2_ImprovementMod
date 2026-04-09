@@ -4,7 +4,7 @@
  * Classifies every game state into one of three synchronization modes:
  *
  *   Lockstep  — Both peers must agree before advancing.
- *               Used for: CharSel, StageSel, Pause, WinScreen confirm.
+ *               Used for: CharSel, StageSel, Pause, WinScreen per-frame lockstep.
  *               Input is edge-triggered (confirm requires neutral→press).
  *
  *   Rollback  — Speculative execution with rollback correction.

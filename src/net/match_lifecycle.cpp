@@ -347,7 +347,7 @@ static void UpdateWinScreenActive() {
     EnforceModOwnership();
 
     // Mode 9 (win screen) is active. Session stays alive.
-    // WinScreenSync handles the confirm gate synchronization.
+    // WinScreenSync handles full per-frame winscreen lockstep.
     // We wait for the mode to change away from Mode 9.
     uint32_t mode = GetGameMode();
     if (mode != MODE_WINSCREEN) {

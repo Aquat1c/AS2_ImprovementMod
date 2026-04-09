@@ -91,6 +91,7 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         // Gameplay stream — unreliable (redundancy handles loss)
         case PacketType::GameplayInput:
         case PacketType::CharSelFrameInput:
+        case PacketType::WinScreenFrameInput:
             return false;
 
         // Diagnostics — unreliable
@@ -109,6 +110,7 @@ inline uint8_t BarrierProtocol_GetChannel(PacketType type) {
     switch (type) {
         case PacketType::GameplayInput:
         case PacketType::CharSelFrameInput:
+        case PacketType::WinScreenFrameInput:
             return CHANNEL_GAMEPLAY;
 
         case PacketType::Ping:

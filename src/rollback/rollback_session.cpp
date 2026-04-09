@@ -680,7 +680,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
         sizeof(GekkoState) / 1024, config.baseline_checksum);
 
     NetplayLog_Write("GEKKO", s_startFrame,
-        "Timesync metric: framesAhead>0 means local behind, framesAhead<0 means local ahead");
+        "Timesync metric: framesAhead>0 means local ahead, framesAhead<0 means local behind");
 
     return true;
 }

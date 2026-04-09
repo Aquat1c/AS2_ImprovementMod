@@ -266,6 +266,14 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             }
             break;
 
+        case PacketType::WinScreenFrameInput:
+            if (payloadLen >= sizeof(WinScreenFrameInputPayload)) {
+                WinScreenSync_OnRemoteFrameInput(static_cast<const WinScreenFrameInputPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short WinScreenFrameInput", type, payloadLen, sizeof(WinScreenFrameInputPayload));
+            }
+            break;
+
         case PacketType::CharSelLock:
             if (payloadLen >= sizeof(CharSelLockPayload)) {
                 CharSelSync_OnRemoteLock(static_cast<const CharSelLockPayload*>(payload));
@@ -744,10 +752,11 @@ static void UpdateBootstrapReady() {
         // Notify match lifecycle layer — it now owns the match flow
         MatchLifecycle_OnMatchEnter();
 
-        // Start rollback from the captured bootstrap baseline immediately.
-        // Waiting for the later PlayableGameplay edge lets the local game run
-        // ahead through intro frames, then rewinds back to frame 0 at session
-        // begin, which destabilizes lifecycle classification across peers.
+        // Arm online wiring startup handoff now:
+        // - restore agreed baseline/state before intro
+        // - keep intro deterministic/passive
+        // - defer rollback-owned BeginFrame/Advance until mutual first
+        //   post-intro interactive release
         Rollback::OnlineWiring_OnGameplayStart();
     }
 

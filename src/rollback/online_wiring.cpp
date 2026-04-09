@@ -56,6 +56,7 @@ static bool     s_initialized            = false;
 static bool     s_rollbackStarted        = false;   // Has rollback started this match
 static bool     s_rollbackActive         = false;   // Is rollback running right now
 static bool     s_gameplayActive         = false;   // Currently in playable gameplay
+static bool     s_liveReleaseArmed       = false;   // Waiting for post-intro interactive release
 static int32_t  s_handoffFrame           = -1;
 static uint32_t s_baselineCRC            = 0;
 static uint32_t s_configHash             = 0;
@@ -65,8 +66,8 @@ static int      s_remoteInputsReceived   = 0;
 static int      s_packetsDispatched      = 0;
 
 // Startup gameplay-entry barrier state:
-// - READY means this peer reached PlayableGameplay and is held at the boundary.
-// - ACK means this peer has observed the remote READY.
+// - READY means this peer reached the FIRST interactive post-intro boundary and is held.
+// - ACK means this peer has observed remote READY.
 // Release requires both READY and ACK observed from both sides.
 static bool     s_startupBarrierEntered    = false;
 static bool     s_localGekkoReadySent      = false;  // local READY sent
@@ -79,6 +80,7 @@ static int32_t  s_localAckFrame            = -1;
 static int32_t  s_remoteReadyFrame         = -1;
 static int32_t  s_remoteAckFrame           = -1;
 static uint32_t s_startupBlockedLogCounter = 0;
+static uint32_t s_introHoldLogCounter      = 0;
 static DWORD    s_lastStartupReadySendAt   = 0;
 static uint8_t  s_lastStartupReadyFlags    = 0;
 
@@ -90,6 +92,13 @@ static int      s_lastRollbackBudget     = -1;
 // Rollback start guard — prevent double-starting
 static bool     s_rollbackBeginPending   = false;
 
+static int32_t GetStartupLogFrame() {
+    if (s_rollbackActive) {
+        return RollbackSession_GetCurrentFrame();
+    }
+    return (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+}
+
 static void ResetStartupBarrierState(const char* reason) {
     const bool hadState =
         s_startupBarrierEntered ||
@@ -100,7 +109,7 @@ static void ResetStartupBarrierState(const char* reason) {
         s_startupReleased;
 
     if (hadState) {
-        NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
+        NetplayLog_Write("STARTUP", GetStartupLogFrame(),
             "Startup barrier reset: reason=%s entered=%d local_ready=%d local_ack=%d "
             "remote_ready=%d remote_ack=%d released=%d "
             "local_ready_frame=%d local_ack_frame=%d remote_ready_frame=%d remote_ack_frame=%d",
@@ -128,6 +137,7 @@ static void ResetStartupBarrierState(const char* reason) {
     s_remoteReadyFrame = -1;
     s_remoteAckFrame = -1;
     s_startupBlockedLogCounter = 0;
+    s_introHoldLogCounter = 0;
     s_lastStartupReadySendAt = 0;
     s_lastStartupReadyFlags = 0;
 }
@@ -136,7 +146,7 @@ static void SendGekkoReadyPacket(uint8_t flags, const char* reason) {
     Net::GekkoReadyPayload payload{};
     payload.flags = flags;
     payload.phase = (uint8_t)Net::MatchLifecycle_GetPhase();
-    payload.rollback_frame = RollbackSession_GetCurrentFrame();
+    payload.rollback_frame = GetStartupLogFrame();
     if ((flags & Net::GEKKO_READY_FLAG_READY) != 0 && s_localReadyFrame < 0) {
         s_localReadyFrame = payload.rollback_frame;
     }
@@ -153,7 +163,7 @@ static void SendGekkoReadyPacket(uint8_t flags, const char* reason) {
     s_lastStartupReadySendAt = GetTickCount();
     s_lastStartupReadyFlags = flags;
 
-    NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
+    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
         "Local GekkoReady sent: flags=0x%02X (%s%s) reason=%s phase=%s",
         flags,
         (flags & Net::GEKKO_READY_FLAG_READY) ? "READY" : "",
@@ -167,7 +177,7 @@ static void LogGameplayPacketAnomaly(const char* reason,
                                      size_t payloadLen,
                                      size_t expectedLen) {
     NetplayLog_Write(
-        "PACKET", RollbackSession_GetCurrentFrame(),
+        "PACKET", GetStartupLogFrame(),
         "%s: type=%s payload=%zu expected=%zu rollback_active=%d gameplay_active=%d dispatched=%d remote_inputs=%d",
         reason ? reason : "gameplay packet anomaly",
         Net::PacketTypeName(type),
@@ -192,6 +202,19 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
             // GekkoNet internal protocol data — buffer for GekkoNet to drain
             if (payloadLen == 0 || !payload) {
                 LogGameplayPacketAnomaly("Empty GekkoData", type, payloadLen, 1);
+                break;
+            }
+
+            if (!s_rollbackActive) {
+                static uint32_t s_preLiveGekkoDrops = 0;
+                s_preLiveGekkoDrops++;
+                if (s_preLiveGekkoDrops <= 5 || (s_preLiveGekkoDrops % 120) == 0) {
+                    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                        "Dropping pre-live GekkoData while rollback session is not active: "
+                        "len=%zu phase=%s",
+                        payloadLen,
+                        Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+                }
                 break;
             }
 
@@ -260,12 +283,12 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
             }
 
             const bool legacyPhase = (phase == 0xFF);
-            const bool remoteAtPlayableBoundary =
+            const bool remoteAtInteractiveBoundary =
                 legacyPhase ||
                 (phase == (uint8_t)Net::MatchLifecyclePhase::PlayableGameplay);
-            if (!remoteAtPlayableBoundary && !s_startupReleased) {
-                NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
-                    "Ignoring remote GekkoReady before playable boundary: flags=0x%02X "
+            if (!remoteAtInteractiveBoundary && !s_startupReleased) {
+                NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                    "Ignoring remote GekkoReady before interactive boundary: flags=0x%02X "
                     "phase=%u remote_frame=%d local_phase=%s",
                     flags,
                     (unsigned)phase,
@@ -278,11 +301,11 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
                 if (!s_remoteGekkoReady) {
                     s_remoteGekkoReady = true;
                     s_remoteReadyFrame = remoteFrame;
-                    NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
+                    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
                         "Remote startup READY observed: flags=0x%02X phase=%u remote_frame=%d",
                         flags, (unsigned)phase, remoteFrame);
                 } else {
-                    NetplayLog_Verbose("STARTUP", RollbackSession_GetCurrentFrame(),
+                    NetplayLog_Verbose("STARTUP", GetStartupLogFrame(),
                         "Duplicate remote READY ignored: flags=0x%02X phase=%u remote_frame=%d",
                         flags, (unsigned)phase, remoteFrame);
                 }
@@ -292,15 +315,26 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
                 if (!s_remoteGekkoReadyAck) {
                     s_remoteGekkoReadyAck = true;
                     s_remoteAckFrame = remoteFrame;
-                    NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
+                    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
                         "Remote startup ACK observed: flags=0x%02X phase=%u remote_frame=%d",
                         flags, (unsigned)phase, remoteFrame);
                 } else {
-                    NetplayLog_Verbose("STARTUP", RollbackSession_GetCurrentFrame(),
+                    NetplayLog_Verbose("STARTUP", GetStartupLogFrame(),
                         "Duplicate remote ACK ignored: flags=0x%02X phase=%u remote_frame=%d",
                         flags, (unsigned)phase, remoteFrame);
                 }
             }
+            break;
+        }
+
+        case Net::PacketType::WinScreenFrameInput: {
+            if (payloadLen < sizeof(Net::WinScreenFrameInputPayload)) {
+                LogGameplayPacketAnomaly("Short WinScreenFrameInput", type, payloadLen,
+                                         sizeof(Net::WinScreenFrameInputPayload));
+                break;
+            }
+            Net::WinScreenSync_OnRemoteFrameInput(
+                static_cast<const Net::WinScreenFrameInputPayload*>(payload));
             break;
         }
 
@@ -329,6 +363,82 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
 // ============================================================================
 // Bootstrap → Rollback Handoff
 // ============================================================================
+
+static bool PrepareBaselineForInteractiveRelease() {
+    if (s_liveReleaseArmed) {
+        return true;
+    }
+
+    const Net::LockedMatchConfig* config = Net::PregameSync_GetLockedConfig();
+    if (!config) {
+        NetplayLog_Write("HANDOFF", -1, "ERROR: No locked config available for startup handoff");
+        LOG_ERROR("[OnlineWiring] No locked config for startup handoff");
+        return false;
+    }
+
+    Net::MatchBootstrapSnapshot bootSnap{};
+    Net::MatchBootstrap_GetSnapshot(&bootSnap);
+
+    s_configHash = Net::LockedMatchConfig_Hash(config);
+    s_baselineCRC = bootSnap.local_baseline_crc;
+    s_handoffDelay = Net::DelayPolicy_GetActiveDelay();
+    s_handoffBudget = Net::DelayPolicy_GetAgreedRollbackBudget();
+    s_handoffFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+
+    NetplayLog_Write("HANDOFF", s_handoffFrame,
+        "=== BOOTSTRAP -> INTRO HANDOFF ===");
+    NetplayLog_Write("HANDOFF", s_handoffFrame,
+        "Config hash=0x%08X baseline_crc=0x%08X start_frame=%u host_start_sim=%d",
+        s_configHash,
+        s_baselineCRC,
+        bootSnap.start_frame,
+        bootSnap.gameplay_start_sim_frame);
+    NetplayLog_Write("HANDOFF", s_handoffFrame,
+        "Load barrier sim: local=%d remote=%d | baseline sim: local=%d remote=%d",
+        bootSnap.local_load_sim_frame,
+        bootSnap.remote_load_sim_frame,
+        bootSnap.local_baseline_sim_frame,
+        bootSnap.remote_baseline_sim_frame);
+
+    // Preserve hard startup alignment before deterministic intro runs.
+    uint32_t preRestoreCRC = CalcCRC32(
+        (const void*)ADDR_MATCH_BASE,
+        (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+    NetplayLog_Write("HANDOFF", s_handoffFrame,
+        "Pre-restore CRC=0x%08X (baseline=0x%08X match=%s)",
+        preRestoreCRC,
+        s_baselineCRC,
+        (preRestoreCRC == s_baselineCRC) ? "YES" : "NO");
+
+    if (Savestate_Load()) {
+        WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, 0);
+        WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, 0);
+        s_handoffFrame = 0;
+
+        uint32_t postRestoreCRC = CalcCRC32(
+            (const void*)ADDR_MATCH_BASE,
+            (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+        NetplayLog_Write("HANDOFF", 0,
+            "Baseline RESTORED before intro: crc=0x%08X match=%s sim=0 writeIdx=0",
+            postRestoreCRC,
+            (postRestoreCRC == s_baselineCRC) ? "YES" : "NO");
+    } else {
+        NetplayLog_Write("HANDOFF", s_handoffFrame,
+            "WARNING: Baseline restore FAILED before intro handoff");
+        LOG_WARN("[OnlineWiring] Baseline restore failed before intro handoff");
+    }
+
+    // Switch to gameplay-phase packet callback now so startup READY/ACK can be
+    // exchanged during intro/passive startup before rollback session begin.
+    Net::Session_SetPacketCallback(OnGameplayPacket);
+    ResetStartupBarrierState("interactive release armed");
+    s_liveReleaseArmed = true;
+
+    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+        "Startup barrier armed: deterministic intro runs locally; "
+        "rollback advance deferred until mutual post-intro interactive release");
+    return true;
+}
 
 static bool TryStartRollbackSession() {
     if (s_rollbackActive) return true;  // Already active
@@ -361,21 +471,21 @@ static bool TryStartRollbackSession() {
     rbConfig.remote_player = remotePlayer;
     rbConfig.initial_delay = activeDelay;
     rbConfig.rollback_budget = rollbackBudget;
-    rbConfig.baseline_checksum = bootSnap.local_baseline_crc;
+    rbConfig.baseline_checksum = s_baselineCRC ? s_baselineCRC : bootSnap.local_baseline_crc;
     const int32_t bootstrapFrame = (int32_t)bootSnap.start_frame;
-    const int32_t gameplayFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-    rbConfig.start_frame = gameplayFrame;
+    const int32_t interactiveFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    rbConfig.start_frame = interactiveFrame;
 
     // Config hash for logging
     s_configHash = Net::LockedMatchConfig_Hash(config);
-    s_baselineCRC = bootSnap.local_baseline_crc;
+    s_baselineCRC = rbConfig.baseline_checksum;
     s_handoffDelay = activeDelay;
     s_handoffBudget = rollbackBudget;
-    s_handoffFrame = gameplayFrame;
+    s_handoffFrame = interactiveFrame;
 
-    // --- LOG BEFORE/AFTER for handoff ---
+    // --- LOG BEFORE/AFTER for live release ---
     NetplayLog_Write("HANDOFF", s_handoffFrame,
-        "=== BOOTSTRAP -> ROLLBACK HANDOFF ===");
+        "=== INTERACTIVE RELEASE -> ROLLBACK START ===");
     NetplayLog_Write("HANDOFF", s_handoffFrame,
         "Config: p1_char=%u p1_pal=%u p2_char=%u p2_pal=%u stage=%u",
         config->p1_character, config->p1_palette,
@@ -390,8 +500,8 @@ static bool TryStartRollbackSession() {
         (role == Net::SessionRole::Host) ? "Host" : "Join",
         config->host_side);
     NetplayLog_Write("HANDOFF", s_handoffFrame,
-        "Baseline CRC=0x%08X bootstrap_frame=%d rollback_start_frame=%d",
-        s_baselineCRC, bootstrapFrame, rbConfig.start_frame);
+        "Baseline CRC=0x%08X bootstrap_frame=%d interactive_release_frame=%d rollback_start_frame=%d",
+        s_baselineCRC, bootstrapFrame, interactiveFrame, rbConfig.start_frame);
     NetplayLog_Write("HANDOFF", s_handoffFrame,
         "Load barrier sim: local=%d remote=%d | baseline sim: local=%d remote=%d | start sim=%d",
         bootSnap.local_load_sim_frame,
@@ -400,51 +510,11 @@ static bool TryStartRollbackSession() {
         bootSnap.remote_baseline_sim_frame,
         bootSnap.gameplay_start_sim_frame);
     NetplayLog_Write("HANDOFF", s_handoffFrame,
-        "Gameplay ownership delta: %d frames from bootstrap baseline",
+        "Rollback start delta from bootstrap baseline: %d frames",
         rbConfig.start_frame - bootstrapFrame);
     NetplayLog_Write("HANDOFF", s_handoffFrame,
         "Active delay=%d rollback_budget=%d",
         activeDelay, rollbackBudget);
-
-    Net::MatchLifecyclePhase phase = Net::MatchLifecycle_GetPhase();
-    NetplayLog_Write("HANDOFF", s_handoffFrame,
-        "Lifecycle phase at handoff: %s",
-        Net::MatchLifecyclePhaseName(phase));
-
-    // ── Restore baseline savestate ──────────────────────────────────
-    // Between the baseline capture and this handoff point, the game ran
-    // uncontrolled frames through the vanilla dispatcher path (Match_ClearPerFrameTempData,
-    // Frame_AdvanceSimulation, and potentially render-side state writes all modify
-    // the main blob). The number of these frames differs between HOST and CLIENT
-    // due to timing, causing the main state to diverge BEFORE GekkoNet even starts.
-    // Restoring the agreed-upon baseline forces both sides to identical state.
-    {
-        uint32_t preRestoreCRC = CalcCRC32((const void*)ADDR_MATCH_BASE,
-            (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
-        NetplayLog_Write("HANDOFF", s_handoffFrame,
-            "Pre-restore CRC=0x%08X (baseline was 0x%08X, delta=%s)",
-            preRestoreCRC, s_baselineCRC,
-            (preRestoreCRC == s_baselineCRC) ? "none" : "DIVERGED");
-
-        if (Savestate_Load()) {
-            // Force sim_frame=0 and writeIdx=0 for clean GekkoNet start
-            WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, 0);
-            WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, 0);
-            rbConfig.start_frame = 0;
-            s_handoffFrame = 0;
-
-            uint32_t postRestoreCRC = CalcCRC32((const void*)ADDR_MATCH_BASE,
-                (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
-            NetplayLog_Write("HANDOFF", 0,
-                "Baseline RESTORED: CRC=0x%08X (match=%s) sim=0 writeIdx=0",
-                postRestoreCRC,
-                (postRestoreCRC == s_baselineCRC) ? "YES" : "NO");
-        } else {
-            NetplayLog_Write("HANDOFF", s_handoffFrame,
-                "WARNING: Baseline restore FAILED — starting from diverged state");
-            LOG_WARN("[OnlineWiring] Baseline restore failed at handoff");
-        }
-    }
 
     // Register gameplay packet callback
     NetplayLog_Write("HANDOFF", s_handoffFrame,
@@ -460,13 +530,10 @@ static bool TryStartRollbackSession() {
         return false;
     }
 
-    // New rollback ownership boundary — clear any stale startup-release flags
-    // from a prior failed attempt before entering the gameplay-entry barrier.
-    ResetStartupBarrierState("rollback session begin");
-
     s_rollbackStarted = true;
     s_rollbackActive = true;
     s_gameplayActive = Net::MatchLifecycle_IsGameplayPlayable();
+    s_liveReleaseArmed = false;
 
     // Enable state digest for desync detection
     RollbackDebug_SetDigestEnabled(true);
@@ -475,6 +542,10 @@ static bool TryStartRollbackSession() {
         NetplayLog_Write("HANDOFF", s_handoffFrame,
             "Rollback session owns pre-playable match frames; lifecycle=%s",
             Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+    }
+    if (!s_startupReleased) {
+        NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+            "WARNING: rollback session started before startup release completed");
     }
 
     NetplayLog_Write("HANDOFF", s_handoffFrame,
@@ -524,6 +595,7 @@ static void StopRollbackSession(const char* reason) {
 
     s_rollbackActive = false;
     s_gameplayActive = false;
+    s_liveReleaseArmed = false;
     ResetStartupBarrierState(reason ? reason : "rollback stop");
 
     NetplayLog_Write("TEARDOWN", frame,
@@ -583,8 +655,7 @@ static void CheckLifecyclePhase() {
         // === Handle phase transitions ===
 
         // Entering PlayableGameplay — usually means interactive control began.
-        // The normal rollback start now happens at GameplayStart handoff; this
-        // path remains as a fallback if bootstrap wiring failed to start it.
+        // Rollback start is deferred to the mutual post-intro startup release.
         if (curPhase == Net::MatchLifecyclePhase::PlayableGameplay) {
             if (s_rollbackStarted) {
                 const bool resumed = (s_lastLifecyclePhase == Net::MatchLifecyclePhase::PauseActive ||
@@ -599,9 +670,18 @@ static void CheckLifecyclePhase() {
                             ? "Gameplay resumed (rollback session already started)"
                             : "Interactive gameplay began under rollback ownership");
                 }
-            } else if (!s_rollbackStarted) {
-                // Fallback: start rollback on first gameplay if handoff missed it.
-                s_rollbackBeginPending = true;
+            } else {
+                if (!s_liveReleaseArmed) {
+                    // Defensive fallback: if handoff wiring was missed, still arm the
+                    // interactive startup barrier here so first-advance cannot race.
+                    s_liveReleaseArmed = true;
+                    ResetStartupBarrierState("lifecycle playable fallback");
+                    Net::Session_SetPacketCallback(OnGameplayPacket);
+                    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                        "Fallback: startup barrier armed at PlayableGameplay (handoff missing)");
+                }
+                NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                    "Reached first interactive boundary; waiting for mutual startup release");
             }
         }
 
@@ -669,6 +749,7 @@ static void CheckLifecyclePhase() {
             // Reset per-match state
             s_rollbackStarted = false;
             s_rollbackBeginPending = false;
+            s_liveReleaseArmed = false;
             s_handoffFrame = -1;
             s_remoteInputsReceived = 0;
             s_packetsDispatched = 0;
@@ -686,7 +767,9 @@ static void CheckLifecyclePhase() {
 
         // IntroActive → will reach PlayableGameplay soon
         if (curPhase == Net::MatchLifecyclePhase::IntroActive) {
-            NetplayLog_Write("LIFE", -1, "Intro active — waiting for playable gameplay");
+            NetplayLog_Write("LIFE", -1,
+                "Intro active — waiting for first interactive boundary (release_armed=%d)",
+                s_liveReleaseArmed ? 1 : 0);
         }
 
         s_lastLifecyclePhase = curPhase;
@@ -702,6 +785,7 @@ void OnlineWiring_Init() {
     s_rollbackStarted = false;
     s_rollbackActive = false;
     s_gameplayActive = false;
+    s_liveReleaseArmed = false;
     s_rollbackBeginPending = false;
     s_handoffFrame = -1;
     s_baselineCRC = 0;
@@ -731,6 +815,9 @@ void OnlineWiring_Shutdown() {
     if (s_rollbackActive) {
         StopRollbackSession("mod shutdown");
     }
+    s_liveReleaseArmed = false;
+    s_rollbackBeginPending = false;
+    ResetStartupBarrierState("shutdown");
     Net::WinScreenSync_Shutdown();
     Net::PauseHandler_Shutdown();
     StressHooks_Shutdown();
@@ -746,36 +833,42 @@ void OnlineWiring_FrameUpdate() {
     // Track delay/budget policy changes (before/after logging)
     CheckPolicyChanges();
 
-    // Deferred rollback start (after phase tracking)
-    if (s_rollbackBeginPending) {
-        s_rollbackBeginPending = false;
-        TryStartRollbackSession();
-    }
-
     // Startup gameplay-entry barrier:
-    // - Intro/passive startup frames may advance under rollback ownership.
-    // - Once local reaches PlayableGameplay, hold advancement until both peers
-    //   have mutually exchanged READY+ACK over GekkoReady control packets.
-    // This prevents one side from entering interactive gameplay first.
-    if (s_rollbackActive && !s_startupReleased) {
-        const bool sessionRunning = RollbackSession_IsSessionRunning();
-        const bool inPlayableGameplay = Net::MatchLifecycle_IsGameplayPlayable();
+    // - Deterministic intro runs in vanilla/passive mode.
+    // - Rollback-owned BeginFrame/Advance is held until BOTH peers report the
+    //   first post-intro interactive boundary and exchange READY+ACK.
+    if ((s_liveReleaseArmed || s_rollbackActive) && !s_startupReleased) {
+        const bool sessionConnected = Net::Session_IsConnected();
+        const bool inPlayableGameplay = IsInPlayableMatchGameplay();
 
         if (!s_startupBarrierEntered) {
             s_startupBarrierEntered = true;
-            NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
-                "Local startup barrier entered: lifecycle=%s session_running=%d",
+            NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                "Local startup barrier entered: lifecycle=%s session_connected=%d rollback_active=%d",
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
-                sessionRunning ? 1 : 0);
+                sessionConnected ? 1 : 0,
+                s_rollbackActive ? 1 : 0);
         }
 
-        if (sessionRunning && inPlayableGameplay) {
+        if (sessionConnected && !inPlayableGameplay) {
+            s_introHoldLogCounter++;
+            if (s_introHoldLogCounter <= 5 || (s_introHoldLogCounter % 120) == 0) {
+                NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                    "Session connected but live advance still gated: intro not finished "
+                    "(phase=%s)",
+                    Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+            }
+        } else {
+            s_introHoldLogCounter = 0;
+        }
+
+        if (sessionConnected && inPlayableGameplay) {
             if (!s_localGekkoReadySent) {
                 uint8_t flags = Net::GEKKO_READY_FLAG_READY;
                 if (s_remoteGekkoReady) {
                     flags |= Net::GEKKO_READY_FLAG_ACK;
                 }
-                SendGekkoReadyPacket(flags, "local entered PlayableGameplay boundary");
+                SendGekkoReadyPacket(flags, "local reached first interactive boundary");
                 s_localGekkoReadySent = true;
                 if ((flags & Net::GEKKO_READY_FLAG_ACK) != 0) {
                     s_localGekkoReadyAckSent = true;
@@ -783,7 +876,7 @@ void OnlineWiring_FrameUpdate() {
             } else if (s_remoteGekkoReady && !s_localGekkoReadyAckSent) {
                 SendGekkoReadyPacket(
                     Net::GEKKO_READY_FLAG_READY | Net::GEKKO_READY_FLAG_ACK,
-                    "remote READY observed");
+                    "remote interactive READY observed");
                 s_localGekkoReadyAckSent = true;
             } else if (s_localGekkoReadySent) {
                 uint8_t resendFlags = Net::GEKKO_READY_FLAG_READY;
@@ -808,37 +901,54 @@ void OnlineWiring_FrameUpdate() {
 
         if (releaseSatisfied) {
             s_startupReleased = true;
-            NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
-                "Gameplay-entry release satisfied: local_ready=%d local_ack=%d "
-                "remote_ready=%d remote_ack=%d local_frame=%d "
-                "local_ready_frame=%d local_ack_frame=%d remote_ready_frame=%d remote_ack_frame=%d "
-                "phase=%s",
+            NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                "Gameplay-entry release satisfied at interactive boundary: "
+                "local_ready=%d local_ack=%d remote_ready=%d remote_ack=%d "
+                "local_frame=%d local_ready_frame=%d local_ack_frame=%d "
+                "remote_ready_frame=%d remote_ack_frame=%d phase=%s",
                 s_localGekkoReadySent ? 1 : 0,
                 s_localGekkoReadyAckSent ? 1 : 0,
                 s_remoteGekkoReady ? 1 : 0,
                 s_remoteGekkoReadyAck ? 1 : 0,
-                RollbackSession_GetCurrentFrame(),
+                GetStartupLogFrame(),
                 s_localReadyFrame,
                 s_localAckFrame,
                 s_remoteReadyFrame,
                 s_remoteAckFrame,
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+
+            if (!s_rollbackStarted) {
+                s_rollbackBeginPending = true;
+            }
         } else if (s_localGekkoReadySent) {
             s_startupBlockedLogCounter++;
             if (s_startupBlockedLogCounter <= 5 ||
                 (s_startupBlockedLogCounter % 120) == 0) {
-                NetplayLog_Write("STARTUP", RollbackSession_GetCurrentFrame(),
-                    "Startup release BLOCKED: waiting_remote_ready=%d waiting_remote_ack=%d "
-                    "session_running=%d local_frame=%d remote_ready_frame=%d remote_ack_frame=%d "
+                NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                    "Startup release BLOCKED at interactive boundary: "
+                    "waiting_remote_ready=%d waiting_remote_ack=%d "
+                    "session_connected=%d local_frame=%d remote_ready_frame=%d remote_ack_frame=%d "
                     "phase=%s",
                     s_remoteGekkoReady ? 0 : 1,
                     s_remoteGekkoReadyAck ? 0 : 1,
-                    sessionRunning ? 1 : 0,
-                    RollbackSession_GetCurrentFrame(),
+                    sessionConnected ? 1 : 0,
+                    GetStartupLogFrame(),
                     s_remoteReadyFrame,
                     s_remoteAckFrame,
                     Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
             }
+        }
+    }
+
+    // Deferred rollback start (after startup barrier update)
+    if (s_rollbackBeginPending) {
+        if (TryStartRollbackSession()) {
+            s_rollbackBeginPending = false;
+        } else {
+            NetplayLog_Write("HANDOFF", GetStartupLogFrame(),
+                "Rollback start still pending (will retry): phase=%s released=%d",
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+                s_startupReleased ? 1 : 0);
         }
     }
 
@@ -887,9 +997,19 @@ void OnlineWiring_FrameUpdate() {
 }
 
 void OnlineWiring_OnGameplayStart() {
-    if (!s_rollbackStarted) {
-        TryStartRollbackSession();
+    if (s_rollbackStarted || s_liveReleaseArmed) {
+        return;
     }
+
+    if (!PrepareBaselineForInteractiveRelease()) {
+        NetplayLog_Write("HANDOFF", GetStartupLogFrame(),
+            "ERROR: failed to prepare interactive-release startup handoff");
+        return;
+    }
+
+    s_rollbackBeginPending = false;
+    NetplayLog_Write("HANDOFF", GetStartupLogFrame(),
+        "Rollback session start deferred: waiting for first post-intro interactive boundary");
 }
 
 void OnlineWiring_OnGameplayPause(const char* reason) {
@@ -899,7 +1019,13 @@ void OnlineWiring_OnGameplayPause(const char* reason) {
 }
 
 void OnlineWiring_OnMatchEnd() {
-    StopRollbackSession("match end event");
+    if (s_rollbackActive) {
+        StopRollbackSession("match end event");
+    } else {
+        s_liveReleaseArmed = false;
+        s_rollbackBeginPending = false;
+        ResetStartupBarrierState("match end");
+    }
 }
 
 void OnlineWiring_OnDisconnect(const char* reason) {
@@ -909,6 +1035,9 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     if (s_rollbackActive) {
         StopRollbackSession(reason ? reason : "disconnect");
     }
+
+    s_liveReleaseArmed = false;
+    s_rollbackBeginPending = false;
 
     // Reset set tracker on session end
     Net::SetTracker_Reset();
@@ -946,6 +1075,7 @@ void OnlineWiring_OnRematch() {
     s_rollbackStarted = false;
     s_rollbackActive = false;
     s_gameplayActive = false;
+    s_liveReleaseArmed = false;
     s_rollbackBeginPending = false;
     s_handoffFrame = -1;
     s_baselineCRC = 0;
@@ -979,6 +1109,7 @@ void OnlineWiring_OnReturnToSession() {
     s_rollbackStarted = false;
     s_rollbackActive = false;
     s_gameplayActive = false;
+    s_liveReleaseArmed = false;
     s_rollbackBeginPending = false;
     s_handoffFrame = -1;
     s_baselineCRC = 0;
@@ -999,9 +1130,24 @@ bool OnlineWiring_IsStartupReleased() {
 }
 
 bool OnlineWiring_IsGameplayEntryAdvanceBlocked() {
-    return s_rollbackActive &&
-           Net::MatchLifecycle_IsGameplayPlayable() &&
-           !s_startupReleased;
+    const bool atInteractiveBoundary = IsInPlayableMatchGameplay();
+    if (!atInteractiveBoundary) {
+        return false;
+    }
+
+    if (!s_startupReleased) {
+        return s_liveReleaseArmed || s_rollbackActive;
+    }
+
+    if (!s_rollbackActive && (s_liveReleaseArmed || s_rollbackBeginPending || !s_rollbackStarted)) {
+        return true;
+    }
+
+    if (s_rollbackActive && !RollbackSession_IsSessionRunning()) {
+        return true;
+    }
+
+    return false;
 }
 
 void OnlineWiring_GetSnapshot(OnlineWiringSnapshot* out) {

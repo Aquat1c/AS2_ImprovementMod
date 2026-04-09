@@ -64,16 +64,18 @@ enum class PacketType : uint16_t {
     // CharSel lockstep (unreliable, channel 1)
     CharSelFrameInput = 40, // Per-frame charsel input with redundancy
 
-    // Win screen / pause (reliable, channel 0)
-    WinScreenConfirm = 41,  // Win screen A/C confirm signal
-    PauseQuit        = 42,  // Pause menu quit signal
+    // Win screen / pause
+    WinScreenConfirm    = 41,  // Legacy win screen one-shot confirm signal
+    PauseQuit           = 42,  // Pause menu quit signal
+    WinScreenFrameInput = 43,  // Mode 9 lockstep frame input with redundancy
 
     // Gameplay (unreliable, channel 1)
     GameplayInput   = 20,   // Legacy mod-owned rollback input sync (DEAD — no send site)
     GekkoData       = 23,   // Raw GekkoNet internal protocol data
 
     // Startup gameplay-entry barrier (reliable, channel 0)
-    // Sent at PlayableGameplay entry while held; release requires mutual ready+ack.
+    // Sent when first post-intro interactive boundary is reached while held;
+    // release requires mutual ready+ack.
     GekkoReady      = 24,   // Startup barrier control (ready/ack)
 
     // Mid-match delay changes (reliable, channel 0)
@@ -241,6 +243,14 @@ struct CharSelFrameInputPayload {
     uint16_t _pad;
 };
 
+struct WinScreenFrameInputPayload {
+    uint32_t frame;              // Lockstep frame number
+    uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
+    uint16_t inputs[8];          // Redundant history: [frame, frame-1, ..., frame-7]
+    uint16_t input_count;        // Number of valid entries in inputs[] (1-8)
+    uint16_t _pad;
+};
+
 struct DelayChangeReqPayload {
     uint8_t  new_delay;          // Requested input delay (1-15)
     uint8_t  _pad[3];
@@ -255,7 +265,7 @@ struct DelayChangeAckPayload {
 #pragma pack(pop)
 
 // GekkoReadyPayload flags
-constexpr uint8_t GEKKO_READY_FLAG_READY = 1 << 0;  // Local reached gameplay-entry boundary
+constexpr uint8_t GEKKO_READY_FLAG_READY = 1 << 0;  // Local reached post-intro interactive boundary
 constexpr uint8_t GEKKO_READY_FLAG_ACK   = 1 << 1;  // Local has observed peer READY
 
 // ============================================================================
@@ -285,6 +295,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::GameplayInput:      return "GameplayInput";
         case PacketType::CharSelFrameInput:  return "CharSelFrameInput";
         case PacketType::WinScreenConfirm:   return "WinScreenConfirm";
+        case PacketType::WinScreenFrameInput:return "WinScreenFrameInput";
         case PacketType::PauseQuit:           return "PauseQuit";
         case PacketType::Ping:           return "Ping";
         case PacketType::Pong:           return "Pong";

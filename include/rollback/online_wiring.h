@@ -36,11 +36,13 @@ void OnlineWiring_FrameUpdate();
 bool OnlineWiring_IsGameplayActive();
 
 /// Returns true once startup gameplay-entry barrier release is complete
-/// (both peers reached PlayableGameplay and mutually acknowledged readiness).
+/// (both peers reached the first post-intro interactive boundary and
+/// mutually acknowledged readiness).
 bool OnlineWiring_IsStartupReleased();
 
-/// Returns true when local PlayableGameplay advancement must still be held by
-/// the startup gameplay-entry barrier (mutual ready+ack not complete yet).
+/// Returns true when first interactive gameplay advancement must still be held
+/// by the startup gameplay-entry barrier (mutual ready+ack or rollback start
+/// handoff still incomplete).
 bool OnlineWiring_IsGameplayEntryAdvanceBlocked();
 
 // ============================================================================
