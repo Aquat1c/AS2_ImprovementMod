@@ -118,31 +118,33 @@ static float GetTimesyncFreezeEnterThreshold() {
 }
 
 static int GetCatchupCooldown(float framesBehind) {
-    // Cooldown MUST stay >= 1 to avoid zero-cooldown oscillation storms.
-    if (framesBehind >= 4.0f) {
-        return 1;
-    }
-    if (framesBehind >= 2.5f) {
-        return 2;
-    }
-    if (framesBehind >= 1.5f) {
+    // Conservative cadence: never allow per-frame catch-up storms.
+    // Keep cooldown >= 3 even under heavy behind pressure.
+    if (framesBehind >= 5.0f) {
         return 3;
     }
-    return 4;
+    if (framesBehind >= 3.0f) {
+        return 4;
+    }
+    if (framesBehind >= 1.75f) {
+        return 5;
+    }
+    return 6;
 }
 
 static int GetAheadThrottleCooldown(float framesAhead) {
-    // Soft leader-throttle cadence; no hard freeze/dead-stop behavior.
-    if (framesAhead >= 4.0f) {
-        return 1;
-    }
-    if (framesAhead >= 3.0f) {
+    // Ahead-side correction cadence. Keep this easier to trigger than catch-up
+    // under pressure, but still bounded to one hold decision window.
+    if (framesAhead >= 5.0f) {
         return 2;
     }
-    if (framesAhead >= 2.0f) {
+    if (framesAhead >= 3.5f) {
         return 3;
     }
-    return 4;
+    if (framesAhead >= 2.0f) {
+        return 4;
+    }
+    return 5;
 }
 
 // ============================================================================
@@ -896,7 +898,6 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         static int s_aheadThrottleCooldown = 0;
         static bool s_doDoubleTick = false;
         static bool s_doAheadThrottleHold = false;
-        static bool s_loggedAheadHoldMarkerOnly = false;
         static bool s_loggedTimesyncEnabled = false;
         static bool s_liveTimesyncWasEnabled = false;
         static bool s_timesyncCatchupArmed = false;
@@ -910,9 +911,11 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         static float s_startupBias = 0.0f;
         static int32_t s_lastCatchupDecisionFrame = -1000000;
         static int32_t s_lastAheadDecisionFrame = -1000000;
+        static int32_t s_lastPacingDecisionFrame = -1000000;
         static bool s_aheadThrottleActive = false;
         static uint32_t s_aheadOverEnterCount = 0;
         static uint32_t s_aheadUnderExitCount = 0;
+        static uint32_t s_behindPressureCount = 0;
         static uint32_t s_startupGateLogCount = 0;
         static uint32_t s_timesyncAheadPressureLogCount = 0;
         static uint32_t s_timesyncSettleSuppressedLogCount = 0;
@@ -930,7 +933,6 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_aheadThrottleCooldown = 0;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
-            s_loggedAheadHoldMarkerOnly = false;
             s_lastDispatcherCallAdvanced = false;
             s_lastAdvanceWasRollback = false;
             s_postReleaseNormalAdvanceCount = 0;
@@ -941,9 +943,11 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_startupBias = 0.0f;
             s_lastCatchupDecisionFrame = -1000000;
             s_lastAheadDecisionFrame = -1000000;
+            s_lastPacingDecisionFrame = -1000000;
             s_aheadThrottleActive = false;
             s_aheadOverEnterCount = 0;
             s_aheadUnderExitCount = 0;
+            s_behindPressureCount = 0;
             s_startupGateLogCount = 0;
             s_timesyncAheadPressureLogCount = 0;
             s_timesyncSettleSuppressedLogCount = 0;
@@ -1000,6 +1004,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         constexpr float AHEAD_THROTTLE_EXIT_HYSTERESIS = 0.75f;
         constexpr uint32_t AHEAD_THROTTLE_ENTER_FRAMES = 3;
         constexpr uint32_t AHEAD_THROTTLE_EXIT_FRAMES = 5;
+        constexpr uint32_t CATCHUP_CONFIRM_FRAMES = 2;
 
         if (liveGameplayTimesync && !s_liveTimesyncWasEnabled) {
             s_liveTimesyncWasEnabled = true;
@@ -1010,12 +1015,13 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_aheadThrottleCooldown = 0;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
-            s_loggedAheadHoldMarkerOnly = false;
             s_lastCatchupDecisionFrame = -1000000;
             s_lastAheadDecisionFrame = -1000000;
+            s_lastPacingDecisionFrame = -1000000;
             s_aheadThrottleActive = false;
             s_aheadOverEnterCount = 0;
             s_aheadUnderExitCount = 0;
+            s_behindPressureCount = 0;
             s_timesyncSettleSuppressedLogCount = 0;
             s_catchupRollbackSuppressedLogCount = 0;
             s_catchupCooldownSuppressedLogCount = 0;
@@ -1039,7 +1045,6 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_timesyncCatchupArmed = false;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
-            s_loggedAheadHoldMarkerOnly = false;
             s_aheadThrottleActive = false;
             s_aheadOverEnterCount = 0;
             s_aheadUnderExitCount = 0;
@@ -1053,6 +1058,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         if (s_startupBiasActive) {
             effectiveFramesAhead -= s_startupBias;
         }
+        const float aheadThresholdEnter = (std::max)(1.25f, freezeEnter * 0.6f);
 
         if (!s_loggedTimesyncEnabled && liveGameplayTimesync) {
             s_loggedTimesyncEnabled = true;
@@ -1060,7 +1066,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 "Gameplay timesync ENABLED (PlayableGameplay + startup released): "
                 "raw=%.2f effective=%.2f bias=%.2f bias_active=%d ahead_enter=%.2f budget=%d",
                 framesAhead, effectiveFramesAhead, s_startupBias,
-                s_startupBiasActive ? 1 : 0, freezeEnter, rollbackBudget);
+                s_startupBiasActive ? 1 : 0, aheadThresholdEnter, rollbackBudget);
         }
 
         if (liveGameplayTimesync) {
@@ -1097,7 +1103,9 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 }
             }
 
-            const float aheadEnter = freezeEnter;
+            // Use a lower ahead-entry threshold than the legacy freezeEnter so
+            // ahead-side correction can actually engage in live windows.
+            const float aheadEnter = aheadThresholdEnter;
             const float aheadExit = (std::max)(0.5f, aheadEnter - AHEAD_THROTTLE_EXIT_HYSTERESIS);
 
             if (effectiveFramesAhead >= aheadEnter) {
@@ -1115,9 +1123,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             }
 
             if (!s_aheadThrottleActive) {
-                if (effectiveFramesAhead >= aheadEnter &&
-                    s_lastDispatcherCallAdvanced &&
-                    !s_lastAdvanceWasRollback) {
+                if (effectiveFramesAhead >= aheadEnter) {
                     s_aheadOverEnterCount++;
                     if (s_aheadOverEnterCount >= AHEAD_THROTTLE_ENTER_FRAMES) {
                         s_aheadThrottleActive = true;
@@ -1153,10 +1159,11 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_postReleaseNormalAdvanceCount = 0;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
-            s_loggedAheadHoldMarkerOnly = false;
             s_aheadThrottleActive = false;
             s_aheadOverEnterCount = 0;
             s_aheadUnderExitCount = 0;
+            s_behindPressureCount = 0;
+            s_lastPacingDecisionFrame = -1000000;
             s_catchupRollbackSuppressedLogCount = 0;
             s_catchupCooldownSuppressedLogCount = 0;
             s_aheadThrottleSuppressedLogCount = 0;
@@ -1177,33 +1184,51 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
 
         const bool rollingBackNow = Rollback::RollbackSession_IsRollingBack();
         const bool catchupBehind = effectiveFramesAhead <= -1.0f;
+        const bool stableNormalAdvance = s_lastDispatcherCallAdvanced && !s_lastAdvanceWasRollback;
+        if (liveGameplayTimesync && s_timesyncCatchupArmed && catchupBehind && stableNormalAdvance && !rollingBackNow) {
+            if (s_behindPressureCount < 255u) {
+                s_behindPressureCount++;
+            }
+        } else if (!catchupBehind) {
+            s_behindPressureCount = 0;
+        }
 
         // If the local peer is behind, schedule an extra tick to catch up.
         // Only applies during live gameplay — not during startup/intro where
         // GekkoNet drives deterministic progression on its own.
         if (liveGameplayTimesync &&
             s_timesyncCatchupArmed &&
-            s_lastDispatcherCallAdvanced &&
+            stableNormalAdvance &&
             catchupBehind &&
             !s_doDoubleTick) {
             const bool blockedByRollback = rollingBackNow || s_lastAdvanceWasRollback;
             const bool blockedByCooldown = s_catchupCooldown > 0;
             const bool blockedByDecisionWindow = timesyncFrame == s_lastCatchupDecisionFrame;
+            const bool blockedByPacingWindow = timesyncFrame == s_lastPacingDecisionFrame;
+            const bool blockedByConfirm = s_behindPressureCount < CATCHUP_CONFIRM_FRAMES;
 
-            if (!blockedByRollback && !blockedByCooldown && !blockedByDecisionWindow) {
+            if (!blockedByRollback &&
+                !blockedByCooldown &&
+                !blockedByDecisionWindow &&
+                !blockedByPacingWindow &&
+                !blockedByConfirm) {
                 const float framesBehind = -effectiveFramesAhead;
+                const uint32_t pressureCount = s_behindPressureCount;
                 s_doDoubleTick = true;
                 s_catchupCooldown = GetCatchupCooldown(framesBehind);
                 s_lastCatchupDecisionFrame = timesyncFrame;
+                s_lastPacingDecisionFrame = timesyncFrame;
+                s_behindPressureCount = 0;
                 Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
                     "Scheduling catch-up tick: behind=%.2f raw=%.2f effective=%.2f "
-                    "bias=%.2f cooldown=%d rb=%d",
+                    "bias=%.2f cooldown=%d rb=%d pressure=%u",
                     framesBehind,
                     framesAhead,
                     effectiveFramesAhead,
                     s_startupBias,
                     s_catchupCooldown,
-                    rollingBackNow ? 1 : 0);
+                    rollingBackNow ? 1 : 0,
+                    pressureCount);
             } else if (blockedByRollback) {
                 s_catchupRollbackSuppressedLogCount++;
                 if (s_catchupRollbackSuppressedLogCount <= 5 ||
@@ -1226,6 +1251,21 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                         framesAhead,
                         effectiveFramesAhead);
                 }
+            } else if (blockedByConfirm) {
+                Rollback::NetplayLog_Verbose("TIMESYNC", timesyncFrame,
+                    "Catch-up waiting for confirm streak: pressure=%u/%u raw=%.2f effective=%.2f",
+                    s_behindPressureCount,
+                    CATCHUP_CONFIRM_FRAMES,
+                    framesAhead,
+                    effectiveFramesAhead);
+            } else if (blockedByPacingWindow || blockedByDecisionWindow) {
+                Rollback::NetplayLog_Verbose("TIMESYNC", timesyncFrame,
+                    "Catch-up skipped by pacing arbitration: pacing_window=%d decision_window=%d "
+                    "raw=%.2f effective=%.2f",
+                    blockedByPacingWindow ? 1 : 0,
+                    blockedByDecisionWindow ? 1 : 0,
+                    framesAhead,
+                    effectiveFramesAhead);
             }
         }
 
@@ -1233,18 +1273,23 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         // This is intentionally a light throttle, not a hard freeze.
         if (liveGameplayTimesync &&
             s_aheadThrottleActive &&
-            s_lastDispatcherCallAdvanced &&
+            stableNormalAdvance &&
             !s_doDoubleTick &&
             !s_doAheadThrottleHold &&
-            effectiveFramesAhead >= freezeEnter) {
+            effectiveFramesAhead >= aheadThresholdEnter) {
             const bool blockedByRollback = rollingBackNow || s_lastAdvanceWasRollback;
             const bool blockedByCooldown = s_aheadThrottleCooldown > 0;
             const bool blockedByDecisionWindow = timesyncFrame == s_lastAheadDecisionFrame;
+            const bool blockedByPacingWindow = timesyncFrame == s_lastPacingDecisionFrame;
 
-            if (!blockedByRollback && !blockedByCooldown && !blockedByDecisionWindow) {
+            if (!blockedByRollback &&
+                !blockedByCooldown &&
+                !blockedByDecisionWindow &&
+                !blockedByPacingWindow) {
                 s_doAheadThrottleHold = true;
                 s_aheadThrottleCooldown = GetAheadThrottleCooldown(effectiveFramesAhead);
                 s_lastAheadDecisionFrame = timesyncFrame;
+                s_lastPacingDecisionFrame = timesyncFrame;
                 Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
                     "Ahead-side SOFT THROTTLE scheduled: raw=%.2f effective=%.2f "
                     "cooldown=%d rb=%d",
@@ -1257,10 +1302,13 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 if (s_aheadThrottleSuppressedLogCount <= 5 ||
                     (s_aheadThrottleSuppressedLogCount % 120) == 0) {
                     Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                        "Ahead-side SOFT THROTTLE suppressed: rollback=%d last_rb=%d cooldown=%d",
+                        "Ahead-side SOFT THROTTLE suppressed: rollback=%d last_rb=%d cooldown=%d "
+                        "pacing_window=%d decision_window=%d",
                         rollingBackNow ? 1 : 0,
                         s_lastAdvanceWasRollback ? 1 : 0,
-                        s_aheadThrottleCooldown);
+                        s_aheadThrottleCooldown,
+                        blockedByPacingWindow ? 1 : 0,
+                        blockedByDecisionWindow ? 1 : 0);
                 }
             }
         }
@@ -1272,16 +1320,18 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             if (s_doAheadThrottleHold) {
                 s_doAheadThrottleHold = false;
                 s_lastDispatcherCallAdvanced = false;
-                if (!s_loggedAheadHoldMarkerOnly) {
-                    Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                        "Ahead-side SOFT THROTTLE marker consumed (no dispatcher short-circuit): "
-                        "raw=%.2f effective=%.2f bias=%.2f cooldown=%d",
-                        framesAhead,
-                        effectiveFramesAhead,
-                        s_startupBias,
-                        s_aheadThrottleCooldown);
-                    s_loggedAheadHoldMarkerOnly = true;
+                Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
+                    "Ahead-side SOFT THROTTLE EXECUTED: skipping one local advance window "
+                    "raw=%.2f effective=%.2f bias=%.2f cooldown=%d",
+                    framesAhead,
+                    effectiveFramesAhead,
+                    s_startupBias,
+                    s_aheadThrottleCooldown);
+                Net::Session_Update();
+                if (!Rollback::RollbackSession_PollSession()) {
+                    return AbortRollbackDispatcher("Peer disconnected during ahead-side throttle hold");
                 }
+                return -1;
             }
 
             // Phase 1: Collect local input and feed to GekkoNet

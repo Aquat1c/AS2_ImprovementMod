@@ -512,6 +512,36 @@ void BaselineSync_LogMismatchAndDump(const BaselineSyncStateView& state) {
     Rollback::NetplayLog_Flush();
 }
 
+uint32_t BaselineSync_ComputeAgreementDigest(const BaselineBreakdownPayload& payload) {
+    struct AgreementFields {
+        uint32_t header_crc;
+        uint32_t context_crc;
+        uint32_t summon_crc;
+        uint32_t p1_entity_crc;
+        uint32_t p2_entity_crc;
+        uint32_t rng_seed;
+        uint32_t sim_frame;
+        uint32_t frame_simulation;
+        uint32_t frame_write_idx;
+        uint32_t frame_net_idx;
+    } fields{};
+
+    // Exclude volatile effect/input/audio-adjacent bytes from bootstrap
+    // agreement to avoid false rematch mismatches.
+    fields.header_crc = payload.header_crc;
+    fields.context_crc = payload.context_crc;
+    fields.summon_crc = payload.summon_crc;
+    fields.p1_entity_crc = payload.p1_entity_crc;
+    fields.p2_entity_crc = payload.p2_entity_crc;
+    fields.rng_seed = payload.rng_seed;
+    fields.sim_frame = payload.sim_frame;
+    fields.frame_simulation = payload.frame_simulation;
+    fields.frame_write_idx = payload.frame_write_idx;
+    fields.frame_net_idx = payload.frame_net_idx;
+
+    return CalcCRC32(&fields, sizeof(fields));
+}
+
 bool BaselineSync_GetLocalBreakdown(BaselineBreakdownPayload* out) {
     if (!out || !s_haveLocalBreakdown) return false;
     *out = s_localBreakdown;

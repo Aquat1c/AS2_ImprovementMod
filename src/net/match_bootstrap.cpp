@@ -90,6 +90,8 @@ static bool            s_remoteBaselineReady= false;
 static bool            s_baselineAgreed     = false;
 static uint32_t        s_localBaselineCRC   = 0;
 static uint32_t        s_remoteBaselineCRC  = 0;
+static uint32_t        s_localBaselineDigest = 0;
+static uint32_t        s_remoteBaselineDigest = 0;
 static bool            s_baselineDigestSent = false;
 static uint8_t         s_localBaselineMode      = 0;
 static uint8_t         s_localBaselineSubstate  = 0;
@@ -167,8 +169,8 @@ static BaselineSyncStateView BuildBaselineStateView() {
     view.remote_mode = s_remoteBaselineMode;
     view.remote_substate = s_remoteBaselineSubstate;
     view.remote_sim_frame = s_remoteBaselineSimFrame;
-    view.local_crc = s_localBaselineCRC;
-    view.remote_crc = s_remoteBaselineCRC;
+    view.local_crc = s_localBaselineDigest;
+    view.remote_crc = s_remoteBaselineDigest;
     view.session_seed = s_config.session_seed;
     return view;
 }
@@ -396,11 +398,13 @@ static void UpdateBaseline() {
         DWORD elapsed = s_baselineStartTime ? (GetTickCount() - s_baselineStartTime) : 0;
         LOG_NETPLAY(LOG_DEBUG,
             "[MatchBoot] Baseline state: mode=%u sub=%u localReady=%s remoteReady=%s "
-            "localCRC=0x%08X remoteCRC=0x%08X digestSent=%s agreed=%s elapsed=%lums",
+            "localMain=0x%08X remoteMain=0x%08X localDigest=0x%08X remoteDigest=0x%08X "
+            "digestSent=%s agreed=%s elapsed=%lums",
             m, s,
             s_localBaselineReady ? "yes" : "no",
             s_remoteBaselineReady ? "yes" : "no",
             s_localBaselineCRC, s_remoteBaselineCRC,
+            s_localBaselineDigest, s_remoteBaselineDigest,
             s_baselineDigestSent ? "yes" : "no",
             s_baselineAgreed ? "yes" : "no",
             elapsed);
@@ -436,20 +440,25 @@ static void UpdateBaseline() {
                 const SavestateInfo* info = Savestate_GetInfo();
                 if (info && info->valid) {
                     s_localBaselineCRC = info->checksum;
-                    s_localBaselineReady = true;
-                    SendBaselineReady();
-                    SendBaselineDigest(s_localBaselineCRC);
-
                     BaselineBreakdownPayload localBreakdown{};
                     BaselineSync_CaptureLocalBreakdown(&localBreakdown);
+                    s_localBaselineDigest = BaselineSync_ComputeAgreementDigest(localBreakdown);
+                    s_localBaselineReady = true;
+                    SendBaselineReady();
+                    SendBaselineDigest(s_localBaselineDigest);
+
                     SendBaselineBreakdown(localBreakdown);
                     BaselineSync_RecordLocalBreakdown(
                         BuildBaselineStateView(),
                         localBreakdown,
                         s_localBaselineCRC);
 
-                    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline captured: crc=0x%08X frame=%u rng=0x%08X",
-                        s_localBaselineCRC, info->frame, info->rng_seed);
+                    LOG_NETPLAY(LOG_INFO,
+                        "[MatchBoot] Baseline captured: main_crc=0x%08X digest=0x%08X frame=%u rng=0x%08X",
+                        s_localBaselineCRC,
+                        s_localBaselineDigest,
+                        info->frame,
+                        info->rng_seed);
                 } else {
                     SetError("Failed to capture baseline savestate");
                 }
@@ -458,15 +467,27 @@ static void UpdateBaseline() {
     }
 
     // Check baseline agreement when both have exchanged
-    if (s_localBaselineReady && s_remoteBaselineReady && s_baselineDigestSent && !s_baselineAgreed) {
-        if (s_localBaselineCRC == s_remoteBaselineCRC) {
+    if (s_localBaselineReady &&
+        s_remoteBaselineReady &&
+        s_baselineDigestSent &&
+        s_localBaselineDigest != 0 &&
+        s_remoteBaselineDigest != 0 &&
+        !s_baselineAgreed) {
+        if (s_localBaselineDigest == s_remoteBaselineDigest) {
             s_baselineAgreed = true;
             s_phase = BootPhase::Ready;
-            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline agreed: crc=0x%08X -> Ready phase", s_localBaselineCRC);
+            LOG_NETPLAY(LOG_INFO,
+                "[MatchBoot] Baseline agreed: digest=0x%08X main_local=0x%08X main_remote=0x%08X -> Ready phase",
+                s_localBaselineDigest,
+                s_localBaselineCRC,
+                s_remoteBaselineCRC);
         } else {
             Rollback::NetplayLog_Write(
                 "BASELINE", s_localBaselineSimFrame,
-                "Baseline mismatch: local_crc=0x%08X remote_crc=0x%08X local=%u/%u/%d remote=%u/%u/%d phase=%s",
+                "Baseline mismatch: local_digest=0x%08X remote_digest=0x%08X "
+                "local_main=0x%08X remote_main=0x%08X local=%u/%u/%d remote=%u/%u/%d phase=%s",
+                s_localBaselineDigest,
+                s_remoteBaselineDigest,
                 s_localBaselineCRC,
                 s_remoteBaselineCRC,
                 s_localBaselineMode,
@@ -477,8 +498,11 @@ static void UpdateBaseline() {
                 s_remoteBaselineSimFrame,
                 BootPhaseName(s_phase));
             BaselineSync_LogMismatchAndDump(BuildBaselineStateView());
-            SetError("Baseline CRC mismatch: local=0x%08X remote=0x%08X",
-                s_localBaselineCRC, s_remoteBaselineCRC);
+            SetError("Baseline digest mismatch: local=0x%08X remote=0x%08X (main local=0x%08X remote=0x%08X)",
+                s_localBaselineDigest,
+                s_remoteBaselineDigest,
+                s_localBaselineCRC,
+                s_remoteBaselineCRC);
         }
     }
 
@@ -587,13 +611,14 @@ void MatchBootstrap_BeginBaseline() {
     s_localBaselineMode = 0;
     s_localBaselineSubstate = 0;
     s_localBaselineSimFrame = -1;
-    // NOTE: Do NOT reset s_remoteBaselineReady or s_remoteBaselineCRC here.
+    // NOTE: Do NOT reset s_remoteBaselineReady or remote digest/main here.
     // The remote peer's BaselineReady/Digest packets may have arrived
     // while we were still in the Loading phase. Resetting them would
     // discard that early notification and cause baseline agreement to
     // time out.
     s_baselineAgreed = false;
     s_localBaselineCRC = 0;
+    s_localBaselineDigest = 0;
     s_baselineDigestSent = false;
     s_gameplayStart = false;
     s_gameplayStartSent = false;
@@ -601,8 +626,11 @@ void MatchBootstrap_BeginBaseline() {
 
     s_baselineStartTime = GetTickCount();
     s_phase = BootPhase::Baseline;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin baseline capture (remote_baseline_already=%s crc=0x%08X)",
-        s_remoteBaselineReady ? "yes" : "no", s_remoteBaselineCRC);
+    LOG_NETPLAY(LOG_INFO,
+        "[MatchBoot] Begin baseline capture (remote_baseline_already=%s digest=0x%08X main=0x%08X)",
+        s_remoteBaselineReady ? "yes" : "no",
+        s_remoteBaselineDigest,
+        s_remoteBaselineCRC);
     BaselineSync_LogBegin(BuildBaselineStateView());
 }
 
@@ -628,6 +656,8 @@ void MatchBootstrap_Abort() {
     s_baselineAgreed = false;
     s_localBaselineCRC = 0;
     s_remoteBaselineCRC = 0;
+    s_localBaselineDigest = 0;
+    s_remoteBaselineDigest = 0;
     s_baselineDigestSent = false;
     s_localBaselineMode = 0;
     s_localBaselineSubstate = 0;
@@ -803,24 +833,32 @@ void MatchBootstrap_OnBaselineReady(const BaselineReadyPayload* p) {
 void MatchBootstrap_OnBaselineDigest(const BaselineDigestPayload* p) {
     if (!p) return;
 
-    s_remoteBaselineCRC = p->crc32;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Remote baseline digest: crc=0x%08X", p->crc32);
+    s_remoteBaselineDigest = p->crc32;
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Remote baseline digest: digest=0x%08X", p->crc32);
     BaselineSync_LogRemoteDigest(BuildBaselineStateView(), p->crc32);
 }
 
 void MatchBootstrap_OnBaselineBreakdown(const BaselineBreakdownPayload* p) {
     if (!p) return;
     BaselineSync_RecordRemoteBreakdown(BuildBaselineStateView(), *p);
+    s_remoteBaselineCRC = p->main_crc;
 
+    const uint32_t expectedDigest = BaselineSync_ComputeAgreementDigest(*p);
     // Keep digest and breakdown consistent even if they arrive in different order.
-    if (s_remoteBaselineCRC == 0) {
-        s_remoteBaselineCRC = p->main_crc;
-    } else if (s_remoteBaselineCRC != p->main_crc) {
+    if (s_remoteBaselineDigest == 0) {
+        s_remoteBaselineDigest = expectedDigest;
         Rollback::NetplayLog_Write(
             "BASELINE", (int32_t)p->sim_frame,
-            "WARNING: Remote baseline digest mismatch: digest=0x%08X breakdown_main=0x%08X",
-            s_remoteBaselineCRC,
-            p->main_crc);
+            "Remote BaselineDigest inferred from breakdown: digest=0x%08X main=0x%08X",
+            s_remoteBaselineDigest,
+            s_remoteBaselineCRC);
+    } else if (s_remoteBaselineDigest != expectedDigest) {
+        Rollback::NetplayLog_Write(
+            "BASELINE", (int32_t)p->sim_frame,
+            "WARNING: Remote baseline digest mismatch: digest=0x%08X breakdown_digest=0x%08X breakdown_main=0x%08X",
+            s_remoteBaselineDigest,
+            expectedDigest,
+            s_remoteBaselineCRC);
     }
 }
 

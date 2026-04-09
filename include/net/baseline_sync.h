@@ -46,9 +46,9 @@ void BaselineSync_RecordRemoteBreakdown(const BaselineSyncStateView& state,
 void BaselineSync_LogRemoteDigest(const BaselineSyncStateView& state,
                                   uint32_t remote_crc);
 void BaselineSync_LogMismatchAndDump(const BaselineSyncStateView& state);
+uint32_t BaselineSync_ComputeAgreementDigest(const BaselineBreakdownPayload& payload);
 
 bool BaselineSync_GetLocalBreakdown(BaselineBreakdownPayload* out);
 bool BaselineSync_GetRemoteBreakdown(BaselineBreakdownPayload* out);
 
 } // namespace Net
-
