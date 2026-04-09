@@ -24,6 +24,7 @@
  *     --jitter <ms>         Jitter +/- (default: 0)
  *     --loss <pct>          Packet loss % (default: 0)
  *     --dup <pct>           Packet duplicate % (default: 0)
+ *     --matches <n>         Number of matches before auto-stop (default: 1)
  *     --no-launch           Write config files but don't launch games
  *     --no-gui              Console-only mode (no ImGui window)
  *     --help                Show help
@@ -107,6 +108,7 @@ struct LauncherConfig {
     float lossPct;
     float dupPct;
     float timesyncThreshold;
+    int   matchCount;
     bool  stageMashTest;
     int   stageMashFrames;
     bool  noLaunch;
@@ -122,6 +124,7 @@ static void SetDefaults(LauncherConfig* cfg) {
     cfg->clientChar   = 1;
     cfg->delayFrames  = 0;
     cfg->durationSec  = 600;
+    cfg->matchCount   = 1;
     cfg->stageMashTest = false;
     cfg->stageMashFrames = 180;
 }
@@ -142,6 +145,7 @@ static void PrintUsage() {
     printf("  --jitter <ms>        Jitter +/- (default: 0)\n");
     printf("  --loss <pct>         Packet loss %% (default: 0)\n");
     printf("  --dup <pct>          Duplicate %% (default: 0)\n");
+    printf("  --matches <n>        Matches before auto-stop (default: 1)\n");
     printf("  --timesync <float>   Timesync threshold (default: 0.5)\n");
     printf("  --stage-mash         Mash opposite directionals during stage preview\n");
     printf("  --stage-mash-frames <n>  Preview frames to mash before confirming (default: 180)\n");
@@ -165,6 +169,7 @@ static bool ParseArgs(int argc, char** argv, LauncherConfig* cfg) {
         else if (!strcmp(arg, "--jitter") && i+1<argc)      cfg->jitterMs = atoi(argv[++i]);
         else if (!strcmp(arg, "--loss") && i+1<argc)        cfg->lossPct = (float)atof(argv[++i]);
         else if (!strcmp(arg, "--dup") && i+1<argc)         cfg->dupPct = (float)atof(argv[++i]);
+        else if (!strcmp(arg, "--matches") && i+1<argc)     cfg->matchCount = atoi(argv[++i]);
         else if (!strcmp(arg, "--timesync") && i+1<argc)    cfg->timesyncThreshold = (float)atof(argv[++i]);
         else if (!strcmp(arg, "--stage-mash"))               cfg->stageMashTest = true;
         else if (!strcmp(arg, "--stage-mash-frames") && i+1<argc) cfg->stageMashFrames = atoi(argv[++i]);
@@ -172,6 +177,7 @@ static bool ParseArgs(int argc, char** argv, LauncherConfig* cfg) {
         else if (!strcmp(arg, "--no-gui"))                   cfg->noGui = true;
         else { printf("Unknown option: %s\n", arg); return false; }
     }
+    if (cfg->matchCount <= 0) cfg->matchCount = 1;
     return true;
 }
 
@@ -198,7 +204,8 @@ static bool WriteConfigFile(const char* path, bool isHost, const LauncherConfig*
     fprintf(f, "enabled=1\nrole=%s\nnickname=%s\nport=%d\n", role, nick, localPort);
     fprintf(f, "target_ip=127.0.0.1\ntarget_port=%d\n", remotePort);
     fprintf(f, "character_id=%d\npalette=%d\ndelay_frames=%d\n", charId, palette, cfg->delayFrames);
-    fprintf(f, "match_duration_sec=%d\n\n", cfg->durationSec);
+    fprintf(f, "match_duration_sec=%d\n", cfg->durationSec);
+    fprintf(f, "match_count=%d\n\n", cfg->matchCount);
         fprintf(f, "stage_mash_test=%d\nstage_mash_frames=%d\n\n",
             cfg->stageMashTest ? 1 : 0,
             cfg->stageMashFrames);
@@ -825,6 +832,8 @@ static bool RunGui(const LauncherConfig* cfg, HANDLE hHost, HANDLE hClient, Harn
     ImVec4 clearColor = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
     bool running = true;
     DWORD completeSince = 0;
+    bool hostSawActive = false;
+    bool clientSawActive = false;
 
     while (running) {
         MSG msg;
@@ -867,13 +876,19 @@ static bool RunGui(const LauncherConfig* cfg, HANDLE hHost, HANDLE hClient, Harn
             }
         }
 
-        const bool hostDone = hostSlot.valid && hostSlot.data && hostSlot.data->phase == 9;
-        const bool clientDone = clientSlot.valid && clientSlot.data && clientSlot.data->phase == 9;
+        if (hostSlot.valid && hostSlot.data && hostSlot.data->phase != 0) hostSawActive = true;
+        if (clientSlot.valid && clientSlot.data && clientSlot.data->phase != 0) clientSawActive = true;
+
+        const bool hostDisabled = hostSlot.valid && hostSlot.data && hostSlot.data->phase == 0;
+        const bool clientDisabled = clientSlot.valid && clientSlot.data && clientSlot.data->phase == 0;
+        const bool hostFailed = hostSlot.valid && hostSlot.data && hostSlot.data->phase == 9;
+        const bool clientFailed = clientSlot.valid && clientSlot.data && clientSlot.data->phase == 9;
         if (hostSlot.valid && hostSlot.data) CaptureHarnessLogPath(runLogs, hostSlot.data);
         if (clientSlot.valid && clientSlot.data) CaptureHarnessLogPath(runLogs, clientSlot.data);
-        const bool bothDone = hostDone && clientDone;
+        const bool bothComplete = hostSawActive && clientSawActive && hostDisabled && clientDisabled;
+        const bool bothFailed = hostFailed && clientFailed;
         const bool bothExited = (hHost == INVALID_HANDLE_VALUE && hClient == INVALID_HANDLE_VALUE);
-        if (bothDone || bothExited) {
+        if (bothComplete || bothFailed || bothExited) {
             if (completeSince == 0) {
                 completeSince = now;
             } else if ((now - completeSince) > 3000) {
@@ -954,7 +969,8 @@ static bool RunGui(const LauncherConfig* cfg, HANDLE hHost, HANDLE hClient, Harn
                 ImGui::SeparatorText("Connection");
                 ImGui::Text("Host port: %d  Client port: %d", cfg->hostPort, cfg->clientPort);
                 ImGui::Text("Host char: %d  Client char: %d", cfg->hostChar, cfg->clientChar);
-                ImGui::Text("Delay: %d  Duration: %d sec", cfg->delayFrames, cfg->durationSec);
+                ImGui::Text("Delay: %d  Duration: %d sec  Matches: %d",
+                            cfg->delayFrames, cfg->durationSec, cfg->matchCount);
                 ImGui::Text("Stage mash: %s  Preview frames: %d",
                             cfg->stageMashTest ? "on" : "off",
                             cfg->stageMashFrames);
@@ -1044,9 +1060,9 @@ static bool RunGui(const LauncherConfig* cfg, HANDLE hHost, HANDLE hClient, Harn
 static const char* PhaseStr(uint32_t p) {
     static const char* names[] = {
         "Disabled","WaitMenu","WaitConnect","WaitCharSel",
-        "SelChar","SelStage","WaitGameplay","InMatch","Failed"
+        "SelChar","SelStage","WaitGameplay","InMatch","WinScreen","Failed"
     };
-    return p <= 8 ? names[p] : "???";
+    return p < (sizeof(names) / sizeof(names[0])) ? names[p] : "???";
 }
 
 static const char* ModeStr(uint32_t m) {
@@ -1116,6 +1132,8 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
     uint32_t prevHostPhase = UINT32_MAX, prevClientPhase = UINT32_MAX;
     uint32_t prevHostMode = UINT32_MAX, prevClientMode = UINT32_MAX;
     uint32_t prevHostSub = UINT32_MAX, prevClientSub = UINT32_MAX;
+    bool hostSawActive = false;
+    bool clientSawActive = false;
 
     printf("\n--- Live Console Monitor ---\n\n");
 
@@ -1163,6 +1181,7 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
 
             // Print phase transitions
             if (hostSlot.valid && hostSlot.data) {
+                if (hostSlot.data->phase != 0) hostSawActive = true;
                 if (hostSlot.data->phase != prevHostPhase) {
                     printf("  [HOST]   Phase: %s -> %s\n",
                         prevHostPhase != UINT32_MAX ? PhaseStr(prevHostPhase) : "---",
@@ -1181,6 +1200,7 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
                 }
             }
             if (clientSlot.valid && clientSlot.data) {
+                if (clientSlot.data->phase != 0) clientSawActive = true;
                 if (clientSlot.data->phase != prevClientPhase) {
                     printf("  [CLIENT] Phase: %s -> %s\n",
                         prevClientPhase != UINT32_MAX ? PhaseStr(prevClientPhase) : "---",
@@ -1224,13 +1244,24 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
                 remaining = 0;
             }
 
-            // Check if both instances reached "Done" phase (9)
-            bool hostDone = hostSlot.valid && hostSlot.data && hostSlot.data->phase == 9;
-            bool clientDone = clientSlot.valid && clientSlot.data && clientSlot.data->phase == 9;
-            if (hostDone && clientDone) {
-                printf("\n  >>> Both instances reached Done phase — match complete <<<\n");
+            // Autoconnect completion/failure checks.
+            const bool hostDisabled = hostSlot.valid && hostSlot.data && hostSlot.data->phase == 0;
+            const bool clientDisabled = clientSlot.valid && clientSlot.data && clientSlot.data->phase == 0;
+            const bool hostFailed = hostSlot.valid && hostSlot.data && hostSlot.data->phase == 9;
+            const bool clientFailed = clientSlot.valid && clientSlot.data && clientSlot.data->phase == 9;
+            const bool bothComplete = hostSawActive && clientSawActive && hostDisabled && clientDisabled;
+            const bool bothFailed = hostFailed && clientFailed;
+
+            if (bothComplete) {
+                printf("\n  >>> Both instances completed configured match run (Disabled phase) <<<\n");
                 // Give them a moment to flush logs, then terminate
                 Sleep(3000);
+                for (int i = 0; i < handleCount; i++)
+                    if (handles[i] != INVALID_HANDLE_VALUE) TerminateProcess(handles[i], 0);
+                remaining = 0;
+            } else if (bothFailed) {
+                printf("\n  >>> Both instances entered Failed phase — terminating run <<<\n");
+                Sleep(1500);
                 for (int i = 0; i < handleCount; i++)
                     if (handles[i] != INVALID_HANDLE_VALUE) TerminateProcess(handles[i], 0);
                 remaining = 0;
@@ -1319,7 +1350,8 @@ int main(int argc, char** argv) {
     printf("  Game dir:  %s\n", cfg.gameDir);
     printf("  Host:      port %d, char %d\n", cfg.hostPort, cfg.hostChar);
     printf("  Client:    port %d, char %d\n", cfg.clientPort, cfg.clientChar);
-    printf("  Delay:     %d frames  Duration: %d sec\n", cfg.delayFrames, cfg.durationSec);
+    printf("  Delay:     %d frames  Duration: %d sec  Matches: %d\n",
+           cfg.delayFrames, cfg.durationSec, cfg.matchCount);
         printf("  Stage test:%s  Preview mash frames: %d\n",
             cfg.stageMashTest ? " on" : " off",
             cfg.stageMashFrames);

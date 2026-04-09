@@ -6,6 +6,7 @@
  */
 
 #include "net/match_bootstrap.h"
+#include "net/baseline_sync.h"
 #include "net/barrier_protocol.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
@@ -151,103 +152,25 @@ static void CaptureGameplayContext(uint8_t* mode, uint8_t* substate, int32_t* si
     }
 }
 
-constexpr size_t kBaselineHashMainSize = (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE;
-constexpr size_t kBaselineHashHeaderSize = 16;
-constexpr size_t kBaselineHashContextSize = ADDR_EFFECT_ARRAY - (ADDR_MATCH_BASE + kBaselineHashHeaderSize);
-constexpr size_t kBaselineHashEffectSize = ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY;
-constexpr size_t kBaselineHashSummonSize = ADDR_P1_ENTITY_BASE - ADDR_SUMMON_ARRAY;
-
-struct BaselineHashBreakdown {
-    uint32_t main_crc;
-    uint32_t header_crc;
-    uint32_t context_crc;
-    uint32_t effect_crc;
-    uint32_t summon_crc;
-    uint32_t p1_entity_crc;
-    uint32_t p2_entity_crc;
-    uint32_t pre_match_gap_crc;
-    uint32_t p1_input_crc;
-    uint32_t p2_input_crc;
-    uint32_t per_frame_temp_crc;
-    uint32_t rng_seed;
-    uint32_t sim_frame;
-    uint32_t display_frame;
-    uint32_t game_mode;
-    uint32_t substate;
-    uint32_t game_type;
-    uint32_t match_phase_timer;
-};
-
-static uint32_t SafeRegionCRC(uintptr_t address, size_t size) {
-    __try {
-        return CalcCRC32(reinterpret_cast<const void*>(address), size);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return 0xDEADDEAD;
-    }
-}
-
-static BaselineHashBreakdown CaptureBaselineHashBreakdown() {
-    BaselineHashBreakdown out{};
-    out.main_crc = SafeRegionCRC(ADDR_MATCH_BASE, kBaselineHashMainSize);
-    out.header_crc = SafeRegionCRC(ADDR_MATCH_BASE, kBaselineHashHeaderSize);
-    out.context_crc = SafeRegionCRC(ADDR_MATCH_BASE + kBaselineHashHeaderSize, kBaselineHashContextSize);
-    out.effect_crc = SafeRegionCRC(ADDR_EFFECT_ARRAY, kBaselineHashEffectSize);
-    out.summon_crc = SafeRegionCRC(ADDR_SUMMON_ARRAY, kBaselineHashSummonSize);
-    out.p1_entity_crc = SafeRegionCRC(ADDR_P1_ENTITY_BASE, ENTITY_SIZE);
-    out.p2_entity_crc = SafeRegionCRC(ADDR_P2_ENTITY_BASE, ENTITY_SIZE);
-    out.pre_match_gap_crc = SafeRegionCRC(ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE);
-    out.p1_input_crc = SafeRegionCRC(ADDR_P1_INPUT_BUFFER, INPUT_BUFFER_SIZE);
-    out.p2_input_crc = SafeRegionCRC(ADDR_P2_INPUT_BUFFER, INPUT_BUFFER_SIZE);
-    out.per_frame_temp_crc = SafeRegionCRC(ADDR_MATCH_PER_FRAME_TEMP, MATCH_PER_FRAME_TEMP_SIZE);
-    out.rng_seed = DetVer_GetRngSeed();
-    out.sim_frame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-    out.display_frame = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
-    out.game_mode = ReadMemory<uint32_t>(ADDR_GAME_MODE);
-    out.substate = ReadMemory<uint32_t>(ADDR_SUB_STATE);
-    out.game_type = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
-    out.match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
-    return out;
-}
-
-static void LogBaselineHashBreakdown(const char* label, uint32_t referenceCrc) {
-    const BaselineHashBreakdown breakdown = CaptureBaselineHashBreakdown();
-    const int32_t frame = (int32_t)breakdown.sim_frame;
-    const bool matchesReference = (referenceCrc != 0 && breakdown.main_crc == referenceCrc);
-
-    Rollback::NetplayLog_Write(
-        "BASELINE", frame,
-        "%s checked: phase=%s main=0x%08X header=0x%08X context=0x%08X effects=0x%08X summons=0x%08X p1=0x%08X p2=0x%08X ref=0x%08X ref_match=%d",
-        label ? label : "Baseline",
-        BootPhaseName(s_phase),
-        breakdown.main_crc,
-        breakdown.header_crc,
-        breakdown.context_crc,
-        breakdown.effect_crc,
-        breakdown.summon_crc,
-        breakdown.p1_entity_crc,
-        breakdown.p2_entity_crc,
-        referenceCrc,
-        matchesReference ? 1 : 0);
-
-    Rollback::NetplayLog_Write(
-        "BASELINE", frame,
-        "%s adjacent: pre_gap=0x%08X p1_input=0x%08X p2_input=0x%08X temp=0x%08X rng=0x%08X sim=%u display=%u mode=%u sub=%u type=%u phase_timer=%u localLoad=%d remoteLoad=%d localBase=%d remoteBase=%d",
-        label ? label : "Baseline",
-        breakdown.pre_match_gap_crc,
-        breakdown.p1_input_crc,
-        breakdown.p2_input_crc,
-        breakdown.per_frame_temp_crc,
-        breakdown.rng_seed,
-        breakdown.sim_frame,
-        breakdown.display_frame,
-        breakdown.game_mode,
-        breakdown.substate,
-        breakdown.game_type,
-        breakdown.match_phase_timer,
-        s_localLoaded ? 1 : 0,
-        s_remoteLoaded ? 1 : 0,
-        s_localBaselineReady ? 1 : 0,
-        s_remoteBaselineReady ? 1 : 0);
+static BaselineSyncStateView BuildBaselineStateView() {
+    BaselineSyncStateView view{};
+    view.phase_name = BootPhaseName(s_phase);
+    view.local_loaded = s_localLoaded;
+    view.remote_loaded = s_remoteLoaded;
+    view.local_ready = s_localBaselineReady;
+    view.remote_ready = s_remoteBaselineReady;
+    view.digest_sent = s_baselineDigestSent;
+    view.baseline_agreed = s_baselineAgreed;
+    view.local_mode = s_localBaselineMode;
+    view.local_substate = s_localBaselineSubstate;
+    view.local_sim_frame = s_localBaselineSimFrame;
+    view.remote_mode = s_remoteBaselineMode;
+    view.remote_substate = s_remoteBaselineSubstate;
+    view.remote_sim_frame = s_remoteBaselineSimFrame;
+    view.local_crc = s_localBaselineCRC;
+    view.remote_crc = s_remoteBaselineCRC;
+    view.session_seed = s_config.session_seed;
+    return view;
 }
 
 static void SendConfig() {
@@ -359,6 +282,19 @@ static void SendBaselineDigest(uint32_t crc) {
 
     s_baselineDigestSent = true;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent BaselineDigest: crc=0x%08X", crc);
+}
+
+static void SendBaselineBreakdown(const BaselineBreakdownPayload& payload) {
+    BarrierProtocol_SendPacket(PacketType::BaselineBreakdown,
+                              &payload, sizeof(payload));
+    LOG_NETPLAY(LOG_INFO,
+        "[MatchBoot] Sent BaselineBreakdown: main=0x%08X header=0x%08X context=0x%08X rng=0x%08X sim=%u display=%u",
+        payload.main_crc,
+        payload.header_crc,
+        payload.context_crc,
+        payload.rng_seed,
+        payload.sim_frame,
+        payload.display_frame);
 }
 
 static void SendGameplayStart(uint32_t frame) {
@@ -503,9 +439,17 @@ static void UpdateBaseline() {
                     s_localBaselineReady = true;
                     SendBaselineReady();
                     SendBaselineDigest(s_localBaselineCRC);
+
+                    BaselineBreakdownPayload localBreakdown{};
+                    BaselineSync_CaptureLocalBreakdown(&localBreakdown);
+                    SendBaselineBreakdown(localBreakdown);
+                    BaselineSync_RecordLocalBreakdown(
+                        BuildBaselineStateView(),
+                        localBreakdown,
+                        s_localBaselineCRC);
+
                     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Baseline captured: crc=0x%08X frame=%u rng=0x%08X",
                         s_localBaselineCRC, info->frame, info->rng_seed);
-                    LogBaselineHashBreakdown("LocalBaselineCaptured", s_localBaselineCRC);
                 } else {
                     SetError("Failed to capture baseline savestate");
                 }
@@ -532,7 +476,7 @@ static void UpdateBaseline() {
                 s_remoteBaselineSubstate,
                 s_remoteBaselineSimFrame,
                 BootPhaseName(s_phase));
-            LogBaselineHashBreakdown("LocalBaselineMismatch", s_localBaselineCRC);
+            BaselineSync_LogMismatchAndDump(BuildBaselineStateView());
             SetError("Baseline CRC mismatch: local=0x%08X remote=0x%08X",
                 s_localBaselineCRC, s_remoteBaselineCRC);
         }
@@ -571,6 +515,7 @@ void MatchBootstrap_Init() {
     s_phase = BootPhase::Idle;
     memset(&s_config, 0, sizeof(s_config));
     s_error[0] = '\0';
+    BaselineSync_Reset();
     s_initialized = true;
     LOG_NETPLAY(LOG_DEBUG, "[MatchBoot] Initialized");
 }
@@ -578,6 +523,7 @@ void MatchBootstrap_Init() {
 void MatchBootstrap_Shutdown() {
     if (!s_initialized) return;
     s_phase = BootPhase::Idle;
+    BaselineSync_Reset();
     s_initialized = false;
     LOG_NETPLAY(LOG_DEBUG, "[MatchBoot] Shutdown");
 }
@@ -585,6 +531,7 @@ void MatchBootstrap_Shutdown() {
 void MatchBootstrap_BeginConfigExchange(const LockedMatchConfig* config) {
     if (!config) return;
 
+    BaselineSync_Reset();
     s_isHost = (Session_GetRole() == SessionRole::Host);
 
     // Host always uses its own config.
@@ -656,17 +603,7 @@ void MatchBootstrap_BeginBaseline() {
     s_phase = BootPhase::Baseline;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin baseline capture (remote_baseline_already=%s crc=0x%08X)",
         s_remoteBaselineReady ? "yes" : "no", s_remoteBaselineCRC);
-    Rollback::NetplayLog_Write(
-        "BASELINE", -1,
-        "Begin baseline: phase=%s remote_ready=%d remote_crc=0x%08X remote_mode=%u remote_sub=%u remote_sim=%d checked_scope=[0x%08X,+0x%zX] unchecked=pre_gap+p1_input+p2_input+temp+misc_globals",
-        BootPhaseName(s_phase),
-        s_remoteBaselineReady ? 1 : 0,
-        s_remoteBaselineCRC,
-        s_remoteBaselineMode,
-        s_remoteBaselineSubstate,
-        s_remoteBaselineSimFrame,
-        (uint32_t)ADDR_MATCH_BASE,
-        kBaselineHashMainSize);
+    BaselineSync_LogBegin(BuildBaselineStateView());
 }
 
 void MatchBootstrap_Abort() {
@@ -701,6 +638,7 @@ void MatchBootstrap_Abort() {
     s_gameplayStart = false;
     s_gameplayStartSent = false;
     s_gameplayStartSimFrame = -1;
+    BaselineSync_Reset();
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Aborted (all state reset)");
 }
 
@@ -867,49 +805,12 @@ void MatchBootstrap_OnBaselineDigest(const BaselineDigestPayload* p) {
 
     s_remoteBaselineCRC = p->crc32;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Remote baseline digest: crc=0x%08X", p->crc32);
-    Rollback::NetplayLog_Write(
-        "BASELINE", s_remoteBaselineSimFrame,
-        "Remote BaselineDigest: crc=0x%08X phase=%s remote_ready=%d remote=%u/%u/%d",
-        p->crc32,
-        BootPhaseName(s_phase),
-        s_remoteBaselineReady ? 1 : 0,
-        s_remoteBaselineMode,
-        s_remoteBaselineSubstate,
-        s_remoteBaselineSimFrame);
+    BaselineSync_LogRemoteDigest(BuildBaselineStateView(), p->crc32);
 }
 
 void MatchBootstrap_OnBaselineBreakdown(const BaselineBreakdownPayload* p) {
     if (!p) return;
-
-    // Breakdown is diagnostic-only, but keep it wired so packet flow stays
-    // compatible with peers that send detailed baseline telemetry.
-    Rollback::NetplayLog_Write(
-        "BASELINE", (int32_t)p->sim_frame,
-        "Remote BaselineBreakdown: main=0x%08X header=0x%08X context=0x%08X "
-        "effects=0x%08X summons=0x%08X p1=0x%08X p2=0x%08X "
-        "pre_gap=0x%08X p1_input=0x%08X p2_input=0x%08X temp=0x%08X "
-        "rng=0x%08X sim=%u display=%u mode=%u sub=%u frame_sim=%u frame_display=%u frame_write=%u frame_net=%u remote_frame=%u",
-        p->main_crc,
-        p->header_crc,
-        p->context_crc,
-        p->effect_crc,
-        p->summon_crc,
-        p->p1_entity_crc,
-        p->p2_entity_crc,
-        p->pre_match_gap_crc,
-        p->p1_input_crc,
-        p->p2_input_crc,
-        p->per_frame_temp_crc,
-        p->rng_seed,
-        p->sim_frame,
-        p->display_frame,
-        p->game_mode,
-        p->substate,
-        p->frame_simulation,
-        p->frame_display,
-        p->frame_write_idx,
-        p->frame_net_idx,
-        p->remote_frame_idx);
+    BaselineSync_RecordRemoteBreakdown(BuildBaselineStateView(), *p);
 
     // Keep digest and breakdown consistent even if they arrive in different order.
     if (s_remoteBaselineCRC == 0) {

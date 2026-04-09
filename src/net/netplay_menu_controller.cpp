@@ -115,6 +115,7 @@ struct AutoConnectConfig {
     int      characterGridIndex;
     int      palette;
     int      matchDurationSec;
+    int      matchCount;
 };
 
 static AutoConnectConfig s_autoConnect = {};
@@ -126,6 +127,7 @@ static bool             s_autoConnectReleasePending = false;
 static bool             s_autoConnectStageGridPressed = false;
 static bool             s_autoConnectStageConfirmPressed = false;
 static bool             s_autoConnectWinScreenPressed = false;
+static int              s_autoConnectCompletedMatches = 0;
 static bool             s_autoRematchCleanupApplied = false;
 static DWORD            s_autoRematchLastAttemptAt = 0;
 
@@ -530,6 +532,10 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
 
     if (next == AutoConnectState::InMatch) {
         s_autoConnectMatchFrame = 0;
+        LOG_NETPLAY(LOG_INFO,
+            "[AutoConnect] Entering match %d/%d",
+            s_autoConnectCompletedMatches + 1,
+            s_autoConnect.matchCount > 0 ? s_autoConnect.matchCount : 1);
     }
 
     s_autoConnectState = next;
@@ -576,8 +582,10 @@ static void LoadAutoConnectConfig() {
     s_autoConnect.characterGridIndex = 0;
     s_autoConnect.palette = 0;
     s_autoConnect.matchDurationSec = 0;
+    s_autoConnect.matchCount = 1;
     s_autoConnectState = AutoConnectState::Disabled;
     s_autoConnectStateFrames = 0;
+    s_autoConnectCompletedMatches = 0;
     s_autoConnectReleasePending = false;
     s_autoConnectStageGridPressed = false;
     s_autoConnectStageConfirmPressed = false;
@@ -672,7 +680,13 @@ static void LoadAutoConnectConfig() {
             s_autoConnect.palette = atoi(val);
         } else if (_stricmp(key, "match_duration_sec") == 0) {
             s_autoConnect.matchDurationSec = atoi(val);
+        } else if (_stricmp(key, "match_count") == 0) {
+            s_autoConnect.matchCount = atoi(val);
         }
+    }
+
+    if (s_autoConnect.matchCount <= 0) {
+        s_autoConnect.matchCount = 1;
     }
 
     if (!s_autoConnect.enabled) {
@@ -693,7 +707,7 @@ static void LoadAutoConnectConfig() {
     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
 
     LOG_NETPLAY(LOG_INFO,
-        "[AutoConnect] Loaded %s (from %s): role=%s nick='%s' port=%u target=%s delay=%d char=%d pal=%d duration=%d",
+        "[AutoConnect] Loaded %s (from %s): role=%s nick='%s' port=%u target=%s delay=%d char=%d pal=%d duration=%d matches=%d",
         kAutoConnectFile,
         parseSource,
         s_autoConnect.isHost ? "Host" : "Join",
@@ -703,7 +717,8 @@ static void LoadAutoConnectConfig() {
         s_preferredDelay,
         s_autoConnect.characterGridIndex,
         s_autoConnect.palette,
-        s_autoConnect.matchDurationSec);
+        s_autoConnect.matchDurationSec,
+        s_autoConnect.matchCount);
 
     // Initialize the test harness SHM so the launcher can see real-time state
     AutoConnectHarness_Init(s_autoConnect.isHost, s_autoConnect.nickname,
@@ -967,12 +982,33 @@ static void HandleAutoConnect() {
 
         case AutoConnectState::ConfirmingWinScreen:
             if (mode == MODE_CHARSEL || mode == MODE_MENU) {
-                LOG_NETPLAY(LOG_INFO, "[AutoConnect] Win screen complete (mode=%u sub=%u)",
-                    mode, sub);
-                if (AutoConnectHarness_IsActive()) {
-                    AutoConnectHarness_Shutdown();
+                const int targetMatches = s_autoConnect.matchCount > 0 ? s_autoConnect.matchCount : 1;
+                s_autoConnectCompletedMatches++;
+                LOG_NETPLAY(LOG_INFO,
+                    "[AutoConnect] Win screen complete (mode=%u sub=%u) match %d/%d",
+                    mode, sub, s_autoConnectCompletedMatches, targetMatches);
+
+                if (s_autoConnectCompletedMatches >= targetMatches) {
+                    if (AutoConnectHarness_IsActive()) {
+                        AutoConnectHarness_Shutdown();
+                    }
+                    AutoConnectTransition(AutoConnectState::Disabled, "configured match count reached");
+                    break;
                 }
-                AutoConnectTransition(AutoConnectState::Disabled, "winscreen complete");
+
+                if (mode == MODE_MENU) {
+                    if (LaunchNetplayCharSel()) {
+                        AutoConnectTransition(AutoConnectState::WaitingForCharSel, "next match launch from menu");
+                    } else {
+                        if (AutoConnectHarness_IsActive()) {
+                            AutoConnectHarness_Shutdown();
+                        }
+                        AutoConnectTransition(AutoConnectState::Failed, "next match launch failed");
+                    }
+                    break;
+                }
+
+                AutoConnectTransition(AutoConnectState::WaitingForCharSel, "next match at charsel");
                 break;
             }
 
@@ -2163,6 +2199,7 @@ void Shutdown() {
     ClearAutoConnectOverride();
     AutoConnectHarness_Shutdown();
     s_autoConnectState = AutoConnectState::Disabled;
+    s_autoConnectCompletedMatches = 0;
     s_autoRematchCleanupApplied = false;
     s_autoRematchLastAttemptAt = 0;
     memset(&s_autoConnect, 0, sizeof(s_autoConnect));
