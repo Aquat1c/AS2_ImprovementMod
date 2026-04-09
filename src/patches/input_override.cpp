@@ -896,6 +896,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         static int s_aheadThrottleCooldown = 0;
         static bool s_doDoubleTick = false;
         static bool s_doAheadThrottleHold = false;
+        static bool s_loggedAheadHoldMarkerOnly = false;
         static bool s_loggedTimesyncEnabled = false;
         static bool s_liveTimesyncWasEnabled = false;
         static bool s_timesyncCatchupArmed = false;
@@ -929,6 +930,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_aheadThrottleCooldown = 0;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
+            s_loggedAheadHoldMarkerOnly = false;
             s_lastDispatcherCallAdvanced = false;
             s_lastAdvanceWasRollback = false;
             s_postReleaseNormalAdvanceCount = 0;
@@ -1008,6 +1010,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_aheadThrottleCooldown = 0;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
+            s_loggedAheadHoldMarkerOnly = false;
             s_lastCatchupDecisionFrame = -1000000;
             s_lastAheadDecisionFrame = -1000000;
             s_aheadThrottleActive = false;
@@ -1036,6 +1039,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_timesyncCatchupArmed = false;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
+            s_loggedAheadHoldMarkerOnly = false;
             s_aheadThrottleActive = false;
             s_aheadOverEnterCount = 0;
             s_aheadUnderExitCount = 0;
@@ -1149,6 +1153,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_postReleaseNormalAdvanceCount = 0;
             s_doDoubleTick = false;
             s_doAheadThrottleHold = false;
+            s_loggedAheadHoldMarkerOnly = false;
             s_aheadThrottleActive = false;
             s_aheadOverEnterCount = 0;
             s_aheadUnderExitCount = 0;
@@ -1267,18 +1272,16 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             if (s_doAheadThrottleHold) {
                 s_doAheadThrottleHold = false;
                 s_lastDispatcherCallAdvanced = false;
-                Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                    "Ahead-side SOFT THROTTLE hold applied: raw=%.2f effective=%.2f "
-                    "bias=%.2f cooldown=%d",
-                    framesAhead,
-                    effectiveFramesAhead,
-                    s_startupBias,
-                    s_aheadThrottleCooldown);
-                Net::Session_Update();
-                if (!Rollback::RollbackSession_PollSession()) {
-                    return AbortRollbackDispatcher("Peer disconnected during ahead-side throttle hold");
+                if (!s_loggedAheadHoldMarkerOnly) {
+                    Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
+                        "Ahead-side SOFT THROTTLE marker consumed (no dispatcher short-circuit): "
+                        "raw=%.2f effective=%.2f bias=%.2f cooldown=%d",
+                        framesAhead,
+                        effectiveFramesAhead,
+                        s_startupBias,
+                        s_aheadThrottleCooldown);
+                    s_loggedAheadHoldMarkerOnly = true;
                 }
-                return -1;
             }
 
             // Phase 1: Collect local input and feed to GekkoNet

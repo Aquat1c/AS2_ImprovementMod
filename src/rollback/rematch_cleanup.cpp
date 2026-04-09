@@ -74,6 +74,11 @@ static void ClearInputResidue() {
     InputSystem_ResetRepeatState(0);
     InputSystem_ResetRepeatState(1);
     InputSystem_SetPauseBlocked(false);
+    if (InputSystem_GetControlSwap()) {
+        Rollback::NetplayLog_Write("REMATCH", -1,
+            "Clearing stale control swap at rematch boundary");
+    }
+    InputSystem_SetControlSwap(false);
 }
 
 } // anonymous namespace

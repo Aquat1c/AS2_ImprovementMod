@@ -24,6 +24,26 @@ struct DesyncDumpParams {
     int      dump_number;     // Sequential dump count
 };
 
+/// Extra context emitted when baseline agreement fails during bootstrap.
+struct BaselineMismatchDumpParams {
+    int32_t  mismatch_frame;
+    uint32_t local_crc;
+    uint32_t remote_crc;
+    uint8_t  local_mode;
+    uint8_t  local_substate;
+    int32_t  local_sim_frame;
+    uint8_t  remote_mode;
+    uint8_t  remote_substate;
+    int32_t  remote_sim_frame;
+    uint32_t frame_simulation;
+    uint32_t frame_display;
+    uint32_t frame_write_idx;
+    uint32_t frame_net_idx;
+    uint32_t remote_frame_idx;
+    uint32_t rng_seed;
+    const char* phase_name;
+};
+
 /// Write a comprehensive state dump to the given file handle.
 /// The caller is responsible for opening/closing the FILE*.
 void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params);
@@ -38,6 +58,9 @@ void DesyncDump_HexDumpRegion(FILE* f, const char* label, uintptr_t addr, size_t
 /// Top-level convenience: checks cooldown, opens file, writes dump, closes.
 /// Returns true if a dump was actually written.
 bool DesyncDump_TryDump(int32_t frame, uint32_t local_crc, uint32_t remote_crc);
+
+/// Writes a dedicated baseline-mismatch dump file with bootstrap context.
+bool DesyncDump_TryBaselineMismatchDump(const BaselineMismatchDumpParams& params);
 
 /// Feed a per-frame checksum into the dump module's local ring buffer.
 /// Call from rollback_debug each frame so dumps can show nearby checksums.

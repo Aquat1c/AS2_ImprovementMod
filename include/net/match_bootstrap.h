@@ -93,6 +93,7 @@ void MatchBootstrap_OnConfigAck(const ConfigAckPayload* p);
 void MatchBootstrap_OnLoadBarrier(const LoadBarrierPayload* p);
 void MatchBootstrap_OnBaselineReady(const BaselineReadyPayload* p);
 void MatchBootstrap_OnBaselineDigest(const BaselineDigestPayload* p);
+void MatchBootstrap_OnBaselineBreakdown(const BaselineBreakdownPayload* p);
 void MatchBootstrap_OnGameplayStart(const GameplayStartPayload* p);
 
 // ============================================================================

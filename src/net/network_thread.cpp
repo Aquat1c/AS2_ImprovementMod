@@ -35,8 +35,9 @@ struct WorkerCommand {
     WorkerCommandType type;
     uint32_t          session_token;
     uint16_t          listen_port;
-    uint32_t          target_ip;
+    char              target_host[96];
     uint16_t          target_port;
+    bool              send_hole_punch;
     uint8_t           channel;
     PacketType        packet_type;
     bool              reliable;
@@ -197,12 +198,37 @@ static void WorkerThreadMain() {
                     activeSessionToken = cmd.session_token;
                     activePeer = nullptr;
                     Transport_DestroyHost();
-                    // Keep existing behavior: join side binds ephemeral local port.
-                    if (!Transport_CreateHost(0)) {
+                    bool hostReady = false;
+                    if (cmd.listen_port > 0) {
+                        hostReady = Transport_CreateHost(cmd.listen_port);
+                        if (!hostReady) {
+                            Rollback::NetplayLog_Write("NTHREAD", -1,
+                                "Join bind on configured port failed, falling back to ephemeral: token=%u listen_port=%u",
+                                cmd.session_token,
+                                cmd.listen_port);
+                        }
+                    }
+                    if (!hostReady) {
+                        hostReady = Transport_CreateHost(0);
+                    }
+                    if (!hostReady) {
                         PushWorkerErrorEvent(cmd.session_token, "Network thread failed to create join host");
                         break;
                     }
-                    ENetPeer* peer = Transport_Connect(cmd.target_ip, cmd.target_port);
+                    if (cmd.send_hole_punch) {
+                        const bool burstOk = Transport_SendHolePunchBurst(
+                            cmd.target_host,
+                            cmd.target_port,
+                            6,
+                            10);
+                        Rollback::NetplayLog_Write("NTHREAD", -1,
+                            "Join hole-punch assist requested: token=%u target=%s:%u burst_ok=%d",
+                            cmd.session_token,
+                            cmd.target_host,
+                            cmd.target_port,
+                            burstOk ? 1 : 0);
+                    }
+                    ENetPeer* peer = Transport_Connect(cmd.target_host, cmd.target_port);
                     if (!peer) {
                         PushWorkerErrorEvent(cmd.session_token, "Network thread failed to initiate connect");
                         Transport_DestroyHost();
@@ -211,13 +237,11 @@ static void WorkerThreadMain() {
                     }
                     activePeer = peer;
                     Rollback::NetplayLog_Write("NTHREAD", -1,
-                        "Worker join connect initiated: token=%u target=%u.%u.%u.%u:%u",
+                        "Worker join connect initiated: token=%u target=%s:%u hole_punch=%d",
                         cmd.session_token,
-                        (cmd.target_ip) & 0xFF,
-                        (cmd.target_ip >> 8) & 0xFF,
-                        (cmd.target_ip >> 16) & 0xFF,
-                        (cmd.target_ip >> 24) & 0xFF,
-                        cmd.target_port);
+                        cmd.target_host,
+                        cmd.target_port,
+                        cmd.send_hole_punch ? 1 : 0);
                     break;
                 }
 
@@ -468,24 +492,28 @@ bool NetworkThread_StartHost(uint32_t session_token, uint16_t listen_port) {
 }
 
 bool NetworkThread_StartJoin(uint32_t session_token, uint16_t listen_port,
-                             uint32_t target_ip, uint16_t target_port) {
+                             const char* target_host, uint16_t target_port,
+                             bool send_hole_punch) {
+    if (!target_host || !target_host[0]) {
+        return false;
+    }
+
     WorkerCommand cmd{};
     cmd.type = WorkerCommandType::StartJoin;
     cmd.session_token = session_token;
     cmd.listen_port = listen_port;
-    cmd.target_ip = target_ip;
+    strncpy_s(cmd.target_host, sizeof(cmd.target_host), target_host, _TRUNCATE);
     cmd.target_port = target_port;
+    cmd.send_hole_punch = send_hole_punch;
     const bool ok = EnqueueCommand(cmd);
     if (ok) {
         Rollback::NetplayLog_Write("NTHREAD", -1,
-            "Queued StartJoin: token=%u local_listen=%u target=%u.%u.%u.%u:%u",
+            "Queued StartJoin: token=%u local_listen=%u target=%s:%u hole_punch=%d",
             session_token,
             listen_port,
-            (target_ip) & 0xFF,
-            (target_ip >> 8) & 0xFF,
-            (target_ip >> 16) & 0xFF,
-            (target_ip >> 24) & 0xFF,
-            target_port);
+            target_host,
+            target_port,
+            send_hole_punch ? 1 : 0);
     }
     return ok;
 }

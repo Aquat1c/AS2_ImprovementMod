@@ -13,6 +13,7 @@ static DWORD g_timeWarpBaseReal = 0;
 static double g_timeWarpBaseFake = 0.0;
 static float g_timeWarpLastScale = 1.0f;
 static bool g_timeWarpInitialized = false;
+static float g_lastLoggedEffectiveScale = 1.0f;
 
 extern bool GetVerboseLogging();
 
@@ -31,6 +32,20 @@ DWORD __cdecl Hook_GetTick() {
     real &= 0x7FFFFFFF;
 
     const float effectiveScale = ComputeEffectiveScale();
+    const bool scaleIsNeutral = fabsf(effectiveScale - 1.0f) <= 0.001f;
+    if (fabsf(g_lastLoggedEffectiveScale - effectiveScale) > 0.001f) {
+        LOG_INFO("[TickHooks] Effective tick scale changed: %.3fx (manual=%.3fx netplay=%.3fx)",
+            effectiveScale, g_manualTickScale, g_netplayTickScale);
+        g_lastLoggedEffectiveScale = effectiveScale;
+    }
+
+    // Fast path: default gameplay should match the game's original tick source exactly.
+    // Do not run through time-warp math unless a non-1.0 scale is actively requested.
+    if (scaleIsNeutral) {
+        g_timeWarpInitialized = false;
+        g_timeWarpLastScale = 1.0f;
+        return real;
+    }
 
     if (!g_timeWarpInitialized) {
         g_timeWarpBaseReal = real;

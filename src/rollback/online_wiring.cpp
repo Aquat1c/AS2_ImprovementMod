@@ -34,6 +34,7 @@
 #include "net/locked_match_config.h"
 #include "net/enet_transport.h"
 #include "net/player_side_mapping.h"
+#include "net/charsel_sync.h"
 #include "net/winscreen_sync.h"
 #include "net/pause_handler.h"
 #include "input/input_system.h"
@@ -64,6 +65,8 @@ static int      s_handoffDelay           = 0;
 static int      s_handoffBudget          = 0;
 static int      s_remoteInputsReceived   = 0;
 static int      s_packetsDispatched      = 0;
+static uint32_t s_backgroundPollCount    = 0;
+static uint32_t s_backgroundPollFailures = 0;
 
 // Startup gameplay-entry barrier state:
 // - READY means this peer reached the FIRST interactive post-intro boundary and is held.
@@ -235,8 +238,8 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
             auto* p = static_cast<const Net::StateDigestPayload*>(payload);
             RollbackDebug_OnRemoteDigest((int32_t)p->frame_number, p->crc32);
 
-            NetplayLog_Verbose("DESYNC", (int32_t)p->frame_number,
-                "Remote digest: crc=0x%08X", p->crc32);
+            NetplayLog_Verbose("DIGEST", (int32_t)p->frame_number,
+                "Remote digest received: crc=0x%08X", p->crc32);
             break;
         }
 
@@ -324,6 +327,39 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
                         flags, (unsigned)phase, remoteFrame);
                 }
             }
+            break;
+        }
+
+        case Net::PacketType::CharSelFrameInput: {
+            if (payloadLen < sizeof(Net::CharSelFrameInputPayload)) {
+                LogGameplayPacketAnomaly("Short CharSelFrameInput", type, payloadLen,
+                                         sizeof(Net::CharSelFrameInputPayload));
+                break;
+            }
+            Net::CharSelSync_OnRemoteFrameInput(
+                static_cast<const Net::CharSelFrameInputPayload*>(payload));
+            break;
+        }
+
+        case Net::PacketType::CharSelLock: {
+            if (payloadLen < sizeof(Net::CharSelLockPayload)) {
+                LogGameplayPacketAnomaly("Short CharSelLock", type, payloadLen,
+                                         sizeof(Net::CharSelLockPayload));
+                break;
+            }
+            Net::CharSelSync_OnRemoteLock(
+                static_cast<const Net::CharSelLockPayload*>(payload));
+            break;
+        }
+
+        case Net::PacketType::StageSync: {
+            if (payloadLen < sizeof(Net::StageSyncPayload)) {
+                LogGameplayPacketAnomaly("Short StageSync", type, payloadLen,
+                                         sizeof(Net::StageSyncPayload));
+                break;
+            }
+            Net::CharSelSync_OnRemoteStage(
+                static_cast<const Net::StageSyncPayload*>(payload));
             break;
         }
 
@@ -774,6 +810,8 @@ static void CheckLifecyclePhase() {
             s_handoffFrame = -1;
             s_remoteInputsReceived = 0;
             s_packetsDispatched = 0;
+            s_backgroundPollCount = 0;
+            s_backgroundPollFailures = 0;
             ResetStartupBarrierState("lifecycle inactive");
 
             // Reset set tracker when session fully ends
@@ -815,6 +853,8 @@ void OnlineWiring_Init() {
     s_handoffBudget = 0;
     s_remoteInputsReceived = 0;
     s_packetsDispatched = 0;
+    s_backgroundPollCount = 0;
+    s_backgroundPollFailures = 0;
     s_lastLifecyclePhase = Net::MatchLifecyclePhase::Inactive;
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
@@ -853,6 +893,32 @@ void OnlineWiring_FrameUpdate() {
 
     // Track delay/budget policy changes (before/after logging)
     CheckPolicyChanges();
+
+    // Keep Gekko session events/liveness flowing even when the input dispatcher
+    // is stalled in lockstep/startup holds. This remains game-thread-owned
+    // (no cross-thread Gekko mutation), but decouples poll cadence from the
+    // dispatcher's ability to advance simulation.
+    if (s_rollbackActive) {
+        s_backgroundPollCount++;
+        const bool pollOk = RollbackSession_PollSession();
+        if (!pollOk) {
+            s_backgroundPollFailures++;
+            NetplayLog_Write("GEKKO", RollbackSession_GetCurrentFrame(),
+                "Background poll FAILED: count=%u failures=%u phase=%s",
+                s_backgroundPollCount,
+                s_backgroundPollFailures,
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+            if (Net::MatchLifecycle_GetPhase() != Net::MatchLifecyclePhase::DisconnectRecovery) {
+                Net::MatchLifecycle_OnDisconnect("Rollback session poll failure");
+            }
+        } else if (s_backgroundPollCount <= 5 || (s_backgroundPollCount % 300) == 0) {
+            NetplayLog_Verbose("GEKKO", RollbackSession_GetCurrentFrame(),
+                "Background poll ok: count=%u phase=%s gameplay=%d",
+                s_backgroundPollCount,
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+                s_gameplayActive ? 1 : 0);
+        }
+    }
 
     // Startup gameplay-entry barrier:
     // - Deterministic intro runs in vanilla/passive mode.
@@ -1105,6 +1171,8 @@ void OnlineWiring_OnRematch() {
     s_handoffBudget = 0;
     s_remoteInputsReceived = 0;
     s_packetsDispatched = 0;
+    s_backgroundPollCount = 0;
+    s_backgroundPollFailures = 0;
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
     ResetStartupBarrierState("rematch");
@@ -1139,6 +1207,8 @@ void OnlineWiring_OnReturnToSession() {
     s_handoffBudget = 0;
     s_remoteInputsReceived = 0;
     s_packetsDispatched = 0;
+    s_backgroundPollCount = 0;
+    s_backgroundPollFailures = 0;
     ResetStartupBarrierState("return to session");
 }
 

@@ -524,6 +524,71 @@ bool DesyncDump_TryDump(int32_t frame, uint32_t local_crc, uint32_t remote_crc) 
     return true;
 }
 
+bool DesyncDump_TryBaselineMismatchDump(const BaselineMismatchDumpParams& params) {
+    const char* logDir = LogWindow_GetLogDir();
+    if (!logDir || !logDir[0]) return false;
+
+    const int32_t frame =
+        (params.mismatch_frame >= 0)
+            ? params.mismatch_frame
+            : (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+
+    const DWORD now = GetTickCount();
+    s_lastDumpTickMs = now;
+    s_dumpCount++;
+
+    DWORD pid = GetCurrentProcessId();
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE,
+                "%s\\baseline_mismatch_%lu_f%d_n%d.txt",
+                logDir, pid, frame, s_dumpCount);
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || !f) {
+        LOG_ERROR("[DesyncDump] Failed to write baseline mismatch dump: %s", path);
+        return false;
+    }
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fprintf(f, "================================================================================\n");
+    fprintf(f, "  BASELINE MISMATCH DUMP #%d\n", s_dumpCount);
+    fprintf(f, "================================================================================\n");
+    fprintf(f, "Time: %04d-%02d-%02d %02d:%02d:%02d.%03d\n",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    fprintf(f, "Phase: %s\n", params.phase_name ? params.phase_name : "unknown");
+    fprintf(f, "Local baseline:  crc=0x%08X mode=%u sub=%u sim=%d\n",
+            params.local_crc,
+            (unsigned)params.local_mode,
+            (unsigned)params.local_substate,
+            params.local_sim_frame);
+    fprintf(f, "Remote baseline: crc=0x%08X mode=%u sub=%u sim=%d\n",
+            params.remote_crc,
+            (unsigned)params.remote_mode,
+            (unsigned)params.remote_substate,
+            params.remote_sim_frame);
+    fprintf(f, "Vanilla sync counters (from sub_562550 lineage): sim=%u display=%u write=%u net=%u remote=%u\n",
+            params.frame_simulation,
+            params.frame_display,
+            params.frame_write_idx,
+            params.frame_net_idx,
+            params.remote_frame_idx);
+    fprintf(f, "Determinism seed: 0x%08X\n", params.rng_seed);
+    fprintf(f, "================================================================================\n\n");
+
+    DesyncDumpParams full{};
+    full.frame = frame;
+    full.local_crc = params.local_crc;
+    full.remote_crc = params.remote_crc;
+    full.dump_number = s_dumpCount;
+    DesyncDump_WriteFullDump(f, full);
+    fclose(f);
+
+    LOG_INFO("[DesyncDump] Baseline mismatch dump #%d written: %s", s_dumpCount, path);
+    return true;
+}
+
 // ============================================================================
 // Public: Feed checksum (called from rollback_debug each frame)
 // ============================================================================

@@ -24,7 +24,7 @@ namespace MenuUtils {
 // ============================================================================
 
 static char           s_publicIP[48]         = "";
-static char           s_yourAddress[64]      = "";
+static char           s_yourAddress[96]      = "";
 static volatile LONG  s_publicIPState        = 0;  // 0=idle, 1=fetching, 2=done, 3=failed
 static HANDLE         s_ipThread             = NULL;
 static char           s_clipboardFlash[48]   = "";
@@ -74,9 +74,19 @@ static DWORD WINAPI FetchPublicIPThread(LPVOID) {
     WinHttpReadData(hRequest, buf, sizeof(buf) - 1, &bytesRead);
     buf[bytesRead] = '\0';
 
-    // Validate: should be a simple dotted-quad IP, no HTML
-    bool valid = (bytesRead >= 7 && bytesRead <= 45 &&
-                  buf[0] >= '0' && buf[0] <= '9');
+    // Validate: plain IP string (IPv4 or IPv6), no HTML/whitespace.
+    bool valid = (bytesRead >= 2 && bytesRead <= 64);
+    for (DWORD i = 0; i < bytesRead && valid; i++) {
+        const char ch = buf[i];
+        const bool ok =
+            (ch >= '0' && ch <= '9') ||
+            (ch >= 'a' && ch <= 'f') ||
+            (ch >= 'A' && ch <= 'F') ||
+            ch == '.' || ch == ':' || ch == '\n' || ch == '\r';
+        if (!ok) {
+            valid = false;
+        }
+    }
     if (valid) {
         // Strip trailing whitespace/newlines
         while (bytesRead > 0 && (buf[bytesRead - 1] == '\n' ||
@@ -124,8 +134,13 @@ const char* GetPublicIP() {
 
 const char* UpdateYourAddress(uint16_t listenPort) {
     if (s_publicIPState == 2 && s_publicIP[0]) {
-        _snprintf_s(s_yourAddress, sizeof(s_yourAddress), _TRUNCATE,
-            "%s:%u", s_publicIP, (unsigned)listenPort);
+        if (strchr(s_publicIP, ':')) {
+            _snprintf_s(s_yourAddress, sizeof(s_yourAddress), _TRUNCATE,
+                "[%s]:%u", s_publicIP, (unsigned)listenPort);
+        } else {
+            _snprintf_s(s_yourAddress, sizeof(s_yourAddress), _TRUNCATE,
+                "%s:%u", s_publicIP, (unsigned)listenPort);
+        }
     } else {
         _snprintf_s(s_yourAddress, sizeof(s_yourAddress), _TRUNCATE,
             "?:%u", (unsigned)listenPort);

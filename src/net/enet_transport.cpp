@@ -3,11 +3,14 @@
  */
 
 #include <enet/enet.h>   // Must be before anything that pulls in windows.h
+#include <windows.h>
+#include <ws2tcpip.h>
 
 #include "net/enet_transport.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
 
+#include <stdio.h>
 #include <string.h>
 
 namespace Net {
@@ -117,37 +120,110 @@ bool Transport_IsHostActive() {
 // Connection
 // ============================================================================
 
-ENetPeer* Transport_Connect(uint32_t ipv4, uint16_t port) {
+ENetPeer* Transport_Connect(const char* host, uint16_t port) {
     if (!s_enetHost) {
         LOG_ERROR("[Net] Transport_Connect: No host active");
         Rollback::NetplayLog_Write("ENET", -1, "Connect failed: no active host");
         return nullptr;
     }
-
-    ENetAddress address;
-    address.host = ipv4;  // Already in network byte order
-    address.port = port;
-
-    ENetPeer* peer = enet_host_connect(s_enetHost, &address, NUM_CHANNELS, 0);
-    if (!peer) {
-        LOG_ERROR("[Net] enet_host_connect failed (port %u)", port);
-        Rollback::NetplayLog_Write("ENET", -1,
-            "Connect failed: %u.%u.%u.%u:%u",
-            (ipv4) & 0xFF, (ipv4 >> 8) & 0xFF, (ipv4 >> 16) & 0xFF, (ipv4 >> 24) & 0xFF,
-            port);
+    if (!host || !host[0]) {
+        LOG_ERROR("[Net] Transport_Connect: empty host");
+        Rollback::NetplayLog_Write("ENET", -1, "Connect failed: empty host");
         return nullptr;
     }
 
-    LOG_INFO("[Net] Connecting to %u.%u.%u.%u:%u...",
-             (ipv4) & 0xFF, (ipv4 >> 8) & 0xFF, (ipv4 >> 16) & 0xFF, (ipv4 >> 24) & 0xFF,
-             port);
+    ENetAddress address{};
+    address.port = port;
+    if (enet_address_set_host(&address, host) < 0) {
+        LOG_ERROR("[Net] Failed to resolve endpoint '%s:%u' (ENet IPv4 transport)", host, port);
+        Rollback::NetplayLog_Write("ENET", -1,
+            "Connect resolve failed: host=%s port=%u", host, port);
+        return nullptr;
+    }
+
+    ENetPeer* peer = enet_host_connect(s_enetHost, &address, NUM_CHANNELS, 0);
+    if (!peer) {
+        LOG_ERROR("[Net] enet_host_connect failed (%s:%u)", host, port);
+        Rollback::NetplayLog_Write("ENET", -1,
+            "Connect failed: host=%s port=%u", host, port);
+        return nullptr;
+    }
+
+    LOG_INFO("[Net] Connecting to %s:%u...", host, port);
     Rollback::NetplayLog_Write("ENET", -1,
-        "Connecting: peer=%p target=%u.%u.%u.%u:%u channels=%u",
+        "Connecting: peer=%p target=%s:%u channels=%u",
         peer,
-        (ipv4) & 0xFF, (ipv4 >> 8) & 0xFF, (ipv4 >> 16) & 0xFF, (ipv4 >> 24) & 0xFF,
+        host,
         port,
         NUM_CHANNELS);
     return peer;
+}
+
+bool Transport_SendHolePunchBurst(const char* host, uint16_t port,
+                                  int burstCount, uint32_t intervalMs) {
+    if (!host || !host[0] || port == 0 || burstCount <= 0) {
+        return false;
+    }
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+
+    char portStr[16] = {};
+    snprintf(portStr, sizeof(portStr), "%u", (unsigned)port);
+
+    addrinfo* result = nullptr;
+    const int gai = getaddrinfo(host, portStr, &hints, &result);
+    if (gai != 0 || !result) {
+        Rollback::NetplayLog_Write("ENET", -1,
+            "Hole punch resolve failed: target=%s:%u gai=%d",
+            host,
+            (unsigned)port,
+            gai);
+        return false;
+    }
+
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        Rollback::NetplayLog_Write("ENET", -1,
+            "Hole punch socket create failed: target=%s:%u wsa=%d",
+            host,
+            (unsigned)port,
+            WSAGetLastError());
+        return false;
+    }
+
+    static const char kPunchPayload[] = "AS2_HOLE_PUNCH";
+    int sentCount = 0;
+    for (int i = 0; i < burstCount; i++) {
+        const int sent = sendto(
+            sock,
+            kPunchPayload,
+            (int)sizeof(kPunchPayload),
+            0,
+            result->ai_addr,
+            (int)result->ai_addrlen);
+        if (sent >= 0) {
+            sentCount++;
+        }
+        if (intervalMs > 0 && i + 1 < burstCount) {
+            Sleep(intervalMs);
+        }
+    }
+
+    closesocket(sock);
+    freeaddrinfo(result);
+
+    Rollback::NetplayLog_Write("ENET", -1,
+        "Hole punch burst sent: target=%s:%u bursts=%d sent=%d",
+        host,
+        (unsigned)port,
+        burstCount,
+        sentCount);
+
+    return sentCount > 0;
 }
 
 void Transport_DisconnectPeer(ENetPeer* peer, uint32_t data) {

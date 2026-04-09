@@ -49,6 +49,7 @@ enum class PacketType : uint16_t {
 
     // NAT traversal coordination (reliable, channel 0)
     NatInfo         = 10,   // Exchange NAT/UPnP status
+    NatTraversalSignal = 34, // Exchange ICE description/candidates over session control
 
     // Pre-game sync (reliable, channel 0)
     CharSelInput    = 11,   // CharSel cursor/confirm state exchange
@@ -60,6 +61,7 @@ enum class PacketType : uint16_t {
     BaselineReady   = 17,   // Peer captured baseline savestate
     BaselineDigest  = 18,   // CRC32 of baseline savestate for agreement
     GameplayStart   = 19,   // Both peers ready — begin gameplay
+    BaselineBreakdown = 25, // Detailed per-region baseline CRCs for mismatch diagnosis
 
     // CharSel lockstep (unreliable, channel 1)
     CharSelFrameInput = 40, // Per-frame charsel input with redundancy
@@ -154,6 +156,23 @@ struct SyncConfirmPayload {
     uint8_t  _pad[2];
 };
 
+struct NatInfoPayload {
+    uint8_t  flags;              // NAT_INFO_FLAG_*
+    uint8_t  upnp_status;        // Net::NatStatus
+    uint8_t  stun_status;        // Net::StunStatus
+    uint8_t  extra_flags;        // NAT_INFO_EX_FLAG_*
+    uint16_t listen_port;        // Local listen port used by ENet host
+    uint16_t external_port;      // External/stun-discovered UDP port
+    char     external_ip[48];    // UPnP/STUN external IP string (v4/v6 text)
+};
+
+struct NatTraversalSignalPayload {
+    uint8_t  signal_type;        // Net::NatSignalType
+    uint8_t  _pad;
+    uint16_t text_len;           // bytes used in text[]
+    char     text[1024];         // ICE SDP/candidate payload (trickle)
+};
+
 // Pre-game sync payloads
 
 struct CharSelInputPayload {
@@ -223,6 +242,41 @@ struct BaselineDigestPayload {
     uint32_t crc32;              // CRC32 of baseline savestate
 };
 
+struct BaselineBreakdownPayload {
+    // Baseline CRC components
+    uint32_t main_crc;
+    uint32_t header_crc;
+    uint32_t context_crc;
+    uint32_t effect_crc;
+    uint32_t summon_crc;
+    uint32_t p1_entity_crc;
+    uint32_t p2_entity_crc;
+
+    // Adjacent/non-hash diagnostics
+    uint32_t pre_match_gap_crc;
+    uint32_t p1_input_crc;
+    uint32_t p2_input_crc;
+    uint32_t per_frame_temp_crc;
+
+    // Contextual counters
+    uint32_t rng_seed;
+    uint32_t sim_frame;
+    uint32_t display_frame;
+    uint32_t game_mode;
+    uint32_t substate;
+    uint32_t game_type;
+    uint32_t match_phase_timer;
+    uint32_t frame_simulation;
+    uint32_t frame_display;
+    uint32_t frame_write_idx;
+    uint32_t frame_net_idx;
+    uint32_t remote_frame_idx;
+
+    // Raw critical bytes
+    uint8_t  match_header_bytes[16];
+    uint8_t  pre_match_gap_bytes[12];
+};
+
 struct GameplayStartPayload {
     uint32_t start_frame;        // Bootstrap baseline frame (typically 0)
     uint32_t host_sim_frame;     // Host native sim frame when start was sent
@@ -268,6 +322,18 @@ struct DelayChangeAckPayload {
 constexpr uint8_t GEKKO_READY_FLAG_READY = 1 << 0;  // Local reached post-intro interactive boundary
 constexpr uint8_t GEKKO_READY_FLAG_ACK   = 1 << 1;  // Local has observed peer READY
 
+// NatInfoPayload flags
+constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;
+constexpr uint8_t NAT_INFO_FLAG_UPNP_MAPPED       = 1 << 1;
+constexpr uint8_t NAT_INFO_FLAG_STUN_ENABLED      = 1 << 2;
+constexpr uint8_t NAT_INFO_FLAG_STUN_OK           = 1 << 3;
+constexpr uint8_t NAT_INFO_FLAG_HOLE_PUNCH        = 1 << 4;
+constexpr uint8_t NAT_INFO_FLAG_RELAY_FALLBACK    = 1 << 5;
+constexpr uint8_t NAT_INFO_FLAG_PREFER_DIRECT     = 1 << 6;
+constexpr uint8_t NAT_INFO_FLAG_IPV6_ENDPOINTS    = 1 << 7;
+constexpr uint8_t NAT_INFO_EX_FLAG_TURN_ENABLED   = 1 << 0;
+constexpr uint8_t NAT_INFO_EX_FLAG_PCP_ENABLED    = 1 << 1;
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -282,6 +348,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::SyncAnnounce:   return "SyncAnnounce";
         case PacketType::SyncConfirm:    return "SyncConfirm";
         case PacketType::NatInfo:        return "NatInfo";
+        case PacketType::NatTraversalSignal: return "NatTraversalSignal";
         case PacketType::CharSelInput:   return "CharSelInput";
         case PacketType::CharSelLock:    return "CharSelLock";
         case PacketType::StageSync:      return "StageSync";
@@ -290,6 +357,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::LoadBarrier:    return "LoadBarrier";
         case PacketType::BaselineReady:  return "BaselineReady";
         case PacketType::BaselineDigest: return "BaselineDigest";
+        case PacketType::BaselineBreakdown: return "BaselineBreakdown";
         case PacketType::GameplayStart:  return "GameplayStart";
         case PacketType::GekkoReady:     return "GekkoReady";
         case PacketType::GameplayInput:   return "GameplayInput";

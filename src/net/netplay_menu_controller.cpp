@@ -10,6 +10,7 @@
 #include "net/mode_ownership.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
+#include "net/nat_traversal.h"
 #include "net/netplay_menu_ui.h"
 #include "net/charsel_sync.h"
 #include "net/pregame_sync.h"
@@ -55,14 +56,30 @@ static bool          s_captureInput      = false;
 static bool          s_waitForNeutral    = false;
 static char          s_status[128]       = "Waiting for network menu selection.";
 static char          s_lastError[128]    = "";
-static char          s_textEditBuffer[64] = "";
+static char          s_textEditBuffer[96] = "";
 static int           s_textCursorPos      = 0;   // Cursor position within text edit buffer
 static char          s_localNickname[24]  = "Player";
 static uint16_t      s_listenPort         = 10700;
-static char          s_remoteEndpoint[64] = "127.0.0.1:10700";
+static char          s_remoteEndpoint[96] = "127.0.0.1:10700";
 static int           s_preferredDelay     = 0;
 static int           s_rollbackBudget     = 7;  // Max rollback frames
 static int           s_rollbackDelay      = 0;  // Input pipeline delay (CCCaster-style)
+static Net::ConnectPreference s_connectPreference = Net::ConnectPreference::AutoDirectThenRelay;
+static bool          s_upnpEnabled        = true;
+static bool          s_stunEnabled        = true;
+static bool          s_holePunchEnabled   = true;
+static bool          s_pcpFallbackEnabled = true;
+static bool          s_turnEnabled        = false;
+static bool          s_allowIPv6Endpoint  = true;
+static char          s_relayEndpoint[96]  = "";
+static char          s_stunEndpoint[96]   = "stun.l.google.com:19302";
+static char          s_turnEndpoint[96]   = "";
+static char          s_turnUsername[64]   = "";
+static char          s_turnPassword[64]   = "";
+static uint32_t      s_natGatherTimeoutMs = 5000;
+static uint32_t      s_natConnectTimeoutMs = 8000;
+static uint32_t      s_natMappingTimeoutMs = 2000;
+static uint8_t       s_natLogVerbosity = 1;
 
 // Config file path (relative to game directory)
 static const char*   kConfigFile          = "as2_netplay.cfg";
@@ -92,7 +109,7 @@ struct AutoConnectConfig {
     bool     isHost;
     char     nickname[24];
     uint16_t listenPort;
-    char     targetIp[64];
+    char     targetIp[96];
     uint16_t targetPort;
     int      preferredDelay;
     int      characterGridIndex;
@@ -109,6 +126,8 @@ static bool             s_autoConnectReleasePending = false;
 static bool             s_autoConnectStageGridPressed = false;
 static bool             s_autoConnectStageConfirmPressed = false;
 static bool             s_autoConnectWinScreenPressed = false;
+static bool             s_autoRematchCleanupApplied = false;
+static DWORD            s_autoRematchLastAttemptAt = 0;
 
 static const char* AutoConnectStateName(AutoConnectState state) {
     switch (state) {
@@ -143,6 +162,22 @@ static void SaveSettings() {
     fprintf(f, "delay=%d\n", s_preferredDelay);
     fprintf(f, "rollback=%d\n", s_rollbackBudget);
     fprintf(f, "rollback_delay=%d\n", s_rollbackDelay);
+    fprintf(f, "connect_mode=%d\n", (int)s_connectPreference);
+    fprintf(f, "upnp=%d\n", s_upnpEnabled ? 1 : 0);
+    fprintf(f, "stun=%d\n", s_stunEnabled ? 1 : 0);
+    fprintf(f, "hole_punch=%d\n", s_holePunchEnabled ? 1 : 0);
+    fprintf(f, "pcp_fallback=%d\n", s_pcpFallbackEnabled ? 1 : 0);
+    fprintf(f, "turn=%d\n", s_turnEnabled ? 1 : 0);
+    fprintf(f, "allow_ipv6=%d\n", s_allowIPv6Endpoint ? 1 : 0);
+    fprintf(f, "relay_endpoint=%s\n", s_relayEndpoint);
+    fprintf(f, "stun_endpoint=%s\n", s_stunEndpoint);
+    fprintf(f, "turn_endpoint=%s\n", s_turnEndpoint);
+    fprintf(f, "turn_username=%s\n", s_turnUsername);
+    fprintf(f, "turn_password=%s\n", s_turnPassword);
+    fprintf(f, "nat_gather_timeout_ms=%u\n", s_natGatherTimeoutMs);
+    fprintf(f, "nat_connect_timeout_ms=%u\n", s_natConnectTimeoutMs);
+    fprintf(f, "nat_mapping_timeout_ms=%u\n", s_natMappingTimeoutMs);
+    fprintf(f, "nat_log_verbosity=%u\n", (unsigned)s_natLogVerbosity);
     fclose(f);
     LOG_NETPLAY(LOG_DEBUG, "[NetMenu] Settings saved to %s", kConfigFile);
 }
@@ -154,7 +189,7 @@ static void LoadSettings() {
         return;
     }
 
-    char line[128];
+    char line[256];
     while (fgets(line, sizeof(line), f)) {
         // Strip newline
         size_t len = strlen(line);
@@ -187,12 +222,74 @@ static void LoadSettings() {
         } else if (_stricmp(key, "rollback_delay") == 0) {
             int rd = atoi(val);
             if (rd >= 0 && rd <= 15) s_rollbackDelay = rd;
+        } else if (_stricmp(key, "connect_mode") == 0) {
+            int mode = atoi(val);
+            if (mode >= (int)Net::ConnectPreference::AutoDirectThenRelay &&
+                mode <= (int)Net::ConnectPreference::RelayOnly) {
+                s_connectPreference = (Net::ConnectPreference)mode;
+            }
+        } else if (_stricmp(key, "upnp") == 0) {
+            s_upnpEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "stun") == 0) {
+            s_stunEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "hole_punch") == 0) {
+            s_holePunchEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "pcp_fallback") == 0) {
+            s_pcpFallbackEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "turn") == 0) {
+            s_turnEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "allow_ipv6") == 0) {
+            s_allowIPv6Endpoint = (atoi(val) != 0);
+        } else if (_stricmp(key, "relay_endpoint") == 0) {
+            strncpy_s(s_relayEndpoint, sizeof(s_relayEndpoint), val, _TRUNCATE);
+        } else if (_stricmp(key, "stun_endpoint") == 0) {
+            strncpy_s(s_stunEndpoint, sizeof(s_stunEndpoint), val, _TRUNCATE);
+        } else if (_stricmp(key, "turn_endpoint") == 0) {
+            strncpy_s(s_turnEndpoint, sizeof(s_turnEndpoint), val, _TRUNCATE);
+        } else if (_stricmp(key, "turn_username") == 0) {
+            strncpy_s(s_turnUsername, sizeof(s_turnUsername), val, _TRUNCATE);
+        } else if (_stricmp(key, "turn_password") == 0) {
+            strncpy_s(s_turnPassword, sizeof(s_turnPassword), val, _TRUNCATE);
+        } else if (_stricmp(key, "nat_gather_timeout_ms") == 0) {
+            int t = atoi(val);
+            if (t >= 1000 && t <= 60000) s_natGatherTimeoutMs = (uint32_t)t;
+        } else if (_stricmp(key, "nat_connect_timeout_ms") == 0) {
+            int t = atoi(val);
+            if (t >= 1000 && t <= 60000) s_natConnectTimeoutMs = (uint32_t)t;
+        } else if (_stricmp(key, "nat_mapping_timeout_ms") == 0) {
+            int t = atoi(val);
+            if (t >= 250 && t <= 30000) s_natMappingTimeoutMs = (uint32_t)t;
+        } else if (_stricmp(key, "nat_log_verbosity") == 0) {
+            int v = atoi(val);
+            if (v >= 0 && v <= 3) s_natLogVerbosity = (uint8_t)v;
         }
     }
 
     fclose(f);
-    LOG_NETPLAY(LOG_INFO, "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_delay=%d",
-        s_localNickname, s_listenPort, s_remoteEndpoint, s_preferredDelay, s_rollbackBudget, s_rollbackDelay);
+    LOG_NETPLAY(LOG_INFO,
+        "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_delay=%d "
+        "mode=%s upnp=%d pcp=%d stun=%d punch=%d turn=%d ipv6=%d relay='%s' stun_srv='%s' turn_srv='%s' "
+        "nat_timeouts=[%u/%u/%u] nat_log=%u",
+        s_localNickname,
+        s_listenPort,
+        s_remoteEndpoint,
+        s_preferredDelay,
+        s_rollbackBudget,
+        s_rollbackDelay,
+        Net::ConnectPreferenceName(s_connectPreference),
+        s_upnpEnabled ? 1 : 0,
+        s_pcpFallbackEnabled ? 1 : 0,
+        s_stunEnabled ? 1 : 0,
+        s_holePunchEnabled ? 1 : 0,
+        s_turnEnabled ? 1 : 0,
+        s_allowIPv6Endpoint ? 1 : 0,
+        s_relayEndpoint,
+        s_stunEndpoint,
+        s_turnEndpoint,
+        s_natGatherTimeoutMs,
+        s_natConnectTimeoutMs,
+        s_natMappingTimeoutMs,
+        (unsigned)s_natLogVerbosity);
 }
 
 static void ApplyDelaySettingsToPolicy(const char* reason) {
@@ -262,37 +359,143 @@ static void ClearError() { s_lastError[0] = '\0'; }
 // Endpoint parsing
 // ============================================================================
 
-/// Parse "ip:port" string into network-order IPv4 + port. Returns true on success.
-static bool ParseEndpoint(const char* str, uint32_t* outIP, uint16_t* outPort) {
-    if (!str || !outIP || !outPort) return false;
+/// Parse endpoint in one of:
+///   ipv4:port
+///   hostname:port
+///   [ipv6]:port
+static bool ParseEndpoint(const char* str, char* outHost, size_t hostCap,
+                          uint16_t* outPort, bool allowIPv6) {
+    if (!str || !outHost || hostCap == 0 || !outPort) return false;
 
-    // Find the last ':' to split IP from port
-    const char* colonPos = strrchr(str, ':');
-    if (!colonPos || colonPos == str) return false;
+    outHost[0] = '\0';
+    *outPort = 0;
 
-    // Extract IP part
-    char ipBuf[64] = {};
-    size_t ipLen = (size_t)(colonPos - str);
-    if (ipLen >= sizeof(ipBuf)) return false;
-    memcpy(ipBuf, str, ipLen);
-    ipBuf[ipLen] = '\0';
+    char buf[128] = {};
+    strncpy_s(buf, sizeof(buf), str, _TRUNCATE);
+    TrimWhitespace(buf);
+    if (!buf[0]) return false;
 
-    // Parse port
-    int port = atoi(colonPos + 1);
+    const char* hostStart = buf;
+    const char* hostEnd = nullptr;
+    const char* portStart = nullptr;
+
+    if (buf[0] == '[') {
+        hostStart = buf + 1;
+        hostEnd = strchr(hostStart, ']');
+        if (!hostEnd || hostEnd == hostStart) return false;
+        if (hostEnd[1] != ':') return false;
+        portStart = hostEnd + 2;
+        if (!allowIPv6) return false;
+    } else {
+        const char* lastColon = strrchr(buf, ':');
+        if (!lastColon || lastColon == buf) return false;
+        // Unbracketed IPv6 contains multiple ':' and is ambiguous.
+        if (strchr(buf, ':') != lastColon) return false;
+        hostEnd = lastColon;
+        portStart = lastColon + 1;
+    }
+
+    if (!portStart || !portStart[0]) return false;
+    int port = atoi(portStart);
     if (port <= 0 || port > 65535) return false;
 
-    // Parse IP octets manually (a.b.c.d)
-    unsigned int a, b, c, d;
-    if (sscanf_s(ipBuf, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
-    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+    const size_t hostLen = (size_t)(hostEnd - hostStart);
+    if (hostLen == 0 || hostLen >= hostCap) return false;
+    memcpy(outHost, hostStart, hostLen);
+    outHost[hostLen] = '\0';
+    TrimWhitespace(outHost);
+    if (!outHost[0]) return false;
 
-    // Network byte order (big endian): a is lowest byte
-    *outIP = (uint32_t)(a | (b << 8) | (c << 16) | (d << 24));
+    if (!allowIPv6 && strchr(outHost, ':')) {
+        return false;
+    }
+
     *outPort = (uint16_t)port;
     return true;
 }
 
+static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg) {
+    if (!outCfg) return false;
+
+    Net::NatRuntimeConfig cfg{};
+    Net::NatRuntimeConfig_SetDefaults(&cfg);
+    cfg.enable_upnp = s_upnpEnabled;
+    cfg.enable_stun = s_stunEnabled;
+    cfg.enable_hole_punch = s_holePunchEnabled;
+    cfg.enable_turn = s_turnEnabled;
+    cfg.enable_pcp_fallback = s_pcpFallbackEnabled;
+    cfg.allow_ipv6_endpoint = s_allowIPv6Endpoint;
+    cfg.prefer_portforwarded_direct = true;
+    cfg.gather_timeout_ms = s_natGatherTimeoutMs;
+    cfg.connect_timeout_ms = s_natConnectTimeoutMs;
+    cfg.mapping_timeout_ms = s_natMappingTimeoutMs;
+    cfg.traversal_log_verbosity = s_natLogVerbosity;
+
+    if (s_stunEndpoint[0]) {
+        char stunHost[96] = {};
+        uint16_t stunPort = 0;
+        if (!ParseEndpoint(s_stunEndpoint, stunHost, sizeof(stunHost), &stunPort, true)) {
+            SetStatus("Invalid STUN server endpoint.");
+            return false;
+        }
+        strncpy_s(cfg.stun_host, sizeof(cfg.stun_host), stunHost, _TRUNCATE);
+        cfg.stun_port = stunPort;
+    } else {
+        strncpy_s(cfg.stun_host, sizeof(cfg.stun_host), "stun.l.google.com", _TRUNCATE);
+        cfg.stun_port = 19302;
+    }
+
+    if (s_turnEnabled && s_turnEndpoint[0]) {
+        char turnHost[96] = {};
+        uint16_t turnPort = 0;
+        if (!ParseEndpoint(s_turnEndpoint, turnHost, sizeof(turnHost), &turnPort, true)) {
+            SetStatus("Invalid TURN server endpoint.");
+            return false;
+        }
+        strncpy_s(cfg.turn_host, sizeof(cfg.turn_host), turnHost, _TRUNCATE);
+        cfg.turn_port = turnPort;
+    } else {
+        cfg.turn_host[0] = '\0';
+        cfg.turn_port = 3478;
+    }
+    strncpy_s(cfg.turn_username, sizeof(cfg.turn_username), s_turnUsername, _TRUNCATE);
+    strncpy_s(cfg.turn_password, sizeof(cfg.turn_password), s_turnPassword, _TRUNCATE);
+
+    *outCfg = cfg;
+    return true;
+}
+
+static void ApplyNatSettingsToService(const char* reason) {
+    Net::NatRuntimeConfig cfg{};
+    if (!BuildNatRuntimeConfig(&cfg)) {
+        LOG_NETPLAY(LOG_WARNING, "[NetMenu] NAT settings invalid (%s)", reason ? reason : "?");
+        return;
+    }
+    Net::Nat_ApplyRuntimeConfig(&cfg);
+    LOG_NETPLAY(LOG_INFO,
+        "[NetMenu] Applied NAT settings (%s): upnp=%d pcp=%d stun=%d punch=%d turn=%d ipv6=%d "
+        "stun=%s:%u turn=%s:%u relay=%s mode=%s timeout[g=%u c=%u m=%u] logv=%u",
+        reason ? reason : "unspecified",
+        cfg.enable_upnp ? 1 : 0,
+        cfg.enable_pcp_fallback ? 1 : 0,
+        cfg.enable_stun ? 1 : 0,
+        cfg.enable_hole_punch ? 1 : 0,
+        cfg.enable_turn ? 1 : 0,
+        cfg.allow_ipv6_endpoint ? 1 : 0,
+        cfg.stun_host,
+        cfg.stun_port,
+        cfg.turn_host,
+        cfg.turn_port,
+        s_relayEndpoint,
+        Net::ConnectPreferenceName(s_connectPreference),
+        cfg.gather_timeout_ms,
+        cfg.connect_timeout_ms,
+        cfg.mapping_timeout_ms,
+        (unsigned)cfg.traversal_log_verbosity);
+}
+
 static bool LaunchNetplayCharSel();
+static void TryAutoRestartPregameFromPostMatchCharSel();
 
 static void ClearAutoConnectOverride() {
     if (!s_autoConnectReleasePending) return;
@@ -446,6 +649,13 @@ static void LoadAutoConnectConfig() {
             }
         } else if (_stricmp(key, "target_ip") == 0 && val[0]) {
             strncpy_s(s_autoConnect.targetIp, sizeof(s_autoConnect.targetIp), val, _TRUNCATE);
+        } else if (_stricmp(key, "target_endpoint") == 0 && val[0]) {
+            char host[96] = {};
+            uint16_t port = 0;
+            if (ParseEndpoint(val, host, sizeof(host), &port, true)) {
+                strncpy_s(s_autoConnect.targetIp, sizeof(s_autoConnect.targetIp), host, _TRUNCATE);
+                s_autoConnect.targetPort = port;
+            }
         } else if (_stricmp(key, "target_port") == 0) {
             int port = atoi(val);
             if (port > 0 && port <= 65535) {
@@ -472,8 +682,13 @@ static void LoadAutoConnectConfig() {
     s_autoConnect.valid = true;
     strncpy_s(s_localNickname, sizeof(s_localNickname), s_autoConnect.nickname, _TRUNCATE);
     s_listenPort = s_autoConnect.listenPort;
-    _snprintf_s(s_remoteEndpoint, sizeof(s_remoteEndpoint), _TRUNCATE,
-        "%s:%u", s_autoConnect.targetIp, s_autoConnect.targetPort);
+    if (strchr(s_autoConnect.targetIp, ':')) {
+        _snprintf_s(s_remoteEndpoint, sizeof(s_remoteEndpoint), _TRUNCATE,
+            "[%s]:%u", s_autoConnect.targetIp, s_autoConnect.targetPort);
+    } else {
+        _snprintf_s(s_remoteEndpoint, sizeof(s_remoteEndpoint), _TRUNCATE,
+            "%s:%u", s_autoConnect.targetIp, s_autoConnect.targetPort);
+    }
     s_preferredDelay = s_autoConnect.preferredDelay;
     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
 
@@ -508,23 +723,58 @@ static bool BeginAutoConnectSession() {
     cfg.listen_port = s_listenPort;
     cfg.connect_timeout_ms = 10000;
     cfg.handshake_timeout_ms = 5000;
+    cfg.connect_preference = s_connectPreference;
+
+    Net::NatRuntimeConfig natCfg{};
+    if (!BuildNatRuntimeConfig(&natCfg)) {
+        return false;
+    }
+    cfg.nat.enable_upnp = natCfg.enable_upnp;
+    cfg.nat.enable_stun = natCfg.enable_stun;
+    cfg.nat.enable_hole_punch = natCfg.enable_hole_punch;
+    cfg.nat.enable_turn = natCfg.enable_turn;
+    cfg.nat.enable_pcp_fallback = natCfg.enable_pcp_fallback;
+    cfg.nat.allow_ipv6_endpoint = natCfg.allow_ipv6_endpoint;
+    cfg.nat.prefer_portforwarded_direct = natCfg.prefer_portforwarded_direct;
+    strncpy_s(cfg.nat.stun_host, sizeof(cfg.nat.stun_host), natCfg.stun_host, _TRUNCATE);
+    cfg.nat.stun_port = natCfg.stun_port;
+    strncpy_s(cfg.nat.turn_host, sizeof(cfg.nat.turn_host), natCfg.turn_host, _TRUNCATE);
+    cfg.nat.turn_port = natCfg.turn_port;
+    strncpy_s(cfg.nat.turn_username, sizeof(cfg.nat.turn_username), natCfg.turn_username, _TRUNCATE);
+    strncpy_s(cfg.nat.turn_password, sizeof(cfg.nat.turn_password), natCfg.turn_password, _TRUNCATE);
+    cfg.nat.gather_timeout_ms = natCfg.gather_timeout_ms;
+    cfg.nat.connect_timeout_ms = natCfg.connect_timeout_ms;
+    cfg.nat.mapping_timeout_ms = natCfg.mapping_timeout_ms;
+    cfg.nat.traversal_log_verbosity = natCfg.traversal_log_verbosity;
 
     ApplyDelaySettingsToPolicy("autoconnect session begin");
+    ApplyNatSettingsToService("autoconnect session begin");
 
     if (s_autoConnect.isHost) {
         LOG_NETPLAY(LOG_INFO, "[AutoConnect] Starting host session on port %u", cfg.listen_port);
         return Net::Session_StartHost(&cfg);
     }
 
-    uint32_t targetIP = 0;
+    char targetHost[96] = {};
     uint16_t targetPort = 0;
-    if (!ParseEndpoint(s_remoteEndpoint, &targetIP, &targetPort)) {
+    if (!ParseEndpoint(s_remoteEndpoint, targetHost, sizeof(targetHost), &targetPort, s_allowIPv6Endpoint)) {
         LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Invalid endpoint '%s'", s_remoteEndpoint);
         return false;
     }
 
-    cfg.target_ip = targetIP;
+    strncpy_s(cfg.target_host, sizeof(cfg.target_host), targetHost, _TRUNCATE);
     cfg.target_port = targetPort;
+
+    if (s_relayEndpoint[0]) {
+        char relayHost[96] = {};
+        uint16_t relayPort = 0;
+        if (!ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
+            LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Invalid relay endpoint '%s'", s_relayEndpoint);
+            return false;
+        }
+        strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
+        cfg.nat.relay_port = relayPort;
+    }
 
     LOG_NETPLAY(LOG_INFO, "[AutoConnect] Starting join session to %s", s_remoteEndpoint);
     return Net::Session_StartJoin(&cfg);
@@ -1018,6 +1268,70 @@ static bool LaunchNetplayCharSel() {
     return true;
 }
 
+static void TryAutoRestartPregameFromPostMatchCharSel() {
+    if (MenuVisible()) return;
+
+    const uint32_t mode = GetGameMode();
+    if (mode != MODE_CHARSEL) {
+        s_autoRematchCleanupApplied = false;
+        s_autoRematchLastAttemptAt = 0;
+        return;
+    }
+
+    Net::SessionSnapshot session{};
+    Net::Session_GetSnapshot(&session);
+    if (!session.active ||
+        (session.state != Net::SessionState::Connected &&
+         session.state != Net::SessionState::Ready)) {
+        return;
+    }
+
+    const Net::PregamePhase prePhase = Net::PregameSync_GetPhase();
+    if (Net::PregameSync_IsActive() || Net::CharSelSync_IsLockstepActive()) {
+        // Pregame lockstep already owns CharSel again.
+        s_autoRematchCleanupApplied = true;
+        return;
+    }
+
+    // Primary rematch signature: previous pregame run ended in GameplayHandoff
+    // and the game routed back to CharSel from win screen.
+    const bool staleGameplayHandoff = (prePhase == Net::PregamePhase::GameplayHandoff);
+    const bool lifecycleSuggestsPostMatch =
+        Net::MatchLifecycle_IsPostMatchRouting() ||
+        Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::WinScreenActive ||
+        Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::PostMatchRoute ||
+        Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::ReturningToCharSel;
+
+    if (!staleGameplayHandoff && !lifecycleSuggestsPostMatch) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if ((now - s_autoRematchLastAttemptAt) < 250) {
+        return;
+    }
+    s_autoRematchLastAttemptAt = now;
+
+    if (!s_autoRematchCleanupApplied) {
+        LOG_NETPLAY(LOG_INFO,
+            "[NetMenu] Auto-rematch handoff detected (phase=%s lifecycle=%s) — preparing next match",
+            Net::PregamePhaseName(prePhase),
+            Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+        Rollback::OnlineWiring_OnRematch();
+        s_autoRematchCleanupApplied = true;
+    }
+
+    if (Net::PregameSync_Begin()) {
+        LOG_NETPLAY(LOG_INFO,
+            "[NetMenu] Auto-rematch pregame restart started on CharSel");
+    } else {
+        LOG_NETPLAY(LOG_WARNING,
+            "[NetMenu] Auto-rematch pregame restart deferred (phase=%s lifecycle=%s)",
+            Net::PregamePhaseName(Net::PregameSync_GetPhase()),
+            Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+    }
+}
+
 // ============================================================================
 // Item counts
 // ============================================================================
@@ -1028,7 +1342,7 @@ static int ItemCount(MenuState st) {
         case MenuState::DirectConnectEntry:  return 3; // Host, Join, Back
         case MenuState::HostEntry:           return 3; // Host, Listen Port, Back
         case MenuState::JoinEntry:           return 3; // Join, Remote Endpoint, Back
-        case MenuState::SettingsEntry:       return 4; // Nickname, Delay, Verbose, Back
+        case MenuState::SettingsEntry:       return 12; // Expanded network/delay settings
         case MenuState::Connecting:          return 1; // Cancel
         case MenuState::Handshake:           return 1; // Cancel
         case MenuState::ConnectedSession:    return 4; // Rollback Frames, Input Delay, Launch CharSel, Disconnect
@@ -1094,15 +1408,44 @@ static void FinishTextEdit(bool commit) {
             SetStatus("Invalid port (1-65535).");
         }
     } else if (field == TextEditField::RemoteEndpoint && s_textEditBuffer[0]) {
-        // Validate the endpoint parses correctly
-        uint32_t testIP = 0;
+        char testHost[96] = {};
         uint16_t testPort = 0;
-        if (ParseEndpoint(s_textEditBuffer, &testIP, &testPort)) {
+        if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, s_allowIPv6Endpoint)) {
             CopyText(s_remoteEndpoint, sizeof(s_remoteEndpoint), s_textEditBuffer);
             LOG_NETPLAY(LOG_INFO, "[NetMenu] Remote endpoint set to: %s", s_remoteEndpoint);
             SetStatus("Remote: %s", s_remoteEndpoint);
         } else {
-            SetStatus("Invalid endpoint (use ip:port).");
+            SetStatus("Invalid endpoint (host:port or [ipv6]:port).");
+        }
+    } else if (field == TextEditField::RelayEndpoint) {
+        if (!s_textEditBuffer[0]) {
+            s_relayEndpoint[0] = '\0';
+            SetStatus("Relay endpoint cleared.");
+        } else {
+            char testHost[96] = {};
+            uint16_t testPort = 0;
+            if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
+                CopyText(s_relayEndpoint, sizeof(s_relayEndpoint), s_textEditBuffer);
+                LOG_NETPLAY(LOG_INFO, "[NetMenu] Relay endpoint set to: %s", s_relayEndpoint);
+                SetStatus("Relay: %s", s_relayEndpoint);
+            } else {
+                SetStatus("Invalid relay endpoint.");
+            }
+        }
+    } else if (field == TextEditField::StunEndpoint) {
+        if (!s_textEditBuffer[0]) {
+            CopyText(s_stunEndpoint, sizeof(s_stunEndpoint), "stun.l.google.com:19302");
+            SetStatus("STUN endpoint reset to default.");
+        } else {
+            char testHost[96] = {};
+            uint16_t testPort = 0;
+            if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
+                CopyText(s_stunEndpoint, sizeof(s_stunEndpoint), s_textEditBuffer);
+                LOG_NETPLAY(LOG_INFO, "[NetMenu] STUN endpoint set to: %s", s_stunEndpoint);
+                SetStatus("STUN: %s", s_stunEndpoint);
+            } else {
+                SetStatus("Invalid STUN endpoint.");
+            }
         }
     }
 
@@ -1111,7 +1454,10 @@ static void FinishTextEdit(bool commit) {
     InputSystem_ResetRepeatState(0);
 
     // Persist settings after any committed change
-    if (commit) SaveSettings();
+    if (commit) {
+        ApplyNatSettingsToService("text edit commit");
+        SaveSettings();
+    }
 }
 
 static void HandleTextEditing() {
@@ -1136,6 +1482,10 @@ static void HandleTextEditing() {
         maxEditLen = sizeof(s_localNickname) - 1; // 23 chars
     } else if (s_textEditField == TextEditField::ListenPort) {
         maxEditLen = 5; // max "65535"
+    } else if (s_textEditField == TextEditField::RemoteEndpoint ||
+               s_textEditField == TextEditField::RelayEndpoint ||
+               s_textEditField == TextEditField::StunEndpoint) {
+        maxEditLen = sizeof(s_remoteEndpoint) - 1;
     }
 
     // Clamp cursor to valid range
@@ -1164,7 +1514,7 @@ static void HandleTextEditing() {
     {
         bool vDown = (GetAsyncKeyState('V') & 0x8000) != 0;
         if (ctrlDown && vDown && !prevDown['V']) {
-            char pasteBuffer[64] = {};
+            char pasteBuffer[128] = {};
             if (MenuUtils::PasteFromClipboard(pasteBuffer, sizeof(pasteBuffer))) {
                 for (int i = 0; pasteBuffer[i] && canInsert(); i++) {
                     insertCharAtCursor(pasteBuffer[i]);
@@ -1299,6 +1649,14 @@ static void HandleTextEditing() {
             else if (vk == VK_OEM_PLUS && canInsert()) {
                 insertCharAtCursor(shiftDown ? '+' : '=');
             }
+
+            // [ and ] (required for bracketed IPv6 endpoint text)
+            else if (vk == VK_OEM_4 && canInsert()) {
+                insertCharAtCursor(shiftDown ? '{' : '[');
+            }
+            else if (vk == VK_OEM_6 && canInsert()) {
+                insertCharAtCursor(shiftDown ? '}' : ']');
+            }
         }
         prevDown[vk] = down;
     }
@@ -1340,21 +1698,88 @@ static void HandleNavigationInput() {
     if (InputSystem_JustPressed(0, INPUT_UP))   MoveSelection(-1);
     if (InputSystem_JustPressed(0, INPUT_DOWN))  MoveSelection(1);
 
-    // Left/Right for inline value adjustment (Settings delay)
-    if (s_state == MenuState::SettingsEntry && s_selectedIndex == 1) {
-        if (InputSystem_JustPressed(0, INPUT_LEFT)) {
-            if (s_preferredDelay > 0) {
-                s_preferredDelay--;
-                Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
-                SetStatus("Input delay: %d", s_preferredDelay);
-                SaveSettings();
+    // Left/Right for inline settings adjustments
+    if (s_state == MenuState::SettingsEntry) {
+        const bool left  = InputSystem_JustPressed(0, INPUT_LEFT);
+        const bool right = InputSystem_JustPressed(0, INPUT_RIGHT);
+        bool changed = false;
+
+        if (left || right) {
+            if (s_selectedIndex == 1) {
+                if (left && s_preferredDelay > 0) {
+                    s_preferredDelay--;
+                    changed = true;
+                } else if (right && s_preferredDelay < 15) {
+                    s_preferredDelay++;
+                    changed = true;
+                }
+                if (changed) {
+                    Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
+                    SetStatus("Input delay: %d", s_preferredDelay);
+                }
+            } else if (s_selectedIndex == 2) {
+                if (left && s_rollbackBudget > Net::ROLLBACK_BUDGET_MIN) {
+                    s_rollbackBudget--;
+                    changed = true;
+                } else if (right && s_rollbackBudget < Net::ROLLBACK_BUDGET_MAX) {
+                    s_rollbackBudget++;
+                    changed = true;
+                }
+                if (changed) {
+                    Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
+                    SetStatus("Rollback frames: %d", s_rollbackBudget);
+                }
+            } else if (s_selectedIndex == 3) {
+                if (left && s_rollbackDelay > Net::DELAY_MIN) {
+                    s_rollbackDelay--;
+                    changed = true;
+                } else if (right && s_rollbackDelay < Net::DELAY_MAX) {
+                    s_rollbackDelay++;
+                    changed = true;
+                }
+                if (changed) {
+                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
+                    SetStatus("Rollback delay: %d", s_rollbackDelay);
+                }
+            } else if (s_selectedIndex == 4) {
+                int mode = (int)s_connectPreference;
+                if (left) {
+                    mode--;
+                    if (mode < (int)Net::ConnectPreference::AutoDirectThenRelay) {
+                        mode = (int)Net::ConnectPreference::RelayOnly;
+                    }
+                    changed = true;
+                } else if (right) {
+                    mode++;
+                    if (mode > (int)Net::ConnectPreference::RelayOnly) {
+                        mode = (int)Net::ConnectPreference::AutoDirectThenRelay;
+                    }
+                    changed = true;
+                }
+                if (changed) {
+                    s_connectPreference = (Net::ConnectPreference)mode;
+                    SetStatus("Connection mode: %s", Net::ConnectPreferenceName(s_connectPreference));
+                }
+            } else if (s_selectedIndex == 5) {
+                s_upnpEnabled = !s_upnpEnabled;
+                changed = true;
+                SetStatus("UPnP: %s", s_upnpEnabled ? "On" : "Off");
+            } else if (s_selectedIndex == 6) {
+                s_stunEnabled = !s_stunEnabled;
+                changed = true;
+                SetStatus("STUN: %s", s_stunEnabled ? "On" : "Off");
+            } else if (s_selectedIndex == 7) {
+                s_holePunchEnabled = !s_holePunchEnabled;
+                changed = true;
+                SetStatus("Hole punch: %s", s_holePunchEnabled ? "On" : "Off");
+            } else if (s_selectedIndex == 8) {
+                s_allowIPv6Endpoint = !s_allowIPv6Endpoint;
+                changed = true;
+                SetStatus("IPv6 endpoint parse: %s", s_allowIPv6Endpoint ? "On" : "Off");
             }
-        }
-        if (InputSystem_JustPressed(0, INPUT_RIGHT)) {
-            if (s_preferredDelay < 15) {
-                s_preferredDelay++;
-                Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
-                SetStatus("Input delay: %d", s_preferredDelay);
+
+            if (changed) {
+                ApplyNatSettingsToService("settings navigation");
                 SaveSettings();
             }
         }
@@ -1462,7 +1887,39 @@ static void ActivateCurrentSelection() {
                 Net::SessionConfig_SetDefaults(&cfg);
                 cfg.listen_port = s_listenPort;
                 strncpy_s(cfg.nickname, sizeof(cfg.nickname), s_localNickname, _TRUNCATE);
+                cfg.connect_preference = s_connectPreference;
+                Net::NatRuntimeConfig natCfg{};
+                if (!BuildNatRuntimeConfig(&natCfg)) {
+                    SetStatus("Invalid NAT/STUN settings.");
+                    break;
+                }
+                cfg.nat.enable_upnp = natCfg.enable_upnp;
+                cfg.nat.enable_stun = natCfg.enable_stun;
+                cfg.nat.enable_hole_punch = natCfg.enable_hole_punch;
+                cfg.nat.enable_turn = natCfg.enable_turn;
+                cfg.nat.enable_pcp_fallback = natCfg.enable_pcp_fallback;
+                cfg.nat.allow_ipv6_endpoint = natCfg.allow_ipv6_endpoint;
+                cfg.nat.prefer_portforwarded_direct = natCfg.prefer_portforwarded_direct;
+                strncpy_s(cfg.nat.stun_host, sizeof(cfg.nat.stun_host), natCfg.stun_host, _TRUNCATE);
+                cfg.nat.stun_port = natCfg.stun_port;
+                strncpy_s(cfg.nat.turn_host, sizeof(cfg.nat.turn_host), natCfg.turn_host, _TRUNCATE);
+                cfg.nat.turn_port = natCfg.turn_port;
+                strncpy_s(cfg.nat.turn_username, sizeof(cfg.nat.turn_username), natCfg.turn_username, _TRUNCATE);
+                strncpy_s(cfg.nat.turn_password, sizeof(cfg.nat.turn_password), natCfg.turn_password, _TRUNCATE);
+                cfg.nat.gather_timeout_ms = natCfg.gather_timeout_ms;
+                cfg.nat.connect_timeout_ms = natCfg.connect_timeout_ms;
+                cfg.nat.mapping_timeout_ms = natCfg.mapping_timeout_ms;
+                cfg.nat.traversal_log_verbosity = natCfg.traversal_log_verbosity;
+                if (s_relayEndpoint[0]) {
+                    char relayHost[96] = {};
+                    uint16_t relayPort = 0;
+                    if (ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
+                        strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
+                        cfg.nat.relay_port = relayPort;
+                    }
+                }
                 ApplyDelaySettingsToPolicy("manual host start");
+                ApplyNatSettingsToService("manual host start");
                 MenuUtils::BeginPublicIPFetch();
                 if (Net::Session_StartHost(&cfg)) {
                     SetStatus("Waiting for peer...");
@@ -1484,19 +1941,53 @@ static void ActivateCurrentSelection() {
         case MenuState::JoinEntry:
             if (s_selectedIndex == 0) {
                 // Join
-                uint32_t targetIP = 0;
+                char targetHost[96] = {};
                 uint16_t targetPort = 0;
-                if (!ParseEndpoint(s_remoteEndpoint, &targetIP, &targetPort)) {
-                    SetStatus("Invalid endpoint. Use ip:port format.");
+                if (!ParseEndpoint(s_remoteEndpoint, targetHost, sizeof(targetHost), &targetPort, s_allowIPv6Endpoint)) {
+                    SetStatus("Invalid endpoint. Use host:port or [ipv6]:port.");
                     break;
                 }
                 Net::SessionConfig cfg{};
                 Net::SessionConfig_SetDefaults(&cfg);
                 cfg.listen_port = s_listenPort;
-                cfg.target_ip = targetIP;
+                strncpy_s(cfg.target_host, sizeof(cfg.target_host), targetHost, _TRUNCATE);
                 cfg.target_port = targetPort;
+                cfg.connect_preference = s_connectPreference;
                 strncpy_s(cfg.nickname, sizeof(cfg.nickname), s_localNickname, _TRUNCATE);
+                Net::NatRuntimeConfig natCfg{};
+                if (!BuildNatRuntimeConfig(&natCfg)) {
+                    SetStatus("Invalid NAT/STUN settings.");
+                    break;
+                }
+                cfg.nat.enable_upnp = natCfg.enable_upnp;
+                cfg.nat.enable_stun = natCfg.enable_stun;
+                cfg.nat.enable_hole_punch = natCfg.enable_hole_punch;
+                cfg.nat.enable_turn = natCfg.enable_turn;
+                cfg.nat.enable_pcp_fallback = natCfg.enable_pcp_fallback;
+                cfg.nat.allow_ipv6_endpoint = natCfg.allow_ipv6_endpoint;
+                cfg.nat.prefer_portforwarded_direct = natCfg.prefer_portforwarded_direct;
+                strncpy_s(cfg.nat.stun_host, sizeof(cfg.nat.stun_host), natCfg.stun_host, _TRUNCATE);
+                cfg.nat.stun_port = natCfg.stun_port;
+                strncpy_s(cfg.nat.turn_host, sizeof(cfg.nat.turn_host), natCfg.turn_host, _TRUNCATE);
+                cfg.nat.turn_port = natCfg.turn_port;
+                strncpy_s(cfg.nat.turn_username, sizeof(cfg.nat.turn_username), natCfg.turn_username, _TRUNCATE);
+                strncpy_s(cfg.nat.turn_password, sizeof(cfg.nat.turn_password), natCfg.turn_password, _TRUNCATE);
+                cfg.nat.gather_timeout_ms = natCfg.gather_timeout_ms;
+                cfg.nat.connect_timeout_ms = natCfg.connect_timeout_ms;
+                cfg.nat.mapping_timeout_ms = natCfg.mapping_timeout_ms;
+                cfg.nat.traversal_log_verbosity = natCfg.traversal_log_verbosity;
+                if (s_relayEndpoint[0]) {
+                    char relayHost[96] = {};
+                    uint16_t relayPort = 0;
+                    if (!ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
+                        SetStatus("Invalid relay endpoint.");
+                        break;
+                    }
+                    strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
+                    cfg.nat.relay_port = relayPort;
+                }
                 ApplyDelaySettingsToPolicy("manual join start");
+                ApplyNatSettingsToService("manual join start");
                 if (Net::Session_StartJoin(&cfg)) {
                     SetStatus("Connecting to host...");
                     TransitionTo(MenuState::Connecting, "join started");
@@ -1505,7 +1996,7 @@ static void ActivateCurrentSelection() {
                 }
             } else if (s_selectedIndex == 1) {
                 // Edit endpoint
-                BeginTextEdit(TextEditField::RemoteEndpoint, s_remoteEndpoint, "Type ip:port.");
+                BeginTextEdit(TextEditField::RemoteEndpoint, s_remoteEndpoint, "Type host:port or [ipv6]:port.");
             } else {
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::DirectConnectEntry, "back from join");
@@ -1516,12 +2007,16 @@ static void ActivateCurrentSelection() {
             if (s_selectedIndex == 0) {
                 // Edit nickname
                 BeginTextEdit(TextEditField::Nickname, s_localNickname, "Type your nickname.");
-            } else if (s_selectedIndex == 3) {
+            } else if (s_selectedIndex == 9) {
+                BeginTextEdit(TextEditField::RelayEndpoint, s_relayEndpoint, "Relay endpoint: host:port or [ipv6]:port.");
+            } else if (s_selectedIndex == 10) {
+                BeginTextEdit(TextEditField::StunEndpoint, s_stunEndpoint, "STUN server: host:port or [ipv6]:port.");
+            } else if (s_selectedIndex == 11) {
                 // Back
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::MenuRoot, "back from settings");
             }
-            // Items 1 (Delay) and 2 (Verbose): adjusted via left/right, not confirm
+            // Most settings are adjusted via left/right.
             break;
 
         case MenuState::ConnectedSession:
@@ -1655,7 +2150,10 @@ void Init() {
     s_captureInput = false;
     LoadSettings();
     ApplyDelaySettingsToPolicy("menu init");
+    ApplyNatSettingsToService("menu init");
     LoadAutoConnectConfig();
+    s_autoRematchCleanupApplied = false;
+    s_autoRematchLastAttemptAt = 0;
     s_initialized = true;
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Initialized");
 }
@@ -1665,6 +2163,8 @@ void Shutdown() {
     ClearAutoConnectOverride();
     AutoConnectHarness_Shutdown();
     s_autoConnectState = AutoConnectState::Disabled;
+    s_autoRematchCleanupApplied = false;
+    s_autoRematchLastAttemptAt = 0;
     memset(&s_autoConnect, 0, sizeof(s_autoConnect));
     FinishClose();
     MenuUtils::Cleanup();
@@ -1683,6 +2183,7 @@ void FrameUpdate() {
     mode = GetGameMode();
 
     HandleAutoConnect();
+    TryAutoRestartPregameFromPostMatchCharSel();
 
     if (!MenuVisible()) return;
 
@@ -1794,6 +2295,33 @@ void GetSnapshot(MenuSnapshot* out) {
     out->listen_port = s_listenPort;
     CopyText(out->remote_endpoint, sizeof(out->remote_endpoint), s_remoteEndpoint);
     out->preferred_delay = s_preferredDelay;
+    out->connection_mode = (int)s_connectPreference;
+    out->upnp_enabled = s_upnpEnabled;
+    out->stun_enabled = s_stunEnabled;
+    out->hole_punch_enabled = s_holePunchEnabled;
+    out->allow_ipv6_endpoint = s_allowIPv6Endpoint;
+    CopyText(out->relay_endpoint, sizeof(out->relay_endpoint), s_relayEndpoint);
+    CopyText(out->stun_endpoint, sizeof(out->stun_endpoint), s_stunEndpoint);
+
+    Net::NatSnapshot natSnap{};
+    Net::Nat_GetSnapshot(&natSnap);
+    char endpointShort[40] = {};
+    if (natSnap.stun_endpoint[0]) {
+        _snprintf_s(endpointShort, sizeof(endpointShort), _TRUNCATE, "%.30s", natSnap.stun_endpoint);
+    } else {
+        _snprintf_s(endpointShort, sizeof(endpointShort), _TRUNCATE, "-");
+    }
+    char natStatus[128];
+    _snprintf_s(natStatus, sizeof(natStatus), _TRUNCATE,
+        "St=%s U=%s P=%s S=%s map=%u/%u ep=%s",
+        Net::NatTraversalStateName(natSnap.traversal_state),
+        Net::NatStatusName(natSnap.upnp_status),
+        Net::NatStatusName(natSnap.pcp_status),
+        Net::StunStatusName(natSnap.stun_status),
+        natSnap.mapped_port,
+        natSnap.pcp_mapped_port,
+        endpointShort);
+    CopyText(out->nat_status, sizeof(out->nat_status), natStatus);
 
     // Peer info from session
     Net::SessionSnapshot sessionSnap{};

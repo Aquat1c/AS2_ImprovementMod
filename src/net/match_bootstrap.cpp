@@ -878,6 +878,51 @@ void MatchBootstrap_OnBaselineDigest(const BaselineDigestPayload* p) {
         s_remoteBaselineSimFrame);
 }
 
+void MatchBootstrap_OnBaselineBreakdown(const BaselineBreakdownPayload* p) {
+    if (!p) return;
+
+    // Breakdown is diagnostic-only, but keep it wired so packet flow stays
+    // compatible with peers that send detailed baseline telemetry.
+    Rollback::NetplayLog_Write(
+        "BASELINE", (int32_t)p->sim_frame,
+        "Remote BaselineBreakdown: main=0x%08X header=0x%08X context=0x%08X "
+        "effects=0x%08X summons=0x%08X p1=0x%08X p2=0x%08X "
+        "pre_gap=0x%08X p1_input=0x%08X p2_input=0x%08X temp=0x%08X "
+        "rng=0x%08X sim=%u display=%u mode=%u sub=%u frame_sim=%u frame_display=%u frame_write=%u frame_net=%u remote_frame=%u",
+        p->main_crc,
+        p->header_crc,
+        p->context_crc,
+        p->effect_crc,
+        p->summon_crc,
+        p->p1_entity_crc,
+        p->p2_entity_crc,
+        p->pre_match_gap_crc,
+        p->p1_input_crc,
+        p->p2_input_crc,
+        p->per_frame_temp_crc,
+        p->rng_seed,
+        p->sim_frame,
+        p->display_frame,
+        p->game_mode,
+        p->substate,
+        p->frame_simulation,
+        p->frame_display,
+        p->frame_write_idx,
+        p->frame_net_idx,
+        p->remote_frame_idx);
+
+    // Keep digest and breakdown consistent even if they arrive in different order.
+    if (s_remoteBaselineCRC == 0) {
+        s_remoteBaselineCRC = p->main_crc;
+    } else if (s_remoteBaselineCRC != p->main_crc) {
+        Rollback::NetplayLog_Write(
+            "BASELINE", (int32_t)p->sim_frame,
+            "WARNING: Remote baseline digest mismatch: digest=0x%08X breakdown_main=0x%08X",
+            s_remoteBaselineCRC,
+            p->main_crc);
+    }
+}
+
 void MatchBootstrap_OnGameplayStart(const GameplayStartPayload* p) {
     if (!p) return;
 

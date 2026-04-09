@@ -186,6 +186,7 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
     // SyncAnnounce due to callback registration timing, this recovers.
     if (!s_remoteSyncAnnounced) {
         s_remoteSyncAnnounced = true;
+        s_remoteSessionId = p->session_id;
         LOG_NETPLAY(LOG_INFO, "[PregameSync] Inferred remote announce from SyncConfirm");
     }
 
@@ -330,6 +331,14 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
                 MatchBootstrap_OnBaselineDigest(static_cast<const BaselineDigestPayload*>(payload));
             } else {
                 LogPregamePacketAnomaly("Short BaselineDigest", type, payloadLen, sizeof(BaselineDigestPayload));
+            }
+            break;
+
+        case PacketType::BaselineBreakdown:
+            if (payloadLen >= sizeof(BaselineBreakdownPayload)) {
+                MatchBootstrap_OnBaselineBreakdown(static_cast<const BaselineBreakdownPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short BaselineBreakdown", type, payloadLen, sizeof(BaselineBreakdownPayload));
             }
             break;
 
@@ -849,9 +858,24 @@ void PregameSync_FrameUpdate() {
 bool PregameSync_Begin() {
     if (!s_initialized) return false;
     if (s_phase != PregamePhase::Idle) {
-        LOG_NETPLAY(LOG_WARNING, "[PregameSync] Begin called but phase is %s",
-            PregamePhaseName(s_phase));
-        return false;
+        // Rematch flow reaches CharSel with PregameSync still in terminal
+        // GameplayHandoff from the previous match. Allow an explicit restart.
+        if (s_phase == PregamePhase::GameplayHandoff ||
+            s_phase == PregamePhase::Error) {
+            LOG_NETPLAY(LOG_INFO,
+                "[PregameSync] Begin requested from terminal phase %s — resetting for restart",
+                PregamePhaseName(s_phase));
+
+            // Clear any stale phase-owned state from the prior match.
+            InputSyncHooks_SetLoadBarrierFreeze(false);
+            CharSelSync_Abort();
+            MatchBootstrap_Abort();
+            SetPhase(PregamePhase::Idle, "restart begin");
+        } else {
+            LOG_NETPLAY(LOG_WARNING, "[PregameSync] Begin called but phase is %s",
+                PregamePhaseName(s_phase));
+            return false;
+        }
     }
 
     if (!IsSessionValid()) {

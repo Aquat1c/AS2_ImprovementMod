@@ -137,6 +137,18 @@ bool RollbackSession_ShouldSuppressSideEffects();
 /// Fatal session error text, or an empty string when healthy.
 const char* RollbackSession_GetErrorReason();
 
+struct RollbackTimesyncTelemetry {
+    int32_t  rollback_count;
+    int32_t  last_rollback_replay_length;
+    int32_t  max_rollback_distance;
+    int32_t  predicted_frames_outstanding;
+    float    gekko_jitter;
+};
+
+/// Lightweight runtime telemetry for pacing/timesync logic.
+/// Unlike RollbackSession_GetSnapshot, this does NOT compute large-state CRCs.
+void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out);
+
 // ============================================================================
 // Local Input Injection (for testing/verification)
 // ============================================================================

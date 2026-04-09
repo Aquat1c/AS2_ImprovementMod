@@ -7,11 +7,13 @@
 
 #include "net/session_manager.h"
 #include "net/network_thread.h"
+#include "net/nat_traversal.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
 
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 
 namespace Net {
 
@@ -30,13 +32,19 @@ static char           s_errorText[128]  = "";
 static PacketCallback s_packetCallback  = nullptr;
 static bool           s_localReady      = false;
 static bool           s_remoteReady     = false;
+static bool           s_localNatInfoSent = false;
 static DWORD          s_stateEnteredAt  = 0;  // GetTickCount when state entered
 static uint32_t       s_activeSessionToken = 0;
+static bool           s_joinFallbackAttempted = false;
+static bool           s_joinUsingRelay = false;
+static char           s_activeJoinHost[96] = "";
+static uint16_t       s_activeJoinPort = 0;
 
 static uint32_t       s_lastInboundDropCount  = 0;
 static uint32_t       s_lastOutboundDropCount = 0;
 static DWORD          s_lastQueueSpikeLogAt   = 0;
 static DWORD          s_lastDrainLagLogAt     = 0;
+static DWORD          s_lastSessionUpdateTick = 0;
 
 constexpr int MAX_DEFERRED_CONTROL_PACKETS = 64;
 
@@ -72,6 +80,7 @@ static void SetError(const char* msg) {
     snprintf(s_errorText, sizeof(s_errorText), "%s", msg);
     LOG_ERROR("[Session] Error: %s", msg);
     Rollback::NetplayLog_Write("SESSION", -1, "ERROR: %s", msg);
+    Nat_StopServices();
     SetState(SessionState::Failed);
 }
 
@@ -85,12 +94,19 @@ static void ResetState() {
     s_errorText[0]  = '\0';
     s_localReady  = false;
     s_remoteReady = false;
+    s_localNatInfoSent = false;
     s_stateEnteredAt = 0;
+    s_joinFallbackAttempted = false;
+    s_joinUsingRelay = false;
+    s_activeJoinHost[0] = '\0';
+    s_activeJoinPort = 0;
     s_deferredControlCount = 0;
     s_lastInboundDropCount = 0;
     s_lastOutboundDropCount = 0;
     s_lastQueueSpikeLogAt = 0;
     s_lastDrainLagLogAt = 0;
+    s_lastSessionUpdateTick = 0;
+    Nat_ClearRemoteHint();
 }
 
 static bool DeferControlPacket(uint8_t channelID, PacketType type,
@@ -266,6 +282,171 @@ static bool QueueTypedPacket(uint8_t channel, PacketType type,
     return queued;
 }
 
+static bool HasRelayConfigured(const SessionConfig* cfg) {
+    return cfg &&
+           cfg->nat.relay_host[0] != '\0' &&
+           cfg->nat.relay_port > 0;
+}
+
+static bool StartJoinAttempt(const char* host, uint16_t port,
+                             bool usingRelay, const char* reason) {
+    if (!host || !host[0] || port == 0 || s_activeSessionToken == 0) {
+        return false;
+    }
+
+    s_joinUsingRelay = usingRelay;
+    strncpy_s(s_activeJoinHost, sizeof(s_activeJoinHost), host, _TRUNCATE);
+    s_activeJoinPort = port;
+    Nat_SetRemoteHint(s_activeJoinHost, s_activeJoinPort);
+    const bool wantsHolePunch = (!usingRelay && s_config.nat.enable_hole_punch);
+    const bool canHolePunch = Nat_IsHolePunchBackendAvailable();
+    const bool useHolePunch = wantsHolePunch && canHolePunch;
+
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Join attempt begin: token=%u host=%s port=%u via=%s reason=%s hole_punch_req=%d hole_punch_use=%d",
+        s_activeSessionToken,
+        s_activeJoinHost,
+        s_activeJoinPort,
+        usingRelay ? "relay" : "direct",
+        reason ? reason : "?",
+        wantsHolePunch ? 1 : 0,
+        useHolePunch ? 1 : 0);
+
+    if (wantsHolePunch && !canHolePunch) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Hole-punch requested but no OSS backend is linked; continuing with direct connect + relay fallback");
+    }
+
+    return NetworkThread_StartJoin(s_activeSessionToken,
+                                   s_config.listen_port,
+                                   s_activeJoinHost,
+                                   s_activeJoinPort,
+                                   useHolePunch);
+}
+
+static bool TryRelayFallback(const char* reason) {
+    if (s_role != SessionRole::Join) {
+        return false;
+    }
+    if (s_joinUsingRelay) {
+        return false;
+    }
+    if (s_joinFallbackAttempted) {
+        return false;
+    }
+    if (s_config.connect_preference != ConnectPreference::AutoDirectThenRelay) {
+        return false;
+    }
+    if (!HasRelayConfigured(&s_config)) {
+        return false;
+    }
+
+    s_joinFallbackAttempted = true;
+
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Direct join failed -> relay fallback: relay=%s:%u reason=%s",
+        s_config.nat.relay_host,
+        s_config.nat.relay_port,
+        reason ? reason : "?");
+
+    NetworkThread_RequestDestroyHost(s_activeSessionToken);
+    NetworkThread_ClearQueues(s_activeSessionToken);
+
+    if (!StartJoinAttempt(s_config.nat.relay_host, s_config.nat.relay_port, true, reason)) {
+        return false;
+    }
+
+    s_stateEnteredAt = GetTickCount();
+    return true;
+}
+
+static void SendNatInfo() {
+    if (s_localNatInfoSent || s_state != SessionState::Connected) {
+        return;
+    }
+
+    NatSnapshot nat{};
+    Nat_GetSnapshot(&nat);
+
+    NatInfoPayload payload{};
+    payload.upnp_status = (uint8_t)nat.upnp_status;
+    payload.stun_status = (uint8_t)nat.stun_status;
+    payload.listen_port = s_config.listen_port;
+    payload.external_port = nat.stun_external_port;
+    strncpy_s(payload.external_ip, sizeof(payload.external_ip),
+              nat.external_ip[0] ? nat.external_ip : nat.stun_endpoint,
+              _TRUNCATE);
+
+    if (nat.upnp_enabled) payload.flags |= NAT_INFO_FLAG_UPNP_ENABLED;
+    if (nat.upnp_status == NatStatus::Mapped) payload.flags |= NAT_INFO_FLAG_UPNP_MAPPED;
+    if (nat.stun_enabled) payload.flags |= NAT_INFO_FLAG_STUN_ENABLED;
+    if (nat.stun_status == StunStatus::Available) payload.flags |= NAT_INFO_FLAG_STUN_OK;
+    if (nat.hole_punch_enabled) payload.flags |= NAT_INFO_FLAG_HOLE_PUNCH;
+    if (HasRelayConfigured(&s_config)) payload.flags |= NAT_INFO_FLAG_RELAY_FALLBACK;
+    if (nat.prefer_portforwarded_direct) payload.flags |= NAT_INFO_FLAG_PREFER_DIRECT;
+    if (nat.allow_ipv6_endpoint) payload.flags |= NAT_INFO_FLAG_IPV6_ENDPOINTS;
+    if (nat.turn_enabled) payload.extra_flags |= NAT_INFO_EX_FLAG_TURN_ENABLED;
+    if (nat.pcp_enabled) payload.extra_flags |= NAT_INFO_EX_FLAG_PCP_ENABLED;
+
+    if (QueueTypedPacket(CHANNEL_CONTROL, PacketType::NatInfo,
+                         &payload, sizeof(payload), true, "nat-info")) {
+        s_localNatInfoSent = true;
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Local NatInfo sent: flags=0x%02X extra=0x%02X upnp=%s pcp=%s stun=%s ext_ip=%s stun_ep=%s join_via=%s",
+            payload.flags,
+            payload.extra_flags,
+            NatStatusName(nat.upnp_status),
+            NatStatusName(nat.pcp_status),
+            StunStatusName(nat.stun_status),
+            nat.external_ip,
+            nat.stun_endpoint,
+            s_joinUsingRelay ? "relay" : "direct");
+    }
+}
+
+static void FlushNatTraversalOutboundSignals() {
+    if (s_state != SessionState::Connected &&
+        s_state != SessionState::Ready &&
+        s_state != SessionState::Handshaking) {
+        return;
+    }
+
+    NatSignalMessage msg{};
+    while (Nat_TryPopOutboundSignal(&msg)) {
+        NatTraversalSignalPayload payload{};
+        payload.signal_type = (uint8_t)msg.type;
+        size_t textLen = 0;
+        while (textLen < sizeof(payload.text) - 1 && msg.text[textLen] != '\0') {
+            textLen++;
+        }
+        payload.text_len = (uint16_t)textLen;
+        if (payload.text_len > 0) {
+            memcpy(payload.text, msg.text, payload.text_len);
+        }
+        payload.text[payload.text_len] = '\0';
+
+        const size_t wireLen =
+            offsetof(NatTraversalSignalPayload, text) + payload.text_len + 1;
+        if (!QueueTypedPacket(CHANNEL_CONTROL,
+                              PacketType::NatTraversalSignal,
+                              &payload,
+                              wireLen,
+                              true,
+                              "nat-traversal-signal")) {
+            Rollback::NetplayLog_Write("SESSION", -1,
+                "Failed to send NAT traversal signal: type=%s len=%u",
+                NatSignalTypeName((NatSignalType)payload.signal_type),
+                (unsigned)payload.text_len);
+            break;
+        }
+
+        Rollback::NetplayLog_Verbose("SESSION", -1,
+            "Sent NAT traversal signal: type=%s len=%u",
+            NatSignalTypeName((NatSignalType)payload.signal_type),
+            (unsigned)payload.text_len);
+    }
+}
+
 // ============================================================================
 // Handshake
 // ============================================================================
@@ -411,6 +592,12 @@ static void OnTransportDisconnect(uintptr_t peerToken, uint32_t data, DWORD tran
         (unsigned long)consumeLagMs);
     s_peerToken = 0;
 
+    if ((s_state == SessionState::Connecting || s_state == SessionState::Handshaking) &&
+        TryRelayFallback("transport-disconnect")) {
+        LOG_INFO("[Session] Direct connect dropped; retrying via relay fallback");
+        return;
+    }
+
     if (s_state == SessionState::Disconnecting) {
         ResetState();
     } else if (s_state != SessionState::Idle && s_state != SessionState::Failed) {
@@ -465,6 +652,7 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
                     SendHelloAck();
                     if (s_role == SessionRole::Host) {
                         SetState(SessionState::Connected);
+                        SendNatInfo();
                     }
                 }
             }
@@ -474,7 +662,60 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
             if (s_state == SessionState::Handshaking) {
                 if (ProcessHelloAckPayload(payload, payloadLen)) {
                     SetState(SessionState::Connected);
+                    SendNatInfo();
                 }
+            }
+            break;
+
+        case PacketType::NatInfo:
+            if (payloadLen >= sizeof(NatInfoPayload)) {
+                const NatInfoPayload* np = static_cast<const NatInfoPayload*>(payload);
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Remote NatInfo: flags=0x%02X extra=0x%02X upnp=%u stun=%u listen=%u external_port=%u external_ip=%s",
+                    np->flags,
+                    np->extra_flags,
+                    np->upnp_status,
+                    np->stun_status,
+                    np->listen_port,
+                    np->external_port,
+                    np->external_ip);
+            } else {
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Remote NatInfo payload too small: got=%zu expected=%zu",
+                    payloadLen,
+                    sizeof(NatInfoPayload));
+            }
+            break;
+
+        case PacketType::NatTraversalSignal:
+            if (payloadLen >= offsetof(NatTraversalSignalPayload, text)) {
+                const NatTraversalSignalPayload* np =
+                    static_cast<const NatTraversalSignalPayload*>(payload);
+                size_t textLen = np->text_len;
+                if (textLen >= NAT_SIGNAL_TEXT_MAX) {
+                    textLen = NAT_SIGNAL_TEXT_MAX - 1;
+                }
+                if (textLen > payloadLen - offsetof(NatTraversalSignalPayload, text)) {
+                    textLen = payloadLen - offsetof(NatTraversalSignalPayload, text);
+                }
+
+                NatSignalMessage msg{};
+                msg.type = (NatSignalType)np->signal_type;
+                if (textLen > 0) {
+                    memcpy(msg.text, np->text, textLen);
+                }
+                msg.text[textLen] = '\0';
+                Nat_SubmitRemoteSignal(&msg);
+
+                Rollback::NetplayLog_Verbose("SESSION", -1,
+                    "Received NAT traversal signal: type=%s len=%u",
+                    NatSignalTypeName(msg.type),
+                    (unsigned)textLen);
+            } else {
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "NatTraversalSignal payload too small: got=%zu expected_at_least=%zu",
+                    payloadLen,
+                    offsetof(NatTraversalSignalPayload, text));
             }
             break;
 
@@ -504,6 +745,7 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
                 NetworkThread_ClearQueues(s_activeSessionToken);
             }
             s_peerToken = 0;
+            Nat_StopServices();
             ResetState();
             break;
         }
@@ -554,6 +796,11 @@ static void CheckTimeouts() {
         case SessionState::Connecting:
             // Host listens indefinitely — only joiner has a connect timeout
             if (s_role == SessionRole::Join && elapsed > s_config.connect_timeout_ms) {
+                if (TryRelayFallback("connect-timeout")) {
+                    Rollback::NetplayLog_Write("SESSION", -1,
+                        "Join timeout redirected to relay fallback");
+                    break;
+                }
                 Rollback::NetplayLog_Write("SESSION", -1,
                     "Connect timeout after %lu ms", (unsigned long)elapsed);
                 SetError("Connection timed out");
@@ -699,6 +946,7 @@ void Session_Shutdown() {
         Session_Cancel();
     }
     NetworkThread_Shutdown();
+    Nat_StopServices();
     s_activeSessionToken = 0;
     ResetState();
     LOG_INFO("[Session] Session manager shut down");
@@ -716,12 +964,47 @@ bool Session_StartHost(const SessionConfig* config) {
     s_role = SessionRole::Host;
 
     Rollback::NetplayLog_Write("SESSION", -1,
-        "StartHost: listen_port=%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u",
+        "StartHost: listen_port=%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u "
+        "upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d ipv6=%d pref_direct=%d "
+        "backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d",
         config->listen_port,
         config->nickname,
         config->build_hash,
         config->connect_timeout_ms,
-        config->handshake_timeout_ms);
+        config->handshake_timeout_ms,
+        config->nat.enable_upnp ? 1 : 0,
+        config->nat.enable_pcp_fallback ? 1 : 0,
+        config->nat.enable_stun ? 1 : 0,
+        config->nat.enable_hole_punch ? 1 : 0,
+        config->nat.enable_turn ? 1 : 0,
+        config->nat.allow_ipv6_endpoint ? 1 : 0,
+        config->nat.prefer_portforwarded_direct ? 1 : 0,
+        Nat_IsUpnpBackendAvailable() ? 1 : 0,
+        Nat_IsPcpBackendAvailable() ? 1 : 0,
+        Nat_IsStunBackendAvailable() ? 1 : 0,
+        Nat_IsHolePunchBackendAvailable() ? 1 : 0,
+        Nat_IsTurnBackendAvailable() ? 1 : 0);
+
+    NatRuntimeConfig natCfg{};
+    NatRuntimeConfig_SetDefaults(&natCfg);
+    natCfg.enable_upnp = config->nat.enable_upnp;
+    natCfg.enable_stun = config->nat.enable_stun;
+    natCfg.enable_hole_punch = config->nat.enable_hole_punch;
+    natCfg.enable_turn = config->nat.enable_turn;
+    natCfg.enable_pcp_fallback = config->nat.enable_pcp_fallback;
+    natCfg.allow_ipv6_endpoint = config->nat.allow_ipv6_endpoint;
+    natCfg.prefer_portforwarded_direct = config->nat.prefer_portforwarded_direct;
+    strncpy_s(natCfg.stun_host, sizeof(natCfg.stun_host), config->nat.stun_host, _TRUNCATE);
+    natCfg.stun_port = config->nat.stun_port;
+    strncpy_s(natCfg.turn_host, sizeof(natCfg.turn_host), config->nat.turn_host, _TRUNCATE);
+    natCfg.turn_port = config->nat.turn_port;
+    strncpy_s(natCfg.turn_username, sizeof(natCfg.turn_username), config->nat.turn_username, _TRUNCATE);
+    strncpy_s(natCfg.turn_password, sizeof(natCfg.turn_password), config->nat.turn_password, _TRUNCATE);
+    natCfg.gather_timeout_ms = config->nat.gather_timeout_ms;
+    natCfg.connect_timeout_ms = config->nat.connect_timeout_ms;
+    natCfg.mapping_timeout_ms = config->nat.mapping_timeout_ms;
+    natCfg.traversal_log_verbosity = config->nat.traversal_log_verbosity;
+    Nat_ApplyRuntimeConfig(&natCfg);
 
     if (!NetworkThread_Init()) {
         SetError("Failed to initialize network worker");
@@ -730,10 +1013,13 @@ bool Session_StartHost(const SessionConfig* config) {
 
     NextSessionToken();
     NetworkThread_ClearQueues(0);
+    Nat_ClearRemoteHint();
     if (!NetworkThread_StartHost(s_activeSessionToken, config->listen_port)) {
         SetError("Failed to start network host thread command");
         return false;
     }
+
+    Nat_StartServices(config->listen_port);
 
     SetState(SessionState::Connecting);
     LOG_INFO("[Session] Hosting on port %u, waiting for peer... (token=%u)",
@@ -755,32 +1041,135 @@ bool Session_StartJoin(const SessionConfig* config) {
     memcpy(&s_config, config, sizeof(s_config));
     s_role = SessionRole::Join;
 
+    const bool relayConfigured = HasRelayConfigured(config);
+
     Rollback::NetplayLog_Write("SESSION", -1,
-        "StartJoin: target=%u.%u.%u.%u:%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u",
-        (config->target_ip) & 0xFF,
-        (config->target_ip >> 8) & 0xFF,
-        (config->target_ip >> 16) & 0xFF,
-        (config->target_ip >> 24) & 0xFF,
+        "StartJoin: target=%s:%u relay=%s:%u mode=%s nick=%s hash=0x%08X "
+        "connect_timeout=%u handshake_timeout=%u upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d "
+        "ipv6=%d pref_direct=%d backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d",
+        config->target_host,
         config->target_port,
+        config->nat.relay_host,
+        config->nat.relay_port,
+        ConnectPreferenceName(config->connect_preference),
         config->nickname,
         config->build_hash,
         config->connect_timeout_ms,
-        config->handshake_timeout_ms);
+        config->handshake_timeout_ms,
+        config->nat.enable_upnp ? 1 : 0,
+        config->nat.enable_pcp_fallback ? 1 : 0,
+        config->nat.enable_stun ? 1 : 0,
+        config->nat.enable_hole_punch ? 1 : 0,
+        config->nat.enable_turn ? 1 : 0,
+        config->nat.allow_ipv6_endpoint ? 1 : 0,
+        config->nat.prefer_portforwarded_direct ? 1 : 0,
+        Nat_IsUpnpBackendAvailable() ? 1 : 0,
+        Nat_IsPcpBackendAvailable() ? 1 : 0,
+        Nat_IsStunBackendAvailable() ? 1 : 0,
+        Nat_IsHolePunchBackendAvailable() ? 1 : 0,
+        Nat_IsTurnBackendAvailable() ? 1 : 0);
+
+    NatRuntimeConfig natCfg{};
+    NatRuntimeConfig_SetDefaults(&natCfg);
+    natCfg.enable_upnp = config->nat.enable_upnp;
+    natCfg.enable_stun = config->nat.enable_stun;
+    natCfg.enable_hole_punch = config->nat.enable_hole_punch;
+    natCfg.enable_turn = config->nat.enable_turn;
+    natCfg.enable_pcp_fallback = config->nat.enable_pcp_fallback;
+    natCfg.allow_ipv6_endpoint = config->nat.allow_ipv6_endpoint;
+    natCfg.prefer_portforwarded_direct = config->nat.prefer_portforwarded_direct;
+    strncpy_s(natCfg.stun_host, sizeof(natCfg.stun_host), config->nat.stun_host, _TRUNCATE);
+    natCfg.stun_port = config->nat.stun_port;
+    strncpy_s(natCfg.turn_host, sizeof(natCfg.turn_host), config->nat.turn_host, _TRUNCATE);
+    natCfg.turn_port = config->nat.turn_port;
+    strncpy_s(natCfg.turn_username, sizeof(natCfg.turn_username), config->nat.turn_username, _TRUNCATE);
+    strncpy_s(natCfg.turn_password, sizeof(natCfg.turn_password), config->nat.turn_password, _TRUNCATE);
+    natCfg.gather_timeout_ms = config->nat.gather_timeout_ms;
+    natCfg.connect_timeout_ms = config->nat.connect_timeout_ms;
+    natCfg.mapping_timeout_ms = config->nat.mapping_timeout_ms;
+    natCfg.traversal_log_verbosity = config->nat.traversal_log_verbosity;
+    Nat_ApplyRuntimeConfig(&natCfg);
 
     if (!NetworkThread_Init()) {
         SetError("Failed to initialize network worker");
         return false;
     }
 
+    const char* initialHost = config->target_host;
+    uint16_t initialPort = config->target_port;
+    bool initialViaRelay = false;
+    const bool directLooksIPv6 = (strchr(config->target_host, ':') != nullptr);
+
+    switch (config->connect_preference) {
+        case ConnectPreference::RelayOnly:
+            if (!relayConfigured) {
+                SetError("Relay mode selected but relay endpoint is missing");
+                return false;
+            }
+            initialHost = config->nat.relay_host;
+            initialPort = config->nat.relay_port;
+            initialViaRelay = true;
+            break;
+
+        case ConnectPreference::DirectOnly:
+            if (!initialHost[0] || initialPort == 0) {
+                SetError("Direct mode selected but target endpoint is invalid");
+                return false;
+            }
+            if (directLooksIPv6) {
+                SetError("Direct IPv6 endpoints require relay fallback with current ENet transport");
+                return false;
+            }
+            break;
+
+        case ConnectPreference::AutoDirectThenRelay:
+        default:
+            if (!initialHost[0] || initialPort == 0) {
+                if (relayConfigured) {
+                    initialHost = config->nat.relay_host;
+                    initialPort = config->nat.relay_port;
+                    initialViaRelay = true;
+                } else {
+                    SetError("No valid direct endpoint or relay fallback configured");
+                    return false;
+                }
+            } else if (directLooksIPv6 && relayConfigured) {
+                initialHost = config->nat.relay_host;
+                initialPort = config->nat.relay_port;
+                initialViaRelay = true;
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Auto join selected relay first because target endpoint is IPv6 literal");
+            }
+            break;
+    }
+
+    if (strchr(initialHost, ':')) {
+        if (initialViaRelay) {
+            SetError("Relay endpoint is IPv6 literal; current ENet transport requires IPv4/DNS relay");
+            return false;
+        }
+        if (relayConfigured && config->connect_preference == ConnectPreference::AutoDirectThenRelay) {
+            initialHost = config->nat.relay_host;
+            initialPort = config->nat.relay_port;
+            initialViaRelay = true;
+            s_joinFallbackAttempted = true;
+            Rollback::NetplayLog_Write("SESSION", -1,
+                "Switching to relay because direct endpoint is IPv6 literal");
+        } else {
+            SetError("Direct IPv6 endpoint unsupported by current ENet transport");
+            return false;
+        }
+    }
+
     NextSessionToken();
     NetworkThread_ClearQueues(0);
-    if (!NetworkThread_StartJoin(s_activeSessionToken,
-                                 config->listen_port,
-                                 config->target_ip,
-                                 config->target_port)) {
+    s_joinFallbackAttempted = initialViaRelay;
+    if (!StartJoinAttempt(initialHost, initialPort, initialViaRelay, "initial")) {
         SetError("Failed to start network join thread command");
         return false;
     }
+
+    Nat_StartServices(config->listen_port);
 
     SetState(SessionState::Connecting);
     Rollback::NetplayLog_Write("NTHREAD", -1,
@@ -823,6 +1212,7 @@ void Session_Cancel() {
         cancelToken);
 
     s_activeSessionToken = 0;
+    Nat_StopServices();
     ResetState();
 }
 
@@ -850,12 +1240,47 @@ void Session_SignalReady() {
 }
 
 void Session_Update() {
+    const DWORD now = GetTickCount();
+    if (s_lastSessionUpdateTick != 0) {
+        const DWORD gapMs = now - s_lastSessionUpdateTick;
+        if (gapMs >= 100) {
+            NetworkThreadStats netStats{};
+            NetworkThread_GetStats(&netStats);
+            const DWORD workerAgeMs =
+                (netStats.last_service_tick_ms > 0 && now >= netStats.last_service_tick_ms)
+                    ? (now - netStats.last_service_tick_ms)
+                    : 0;
+
+            Rollback::NetplayLog_Write("NTHREAD", -1,
+                "Game-thread Session_Update gap=%lums worker_running=%d worker_age=%lums "
+                "inbound_depth=%u outbound_depth=%u state=%s role=%s token=%u",
+                (unsigned long)gapMs,
+                netStats.worker_running ? 1 : 0,
+                (unsigned long)workerAgeMs,
+                netStats.inbound_queue_depth,
+                netStats.outbound_queue_depth,
+                SessionStateName(s_state),
+                SessionRoleName(s_role),
+                s_activeSessionToken);
+        }
+    }
+    s_lastSessionUpdateTick = now;
+
     // Game thread owns packet interpretation and callback dispatch. Network
     // thread only enqueues transport events.
     DrainNetworkEvents();
 
     if (s_state != SessionState::Idle && s_state != SessionState::Failed) {
         CheckTimeouts();
+    }
+
+    if (s_state == SessionState::Connected) {
+        SendNatInfo();
+    }
+    if (s_state == SessionState::Handshaking ||
+        s_state == SessionState::Connected ||
+        s_state == SessionState::Ready) {
+        FlushNatTraversalOutboundSignals();
     }
 
     UpdateStats();

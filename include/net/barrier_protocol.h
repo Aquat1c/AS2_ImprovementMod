@@ -72,6 +72,7 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
 
         // NAT coordination — reliable
         case PacketType::NatInfo:
+        case PacketType::NatTraversalSignal:
 
         // Pre-game barriers — always reliable
         case PacketType::CharSelInput:
@@ -82,6 +83,7 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         case PacketType::LoadBarrier:
         case PacketType::BaselineReady:
         case PacketType::BaselineDigest:
+        case PacketType::BaselineBreakdown:
         case PacketType::GameplayStart:
 
         // Startup gameplay-entry barrier — reliable
@@ -120,6 +122,7 @@ inline uint8_t BarrierProtocol_GetChannel(PacketType type) {
 
         // Startup gameplay-entry barrier — control channel, same as GameplayStart
         case PacketType::GekkoReady:
+        case PacketType::NatTraversalSignal:
             return CHANNEL_CONTROL;
 
         default:

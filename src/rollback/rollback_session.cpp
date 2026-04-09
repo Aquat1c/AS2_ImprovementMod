@@ -198,6 +198,7 @@ static int32_t  s_remoteInputsRecv    = 0;
 static int32_t  s_saveEventCount      = 0;
 static int32_t  s_loadEventCount      = 0;
 static int32_t  s_advanceEventCount   = 0;
+static bool     s_loggedInputBridge   = false;
 
 // ============================================================================
 // Match Handler — direct call during rollback resimulation
@@ -414,6 +415,30 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
     // Store for GetAdvanceInputs (read by input_override.cpp for normal frames)
     s_advP1 = raw_p1;
     s_advP2 = raw_p2;
+
+    // Game-slot mapping diagnostics:
+    // - raw_p1/raw_p2 always represent game P1/P2 inputs.
+    // - local/remote attribution depends on local side assignment.
+    const uint16_t localByGameSlot = (s_localPlayer == 0) ? raw_p1 : raw_p2;
+    const uint16_t remoteByGameSlot = (s_localPlayer == 0) ? raw_p2 : raw_p1;
+    if (!s_loggedInputBridge) {
+        s_loggedInputBridge = true;
+        NetplayLog_Write("GEKKO", frame,
+            "SDL->Rollback bridge ACTIVE: local_slot=P%d remote_slot=P%d "
+            "local_input_sourced_from=PlayerMapping_ReadLocalInput "
+            "remote_input_sourced_from=GekkoData stream",
+            s_localPlayer + 1,
+            s_remotePlayer + 1);
+    }
+    NetplayLog_Verbose("GEKKO", frame,
+        "Advance map: game[P1=0x%04X P2=0x%04X] local[P%d=0x%04X] remote[P%d=0x%04X] rb=%d",
+        raw_p1,
+        raw_p2,
+        s_localPlayer + 1,
+        localByGameSlot,
+        s_remotePlayer + 1,
+        remoteByGameSlot,
+        rolling_back ? 1 : 0);
 
     // Write inputs to game buffers via InputSystem
     InputSystem_SetNetplayInput(0, raw_p1);
@@ -653,6 +678,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_saveEventCount    = 0;
     s_loadEventCount    = 0;
     s_advanceEventCount = 0;
+    s_loggedInputBridge = false;
 
     // Clear receive buffer
     for (int i = 0; i < s_recvCount; i++) {
@@ -924,6 +950,34 @@ bool RollbackSession_ShouldSuppressSideEffects() {
 
 const char* RollbackSession_GetErrorReason() {
     return s_sessionError;
+}
+
+void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+
+    out->rollback_count = s_totalRollbacks;
+    out->last_rollback_replay_length = s_lastRollbackLength;
+    out->max_rollback_distance = s_maxRollbackDepth;
+
+    const float framesAhead = RollbackSession_FramesAhead();
+    int predictedOutstanding = 0;
+    if (framesAhead > 0.0f) {
+        predictedOutstanding = (int)ceilf(framesAhead);
+    }
+    if (predictedOutstanding < 0) {
+        predictedOutstanding = 0;
+    }
+    if (predictedOutstanding > s_rollbackBudget) {
+        predictedOutstanding = s_rollbackBudget;
+    }
+    out->predicted_frames_outstanding = predictedOutstanding;
+
+    if (s_session && s_remoteHandle >= 0) {
+        GekkoNetworkStats stats{};
+        gekko_network_stats(s_session, s_remoteHandle, &stats);
+        out->gekko_jitter = stats.jitter;
+    }
 }
 
 // ============================================================================

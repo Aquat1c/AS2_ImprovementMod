@@ -91,6 +91,8 @@ enum class TextEditField : uint32_t {
     Nickname,
     RemoteEndpoint,
     ListenPort,
+    RelayEndpoint,
+    StunEndpoint,
 };
 
 // ============================================================================
@@ -109,7 +111,7 @@ struct MenuSnapshot {
     int           fade_frames;
     char          status[128];
     char          last_error[128];
-    char          your_address[64];
+    char          your_address[96];
     char          clipboard_flash[48];
     char          local_nickname[32];
     char          peer_nickname[32];
@@ -119,8 +121,16 @@ struct MenuSnapshot {
 
     // Connection config (editable by user)
     uint16_t      listen_port;
-    char          remote_endpoint[64];
+    char          remote_endpoint[96];
     int           preferred_delay;
+    int           connection_mode;     // Net::ConnectPreference
+    bool          upnp_enabled;
+    bool          stun_enabled;
+    bool          hole_punch_enabled;
+    bool          allow_ipv6_endpoint;
+    char          relay_endpoint[96];
+    char          stun_endpoint[96];
+    char          nat_status[128];
 
     // Session display
     bool          is_host;
@@ -136,7 +146,7 @@ struct MenuSnapshot {
     // Text editing state
     bool          is_text_editing;
     TextEditField text_edit_field;
-    char          text_edit_buffer[64];
+    char          text_edit_buffer[96];
     int           text_cursor_pos;
 };
 

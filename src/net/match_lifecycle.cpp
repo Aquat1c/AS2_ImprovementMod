@@ -365,8 +365,7 @@ static void UpdatePostMatchRoute() {
     EnforceModOwnership();
 
     // Post-match: the game has transitioned away from Mode 8.
-    // We wait for the menu controller to present post-match options.
-    // The PostMatchIntent will be set by the menu controller.
+    // Prefer explicit intent from the menu controller when available.
     switch (s_postMatchIntent) {
         case PostMatchIntent::Rematch:
             SetPhase(MatchLifecyclePhase::ReturningToCharSel, "rematch selected");
@@ -383,6 +382,23 @@ static void UpdatePostMatchRoute() {
             break;
         default:
             break;
+    }
+
+    // If no explicit intent was set, honor the actual route chosen by the
+    // game state so we do not stall in PostMatchRoute indefinitely.
+    if (s_postMatchIntent == PostMatchIntent::None) {
+        const uint32_t mode = GetGameMode();
+        if (mode == MODE_CHARSEL) {
+            SetPhase(MatchLifecyclePhase::ReturningToCharSel,
+                "post-match direct route to charsel");
+        } else if (mode == MODE_MENU) {
+            SetPhase(MatchLifecyclePhase::ReturningToMenu,
+                "post-match direct route to menu");
+        } else if (!IsSessionAlive()) {
+            s_matchOwned = false;
+            SetPhase(MatchLifecyclePhase::Inactive,
+                "post-match route lost session");
+        }
     }
 }
 

@@ -50,9 +50,9 @@ bool Transport_IsHostActive();
 // Connection
 // ============================================================================
 
-/// Initiate an outbound connection to the target. Returns the ENet peer or nullptr.
+/// Initiate an outbound connection to the target host/IP. Returns ENet peer or nullptr.
 /// The actual connection completes asynchronously via ENET_EVENT_TYPE_CONNECT.
-ENetPeer* Transport_Connect(uint32_t ipv4, uint16_t port);
+ENetPeer* Transport_Connect(const char* host, uint16_t port);
 
 /// Gracefully disconnect a peer. ENet will flush and then emit DISCONNECT event.
 void Transport_DisconnectPeer(ENetPeer* peer, uint32_t data = 0);
@@ -75,6 +75,11 @@ bool Transport_Send(ENetPeer* peer, uint8_t channel, const void* data, size_t le
 /// Convenience: build a [PacketType | payload] buffer and send.
 bool Transport_SendTyped(ENetPeer* peer, uint8_t channel, PacketType type,
                          const void* payload, size_t payloadLen, bool reliable);
+
+/// Legacy hook for explicit hole-punch bursts.
+/// Sends a small UDP burst to the target endpoint to assist NAT pinhole setup.
+bool Transport_SendHolePunchBurst(const char* host, uint16_t port,
+                                  int burstCount, uint32_t intervalMs);
 
 // ============================================================================
 // Polling

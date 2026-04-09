@@ -60,7 +60,8 @@ void NetworkThread_Shutdown();
 
 bool NetworkThread_StartHost(uint32_t session_token, uint16_t listen_port);
 bool NetworkThread_StartJoin(uint32_t session_token, uint16_t listen_port,
-                             uint32_t target_ip, uint16_t target_port);
+                             const char* target_host, uint16_t target_port,
+                             bool send_hole_punch);
 
 bool NetworkThread_SendPacket(uint32_t session_token, uint8_t channel,
                               PacketType type, const void* payload,
@@ -74,4 +75,3 @@ bool NetworkThread_TryPopEvent(NetworkThreadEvent* out);
 void NetworkThread_GetStats(NetworkThreadStats* out);
 
 } // namespace Net
-
