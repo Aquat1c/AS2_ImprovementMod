@@ -23,6 +23,9 @@ namespace Rollback {
 void RollbackDebug_Init();
 void RollbackDebug_Shutdown();
 
+/// Reset per-match digest/checksum/desync state while keeping the module initialized.
+void RollbackDebug_ResetSession();
+
 // ============================================================================
 // Per-Frame
 // ============================================================================

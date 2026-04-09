@@ -607,7 +607,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
 
         // Poll SDL input and get local packed input
         InputSystem_Update();
-        uint16_t localInput = InputSystem_GetInput(0);
+        uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
 
         Rollback::NetplayLog_Write("INPUT", -1,
             "Step 2: localInput=0x%04X, calling CaptureLocalInput", localInput);
@@ -765,7 +765,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         }
 
         InputSystem_Update();
-        const uint16_t localInput = InputSystem_GetInput(0);
+        const uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
         Net::WinScreenSync_CaptureLocalInput(localInput);
 
         if (!Net::WinScreenSync_HasInputsForCurrentFrame()) {
@@ -1611,7 +1611,7 @@ int __cdecl Hook_InputProcess(int gameState) {
             const bool edgeReset = Net::StageSelSync_ConsumeEdgeReset();
 
             InputSystem_Update();
-            const uint16_t localInput = InputSystem_GetInput(0);
+            const uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
             Net::CharSelSync_CaptureLocalInput(localInput);
 
             if (!Net::CharSelSync_HasInputsForCurrentFrame()) {

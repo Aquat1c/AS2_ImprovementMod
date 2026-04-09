@@ -124,6 +124,10 @@ float RollbackSession_FramesAhead();
 /// Current active delay.
 int RollbackSession_GetActiveDelay();
 
+/// Apply a new local input delay to the active Gekko session.
+/// Returns true if accepted by the active session.
+bool RollbackSession_SetLocalDelay(int delay);
+
 /// Current rollback budget.
 int RollbackSession_GetRollbackBudget();
 

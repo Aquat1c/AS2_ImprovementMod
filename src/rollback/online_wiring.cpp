@@ -535,6 +535,13 @@ static bool TryStartRollbackSession() {
     s_gameplayActive = Net::MatchLifecycle_IsGameplayPlayable();
     s_liveReleaseArmed = false;
 
+    // Mark delay as consumed by the live rollback session.
+    Net::DelayPolicy_OnRollbackApplied(activeDelay);
+
+    // Reset per-match digest history/desync flags so warnings don't leak across
+    // rematch/new-session frame-number reuse windows.
+    RollbackDebug_ResetSession();
+
     // Enable state digest for desync detection
     RollbackDebug_SetDigestEnabled(true);
 
@@ -636,6 +643,20 @@ static void CheckPolicyChanges() {
     int curDelay = Net::DelayPolicy_GetActiveDelay();
     if (s_lastActiveDelay >= 0 && curDelay != s_lastActiveDelay) {
         LogDelayChange(s_lastActiveDelay, curDelay, "delay policy update");
+
+        if (s_rollbackActive) {
+            const bool applied = RollbackSession_SetLocalDelay(curDelay);
+            if (applied) {
+                Net::DelayPolicy_OnRollbackApplied(curDelay);
+                NetplayLog_Write("DELAY", RollbackSession_GetCurrentFrame(),
+                    "Applied delay policy update to live rollback session: delay=%d",
+                    curDelay);
+            } else {
+                NetplayLog_Write("DELAY", RollbackSession_GetCurrentFrame(),
+                    "WARNING: failed to apply live delay update to rollback session: delay=%d",
+                    curDelay);
+            }
+        }
     }
     s_lastActiveDelay = curDelay;
 

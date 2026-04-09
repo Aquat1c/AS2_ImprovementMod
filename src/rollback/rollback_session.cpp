@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <algorithm>
+#include <math.h>
 #include <windows.h>
 #include <xmmintrin.h>  // _mm_getcsr / _mm_setcsr for FPU state capture
 
@@ -888,6 +889,31 @@ int RollbackSession_GetActiveDelay() {
     return s_activeDelay;
 }
 
+bool RollbackSession_SetLocalDelay(int delay) {
+    if (!s_active || !s_session || s_localHandle < 0) {
+        return false;
+    }
+
+    if (delay < 0) {
+        delay = 0;
+    } else if (delay > 255) {
+        delay = 255;
+    }
+
+    if (s_activeDelay == delay) {
+        return true;
+    }
+
+    const int prevDelay = s_activeDelay;
+    gekko_set_local_delay(s_session, s_localHandle, (unsigned char)delay);
+    s_activeDelay = delay;
+
+    NetplayLog_Write("GEKKO", s_currentFrame,
+        "Local delay updated: %d -> %d (handle=%d)",
+        prevDelay, s_activeDelay, s_localHandle);
+    return true;
+}
+
 int RollbackSession_GetRollbackBudget() {
     return s_rollbackBudget;
 }
@@ -923,8 +949,24 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
 
     // Frame state
     out->current_frame = s_currentFrame;
-    out->last_confirmed_frame = s_currentFrame;   // GekkoNet doesn't expose confirmed frame
-    out->last_remote_received_frame = s_remoteInputsRecv > 0 ? s_currentFrame : -1;
+    const float framesAhead = RollbackSession_FramesAhead();
+    int predictedOutstanding = 0;
+    if (framesAhead > 0.0f) {
+        predictedOutstanding = (int)ceilf(framesAhead);
+    }
+    if (predictedOutstanding < 0) {
+        predictedOutstanding = 0;
+    }
+    if (predictedOutstanding > s_rollbackBudget) {
+        predictedOutstanding = s_rollbackBudget;
+    }
+
+    out->last_confirmed_frame = s_currentFrame - predictedOutstanding;
+    if (out->last_confirmed_frame < s_startFrame) {
+        out->last_confirmed_frame = s_startFrame;
+    }
+    out->last_remote_received_frame =
+        (s_remoteInputsRecv > 0) ? out->last_confirmed_frame : -1;
     out->last_saved_state_frame = s_lastSavedFrame;
 
     // Rollback stats
@@ -932,12 +974,12 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->last_rollback_start_frame = s_lastRollbackFrame;
     out->last_rollback_replay_length = s_lastRollbackLength;
     out->max_rollback_distance = s_maxRollbackDepth;
-    out->predicted_frames_outstanding = 0;  // GekkoNet manages prediction internally
+    out->predicted_frames_outstanding = predictedOutstanding;
 
     // GekkoNet state
     out->is_rolling_back = s_rollingBack;
     out->side_effects_suppressed = s_rollingBack;
-    out->frames_ahead = RollbackSession_FramesAhead();
+    out->frames_ahead = framesAhead;
 
     // Policy
     out->active_delay = s_activeDelay;

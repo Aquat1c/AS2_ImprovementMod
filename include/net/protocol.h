@@ -292,11 +292,14 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::BaselineDigest: return "BaselineDigest";
         case PacketType::GameplayStart:  return "GameplayStart";
         case PacketType::GekkoReady:     return "GekkoReady";
-        case PacketType::GameplayInput:      return "GameplayInput";
-        case PacketType::CharSelFrameInput:  return "CharSelFrameInput";
-        case PacketType::WinScreenConfirm:   return "WinScreenConfirm";
-        case PacketType::WinScreenFrameInput:return "WinScreenFrameInput";
+        case PacketType::GameplayInput:   return "GameplayInput";
+        case PacketType::DelayChangeReq:  return "DelayChangeReq";
+        case PacketType::DelayChangeAck:  return "DelayChangeAck";
+        case PacketType::GekkoData:       return "GekkoData";
+        case PacketType::CharSelFrameInput:   return "CharSelFrameInput";
+        case PacketType::WinScreenConfirm:    return "WinScreenConfirm";
         case PacketType::PauseQuit:           return "PauseQuit";
+        case PacketType::WinScreenFrameInput: return "WinScreenFrameInput";
         case PacketType::Ping:           return "Ping";
         case PacketType::Pong:           return "Pong";
         case PacketType::StateDigest:    return "StateDigest";

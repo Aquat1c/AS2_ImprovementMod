@@ -195,6 +195,20 @@ static void LoadSettings() {
         s_localNickname, s_listenPort, s_remoteEndpoint, s_preferredDelay, s_rollbackBudget, s_rollbackDelay);
 }
 
+static void ApplyDelaySettingsToPolicy(const char* reason) {
+    Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
+    Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
+    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
+
+    LOG_NETPLAY(LOG_INFO,
+        "[NetMenu] Applied delay policy settings (%s): pref=%d rb=%d rb_delay=%d active=%d",
+        reason ? reason : "unspecified",
+        s_preferredDelay,
+        s_rollbackBudget,
+        s_rollbackDelay,
+        Net::DelayPolicy_GetActiveDelay());
+}
+
 // ============================================================================
 // Memory helpers
 // ============================================================================
@@ -495,7 +509,7 @@ static bool BeginAutoConnectSession() {
     cfg.connect_timeout_ms = 10000;
     cfg.handshake_timeout_ms = 5000;
 
-    Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
+    ApplyDelaySettingsToPolicy("autoconnect session begin");
 
     if (s_autoConnect.isHost) {
         LOG_NETPLAY(LOG_INFO, "[AutoConnect] Starting host session on port %u", cfg.listen_port);
@@ -1448,6 +1462,7 @@ static void ActivateCurrentSelection() {
                 Net::SessionConfig_SetDefaults(&cfg);
                 cfg.listen_port = s_listenPort;
                 strncpy_s(cfg.nickname, sizeof(cfg.nickname), s_localNickname, _TRUNCATE);
+                ApplyDelaySettingsToPolicy("manual host start");
                 MenuUtils::BeginPublicIPFetch();
                 if (Net::Session_StartHost(&cfg)) {
                     SetStatus("Waiting for peer...");
@@ -1481,6 +1496,7 @@ static void ActivateCurrentSelection() {
                 cfg.target_ip = targetIP;
                 cfg.target_port = targetPort;
                 strncpy_s(cfg.nickname, sizeof(cfg.nickname), s_localNickname, _TRUNCATE);
+                ApplyDelaySettingsToPolicy("manual join start");
                 if (Net::Session_StartJoin(&cfg)) {
                     SetStatus("Connecting to host...");
                     TransitionTo(MenuState::Connecting, "join started");
@@ -1638,6 +1654,7 @@ void Init() {
     s_fadeFrames = 0;
     s_captureInput = false;
     LoadSettings();
+    ApplyDelaySettingsToPolicy("menu init");
     LoadAutoConnectConfig();
     s_initialized = true;
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Initialized");

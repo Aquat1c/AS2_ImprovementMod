@@ -249,7 +249,7 @@ void DelayPolicy_Init() {
     s_agreedRollbackDelay = 0;
     s_sessionNegotiated = false;
 
-    s_activeDelay = 0;
+    s_activeDelay = ClampDelay(s_rollbackDelay);
     s_rollbackCurrentDelay = -1;
     s_rollbackSynced = false;
 
@@ -266,7 +266,8 @@ void DelayPolicy_Init() {
     s_prevTransition = false;
 
     s_initialized = true;
-    LOG_INFO("[DelayPolicy] Initialized");
+    LOG_INFO("[DelayPolicy] Initialized (configured=%d rollback_budget=%d rollback_delay=%d active=%d)",
+        s_configuredDelay, s_rollbackBudget, s_rollbackDelay, s_activeDelay);
 }
 
 void DelayPolicy_Shutdown() {
@@ -423,8 +424,21 @@ int DelayPolicy_GetRollbackBudget() {
 }
 
 void DelayPolicy_SetRollbackDelay(int frames) {
+    const int prevRollbackDelay = s_rollbackDelay;
+    const int prevActiveDelay = s_activeDelay;
+
     s_rollbackDelay = ClampDelay(frames);
-    LOG_INFO("[DelayPolicy] Rollback delay set to %d", s_rollbackDelay);
+
+    // Rollback delay is the effective local input pipeline delay for rollback.
+    // Apply immediately in policy state so startup negotiation and live session
+    // updates consume the newest value.
+    s_activeDelay = s_rollbackDelay;
+    if (s_activeDelay != prevActiveDelay) {
+        s_rollbackSynced = false;
+    }
+
+    LOG_INFO("[DelayPolicy] Rollback delay set: cfg=%d->%d active=%d->%d",
+        prevRollbackDelay, s_rollbackDelay, prevActiveDelay, s_activeDelay);
 }
 
 int DelayPolicy_GetRollbackDelay() {
@@ -504,7 +518,7 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
     s_agreedDelay = agreed;
     s_agreedRollback = agreed_rb;
     s_agreedRollbackDelay = s_rollbackDelay;  // Each peer uses its own rollback delay
-    s_activeDelay = s_rollbackDelay;  // Active delay = rollback delay (input pipeline)
+    s_activeDelay = ClampDelay(s_rollbackDelay);  // Active delay = rollback delay (input pipeline)
     s_sessionNegotiated = true;
     s_rollbackSynced = false;  // Rollback session hasn't applied this yet
 
@@ -512,12 +526,12 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
         " local_eff=%d remote_eff=%d agreed=%d"
         " range=[%d,%d] remote_range=[%d,%d]"
         " local_rec=%d remote_rec=%d"
-        " rollback=%d rollback_delay=%d"
+        " rollback=%d rollback_delay=%d active_delay=%d"
         " rtt=%.1fms jitter=%.1fms",
         local_effective, remote_effective, agreed,
         DELAY_MIN, DELAY_MAX, remote_range_min, remote_range_max,
         s_recommendedDelay, remote->recommended_delay,
-        agreed_rb, s_rollbackDelay,
+        agreed_rb, s_rollbackDelay, s_activeDelay,
         s_jitter.GetSmoothedRTT(), s_jitter.GetJitter());
 }
 
@@ -641,7 +655,7 @@ void DelayPolicy_ResetSession() {
     s_agreedRollbackDelay = 0;
     s_sessionNegotiated = false;
 
-    s_activeDelay = 0;
+    s_activeDelay = ClampDelay(s_rollbackDelay);
     s_rollbackCurrentDelay = -1;
     s_rollbackSynced = false;
 
@@ -657,7 +671,8 @@ void DelayPolicy_ResetSession() {
     s_prevSubstate = 0xFFFFFFFF;
     s_prevTransition = false;
 
-    LOG_INFO("[DelayPolicy] Session reset");
+    LOG_INFO("[DelayPolicy] Session reset (rollback_delay=%d active_delay=%d)",
+        s_rollbackDelay, s_activeDelay);
 }
 
 // ============================================================================

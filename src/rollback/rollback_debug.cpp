@@ -17,6 +17,7 @@
 #include "ui/log_window.h"
 #include "imgui.h"
 
+#include <algorithm>
 #include <string.h>
 #include <windows.h>
 
@@ -63,6 +64,54 @@ static uint32_t s_currentChecksum   = 0;
 
 // Forward declarations
 static bool TryGetChecksumForFrame(int32_t frame, uint32_t* checksum);
+static void ResetChecksumHistory();
+
+static uint32_t Rotl32(uint32_t value, int bits) {
+    return (value << bits) | (value >> (32 - bits));
+}
+
+static uint32_t ComputeGameplayDigestChecksum() {
+    uint32_t p1Entity = 0;
+    uint32_t p2Entity = 0;
+    uint32_t preMatchGap = 0;
+    uint32_t rngSeed = 0;
+
+    __try {
+        p1Entity = CalcCRC32((const void*)ADDR_P1_ENTITY_BASE, ENTITY_SIZE);
+        p2Entity = CalcCRC32((const void*)ADDR_P2_ENTITY_BASE, ENTITY_SIZE);
+        preMatchGap = CalcCRC32((const void*)ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE);
+        rngSeed = DetVer_GetRngSeed();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0xDEADDEAD;
+    }
+
+    // Use gameplay-critical deterministic state only (both entities + RNG + pre-match gap).
+    // This avoids false warnings from non-authoritative visual/transient memory regions.
+    return p1Entity ^ Rotl32(p2Entity, 5) ^ Rotl32(preMatchGap, 11) ^ rngSeed;
+}
+
+static void ResetSessionState() {
+    s_desyncDetected = false;
+    s_desyncFrame = -1;
+    s_desyncLocalCrc = 0;
+    s_desyncRemoteCrc = 0;
+    s_digestsSent = 0;
+    s_digestsRecv = 0;
+    s_digestsMatched = 0;
+    s_digestsMismatched = 0;
+    s_lastDigestFrame = -1;
+    s_statusSent = 0;
+    s_statusRecv = 0;
+    s_remoteStatusFrame = -1;
+    s_remoteStatusGameFrame = -1;
+    s_remoteStatusViewFrame = -1;
+    s_remoteStatusConfirmedFrame = -1;
+    s_remoteStatusPredicted = 0;
+    s_remoteStatusChecksum = 0;
+    s_currentChecksum = 0;
+    ResetChecksumHistory();
+    DesyncDump_Reset();
+}
 
 static void ResetChecksumHistory() {
     for (int i = 0; i < kChecksumHistorySize; ++i) {
@@ -100,30 +149,21 @@ static bool TryGetChecksumForFrame(int32_t frame, uint32_t* checksum) {
 // ============================================================================
 
 void RollbackDebug_Init() {
-    s_desyncDetected = false;
-    s_desyncFrame = -1;
-    s_digestsSent = 0;
-    s_digestsRecv = 0;
-    s_digestsMatched = 0;
-    s_digestsMismatched = 0;
-    s_lastDigestFrame = -1;
-    s_statusSent = 0;
-    s_statusRecv = 0;
-    s_remoteStatusFrame = -1;
-    s_remoteStatusGameFrame = -1;
-    s_remoteStatusViewFrame = -1;
-    s_remoteStatusConfirmedFrame = -1;
-    s_remoteStatusPredicted = 0;
-    s_remoteStatusChecksum = 0;
-    s_currentChecksum = 0;
-    ResetChecksumHistory();
-    DesyncDump_Reset();
+    ResetSessionState();
     s_initialized = true;
     LOG_INFO("[RollbackDebug] Initialized");
 }
 
 void RollbackDebug_Shutdown() {
     s_initialized = false;
+}
+
+void RollbackDebug_ResetSession() {
+    if (!s_initialized) {
+        return;
+    }
+    ResetSessionState();
+    LOG_INFO("[RollbackDebug] Session diagnostics reset");
 }
 
 // ============================================================================
@@ -137,14 +177,8 @@ void RollbackDebug_FrameUpdate() {
 
     int32_t frame = RollbackSession_GetCurrentFrame();
 
-    // Compute current state checksum
-    __try {
-        s_currentChecksum = CalcCRC32(
-            (const void*)ADDR_MATCH_BASE,
-            (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        s_currentChecksum = 0xDEADDEAD;
-    }
+    // Compute deterministic gameplay-core checksum.
+    s_currentChecksum = ComputeGameplayDigestChecksum();
 
     StoreChecksumForFrame(frame, s_currentChecksum);
     DesyncDump_StoreChecksum(frame, s_currentChecksum);
@@ -162,7 +196,7 @@ void RollbackDebug_FrameUpdate() {
             Net::CHANNEL_DEBUG,
             Net::PacketType::StateDigest,
             &digest, sizeof(digest),
-            false  // Unreliable
+            true  // Reliable to avoid debug transport artifacts
         );
 
         s_digestsSent++;
@@ -181,8 +215,8 @@ void RollbackDebug_FrameUpdate() {
 
         RollbackSessionSnapshot rbSnap{};
         RollbackSession_GetSnapshot(&rbSnap);
-        status.remote_view_frame = 0;  // GekkoNet manages this internally
         status.confirmed_frame = rbSnap.last_confirmed_frame;
+        status.remote_view_frame = rbSnap.last_confirmed_frame;
         status.predicted_frames = rbSnap.predicted_frames_outstanding;
         status.checksum = s_currentChecksum;
 
@@ -228,14 +262,38 @@ void RollbackDebug_FrameUpdate() {
 void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc) {
     s_digestsRecv++;
 
-    // Only compare if we have a confirmed (non-predicted) state for this frame.
-    // With GekkoNet, use last_confirmed_frame from the snapshot.
+    // Only compare fully settled frames on BOTH peers.
     RollbackSessionSnapshot snap{};
     RollbackSession_GetSnapshot(&snap);
-    if (frame > snap.last_confirmed_frame) return;
+
+    constexpr int kMinimumSettleLagFrames = 6;
+    const int settleLagFrames = (std::max)(
+        kMinimumSettleLagFrames,
+        RollbackSession_GetRollbackBudget() + RollbackSession_GetActiveDelay() + 2);
+    const int32_t localSettledFrame = snap.current_frame - settleLagFrames;
+
+    if (frame > snap.last_confirmed_frame || frame > localSettledFrame) {
+        NetplayLog_Verbose("DIGEST", frame,
+            "Skip compare: frame not locally settled (frame=%d confirmed=%d settled=%d current=%d)",
+            frame,
+            snap.last_confirmed_frame,
+            localSettledFrame,
+            snap.current_frame);
+        return;
+    }
+
+    if (s_remoteStatusConfirmedFrame >= 0 && frame > s_remoteStatusConfirmedFrame) {
+        NetplayLog_Verbose("DIGEST", frame,
+            "Skip compare: frame not remotely confirmed yet (frame=%d remote_confirmed=%d)",
+            frame,
+            s_remoteStatusConfirmedFrame);
+        return;
+    }
 
     uint32_t local_crc = 0;
     if (!TryGetChecksumForFrame(frame, &local_crc)) {
+        NetplayLog_Verbose("DIGEST", frame,
+            "Skip compare: local checksum not retained for frame");
         return;
     }
 
@@ -290,7 +348,8 @@ void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_frame,
     const int32_t localGameFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
     const int32_t frameDelta = localFrame - remote_frame;
     const int32_t gameDelta = localGameFrame - remote_game_frame;
-    const int32_t remoteViewDelta = localFrame - remote_view_frame;
+    const bool remoteViewValid = (remote_view_frame >= 0);
+    const int32_t remoteViewDelta = remoteViewValid ? (localFrame - remote_view_frame) : 0;
 
     NetplayLog_Verbose("FSYNC", localFrame,
         "Remote status: remote_frame=%d remote_game=%d remote_view=%d confirmed=%d predicted=%d "
@@ -305,9 +364,17 @@ void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_frame,
         remoteViewDelta,
         remote_checksum);
 
-    if (frameDelta > 2 || frameDelta < -2 ||
-        gameDelta > 2 || gameDelta < -2 ||
-        remoteViewDelta > 4 || remoteViewDelta < -4) {
+    const int frameSkewThreshold = (std::max)(RollbackSession_GetRollbackBudget() + 2, 6);
+    const int gameSkewThreshold = 30;
+    const int remoteViewSkewThreshold = (std::max)(RollbackSession_GetRollbackBudget() + 4, 8);
+
+    const bool frameSkew = (frameDelta > frameSkewThreshold || frameDelta < -frameSkewThreshold);
+    const bool gameSkew = (gameDelta > gameSkewThreshold || gameDelta < -gameSkewThreshold);
+    const bool remoteViewSkew =
+        remoteViewValid &&
+        (remoteViewDelta > remoteViewSkewThreshold || remoteViewDelta < -remoteViewSkewThreshold);
+
+    if (frameSkew || gameSkew || remoteViewSkew) {
         NetplayLog_Write("FSYNC", localFrame,
             "SKEW: local_frame=%d remote_frame=%d local_game=%d remote_game=%d remote_view=%d "
             "confirmed=%d predicted=%d local_crc=0x%08X remote_crc=0x%08X",
