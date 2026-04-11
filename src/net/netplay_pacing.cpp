@@ -29,7 +29,6 @@ static bool s_initialized = false;
 static bool s_localModeLogged = false;
 static bool s_stallActive = false;
 static int  s_stallFrameCount = 0;
-static int  s_emergencyHoldCount = 0;
 static int  s_stallGap = 0;
 static int  s_stallThreshold = 0;
 
@@ -131,7 +130,6 @@ void NetplayPacing_Init() {
     s_localModeLogged = false;
     s_stallActive = false;
     s_stallFrameCount = 0;
-    s_emergencyHoldCount = 0;
     s_stallGap = 0;
     s_stallThreshold = 0;
     s_controller = NetplayPacingController{};
@@ -156,7 +154,6 @@ void NetplayPacing_ResetSession(const char* reason) {
     DeactivatePacing(s_phase, reason ? reason : "session reset", false);
     ResetNetplayTickScaleState();
     s_localModeLogged = false;
-    s_emergencyHoldCount = 0;
 }
 
 void NetplayPacing_NotifyLocalMode() {
@@ -239,23 +236,6 @@ NetplayPacingAction NetplayPacing_BeginFrame(
         s_stallFrameCount = 0;
     }
 
-    const bool saturatedSlowdown =
-        s_controller.filtered_adjust_ms >= (NetplayPacingController::kMaxAdjustMs - 0.05f);
-    if (telemetry.frames_ahead >= 3.0f && saturatedSlowdown) {
-        s_emergencyHoldCount++;
-        Rollback::NetplayLog_Write(
-            "PACE",
-            telemetry.rb_frame_current,
-            "emergency_hold phase=%s rb=%d frames_ahead=%.2f adjust_ms=%.2f threshold=%d count=%d",
-            MatchRollbackPhaseName(phase),
-            telemetry.rb_frame_current,
-            telemetry.frames_ahead,
-            s_controller.filtered_adjust_ms,
-            stallThreshold,
-            s_emergencyHoldCount);
-        return NetplayPacingAction::EmergencyHold;
-    }
-
     return NetplayPacingAction::None;
 }
 
@@ -325,7 +305,6 @@ void NetplayPacing_GetSnapshot(NetplayPacingSnapshot* out) {
     out->frames_ahead = s_controller.last_frames_ahead;
     out->filtered_adjust_ms = s_controller.filtered_adjust_ms;
     out->stall_frame_count = s_stallFrameCount;
-    out->emergency_hold_count = s_emergencyHoldCount;
     out->stall_gap = s_stallGap;
     out->stall_threshold = s_stallThreshold;
     CopyTickState(out);

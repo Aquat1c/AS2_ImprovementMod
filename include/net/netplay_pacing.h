@@ -10,7 +10,6 @@ namespace Net {
 enum class NetplayPacingAction : uint8_t {
     None = 0,
     StallHold,
-    EmergencyHold,
 };
 
 struct NetplayPacingSnapshot {
@@ -23,7 +22,6 @@ struct NetplayPacingSnapshot {
     float target_scale;
     float current_scale;
     int   stall_frame_count;
-    int   emergency_hold_count;
     int   stall_gap;
     int   stall_threshold;
 };

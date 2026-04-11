@@ -519,7 +519,6 @@ void RollbackDebug_RenderImGui(bool* p_open) {
         ImGui::Text("Tick Target:      %.3f", wiringSnap.target_tick_scale);
         ImGui::Text("Tick Current:     %.3f", wiringSnap.current_tick_scale);
         ImGui::Text("Stall Frames:     %d", tsDebug.stall_frame_count);
-        ImGui::Text("Emergency Holds:  %d", tsDebug.hard_skip_count);
         ImGui::Text("Stalled:          %s", tsDebug.stalled ? "yes" : "no");
         ImGui::Text("Local Delay:      %d", delaySnap.active_delay);
         ImGui::Text("Effective Delay:  %d", delaySnap.effective_local_delay);

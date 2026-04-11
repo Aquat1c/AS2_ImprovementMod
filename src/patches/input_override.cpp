@@ -1666,36 +1666,23 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             if (pacingAction != Net::NetplayPacingAction::None) {
                 Net::NetplayPacingSnapshot pacingSnap{};
                 Net::NetplayPacing_GetSnapshot(&pacingSnap);
-                if (pacingAction == Net::NetplayPacingAction::StallHold) {
-                    if (pacingSnap.stall_frame_count <= 5 ||
-                        (pacingSnap.stall_frame_count % 120) == 0) {
-                        Rollback::NetplayLog_Write(
-                            "STALL", currentFrame,
-                            "Holding gameplay: rb_current=%d rb_remote=%d gap=%d threshold=%d phase=%s",
-                            currentFrame,
-                            preTelemetry.rb_frame_last_remote_received,
-                            pacingSnap.stall_gap,
-                            pacingSnap.stall_threshold,
-                            Net::MatchRollbackPhaseName(rollbackPhase));
-                    }
-                } else if (pacingSnap.emergency_hold_count <= 5 ||
-                           (pacingSnap.emergency_hold_count % 120) == 0) {
+                if (pacingSnap.stall_frame_count <= 5 ||
+                    (pacingSnap.stall_frame_count % 120) == 0) {
                     Rollback::NetplayLog_Write(
-                        "TIMESYNC", currentFrame,
-                        "Emergency ahead-side hold: frames_ahead=%.2f target_scale=%.3f phase=%s count=%d",
-                        pacingSnap.frames_ahead,
-                        pacingSnap.target_scale,
+                        "STALL", currentFrame,
+                        "Holding gameplay: rb_current=%d rb_remote=%d gap=%d threshold=%d phase=%s count=%d",
+                        currentFrame,
+                        preTelemetry.rb_frame_last_remote_received,
+                        pacingSnap.stall_gap,
+                        pacingSnap.stall_threshold,
                         Net::MatchRollbackPhaseName(rollbackPhase),
-                        pacingSnap.emergency_hold_count);
+                        pacingSnap.stall_frame_count);
                 }
                 InputSyncHooks_SetTimesyncFreeze(true);
                 Net::Session_Update();
                 if (!Rollback::RollbackSession_PollSession()) {
                     InputSyncHooks_SetTimesyncFreeze(false);
-                    return AbortRollbackDispatcher(
-                        pacingAction == Net::NetplayPacingAction::StallHold
-                            ? "Peer disconnected during stall hold"
-                            : "Peer disconnected during emergency pacing hold");
+                    return AbortRollbackDispatcher("Peer disconnected during stall hold");
                 }
                 ResetVanillaTimeoutCounters();
                 return -1;
@@ -2261,6 +2248,5 @@ void GetTimesyncDebugInfo(TimesyncDebugInfo* out) {
     out->frames_ahead = pacingSnap.frames_ahead;
     out->rate_adjust_ms = pacingSnap.filtered_adjust_ms;
     out->stall_frame_count = pacingSnap.stall_frame_count;
-    out->hard_skip_count = pacingSnap.emergency_hold_count;
     out->stalled = pacingSnap.stall_active;
 }
