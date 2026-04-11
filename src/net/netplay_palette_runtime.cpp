@@ -73,6 +73,7 @@ static bool          s_initialized = false;
 static bool          s_enabled = true;
 static bool          s_remotePreviewEnabled = false;
 static bool          s_matchActive = false;
+static bool          s_winscreenSuppressOverrides = false;
 static uint32_t      s_localEpoch = 0;
 static uint32_t      s_stateRevision = 0;
 static uint32_t      s_configHash = 0;
@@ -136,6 +137,7 @@ static void AdvanceStateRevision() {
 
 static void ResetMatchState(const char* reason) {
     s_matchActive = false;
+    s_winscreenSuppressOverrides = false;
     s_localEpoch = 0;
     s_stateRevision = 0;
     s_configHash = 0;
@@ -254,6 +256,27 @@ static bool LocalTransportHasCustomBank() {
     return IsValidGameSlot(s_localGameSlot) &&
            s_enabled &&
            s_player[s_localGameSlot].local_custom_loaded;
+}
+
+static bool HasVisualOverrideForGameSlot(int gameSlot) {
+    if (!IsValidGameSlot(gameSlot)) {
+        return false;
+    }
+
+    const PlayerRuntime& player = s_player[gameSlot];
+    if (!player.valid) {
+        return false;
+    }
+
+    if (!s_matchActive) {
+        return player.local_custom_loaded;
+    }
+
+    if (gameSlot == s_localGameSlot) {
+        return player.local_custom_loaded;
+    }
+
+    return s_remotePreviewEnabled && player.remote_custom_loaded;
 }
 
 static uint8_t BuildLocalFlags() {
@@ -695,6 +718,60 @@ void NetplayPaletteRuntime_OnLockedMatchConfig(const LockedMatchConfig* config) 
         s_player[s_localGameSlot].local_custom_loaded ? 1 : 0);
 }
 
+void NetplayPaletteRuntime_OnRoundRestart() {
+    if (!s_initialized || !s_matchActive) {
+        return;
+    }
+
+    s_winscreenSuppressOverrides = false;
+
+    int reloadCount = 0;
+    for (int slot = 0; slot < 2; ++slot) {
+        if (!HasVisualOverrideForGameSlot(slot) || !s_player[slot].asset_loaded) {
+            continue;
+        }
+
+        RequestLiveReload((uint8_t)slot, "round restart reapply");
+        ++reloadCount;
+    }
+
+    SetStatus(reloadCount > 0
+            ? "Reapplying palette overrides for round restart"
+            : "Round restart: no palette overrides to reapply");
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Round restart palette refresh: reload_count=%d local_slot=%d suppress=%d",
+        reloadCount,
+        s_localGameSlot,
+        s_winscreenSuppressOverrides ? 1 : 0);
+}
+
+void NetplayPaletteRuntime_OnWinScreenEnter() {
+    if (!s_initialized || !s_matchActive || s_winscreenSuppressOverrides) {
+        return;
+    }
+
+    s_winscreenSuppressOverrides = true;
+
+    int reloadCount = 0;
+    for (int slot = 0; slot < 2; ++slot) {
+        if (!HasVisualOverrideForGameSlot(slot) || !s_player[slot].asset_loaded) {
+            continue;
+        }
+
+        RequestLiveReload((uint8_t)slot, "winscreen clear");
+        ++reloadCount;
+    }
+
+    SetStatus(reloadCount > 0
+            ? "Clearing palette overrides for win screen"
+            : "Win screen entered: palette overrides disabled");
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Win screen palette clear: reload_count=%d local_slot=%d remote_preview=%d",
+        reloadCount,
+        s_localGameSlot,
+        s_remotePreviewEnabled ? 1 : 0);
+}
+
 void NetplayPaletteRuntime_OnMatchEnd(const char* reason) {
     ResetMatchState(reason ? reason : "match ended");
 }
@@ -993,6 +1070,10 @@ bool NetplayPaletteRuntime_CopyAssetOverrideBank(uint8_t gameSlot, NetplayPalett
 
     if (!s_matchActive) {
         return CopyBank(s_player[gameSlot].local_custom_bank, out);
+    }
+
+    if (s_winscreenSuppressOverrides) {
+        return false;
     }
 
     if (gameSlot == (uint8_t)s_localGameSlot) {

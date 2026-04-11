@@ -27,6 +27,7 @@
 static bool g_menuOpen = true;
 static int g_currentTab = 0;
 static bool g_showAdvanced = false;
+static float g_lastMenuWindowScale = -1.0f;
 
 // Binding state (unified: one capture mode for both KB and gamepad)
 static bool g_waitingForBind = false;
@@ -99,6 +100,8 @@ static const char* GetBindingDisplayStr(const KeyBinding_t* bind, char* buf, int
 // ============================================================================
 
 static void TabInputConfig() {
+    const float uiScale = ModUI_GetScale();
+
     // Background input toggle
     bool bgInput = InputSystem_IsBackgroundInputEnabled();
     if (ImGui::Checkbox("Background Input (work when unfocused)", &bgInput)) {
@@ -181,7 +184,9 @@ static void TabInputConfig() {
                 PlayerBindings_t* bindings = (PlayerBindings_t*)InputSystem_GetBindings(player);
 
                 // Column headers
-                float col1 = 100.0f, col2 = col1 + 160.0f, col3 = col2 + 160.0f;
+                float col1 = ModUI_Scale(100.0f);
+                float col2 = col1 + ModUI_Scale(160.0f);
+                float col3 = col2 + ModUI_Scale(160.0f);
                 ImGui::Text("Action");
                 ImGui::SameLine(col1); ImGui::Text("Keyboard");
                 ImGui::SameLine(col2); ImGui::Text("Gamepad");
@@ -222,7 +227,7 @@ static void TabInputConfig() {
                             snprintf(id, sizeof(id), "%s##KB%d_%d", kbStr, player, i);
                         }
 
-                        if (ImGui::Button(id, ImVec2(140, 0))) {
+                        if (ImGui::Button(id, ImVec2(ModUI_Scale(140.0f), 0.0f))) {
                             if (!g_waitingForBind) {
                                 InputSystem_StartBinding(player, i);
                                 g_waitingForBind = true;
@@ -380,15 +385,25 @@ bool ModMenu_IsOpen() {
 
 void ModMenu_Render() {
     if (!ProxyMenuVisible() || !g_menuOpen) return;
+
+    const float uiScale = ModUI_GetScale();
+    const ImVec2 defaultPos(ModUI_Scale(10.0f), ModUI_Scale(10.0f));
+    const ImVec2 defaultSize(ModUI_Scale(500.0f), ModUI_Scale(440.0f));
     
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(500, 440), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(defaultPos, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(defaultSize, ImGuiCond_FirstUseEver);
     
     ImGuiWindowFlags flags = ImGuiWindowFlags_MenuBar;
     
     if (!ImGui::Begin("AS2 Mod", &g_menuOpen, flags)) {
         ImGui::End();
         return;
+    }
+
+    const float scaleDelta = uiScale - g_lastMenuWindowScale;
+    if (scaleDelta < -0.01f || scaleDelta > 0.01f) {
+        ImGui::SetWindowSize(defaultSize, ImGuiCond_Always);
+        g_lastMenuWindowScale = uiScale;
     }
     
     // Menu bar

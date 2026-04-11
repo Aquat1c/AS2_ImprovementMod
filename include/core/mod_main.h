@@ -76,6 +76,11 @@ uint16_t  GetP2HP();
 uint32_t  AS2_GetQuickChecksum();
 void      AS2_ClearVanillaNetplayBuffers();
 
+// Shared UI scaling helpers. These compensate for proxy upscaling so the
+// mod's ImGui does not become oversized when the window is enlarged.
+float     ModUI_GetScale();
+float     ModUI_Scale(float value);
+
 // Verbose logging control
 void SetVerboseLogging(bool enabled);
 bool GetVerboseLogging();

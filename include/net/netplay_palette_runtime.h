@@ -88,6 +88,8 @@ bool NetplayPaletteRuntime_GetSyncEnabled();
 bool NetplayPaletteRuntime_GetRemotePreviewEnabled();
 
 void NetplayPaletteRuntime_OnLockedMatchConfig(const LockedMatchConfig* config);
+void NetplayPaletteRuntime_OnRoundRestart();
+void NetplayPaletteRuntime_OnWinScreenEnter();
 void NetplayPaletteRuntime_OnMatchEnd(const char* reason);
 void NetplayPaletteRuntime_OnDisconnect(const char* reason);
 

@@ -21,6 +21,7 @@ namespace Net {
 constexpr uint16_t PROTOCOL_VERSION = 5;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
+constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
 constexpr int      NETPLAY_PALETTE_BANK_SIZE = 1024;
 constexpr int      NETPLAY_PALETTE_MAX_PAYLOAD = NETPLAY_PALETTE_BANK_SIZE;
 

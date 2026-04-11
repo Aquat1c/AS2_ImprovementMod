@@ -43,6 +43,7 @@
 #include "testing/scripted_input_runner.h"
 #include "training/practice_tools.h"
 #include "imgui.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <mmsystem.h>
@@ -80,6 +81,11 @@ static ModConfig g_config = {
 static HMODULE g_gameModule = nullptr;
 static bool g_initialized = false;
 static bool g_forceBorderlessFullscreen = false;
+static bool g_imguiBaseStyleCaptured = false;
+static float g_lastAppliedImGuiScale = -1.0f;
+static ImGuiStyle g_imguiBaseStyle = {};
+
+typedef void (__cdecl *ProxyGetResolution_t)(int* width, int* height);
 
 // ============================================================================
 // Config accessors (for other modules)
@@ -91,6 +97,82 @@ bool ModConfig_UseSDLInput() {
 
 bool ModConfig_VerboseLogging() {
     return g_config.verboseLogging;
+}
+
+static float ClampFloat(float value, float minValue, float maxValue) {
+    if (value < minValue) {
+        return minValue;
+    }
+    if (value > maxValue) {
+        return maxValue;
+    }
+    return value;
+}
+
+float ModUI_GetScale() {
+    static HMODULE s_proxyModule = nullptr;
+    static ProxyGetResolution_t s_getNativeResolution = nullptr;
+    static ProxyGetResolution_t s_getScreenResolution = nullptr;
+    static bool s_lookedUp = false;
+
+    if (!s_lookedUp) {
+        s_lookedUp = true;
+        s_proxyModule = GetModuleHandleA("d3d9.dll");
+        if (s_proxyModule) {
+            s_getNativeResolution = (ProxyGetResolution_t)GetProcAddress(s_proxyModule, "GetNativeResolution");
+            s_getScreenResolution = (ProxyGetResolution_t)GetProcAddress(s_proxyModule, "GetScreenResolution");
+        }
+    }
+
+    if (!s_getNativeResolution || !s_getScreenResolution) {
+        return 1.0f;
+    }
+
+    int nativeWidth = 0;
+    int nativeHeight = 0;
+    int screenWidth = 0;
+    int screenHeight = 0;
+    s_getNativeResolution(&nativeWidth, &nativeHeight);
+    s_getScreenResolution(&screenWidth, &screenHeight);
+    if (nativeWidth <= 0 || nativeHeight <= 0 || screenWidth <= 0 || screenHeight <= 0) {
+        return 1.0f;
+    }
+
+    const float scaleX = (float)screenWidth / (float)nativeWidth;
+    const float scaleY = (float)screenHeight / (float)nativeHeight;
+    float upscale = scaleX < scaleY ? scaleX : scaleY;
+    if (upscale < 1.0f) {
+        upscale = 1.0f;
+    }
+
+    return ClampFloat(1.0f / upscale, 0.40f, 1.0f);
+}
+
+float ModUI_Scale(float value) {
+    return value * ModUI_GetScale();
+}
+
+static void ApplySharedImGuiScale() {
+    if (!ImGui::GetCurrentContext()) {
+        return;
+    }
+
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImGuiIO& io = ImGui::GetIO();
+    if (!g_imguiBaseStyleCaptured) {
+        g_imguiBaseStyle = style;
+        g_imguiBaseStyleCaptured = true;
+    }
+
+    const float scale = ModUI_GetScale();
+    if (fabsf(scale - g_lastAppliedImGuiScale) < 0.001f) {
+        return;
+    }
+
+    style = g_imguiBaseStyle;
+    style.ScaleAllSizes(scale);
+    io.FontGlobalScale = scale;
+    g_lastAppliedImGuiScale = scale;
 }
 
 // ============================================================================
@@ -310,6 +392,8 @@ extern "C" {
 
 __declspec(dllexport) void ModSetImGuiContext(void* ctx) {
     ImGui::SetCurrentContext((ImGuiContext*)ctx);
+    g_imguiBaseStyleCaptured = false;
+    g_lastAppliedImGuiScale = -1.0f;
 }
 
 __declspec(dllexport) void ModSetLogDir(const char* dir) {
@@ -532,6 +616,7 @@ __declspec(dllexport) void ModOnFrame() {
 
 __declspec(dllexport) void ModOnPresent(void* pDevice) {
     if (!g_initialized) return;
+    ApplySharedImGuiScale();
     HitboxViewer_Render();
     NetplayHud_Render();
     PracticeTools_RenderHUD();

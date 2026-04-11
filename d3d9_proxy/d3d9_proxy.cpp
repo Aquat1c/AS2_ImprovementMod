@@ -436,6 +436,7 @@ static HWND g_gameWindow = nullptr;
 static HWND g_gameParentWindow = nullptr;
 static WNDPROC g_originalWndProc = nullptr;
 static IDirect3DDevice9* g_pDevice = nullptr;
+static bool g_imguiDrawDataReady = false;
 
 // Menu state
 static bool g_showMenu = true;
@@ -2285,6 +2286,7 @@ void ShutdownImGui() {
     if (!g_imguiInitialized) return;
     
     ProxyLog("[IMGUI] Shutting down ImGui...");
+    g_imguiDrawDataReady = false;
     
     if (g_originalWndProc && g_gameWindow) {
         SetWindowLongPtrA(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)g_originalWndProc);
@@ -2300,6 +2302,143 @@ void ShutdownImGui() {
 // ============================================================================
 // ImGui Rendering
 // ============================================================================
+
+static bool ShouldRenderImGuiViaScalingTarget() {
+    if (!g_scalingInitialized || !g_pScalingSwapChain || !g_pScalingBackBuffer) {
+        return false;
+    }
+
+    return g_isCurrentlyBorderless ||
+        g_currentWindowWidth > g_nativeWidth ||
+        g_currentWindowHeight > g_nativeHeight;
+}
+
+static void TransformImGuiDrawData(ImDrawData* drawData,
+                                   const ImVec2& originalDisplayPos,
+                                   float scaleX,
+                                   float scaleY,
+                                   float offsetX,
+                                   float offsetY) {
+    if (!drawData) {
+        return;
+    }
+
+    for (int listIndex = 0; listIndex < drawData->CmdListsCount; ++listIndex) {
+        ImDrawList* drawList = drawData->CmdLists[listIndex];
+        if (!drawList) {
+            continue;
+        }
+
+        for (int vertexIndex = 0; vertexIndex < drawList->VtxBuffer.Size; ++vertexIndex) {
+            ImDrawVert& vertex = drawList->VtxBuffer[vertexIndex];
+            vertex.pos.x = offsetX + (vertex.pos.x - originalDisplayPos.x) * scaleX;
+            vertex.pos.y = offsetY + (vertex.pos.y - originalDisplayPos.y) * scaleY;
+        }
+
+        for (int cmdIndex = 0; cmdIndex < drawList->CmdBuffer.Size; ++cmdIndex) {
+            ImDrawCmd& cmd = drawList->CmdBuffer[cmdIndex];
+            cmd.ClipRect.x = offsetX + (cmd.ClipRect.x - originalDisplayPos.x) * scaleX;
+            cmd.ClipRect.y = offsetY + (cmd.ClipRect.y - originalDisplayPos.y) * scaleY;
+            cmd.ClipRect.z = offsetX + (cmd.ClipRect.z - originalDisplayPos.x) * scaleX;
+            cmd.ClipRect.w = offsetY + (cmd.ClipRect.w - originalDisplayPos.y) * scaleY;
+        }
+    }
+}
+
+static bool RenderPreparedImGuiToScalingTarget(IDirect3DDevice9* pDevice,
+                                               IDirect3DSurface9* pTargetSurface,
+                                               int targetWidth,
+                                               int targetHeight,
+                                               const RECT& destRect) {
+    if (!g_imguiDrawDataReady || !pDevice || !pTargetSurface) {
+        return false;
+    }
+
+    ImDrawData* drawData = ImGui::GetDrawData();
+    if (!drawData || drawData->CmdListsCount <= 0 ||
+        drawData->DisplaySize.x <= 0.0f || drawData->DisplaySize.y <= 0.0f) {
+        g_imguiDrawDataReady = false;
+        return false;
+    }
+
+    const int destWidth = destRect.right - destRect.left;
+    const int destHeight = destRect.bottom - destRect.top;
+    if (destWidth <= 0 || destHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+        g_imguiDrawDataReady = false;
+        return false;
+    }
+
+    const ImVec2 originalDisplayPos = drawData->DisplayPos;
+    const ImVec2 originalDisplaySize = drawData->DisplaySize;
+    const ImVec2 originalFramebufferScale = drawData->FramebufferScale;
+    const float scaleX = (float)destWidth / originalDisplaySize.x;
+    const float scaleY = (float)destHeight / originalDisplaySize.y;
+
+    IDirect3DSurface9* previousRenderTarget = nullptr;
+    IDirect3DSurface9* previousDepthStencil = nullptr;
+    pDevice->GetRenderTarget(0, &previousRenderTarget);
+    pDevice->GetDepthStencilSurface(&previousDepthStencil);
+
+    HRESULT hr = pDevice->SetRenderTarget(0, pTargetSurface);
+    if (FAILED(hr)) {
+        if (previousDepthStencil) previousDepthStencil->Release();
+        if (previousRenderTarget) previousRenderTarget->Release();
+        g_imguiDrawDataReady = false;
+        return false;
+    }
+
+    pDevice->SetDepthStencilSurface(nullptr);
+
+    hr = pDevice->BeginScene();
+    if (FAILED(hr)) {
+        if (previousDepthStencil) {
+            pDevice->SetDepthStencilSurface(previousDepthStencil);
+        }
+        if (previousRenderTarget) {
+            pDevice->SetRenderTarget(0, previousRenderTarget);
+        }
+        if (previousDepthStencil) previousDepthStencil->Release();
+        if (previousRenderTarget) previousRenderTarget->Release();
+        g_imguiDrawDataReady = false;
+        return false;
+    }
+
+    TransformImGuiDrawData(drawData,
+        originalDisplayPos,
+        scaleX,
+        scaleY,
+        (float)destRect.left,
+        (float)destRect.top);
+    drawData->DisplayPos = ImVec2(0.0f, 0.0f);
+    drawData->DisplaySize = ImVec2((float)targetWidth, (float)targetHeight);
+    drawData->FramebufferScale = ImVec2(1.0f, 1.0f);
+
+    ImGui_ImplDX9_RenderDrawData(drawData);
+
+    drawData->DisplayPos = originalDisplayPos;
+    drawData->DisplaySize = originalDisplaySize;
+    drawData->FramebufferScale = originalFramebufferScale;
+    TransformImGuiDrawData(drawData,
+        ImVec2((float)destRect.left, (float)destRect.top),
+        1.0f / scaleX,
+        1.0f / scaleY,
+        originalDisplayPos.x,
+        originalDisplayPos.y);
+
+    pDevice->EndScene();
+
+    if (previousDepthStencil) {
+        pDevice->SetDepthStencilSurface(previousDepthStencil);
+        previousDepthStencil->Release();
+    }
+    if (previousRenderTarget) {
+        pDevice->SetRenderTarget(0, previousRenderTarget);
+        previousRenderTarget->Release();
+    }
+
+    g_imguiDrawDataReady = false;
+    return true;
+}
 
 void RenderImGui() {
     if (!g_imguiInitialized || !g_pDevice) return;
@@ -2359,7 +2498,13 @@ void RenderImGui() {
     // Render
     ImGui::EndFrame();
     ImGui::Render();
+    g_imguiDrawDataReady = true;
+    if (ShouldRenderImGuiViaScalingTarget()) {
+        return;
+    }
+
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    g_imguiDrawDataReady = false;
 }
 
 // ============================================================================
@@ -2741,6 +2886,20 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* pDevice,
                 // Fall through to try original present
                 return g_pOriginalPresent(pDevice, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
             }
+
+            if (g_imguiDrawDataReady) {
+                D3DSURFACE_DESC scalingDesc = {};
+                if (SUCCEEDED(g_pScalingBackBuffer->GetDesc(&scalingDesc))) {
+                    RenderPreparedImGuiToScalingTarget(
+                        pDevice,
+                        g_pScalingBackBuffer,
+                        (int)scalingDesc.Width,
+                        (int)scalingDesc.Height,
+                        g_letterboxDestRect);
+                } else {
+                    g_imguiDrawDataReady = false;
+                }
+            }
             
             // Present the scaling swap chain (this fills the window!)
             if (shouldLog) {
@@ -2937,6 +3096,20 @@ HRESULT WINAPI HookedSwapChainPresent(IDirect3DSwapChain9* pSwapChain,
             ProxyLog("[SWAPCHAIN] ERROR: StretchRect failed: 0x%08X", hr);
             if (hr == D3DERR_DEVICELOST) {
                 g_deviceLost = true;
+            }
+        }
+
+        if (SUCCEEDED(hr) && g_imguiDrawDataReady) {
+            D3DSURFACE_DESC scalingDesc = {};
+            if (SUCCEEDED(g_pScalingBackBuffer->GetDesc(&scalingDesc))) {
+                RenderPreparedImGuiToScalingTarget(
+                    pDevice,
+                    g_pScalingBackBuffer,
+                    (int)scalingDesc.Width,
+                    (int)scalingDesc.Height,
+                    g_letterboxDestRect);
+            } else {
+                g_imguiDrawDataReady = false;
             }
         }
         

@@ -888,6 +888,7 @@ static void CheckLifecyclePhase() {
         // Entering WinScreenActive — begin win screen sync
         if (curPhase == Net::MatchLifecyclePhase::WinScreenActive &&
             s_lastLifecyclePhase != Net::MatchLifecyclePhase::WinScreenActive) {
+            Net::NetplayPaletteRuntime_OnWinScreenEnter();
             Net::WinScreenSync_Begin();
             NetplayLog_Write("LIFE", -1,
                 "Win screen entered — rollback gameplay session detached, post-match lockstep active");
@@ -930,6 +931,9 @@ static void CheckLifecyclePhase() {
 
         // MatchInit — potential round restart, re-enable gameplay flag
         if (curPhase == Net::MatchLifecyclePhase::MatchInit && s_rollbackStarted) {
+            if (s_lastLifecyclePhase == Net::MatchLifecyclePhase::RoundTransition) {
+                Net::NetplayPaletteRuntime_OnRoundRestart();
+            }
             // New round starting — rollback session stays alive
             NetplayLog_Write("LIFE", -1,
                 "New round init — same rollback session continues: frame_origin_abs=%d startup_released=%d pending_frame=%d",
