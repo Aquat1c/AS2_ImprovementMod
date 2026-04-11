@@ -163,14 +163,42 @@ static void BuildPalettePayload(Spectator::PaletteStatePayload* out) {
         out->player[index].character_id = palette.player[index].character_id;
         out->player[index].base_palette = palette.player[index].base_palette;
         out->player[index].flags = palette.player[index].flags;
-        out->player[index].payload_size = (uint8_t)palette.player[index].payload_size;
+        out->player[index].has_custom_data = palette.player[index].has_custom_bank ? 1 : 0;
+        out->player[index].payload_size = palette.player[index].payload_size;
         out->player[index].payload_crc = palette.player[index].payload_crc;
-        if (palette.player[index].payload_size > 0) {
-            memcpy(out->player[index].payload,
-                palette.player[index].payload,
-                palette.player[index].payload_size);
-        }
     }
+}
+
+static bool SendPaletteSyncForPeer(uintptr_t peerId,
+                                   const Spectator::PaletteStatePayload* statePayload) {
+    if (!statePayload || !SpectatorManager_SendPaletteState(peerId, statePayload)) {
+        return false;
+    }
+
+    for (int index = 0; index < 2; index++) {
+        if (!statePayload->player[index].has_custom_data ||
+            statePayload->player[index].payload_size != NETPLAY_PALETTE_BANK_SIZE) {
+            continue;
+        }
+
+        NetplayPaletteBank bank{};
+        if (!NetplayPaletteRuntime_CopySpectatorBank((uint8_t)index, &bank)) {
+            continue;
+        }
+
+        Spectator::PaletteDataPayload data{};
+        data.match_id = statePayload->match_id;
+        data.palette_epoch = statePayload->palette_epoch;
+        data.game_slot = (uint8_t)index;
+        data.character_id = bank.character_id;
+        data.base_palette = bank.base_palette;
+        data.payload_crc = bank.crc32;
+        data.payload_size = NETPLAY_PALETTE_BANK_SIZE;
+        memcpy(data.payload, bank.data, NETPLAY_PALETTE_BANK_SIZE);
+        SpectatorManager_SendPaletteData(peerId, &data);
+    }
+
+    return true;
 }
 
 } // namespace
@@ -253,7 +281,7 @@ void SpectatorRuntime_FrameUpdate() {
         const SpectatorPeerSnapshot& peer = peers[peerIndex];
         if (peer.needs_full_sync) {
             SpectatorManager_SendMatchState(peer.peer_id, &matchPayload);
-            SpectatorManager_SendPaletteState(peer.peer_id, &palettePayload);
+            SendPaletteSyncForPeer(peer.peer_id, &palettePayload);
             SpectatorManager_SetPeerNextFrame(peer.peer_id, s_archiveBaseRbFrame);
             SpectatorManager_ClearPeerFullSync(peer.peer_id);
         }
@@ -294,7 +322,7 @@ void SpectatorRuntime_FrameUpdate() {
     if (paletteSnapshot.epoch != s_lastBroadcastPaletteEpoch) {
         s_lastBroadcastPaletteEpoch = paletteSnapshot.epoch;
         for (int peerIndex = 0; peerIndex < peerCount; peerIndex++) {
-            SpectatorManager_SendPaletteState(peers[peerIndex].peer_id, &palettePayload);
+            SendPaletteSyncForPeer(peers[peerIndex].peer_id, &palettePayload);
         }
     }
 

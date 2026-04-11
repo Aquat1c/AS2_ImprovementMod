@@ -429,6 +429,17 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
             break;
         }
 
+        case Net::PacketType::PaletteData: {
+            if (payloadLen < sizeof(Net::PaletteDataPayload)) {
+                LogGameplayPacketAnomaly("Short PaletteData", type, payloadLen,
+                                         sizeof(Net::PaletteDataPayload));
+                break;
+            }
+            Net::NetplayPaletteRuntime_OnRemoteData(
+                static_cast<const Net::PaletteDataPayload*>(payload));
+            break;
+        }
+
         case Net::PacketType::PaletteAck: {
             if (payloadLen < sizeof(Net::PaletteAckPayload)) {
                 LogGameplayPacketAnomaly("Short PaletteAck", type, payloadLen,

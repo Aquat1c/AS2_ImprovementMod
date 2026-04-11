@@ -18,10 +18,11 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 4;
+constexpr uint16_t PROTOCOL_VERSION = 5;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
-constexpr int      NETPLAY_PALETTE_MAX_PAYLOAD = 128;
+constexpr int      NETPLAY_PALETTE_BANK_SIZE = 1024;
+constexpr int      NETPLAY_PALETTE_MAX_PAYLOAD = NETPLAY_PALETTE_BANK_SIZE;
 
 // ============================================================================
 // ENet Channel Assignments
@@ -74,7 +75,8 @@ enum class PacketType : uint16_t {
 
     // Palette metadata control-plane (reliable, channel 0)
     PaletteConfig      = 50,
-    PaletteAck         = 51,
+    PaletteData        = 51,
+    PaletteAck         = 52,
 
     // Gameplay (unreliable, channel 1)
     GameplayInput   = 20,   // Legacy mod-owned rollback input sync (DEAD — no send site)
@@ -318,10 +320,22 @@ struct PaletteConfigPayload {
     uint8_t  character_id;
     uint8_t  base_palette;
     uint8_t  flags;
-    uint32_t payload_crc;
     uint16_t payload_size;
     uint16_t _pad;
-    uint8_t  payload[NETPLAY_PALETTE_MAX_PAYLOAD];
+    uint32_t payload_crc;
+};
+
+struct PaletteDataPayload {
+    uint32_t epoch;
+    uint32_t config_hash;
+    uint8_t  game_slot;
+    uint8_t  character_id;
+    uint8_t  base_palette;
+    uint8_t  _pad0;
+    uint32_t payload_crc;
+    uint16_t payload_size;
+    uint16_t _pad1;
+    uint8_t  payload[NETPLAY_PALETTE_BANK_SIZE];
 };
 
 struct PaletteAckPayload {
@@ -329,7 +343,8 @@ struct PaletteAckPayload {
     uint32_t config_hash;
     uint8_t  game_slot;
     uint8_t  accepted;
-    uint16_t payload_size;
+    uint8_t  received_data;
+    uint8_t  _pad;
     uint32_t payload_crc;
 };
 
@@ -354,6 +369,9 @@ constexpr uint8_t NETPLAY_PALETTE_FLAG_TRANSPORT_ENABLED = 1 << 0;
 constexpr uint8_t NETPLAY_PALETTE_FLAG_REMOTE_PREVIEW_ENABLED = 1 << 1;
 constexpr uint8_t NETPLAY_PALETTE_FLAG_HAS_CUSTOM_DATA = 1 << 2;
 constexpr uint8_t NETPLAY_PALETTE_FLAG_SPECTATOR_PROPAGATE = 1 << 3;
+
+static_assert(sizeof(PacketType) + sizeof(PaletteDataPayload) <= MAX_PACKET_SIZE,
+    "PaletteDataPayload must fit inside one transport packet");
 
 // NatInfoPayload flags
 constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;
@@ -402,6 +420,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::PauseQuit:           return "PauseQuit";
         case PacketType::WinScreenFrameInput: return "WinScreenFrameInput";
         case PacketType::PaletteConfig:       return "PaletteConfig";
+        case PacketType::PaletteData:         return "PaletteData";
         case PacketType::PaletteAck:          return "PaletteAck";
         case PacketType::Ping:           return "Ping";
         case PacketType::Pong:           return "Pong";

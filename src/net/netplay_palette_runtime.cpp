@@ -1,10 +1,18 @@
 #include "net/netplay_palette_runtime.h"
 
+#include "core/game_state.h"
+#include "net/netplay_palette_storage.h"
 #include "net/player_side_mapping.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "patches/memory_utils.h"
 #include "rollback/netplay_log.h"
+#include "ui/log_window.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -15,20 +23,68 @@ namespace {
 using namespace Net;
 
 constexpr DWORD kPaletteResendIntervalMs = 500;
+constexpr const char* kCharacterArchiveStemById[] = {
+    "ran",
+    "hat",
+    "pat",
+    "see",
+    "ray",
+    "ari",
+    "mar",
+    "shi",
+    "fan",
+    "mik",
+    "men",
+    "han",
+    "sat",
+    "tig",
+    "esc",
+    "mak",
+    "ali",
+    "nal",
+    "dem",
+    "lit",
+    "tad",
+    "fna",
+};
 
-static bool s_initialized = false;
-static bool s_enabled = true;
-static bool s_remotePreviewEnabled = false;
-static bool s_matchActive = false;
-static uint32_t s_epoch = 0;
-static uint32_t s_configHash = 0;
-static bool s_localDirty = false;
-static bool s_localSent = false;
-static bool s_remoteAcknowledged = false;
-static DWORD s_lastSendAt = 0;
-static int s_localGameSlot = -1;
-static NetplayPalettePlayerState s_player[2] = {};
-static char s_status[128] = "Palette runtime idle.";
+struct PlayerRuntime {
+    bool               valid;
+    uint8_t            game_slot;
+    uint8_t            character_id;
+    uint8_t            base_palette;
+    uint8_t            remote_flags;
+    uint32_t           remote_epoch;
+    uint32_t           remote_config_hash;
+    bool               asset_loaded;
+    uint16_t           asset_count;
+    char               archive_path[MAX_PATH];
+    char               patch_path[MAX_PATH];
+    NetplayPaletteBank vanilla_bank;
+    NetplayPaletteBank live_bank;
+    bool               live_bank_loaded;
+    NetplayPaletteBank local_custom_bank;
+    bool               local_custom_loaded;
+    NetplayPaletteBank remote_custom_bank;
+    bool               remote_custom_loaded;
+};
+
+static bool          s_initialized = false;
+static bool          s_enabled = true;
+static bool          s_remotePreviewEnabled = false;
+static bool          s_matchActive = false;
+static uint32_t      s_localEpoch = 0;
+static uint32_t      s_stateRevision = 0;
+static uint32_t      s_configHash = 0;
+static bool          s_localDirty = false;
+static bool          s_localSent = false;
+static bool          s_remoteAcknowledged = false;
+static DWORD         s_lastSendAt = 0;
+static int           s_localGameSlot = -1;
+static int           s_offlineEditorGameSlot = -1;
+static PlayerRuntime s_player[2] = {};
+static bool          s_liveReloadRequested[2] = {};
+static char          s_status[128] = "Palette runtime idle.";
 
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
@@ -48,82 +104,461 @@ static void SetStatus(const char* fmt, ...) {
     va_end(ap);
 }
 
+static void ZeroBank(NetplayPaletteBank* bank) {
+    if (!bank) {
+        return;
+    }
+    memset(bank, 0, sizeof(*bank));
+    bank->valid = false;
+}
+
+static void ClearPlayerRuntime(PlayerRuntime* player, uint8_t gameSlot) {
+    if (!player) {
+        return;
+    }
+    memset(player, 0, sizeof(*player));
+    player->game_slot = gameSlot;
+}
+
+static void AdvanceLocalEpoch() {
+    ++s_localEpoch;
+    if (s_localEpoch == 0) {
+        s_localEpoch = 1;
+    }
+}
+
+static void AdvanceStateRevision() {
+    ++s_stateRevision;
+    if (s_stateRevision == 0) {
+        s_stateRevision = 1;
+    }
+}
+
 static void ResetMatchState(const char* reason) {
     s_matchActive = false;
+    s_localEpoch = 0;
+    s_stateRevision = 0;
     s_configHash = 0;
     s_localDirty = false;
     s_localSent = false;
     s_remoteAcknowledged = false;
     s_lastSendAt = 0;
     s_localGameSlot = -1;
-    memset(s_player, 0, sizeof(s_player));
+    s_offlineEditorGameSlot = -1;
+    memset(s_liveReloadRequested, 0, sizeof(s_liveReloadRequested));
+    ClearPlayerRuntime(&s_player[0], 0);
+    ClearPlayerRuntime(&s_player[1], 1);
     SetStatus("Palette runtime idle%s%s",
         reason ? ": " : "",
         reason ? reason : "");
+    LOG_INFO("[Palette] Runtime reset: reason=%s", reason ? reason : "none");
 }
 
-static void RefreshLocalFlags() {
-    if (s_localGameSlot < 0 || s_localGameSlot > 1) {
-        return;
+static bool IsValidGameSlot(int gameSlot) {
+    return gameSlot >= 0 && gameSlot < 2;
+}
+
+static bool HasOfflineLocalContext() {
+    return !s_matchActive &&
+           (s_player[0].valid || s_player[1].valid);
+}
+
+static bool IsOfflinePaletteEditingGameType(uint32_t gameType) {
+    switch (gameType) {
+        case GAMETYPE_ARCADE:
+        case GAMETYPE_VS_CPU:
+        case GAMETYPE_VS_HUMAN:
+        case GAMETYPE_TRAINING:
+            return true;
+        default:
+            return false;
     }
-    NetplayPalettePlayerState& local = s_player[s_localGameSlot];
-    local.flags = 0;
+}
+
+static bool IsOfflinePaletteContextRetentionMode(uint32_t gameMode) {
+    switch (gameMode) {
+        case MODE_CHARSEL:
+        case MODE_PREMATCH_INTRO:
+        case MODE_MATCH:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool IsIgnoredOfflinePaletteGameType(uint32_t gameType) {
+    return gameType == GAMETYPE_NETPLAY ||
+           gameType == GAMETYPE_REPLAY ||
+           gameType == GAMETYPE_DEMO;
+}
+
+static int FindFirstValidOfflineGameSlot() {
+    for (int slot = 0; slot < 2; slot++) {
+        if (s_player[slot].valid) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
+static int GetEditableGameSlot() {
+    if (s_matchActive) {
+        return IsValidGameSlot(s_localGameSlot) ? s_localGameSlot : -1;
+    }
+
+    if (GetGameMode() != MODE_MATCH || !HasOfflineLocalContext()) {
+        return -1;
+    }
+
+    if (IsValidGameSlot(s_offlineEditorGameSlot) && s_player[s_offlineEditorGameSlot].valid) {
+        return s_offlineEditorGameSlot;
+    }
+
+    return FindFirstValidOfflineGameSlot();
+}
+
+static int ResolveCharacterIdFromArchivePath(const char* archivePath) {
+    if (!archivePath || !archivePath[0]) {
+        return -1;
+    }
+
+    const char* stem = archivePath;
+    for (const char* scan = archivePath; *scan; ++scan) {
+        if (*scan == '\\' || *scan == '/') {
+            stem = scan + 1;
+        }
+    }
+
+    char fileStem[16] = {};
+    size_t stemLen = 0;
+    while (stem[stemLen] && stem[stemLen] != '.' && stemLen + 1 < sizeof(fileStem)) {
+        fileStem[stemLen] = stem[stemLen];
+        ++stemLen;
+    }
+    fileStem[stemLen] = '\0';
+
+    if (stemLen == 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < (int)(sizeof(kCharacterArchiveStemById) / sizeof(kCharacterArchiveStemById[0])); ++i) {
+        if (_stricmp(fileStem, kCharacterArchiveStemById[i]) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static bool LocalTransportHasCustomBank() {
+    return IsValidGameSlot(s_localGameSlot) &&
+           s_enabled &&
+           s_player[s_localGameSlot].local_custom_loaded;
+}
+
+static uint8_t BuildLocalFlags() {
+    uint8_t flags = 0;
     if (s_enabled) {
-        local.flags |= NETPLAY_PALETTE_FLAG_TRANSPORT_ENABLED;
+        flags |= NETPLAY_PALETTE_FLAG_TRANSPORT_ENABLED;
     }
     if (s_remotePreviewEnabled) {
-        local.flags |= NETPLAY_PALETTE_FLAG_REMOTE_PREVIEW_ENABLED;
+        flags |= NETPLAY_PALETTE_FLAG_REMOTE_PREVIEW_ENABLED;
     }
-    if (local.payload_size > 0) {
-        local.flags |= NETPLAY_PALETTE_FLAG_HAS_CUSTOM_DATA;
+    if (LocalTransportHasCustomBank()) {
+        flags |= NETPLAY_PALETTE_FLAG_HAS_CUSTOM_DATA;
     }
-    local.flags |= NETPLAY_PALETTE_FLAG_SPECTATOR_PROPAGATE;
+    if (IsValidGameSlot(s_localGameSlot) && s_player[s_localGameSlot].local_custom_loaded) {
+        flags |= NETPLAY_PALETTE_FLAG_SPECTATOR_PROPAGATE;
+    }
+    return flags;
+}
+
+static void MarkLocalDirty(bool visualStateChanged, const char* reason) {
+    AdvanceLocalEpoch();
+    if (visualStateChanged) {
+        AdvanceStateRevision();
+    }
+    s_localDirty = true;
+    s_localSent = false;
+    s_remoteAcknowledged = false;
+    s_lastSendAt = 0;
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Local palette dirty: visual=%d reason=%s epoch=%u state=%u",
+        visualStateChanged ? 1 : 0,
+        reason ? reason : "unspecified",
+        s_localEpoch,
+        s_stateRevision);
+}
+
+static void RequestLiveReload(uint8_t gameSlot, const char* reason) {
+    if (!IsValidGameSlot(gameSlot) || !s_player[gameSlot].asset_loaded) {
+        return;
+    }
+    s_liveReloadRequested[gameSlot] = true;
+    LOG_INFO("[Palette] Live reload requested slot=P%d reason=%s",
+        gameSlot + 1,
+        reason ? reason : "unspecified");
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Live reload requested: slot=P%d reason=%s",
+        gameSlot + 1,
+        reason ? reason : "unspecified");
+}
+
+static void RefreshLocalStoredBank() {
+    if (!IsValidGameSlot(s_localGameSlot)) {
+        return;
+    }
+
+    PlayerRuntime& local = s_player[s_localGameSlot];
+    ZeroBank(&local.local_custom_bank);
+    local.local_custom_loaded = NetplayPaletteStorage_GetBank(
+        local.character_id,
+        local.base_palette,
+        &local.local_custom_bank);
+}
+
+static void RefreshStoredBankForSlot(uint8_t gameSlot) {
+    if (!IsValidGameSlot(gameSlot)) {
+        return;
+    }
+
+    PlayerRuntime& player = s_player[gameSlot];
+    ZeroBank(&player.local_custom_bank);
+    player.local_custom_loaded = NetplayPaletteStorage_GetBank(
+        player.character_id,
+        player.base_palette,
+        &player.local_custom_bank);
+}
+
+static void MaybeArmOfflineLocalContext(uint8_t gameSlot,
+                                        uint8_t characterId,
+                                        uint8_t basePalette) {
+    const uint32_t gameType = GetGameType();
+    if (s_matchActive) {
+        LOG_INFO("[Palette] Offline context skip: slot=P%d char=%u base=%u reason=match-active mode=%u sub=%u type=%u",
+            gameSlot + 1,
+            characterId,
+            basePalette,
+            (unsigned)GetGameMode(),
+            (unsigned)GetSubstate(),
+            (unsigned)gameType);
+        return;
+    }
+
+    if (IsIgnoredOfflinePaletteGameType(gameType) ||
+        !IsOfflinePaletteEditingGameType(gameType)) {
+        LOG_INFO("[Palette] Offline context skip: slot=P%d char=%u base=%u reason=game-type mode=%u sub=%u type=%u",
+            gameSlot + 1,
+            characterId,
+            basePalette,
+            (unsigned)GetGameMode(),
+            (unsigned)GetSubstate(),
+            (unsigned)gameType);
+        return;
+    }
+
+    PlayerRuntime& player = s_player[gameSlot];
+    const bool sameContext = player.valid &&
+        player.character_id == characterId &&
+        player.base_palette == basePalette;
+
+    player.valid = true;
+    player.game_slot = gameSlot;
+    player.character_id = characterId;
+    player.base_palette = basePalette;
+
+    if (!IsValidGameSlot(s_offlineEditorGameSlot) || !s_player[s_offlineEditorGameSlot].valid) {
+        s_offlineEditorGameSlot = gameSlot;
+    }
+
+    if (sameContext) {
+        return;
+    }
+
+    RefreshStoredBankForSlot(gameSlot);
+    AdvanceStateRevision();
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Offline palette context armed: slot=P%d char=%u base=%u stored_custom=%d",
+        gameSlot + 1,
+        player.character_id,
+        player.base_palette,
+        player.local_custom_loaded ? 1 : 0);
+    LOG_INFO("[Palette] Offline context armed slot=P%d char=%u base=%u stored=%d mode=%u sub=%u type=%u",
+        gameSlot + 1,
+        player.character_id,
+        player.base_palette,
+        player.local_custom_loaded ? 1 : 0,
+        (unsigned)GetGameMode(),
+        (unsigned)GetSubstate(),
+        (unsigned)GetGameType());
+}
+
+static void MarkPaletteChanged(uint8_t gameSlot, bool visualStateChanged, const char* reason) {
+    if (s_matchActive && gameSlot == (uint8_t)s_localGameSlot) {
+        MarkLocalDirty(visualStateChanged, reason);
+        return;
+    }
+
+    if (visualStateChanged) {
+        AdvanceStateRevision();
+    }
+
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Offline palette changed: slot=P%d visual=%d reason=%s state=%u",
+        gameSlot + 1,
+        visualStateChanged ? 1 : 0,
+        reason ? reason : "unspecified",
+        s_stateRevision);
+}
+
+static void SendAck(uint8_t gameSlot,
+                    uint32_t epoch,
+                    uint32_t configHash,
+                    uint8_t accepted,
+                    uint8_t receivedData,
+                    uint32_t payloadCrc) {
+    PaletteAckPayload ack{};
+    ack.epoch = epoch;
+    ack.config_hash = configHash;
+    ack.game_slot = gameSlot;
+    ack.accepted = accepted;
+    ack.received_data = receivedData;
+    ack.payload_crc = payloadCrc;
+    Session_SendPacket(
+        CHANNEL_CONTROL,
+        PacketType::PaletteAck,
+        &ack,
+        sizeof(ack),
+        true);
 }
 
 static bool SendLocalConfig() {
-    if (!s_matchActive || !Session_IsConnected() || s_localGameSlot < 0 || s_localGameSlot > 1) {
+    if (!s_matchActive || !Session_IsConnected() || !IsValidGameSlot(s_localGameSlot)) {
         return false;
     }
 
-    RefreshLocalFlags();
+    PlayerRuntime& local = s_player[s_localGameSlot];
+    const bool hasCustomData = LocalTransportHasCustomBank();
 
-    const NetplayPalettePlayerState& local = s_player[s_localGameSlot];
-    PaletteConfigPayload payload{};
-    payload.epoch = s_epoch;
-    payload.config_hash = s_configHash;
-    payload.game_slot = (uint8_t)s_localGameSlot;
-    payload.character_id = local.character_id;
-    payload.base_palette = local.base_palette;
-    payload.flags = local.flags;
-    payload.payload_crc = local.payload_crc;
-    payload.payload_size = (uint16_t)local.payload_size;
-    if (local.payload_size > 0) {
-        memcpy(payload.payload, local.payload, local.payload_size);
-    }
+    PaletteConfigPayload config{};
+    config.epoch = s_localEpoch;
+    config.config_hash = s_configHash;
+    config.game_slot = (uint8_t)s_localGameSlot;
+    config.character_id = local.character_id;
+    config.base_palette = local.base_palette;
+    config.flags = BuildLocalFlags();
+    config.payload_size = hasCustomData ? NETPLAY_PALETTE_BANK_SIZE : 0;
+    config.payload_crc = hasCustomData ? local.local_custom_bank.crc32 : 0;
 
-    const bool sent = Session_SendPacket(
+    const bool configSent = Session_SendPacket(
         CHANNEL_CONTROL,
         PacketType::PaletteConfig,
-        &payload,
-        sizeof(payload),
+        &config,
+        sizeof(config),
         true);
-    if (sent) {
+
+    bool dataSent = true;
+    if (configSent && hasCustomData) {
+        PaletteDataPayload data{};
+        data.epoch = s_localEpoch;
+        data.config_hash = s_configHash;
+        data.game_slot = (uint8_t)s_localGameSlot;
+        data.character_id = local.character_id;
+        data.base_palette = local.base_palette;
+        data.payload_crc = local.local_custom_bank.crc32;
+        data.payload_size = NETPLAY_PALETTE_BANK_SIZE;
+        memcpy(data.payload, local.local_custom_bank.data, NETPLAY_PALETTE_BANK_SIZE);
+        dataSent = Session_SendPacket(
+            CHANNEL_CONTROL,
+            PacketType::PaletteData,
+            &data,
+            sizeof(data),
+            true);
+    }
+
+    if (configSent) {
         s_localSent = true;
         s_localDirty = false;
         s_lastSendAt = GetTickCount();
-        SetStatus("Palette epoch %u sent for P%d", s_epoch, s_localGameSlot + 1);
+        SetStatus("Palette epoch %u sent for P%d", s_localEpoch, s_localGameSlot + 1);
         Rollback::NetplayLog_Write("PALETTE", -1,
-            "Local palette config sent: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X",
-            s_epoch,
+            "Local palette send: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X data_sent=%d",
+            s_localEpoch,
             s_configHash,
             s_localGameSlot + 1,
             local.character_id,
             local.base_palette,
-            local.flags,
-            (unsigned)local.payload_size,
-            local.payload_crc);
+            config.flags,
+            (unsigned)config.payload_size,
+            config.payload_crc,
+            dataSent ? 1 : 0);
     }
-    return sent;
+
+    return configSent && dataSent;
+}
+
+static bool CopyBank(const NetplayPaletteBank& bank, NetplayPaletteBank* out) {
+    if (!out || !bank.valid) {
+        return false;
+    }
+    *out = bank;
+    return true;
+}
+
+static void PopulateBank(NetplayPaletteBank* bank,
+                         uint8_t characterId,
+                         uint8_t basePalette,
+                         const void* data,
+                         size_t len) {
+    if (!bank || !data || len < NETPLAY_PALETTE_BANK_SIZE) {
+        return;
+    }
+
+    bank->valid = true;
+    bank->character_id = characterId;
+    bank->base_palette = basePalette;
+    memcpy(bank->data, data, NETPLAY_PALETTE_BANK_SIZE);
+    bank->crc32 = CalcCRC32(bank->data, NETPLAY_PALETTE_BANK_SIZE);
+}
+
+static void UpdateObservedBank(PlayerRuntime* player,
+                               NetplayPaletteBank* bank,
+                               bool* loadedFlag,
+                               uint8_t gameSlot,
+                               uint8_t characterId,
+                               uint8_t basePalette,
+                               const void* data,
+                               size_t len,
+                               uint16_t assetCount,
+                               const char* archivePath,
+                               const char* patchPath,
+                               const char* logLabel,
+                               const char* statusLabel) {
+    if (!player || !bank || !loadedFlag || !data || len < NETPLAY_PALETTE_BANK_SIZE) {
+        return;
+    }
+
+    player->valid = true;
+    player->game_slot = gameSlot;
+    player->character_id = characterId;
+    player->base_palette = basePalette;
+    player->asset_loaded = true;
+    player->asset_count = assetCount;
+    CopyText(player->archive_path, sizeof(player->archive_path), archivePath);
+    CopyText(player->patch_path, sizeof(player->patch_path), patchPath);
+
+    PopulateBank(bank, characterId, basePalette, data, len);
+    *loadedFlag = true;
+
+    SetStatus("%s for P%d", statusLabel, gameSlot + 1);
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "%s: slot=P%d char=%u base=%u asset_count=%u crc=0x%08X",
+        logLabel,
+        gameSlot + 1,
+        characterId,
+        basePalette,
+        (unsigned)assetCount,
+        bank->crc32);
 }
 
 } // namespace
@@ -134,6 +569,7 @@ void NetplayPaletteRuntime_Init() {
     if (s_initialized) {
         return;
     }
+    NetplayPaletteStorage_Init();
     ResetMatchState(nullptr);
     s_initialized = true;
 }
@@ -143,11 +579,30 @@ void NetplayPaletteRuntime_Shutdown() {
         return;
     }
     ResetMatchState("shutdown");
+    NetplayPaletteStorage_Shutdown();
     s_initialized = false;
 }
 
 void NetplayPaletteRuntime_FrameUpdate() {
-    if (!s_initialized || !s_matchActive) {
+    if (!s_initialized) {
+        return;
+    }
+
+    if (!s_matchActive) {
+        if (HasOfflineLocalContext() &&
+            (IsIgnoredOfflinePaletteGameType(GetGameType()) ||
+             !IsOfflinePaletteContextRetentionMode(GetGameMode()))) {
+            LOG_INFO("[Palette] Clearing offline context: mode=%u sub=%u type=%u has_p1=%d has_p2=%d",
+                (unsigned)GetGameMode(),
+                (unsigned)GetSubstate(),
+                (unsigned)GetGameType(),
+                s_player[0].valid ? 1 : 0,
+                s_player[1].valid ? 1 : 0);
+            ResetMatchState("left offline palette flow");
+        } else if (!IsValidGameSlot(s_offlineEditorGameSlot) ||
+                   (IsValidGameSlot(s_offlineEditorGameSlot) && !s_player[s_offlineEditorGameSlot].valid)) {
+            s_offlineEditorGameSlot = FindFirstValidOfflineGameSlot();
+        }
         return;
     }
 
@@ -169,17 +624,24 @@ void NetplayPaletteRuntime_SetSyncEnabled(bool enabled) {
         return;
     }
     s_enabled = enabled;
-    RefreshLocalFlags();
-    s_localDirty = true;
+    MarkLocalDirty(false, enabled ? "sync enabled" : "sync disabled");
 }
 
 void NetplayPaletteRuntime_SetRemotePreviewEnabled(bool enabled) {
     if (s_remotePreviewEnabled == enabled) {
         return;
     }
+
     s_remotePreviewEnabled = enabled;
-    RefreshLocalFlags();
-    s_localDirty = true;
+    MarkLocalDirty(false, enabled ? "remote preview enabled" : "remote preview disabled");
+
+    const int remoteSlot = IsValidGameSlot(s_localGameSlot)
+        ? (s_localGameSlot == 0 ? 1 : 0)
+        : -1;
+    if (IsValidGameSlot(remoteSlot) && s_player[remoteSlot].remote_custom_loaded) {
+        RequestLiveReload((uint8_t)remoteSlot,
+            enabled ? "remote preview enabled" : "remote preview disabled");
+    }
 }
 
 bool NetplayPaletteRuntime_GetSyncEnabled() {
@@ -190,39 +652,14 @@ bool NetplayPaletteRuntime_GetRemotePreviewEnabled() {
     return s_remotePreviewEnabled;
 }
 
-void NetplayPaletteRuntime_SetLocalOpaquePayload(const void* data, size_t len) {
-    if (s_localGameSlot < 0 || s_localGameSlot > 1) {
-        return;
-    }
-
-    NetplayPalettePlayerState& local = s_player[s_localGameSlot];
-    const size_t clamped = (len > NETPLAY_PALETTE_MAX_PAYLOAD)
-        ? NETPLAY_PALETTE_MAX_PAYLOAD
-        : len;
-    local.payload_size = (uint16_t)clamped;
-    if (clamped > 0 && data) {
-        memcpy(local.payload, data, clamped);
-        local.payload_crc = CalcCRC32(local.payload, clamped);
-    } else {
-        memset(local.payload, 0, sizeof(local.payload));
-        local.payload_crc = 0;
-    }
-    RefreshLocalFlags();
-    s_localDirty = true;
-}
-
 void NetplayPaletteRuntime_OnLockedMatchConfig(const LockedMatchConfig* config) {
     if (!s_initialized || !config) {
         return;
     }
 
-    memset(s_player, 0, sizeof(s_player));
-    s_epoch++;
-    s_configHash = LockedMatchConfig_Hash(config);
+    ResetMatchState(nullptr);
     s_matchActive = true;
-    s_localSent = false;
-    s_remoteAcknowledged = false;
-    s_lastSendAt = 0;
+    s_configHash = LockedMatchConfig_Hash(config);
 
     s_player[0].valid = true;
     s_player[0].game_slot = 0;
@@ -236,19 +673,26 @@ void NetplayPaletteRuntime_OnLockedMatchConfig(const LockedMatchConfig* config) 
 
     const bool isHost = Session_GetRole() == SessionRole::Host;
     s_localGameSlot = PlayerMapping_DeriveFromRole(config->host_side, isHost);
-    RefreshLocalFlags();
+    if (!IsValidGameSlot(s_localGameSlot)) {
+        s_localGameSlot = isHost ? 0 : 1;
+    }
+
+    RefreshLocalStoredBank();
+    AdvanceLocalEpoch();
+    AdvanceStateRevision();
     s_localDirty = true;
 
     SetStatus("Palette runtime armed: epoch=%u config=0x%08X local=P%d",
-        s_epoch,
+        s_localEpoch,
         s_configHash,
         s_localGameSlot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
-        "Palette runtime armed: epoch=%u config=0x%08X local=P%d remote=P%d",
-        s_epoch,
+        "Palette runtime armed: epoch=%u config=0x%08X local=P%d remote=P%d local_custom=%d",
+        s_localEpoch,
         s_configHash,
         s_localGameSlot + 1,
-        s_localGameSlot == 0 ? 2 : 1);
+        s_localGameSlot == 0 ? 2 : 1,
+        s_player[s_localGameSlot].local_custom_loaded ? 1 : 0);
 }
 
 void NetplayPaletteRuntime_OnMatchEnd(const char* reason) {
@@ -264,74 +708,518 @@ void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
         return;
     }
 
-    NetplayPalettePlayerState& remote = s_player[payload->game_slot];
+    PlayerRuntime& remote = s_player[payload->game_slot];
+    remote.remote_flags = payload->flags;
+
+    if (!s_matchActive || payload->config_hash != s_configHash) {
+        SendAck(payload->game_slot,
+            payload->epoch,
+            payload->config_hash,
+            0,
+            0,
+            0);
+        return;
+    }
+
     remote.valid = true;
     remote.game_slot = payload->game_slot;
     remote.character_id = payload->character_id;
     remote.base_palette = payload->base_palette;
-    remote.flags = payload->flags;
-    remote.payload_crc = payload->payload_crc;
-    remote.payload_size = payload->payload_size > NETPLAY_PALETTE_MAX_PAYLOAD
-        ? NETPLAY_PALETTE_MAX_PAYLOAD
-        : payload->payload_size;
-    if (remote.payload_size > 0) {
-        memcpy(remote.payload, payload->payload, remote.payload_size);
+    remote.remote_epoch = payload->epoch;
+    remote.remote_config_hash = payload->config_hash;
+
+    const bool expectsData =
+        (payload->flags & NETPLAY_PALETTE_FLAG_HAS_CUSTOM_DATA) != 0 &&
+        payload->payload_size == NETPLAY_PALETTE_BANK_SIZE;
+
+    if (!expectsData) {
+        const bool hadCustomBank = remote.remote_custom_loaded;
+        ZeroBank(&remote.remote_custom_bank);
+        remote.remote_custom_loaded = false;
+        SendAck(payload->game_slot,
+            payload->epoch,
+            payload->config_hash,
+            1,
+            0,
+            0);
+
+        if (hadCustomBank) {
+            AdvanceStateRevision();
+            if (payload->game_slot != s_localGameSlot && s_remotePreviewEnabled) {
+                RequestLiveReload(payload->game_slot, "remote palette cleared");
+            }
+        }
     }
 
-    PaletteAckPayload ack{};
-    ack.epoch = payload->epoch;
-    ack.config_hash = payload->config_hash;
-    ack.game_slot = payload->game_slot;
-    ack.accepted = (payload->config_hash == s_configHash) ? 1 : 0;
-    ack.payload_size = remote.payload_size;
-    ack.payload_crc = remote.payload_crc;
-    Session_SendPacket(CHANNEL_CONTROL,
-        PacketType::PaletteAck,
-        &ack,
-        sizeof(ack),
-        true);
-
-    SetStatus("Remote palette config received for P%d", payload->game_slot + 1);
+    SetStatus(expectsData
+            ? "Remote palette data pending for P%d"
+            : "Remote palette config received for P%d",
+        payload->game_slot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
-        "Remote palette config: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X",
+        "Remote palette config: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X expects_data=%d",
         payload->epoch,
         payload->config_hash,
         payload->game_slot + 1,
         payload->character_id,
         payload->base_palette,
         payload->flags,
-        (unsigned)remote.payload_size,
-        remote.payload_crc);
+        (unsigned)payload->payload_size,
+        payload->payload_crc,
+        expectsData ? 1 : 0);
 }
 
-void NetplayPaletteRuntime_OnRemoteAck(const PaletteAckPayload* payload) {
-    if (!payload) {
+void NetplayPaletteRuntime_OnRemoteData(const PaletteDataPayload* payload) {
+    if (!payload || payload->game_slot > 1) {
         return;
     }
 
-    if (payload->config_hash == s_configHash &&
-        payload->epoch == s_epoch &&
-        payload->accepted != 0) {
-        s_remoteAcknowledged = true;
-        SetStatus("Palette epoch %u acknowledged by remote", s_epoch);
+    PlayerRuntime& remote = s_player[payload->game_slot];
+    const bool validPacket =
+        s_matchActive &&
+        payload->config_hash == s_configHash &&
+        payload->epoch == remote.remote_epoch &&
+        payload->config_hash == remote.remote_config_hash &&
+        payload->payload_size == NETPLAY_PALETTE_BANK_SIZE &&
+        payload->character_id == remote.character_id &&
+        payload->base_palette == remote.base_palette &&
+        CalcCRC32(payload->payload, NETPLAY_PALETTE_BANK_SIZE) == payload->payload_crc;
+
+    if (!validPacket) {
+        SendAck(payload->game_slot,
+            payload->epoch,
+            payload->config_hash,
+            0,
+            0,
+            0);
+        Rollback::NetplayLog_Write("PALETTE", -1,
+            "Rejected remote palette data: epoch=%u config=0x%08X slot=P%d size=%u crc=0x%08X",
+            payload->epoch,
+            payload->config_hash,
+            payload->game_slot + 1,
+            (unsigned)payload->payload_size,
+            payload->payload_crc);
+        return;
     }
+
+    remote.remote_custom_bank.valid = true;
+    remote.remote_custom_bank.character_id = payload->character_id;
+    remote.remote_custom_bank.base_palette = payload->base_palette;
+    remote.remote_custom_bank.crc32 = payload->payload_crc;
+    memcpy(remote.remote_custom_bank.data, payload->payload, NETPLAY_PALETTE_BANK_SIZE);
+    remote.remote_custom_loaded = true;
+
+    AdvanceStateRevision();
+    SendAck(payload->game_slot,
+        payload->epoch,
+        payload->config_hash,
+        1,
+        1,
+        payload->payload_crc);
+
+    if (payload->game_slot != s_localGameSlot && s_remotePreviewEnabled) {
+        RequestLiveReload(payload->game_slot, "remote palette updated");
+    }
+
+    SetStatus("Remote custom palette ready for P%d", payload->game_slot + 1);
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Remote palette data accepted: epoch=%u config=0x%08X slot=P%d crc=0x%08X",
+        payload->epoch,
+        payload->config_hash,
+        payload->game_slot + 1,
+        payload->payload_crc);
+}
+
+void NetplayPaletteRuntime_OnRemoteAck(const PaletteAckPayload* payload) {
+    if (!payload || !IsValidGameSlot(s_localGameSlot)) {
+        return;
+    }
+
+    if (payload->config_hash != s_configHash ||
+        payload->epoch != s_localEpoch ||
+        payload->game_slot != (uint8_t)s_localGameSlot) {
+        return;
+    }
+
+    const uint32_t expectedCrc = LocalTransportHasCustomBank()
+        ? s_player[s_localGameSlot].local_custom_bank.crc32
+        : 0;
+    const bool expectedData = LocalTransportHasCustomBank();
+
+    if (payload->accepted != 0 &&
+        ((!expectedData && payload->received_data == 0 && payload->payload_crc == 0) ||
+         (expectedData && payload->received_data != 0 && payload->payload_crc == expectedCrc))) {
+        s_remoteAcknowledged = true;
+        SetStatus("Palette epoch %u acknowledged by remote", s_localEpoch);
+        Rollback::NetplayLog_Write("PALETTE", -1,
+            "Remote palette ack accepted: epoch=%u slot=P%d crc=0x%08X",
+            payload->epoch,
+            payload->game_slot + 1,
+            payload->payload_crc);
+    }
+}
+
+bool NetplayPaletteRuntime_CopyEditableLocalBank(NetplayPaletteBank* out) {
+    const int editableSlot = GetEditableGameSlot();
+    if (!out || !IsValidGameSlot(editableSlot)) {
+        return false;
+    }
+
+    const PlayerRuntime& player = s_player[editableSlot];
+    if (player.live_bank_loaded) {
+        return CopyBank(player.live_bank, out);
+    }
+    if (player.local_custom_loaded) {
+        return CopyBank(player.local_custom_bank, out);
+    }
+    return CopyBank(player.vanilla_bank, out);
+}
+
+bool NetplayPaletteRuntime_CopyLocalBankForSource(NetplayPaletteBankSource source, NetplayPaletteBank* out) {
+    const int editableSlot = GetEditableGameSlot();
+    if (!out || !IsValidGameSlot(editableSlot)) {
+        return false;
+    }
+
+    const PlayerRuntime& player = s_player[editableSlot];
+    switch (source) {
+        case NetplayPaletteBankSource::LiveMemory:
+            return CopyBank(player.live_bank, out);
+        case NetplayPaletteBankSource::VanillaSource:
+            return CopyBank(player.vanilla_bank, out);
+        case NetplayPaletteBankSource::SavedCustom:
+            return CopyBank(player.local_custom_bank, out);
+        default:
+            return false;
+    }
+}
+
+bool NetplayPaletteRuntime_SetLocalCustomBank(const NetplayPaletteBank* bank, bool persistToDisk) {
+    const int editableSlot = GetEditableGameSlot();
+    if (!bank || !IsValidGameSlot(editableSlot)) {
+        return false;
+    }
+
+    PlayerRuntime& player = s_player[editableSlot];
+    NetplayPaletteBank updatedBank = *bank;
+    updatedBank.valid = true;
+    updatedBank.character_id = player.character_id;
+    updatedBank.base_palette = player.base_palette;
+    updatedBank.crc32 = CalcCRC32(updatedBank.data, NETPLAY_PALETTE_BANK_SIZE);
+
+    const bool unchanged = player.local_custom_loaded &&
+        player.local_custom_bank.character_id == updatedBank.character_id &&
+        player.local_custom_bank.base_palette == updatedBank.base_palette &&
+        player.local_custom_bank.crc32 == updatedBank.crc32 &&
+        memcmp(player.local_custom_bank.data, updatedBank.data, NETPLAY_PALETTE_BANK_SIZE) == 0;
+    if (unchanged) {
+        return !persistToDisk || NetplayPaletteStorage_SaveBank(&updatedBank);
+    }
+
+    player.local_custom_bank = updatedBank;
+    player.local_custom_loaded = true;
+
+    const bool saved = !persistToDisk || NetplayPaletteStorage_SaveBank(&player.local_custom_bank);
+    MarkPaletteChanged((uint8_t)editableSlot, true, persistToDisk ? "local custom saved" : "local custom updated");
+    RequestLiveReload((uint8_t)editableSlot, "local custom updated");
+    SetStatus(persistToDisk
+            ? "Saved custom palette for P%d"
+            : "Updated live palette for P%d",
+        editableSlot + 1);
+    return saved;
+}
+
+bool NetplayPaletteRuntime_ClearLocalCustomBank(bool deleteFromDisk) {
+    const int editableSlot = GetEditableGameSlot();
+    if (!IsValidGameSlot(editableSlot)) {
+        return false;
+    }
+
+    PlayerRuntime& player = s_player[editableSlot];
+    if (!player.local_custom_loaded) {
+        return !deleteFromDisk ||
+            NetplayPaletteStorage_DeleteBank(player.character_id, player.base_palette);
+    }
+
+    ZeroBank(&player.local_custom_bank);
+    player.local_custom_loaded = false;
+
+    const bool deleted = !deleteFromDisk ||
+        NetplayPaletteStorage_DeleteBank(player.character_id, player.base_palette);
+    MarkPaletteChanged((uint8_t)editableSlot, true, deleteFromDisk ? "local custom deleted" : "local custom cleared");
+    RequestLiveReload((uint8_t)editableSlot, "local custom cleared");
+    SetStatus("Cleared custom palette for P%d", editableSlot + 1);
+    return deleted;
+}
+
+bool NetplayPaletteRuntime_SetOfflineEditorGameSlot(uint8_t gameSlot) {
+    if (s_matchActive || !IsValidGameSlot(gameSlot) || !s_player[gameSlot].valid) {
+        return false;
+    }
+
+    s_offlineEditorGameSlot = gameSlot;
+    SetStatus("Offline palette editor switched to P%d", gameSlot + 1);
+    return true;
+}
+
+void NetplayPaletteRuntime_GetLocalContext(NetplayPaletteLocalContext* out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->match_active = s_matchActive;
+    out->transport_enabled = s_enabled;
+    out->remote_preview_enabled = s_remotePreviewEnabled;
+
+    const int editableSlot = GetEditableGameSlot();
+    if (IsValidGameSlot(editableSlot)) {
+        const PlayerRuntime& player = s_player[editableSlot];
+        out->available = player.valid;
+        out->has_custom_bank = player.local_custom_loaded;
+        out->has_vanilla_bank = player.vanilla_bank.valid;
+        out->has_live_bank = player.live_bank_loaded;
+        out->asset_loaded = player.asset_loaded;
+        out->game_slot = (uint8_t)editableSlot;
+        out->character_id = player.character_id;
+        out->base_palette = player.base_palette;
+    }
+
+    CopyText(out->status, sizeof(out->status), s_status);
+}
+
+bool NetplayPaletteRuntime_CopyAssetOverrideBank(uint8_t gameSlot, NetplayPaletteBank* out) {
+    if (!IsValidGameSlot(gameSlot) || !out) {
+        return false;
+    }
+
+    if (!s_matchActive) {
+        return CopyBank(s_player[gameSlot].local_custom_bank, out);
+    }
+
+    if (gameSlot == (uint8_t)s_localGameSlot) {
+        return CopyBank(s_player[gameSlot].local_custom_bank, out);
+    }
+
+    if (!s_remotePreviewEnabled) {
+        return false;
+    }
+
+    return CopyBank(s_player[gameSlot].remote_custom_bank, out);
+}
+
+bool NetplayPaletteRuntime_CopySpectatorBank(uint8_t gameSlot, NetplayPaletteBank* out) {
+    if (!IsValidGameSlot(gameSlot) || !out) {
+        return false;
+    }
+
+    if (!s_matchActive) {
+        return CopyBank(s_player[gameSlot].local_custom_bank, out);
+    }
+
+    if (gameSlot == (uint8_t)s_localGameSlot) {
+        return CopyBank(s_player[gameSlot].local_custom_bank, out);
+    }
+
+    return CopyBank(s_player[gameSlot].remote_custom_bank, out);
+}
+
+void NetplayPaletteRuntime_OnAssetBankCaptured(uint8_t gameSlot,
+                                               uint8_t basePalette,
+                                               const void* data,
+                                               size_t len,
+                                               uint16_t assetCount,
+                                               const char* archivePath,
+                                               const char* patchPath) {
+    if (!IsValidGameSlot(gameSlot) || !data || len < NETPLAY_PALETTE_BANK_SIZE) {
+        return;
+    }
+
+    PlayerRuntime& player = s_player[gameSlot];
+    const int derivedCharacterId = ResolveCharacterIdFromArchivePath(archivePath);
+    const bool hadPlayerContext = player.valid;
+
+    if (derivedCharacterId >= 0) {
+        if (!s_matchActive) {
+            MaybeArmOfflineLocalContext(gameSlot, (uint8_t)derivedCharacterId, basePalette);
+        } else if (hadPlayerContext && player.character_id != (uint8_t)derivedCharacterId) {
+            Rollback::NetplayLog_Write("PALETTE", -1,
+                "Palette character mismatch: slot=P%d config_char=%u archive_char=%u archive=%s",
+                gameSlot + 1,
+                player.character_id,
+                (unsigned)derivedCharacterId,
+                archivePath ? archivePath : "(null)");
+        }
+    }
+
+    player.valid = true;
+    player.game_slot = gameSlot;
+    if (derivedCharacterId >= 0 && (!s_matchActive || !hadPlayerContext)) {
+        player.character_id = (uint8_t)derivedCharacterId;
+    }
+    player.asset_loaded = true;
+    player.asset_count = assetCount;
+    player.base_palette = basePalette;
+    CopyText(player.archive_path, sizeof(player.archive_path), archivePath);
+    CopyText(player.patch_path, sizeof(player.patch_path), patchPath);
+
+    UpdateObservedBank(&player,
+        &player.vanilla_bank,
+        &player.asset_loaded,
+        gameSlot,
+        player.character_id,
+        basePalette,
+        data,
+        len,
+        assetCount,
+        archivePath,
+        patchPath,
+        "Captured vanilla source palette",
+        "Captured vanilla source bank");
+    LOG_INFO("[Palette] Captured source bank slot=P%d char=%u base=%u archive=%s patch=%s assets=%u",
+        gameSlot + 1,
+        player.character_id,
+        basePalette,
+        archivePath ? archivePath : "(null)",
+        patchPath ? patchPath : "(null)",
+        (unsigned)assetCount);
+}
+
+void NetplayPaletteRuntime_OnLiveBankObserved(uint8_t gameSlot,
+                                             uint8_t basePalette,
+                                             const void* data,
+                                             size_t len,
+                                             uint16_t assetCount,
+                                             const char* archivePath,
+                                             const char* patchPath) {
+    if (!IsValidGameSlot(gameSlot) || !data || len < NETPLAY_PALETTE_BANK_SIZE) {
+        return;
+    }
+
+    PlayerRuntime& player = s_player[gameSlot];
+    const int derivedCharacterId = ResolveCharacterIdFromArchivePath(archivePath);
+    const bool hadPlayerContext = player.valid;
+
+    if (derivedCharacterId >= 0) {
+        if (!s_matchActive) {
+            MaybeArmOfflineLocalContext(gameSlot, (uint8_t)derivedCharacterId, basePalette);
+        } else if (hadPlayerContext && player.character_id != (uint8_t)derivedCharacterId) {
+            Rollback::NetplayLog_Write("PALETTE", -1,
+                "Live palette character mismatch: slot=P%d config_char=%u archive_char=%u archive=%s",
+                gameSlot + 1,
+                player.character_id,
+                (unsigned)derivedCharacterId,
+                archivePath ? archivePath : "(null)");
+        }
+    }
+
+    if (derivedCharacterId >= 0 && (!s_matchActive || !hadPlayerContext)) {
+        player.character_id = (uint8_t)derivedCharacterId;
+    }
+
+    UpdateObservedBank(&player,
+        &player.live_bank,
+        &player.live_bank_loaded,
+        gameSlot,
+        player.character_id,
+        basePalette,
+        data,
+        len,
+        assetCount,
+        archivePath,
+        patchPath,
+        "Observed live decoded palette",
+        "Observed live memory bank");
+    LOG_INFO("[Palette] Observed live bank slot=P%d char=%u base=%u archive=%s patch=%s assets=%u",
+        gameSlot + 1,
+        player.character_id,
+        basePalette,
+        archivePath ? archivePath : "(null)",
+        patchPath ? patchPath : "(null)",
+        (unsigned)assetCount);
+}
+
+bool NetplayPaletteRuntime_ConsumeLiveReloadRequest(NetplayPaletteReloadRequest* out) {
+    if (!out) {
+        return false;
+    }
+
+    for (int slot = 0; slot < 2; slot++) {
+        if (!s_liveReloadRequested[slot]) {
+            continue;
+        }
+        s_liveReloadRequested[slot] = false;
+        out->game_slot = (uint8_t)slot;
+        return true;
+    }
+    return false;
+}
+
+void NetplayPaletteRuntime_OnLiveReloadComplete(uint8_t gameSlot, bool success, const char* reason) {
+    if (!IsValidGameSlot(gameSlot)) {
+        return;
+    }
+
+    LOG_INFO("[Palette] Live reload %s slot=P%d reason=%s",
+        success ? "complete" : "failed",
+        gameSlot + 1,
+        reason ? reason : "unspecified");
+    SetStatus(success
+            ? "Live palette reload complete for P%d"
+            : "Live palette reload failed for P%d",
+        gameSlot + 1);
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Live reload %s: slot=P%d reason=%s",
+        success ? "complete" : "failed",
+        gameSlot + 1,
+        reason ? reason : "unspecified");
 }
 
 void NetplayPaletteRuntime_GetSnapshot(NetplayPaletteRuntimeSnapshot* out) {
     if (!out) {
         return;
     }
+
     memset(out, 0, sizeof(*out));
     out->initialized = s_initialized;
     out->enabled = s_enabled;
     out->remote_preview_enabled = s_remotePreviewEnabled;
     out->match_active = s_matchActive;
-    out->epoch = s_epoch;
+    out->epoch = s_stateRevision;
     out->config_hash = s_configHash;
     out->local_sent = s_localSent;
     out->remote_acknowledged = s_remoteAcknowledged;
-    out->player[0] = s_player[0];
-    out->player[1] = s_player[1];
+
+    for (int slot = 0; slot < 2; slot++) {
+        NetplayPalettePlayerState& dst = out->player[slot];
+        const PlayerRuntime& src = s_player[slot];
+        dst.valid = src.valid;
+        dst.game_slot = (uint8_t)slot;
+        dst.character_id = src.character_id;
+        dst.base_palette = src.base_palette;
+        dst.flags = s_matchActive
+            ? ((slot == s_localGameSlot) ? BuildLocalFlags() : src.remote_flags)
+            : 0;
+        if (!s_matchActive) {
+            dst.has_custom_bank = src.local_custom_loaded;
+            dst.custom_bank_ready = src.local_custom_loaded;
+            dst.payload_crc = src.local_custom_loaded ? src.local_custom_bank.crc32 : 0;
+            dst.payload_size = src.local_custom_loaded ? NETPLAY_PALETTE_BANK_SIZE : 0;
+        } else if (slot == s_localGameSlot) {
+            dst.has_custom_bank = src.local_custom_loaded;
+            dst.custom_bank_ready = src.local_custom_loaded;
+            dst.payload_crc = src.local_custom_loaded ? src.local_custom_bank.crc32 : 0;
+            dst.payload_size = src.local_custom_loaded ? NETPLAY_PALETTE_BANK_SIZE : 0;
+        } else {
+            dst.has_custom_bank = src.remote_custom_loaded;
+            dst.custom_bank_ready = src.remote_custom_loaded;
+            dst.payload_crc = src.remote_custom_loaded ? src.remote_custom_bank.crc32 : 0;
+            dst.payload_size = src.remote_custom_loaded ? NETPLAY_PALETTE_BANK_SIZE : 0;
+        }
+        dst.vanilla_bank_ready = src.vanilla_bank.valid;
+        dst.live_bank_ready = src.live_bank_loaded;
+        dst.asset_loaded = src.asset_loaded;
+        dst.asset_count = src.asset_count;
+    }
+
     CopyText(out->status, sizeof(out->status), s_status);
 }
 

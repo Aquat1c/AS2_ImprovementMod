@@ -12,6 +12,7 @@
 //  - Filesystem Shift-JIS path hooks (CreateFileA, etc.)
 //  - MultiByteToWideChar CP redirect
 //  - Tick/timing hook (GetTick)
+//  - Character palette asset-load hook
 //
 // Does NOT install: RNG hooks, rollback hooks, savestate hooks, audio/render hooks.
 

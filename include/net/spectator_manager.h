@@ -59,6 +59,7 @@ bool SpectatorManager_SetPeerNextFrame(uintptr_t peer_id, int32_t next_rb_frame)
 
 bool SpectatorManager_SendMatchState(uintptr_t peer_id, const Spectator::MatchStatePayload* payload);
 bool SpectatorManager_SendPaletteState(uintptr_t peer_id, const Spectator::PaletteStatePayload* payload);
+bool SpectatorManager_SendPaletteData(uintptr_t peer_id, const Spectator::PaletteDataPayload* payload);
 bool SpectatorManager_SendFrameBatch(uintptr_t peer_id, const Spectator::FrameBatchPayload* payload);
 void SpectatorManager_BroadcastHeartbeat(const Spectator::HeartbeatPayload* payload);
 void SpectatorManager_BroadcastDisconnect(const Spectator::DisconnectPayload* payload);

@@ -15,7 +15,7 @@
 
 namespace Net::Spectator {
 
-constexpr uint16_t PROTOCOL_VERSION = 1;
+constexpr uint16_t PROTOCOL_VERSION = 2;
 constexpr int MAX_PACKET_SIZE = 1200;
 constexpr int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;
 constexpr int MAX_FRAME_BATCH = 32;
@@ -31,9 +31,10 @@ enum class PacketType : uint16_t {
     MatchState = 4,
     FrameBatch = 5,
     PaletteState = 6,
-    Heartbeat = 7,
-    Disconnect = 8,
-    ClientStatus = 9,
+    PaletteData = 7,
+    Heartbeat = 8,
+    Disconnect = 9,
+    ClientStatus = 10,
 };
 
 enum MatchStateKind : uint8_t {
@@ -108,15 +109,29 @@ struct PalettePlayerState {
     uint8_t character_id;
     uint8_t base_palette;
     uint8_t flags;
-    uint8_t payload_size;
+    uint8_t has_custom_data;
+    uint16_t payload_size;
+    uint16_t _pad;
     uint32_t payload_crc;
-    uint8_t payload[NETPLAY_PALETTE_MAX_PAYLOAD];
 };
 
 struct PaletteStatePayload {
     uint32_t match_id;
     uint32_t palette_epoch;
     PalettePlayerState player[2];
+};
+
+struct PaletteDataPayload {
+    uint32_t match_id;
+    uint32_t palette_epoch;
+    uint8_t  game_slot;
+    uint8_t  character_id;
+    uint8_t  base_palette;
+    uint8_t  _pad0;
+    uint32_t payload_crc;
+    uint16_t payload_size;
+    uint16_t _pad1;
+    uint8_t  payload[NETPLAY_PALETTE_BANK_SIZE];
 };
 
 struct HeartbeatPayload {
@@ -143,6 +158,9 @@ struct DisconnectPayload {
 #pragma pack(pop)
 
 const char* PacketTypeName(PacketType type);
+
+static_assert(sizeof(PacketType) + sizeof(PaletteDataPayload) <= MAX_PACKET_SIZE,
+    "Spectator PaletteDataPayload must fit inside one packet");
 
 inline bool ValidatePacketSize(const void* data, size_t length) {
     return data != nullptr && length >= sizeof(PacketType);

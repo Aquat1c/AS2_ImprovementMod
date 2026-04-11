@@ -359,6 +359,14 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             }
             break;
 
+        case PacketType::PaletteData:
+            if (payloadLen >= sizeof(PaletteDataPayload)) {
+                NetplayPaletteRuntime_OnRemoteData(static_cast<const PaletteDataPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short PaletteData", type, payloadLen, sizeof(PaletteDataPayload));
+            }
+            break;
+
         case PacketType::PaletteAck:
             if (payloadLen >= sizeof(PaletteAckPayload)) {
                 NetplayPaletteRuntime_OnRemoteAck(static_cast<const PaletteAckPayload*>(payload));

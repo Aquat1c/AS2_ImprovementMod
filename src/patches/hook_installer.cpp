@@ -4,6 +4,7 @@
 #include "patches/tick_hooks.h"
 #include "patches/locale_patch.h"
 #include "patches/filesystem_patch.h"
+#include "patches/palette_asset_hook.h"
 #include "training/practice_tools.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -196,6 +197,10 @@ bool InstallHooks() {
         LOG_WARN("Failed to hook CmdHistoryUpdate! Status: %d (continuing anyway)", status);
     } else {
         LOG_INFO("Hooked sub_4C8C50 (command history update - practice swap redirect)");
+    }
+
+    if (!PaletteAssetHook_Install()) {
+        LOG_WARN("Failed to install character palette asset hook (continuing anyway)");
     }
     
     // --- Enable all hooks ---

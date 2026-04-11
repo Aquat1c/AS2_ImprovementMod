@@ -17,6 +17,7 @@
 #include "patches/unlock_patch.h"
 #include "patches/input_override.h"
 #include "patches/hook_installer.h"
+#include "patches/palette_asset_hook.h"
 #include "patches/tick_hooks.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/savestate.h"
@@ -360,6 +361,7 @@ __declspec(dllexport) void ModShutdown() {
         ModeOwnership::Remove();
         Net::SpectatorClient_Shutdown();
         Net::SpectatorRuntime_Shutdown();
+        PaletteAssetHook_Shutdown();
         Net::NetplayPaletteRuntime_Shutdown();
         Net::Session_Shutdown();
         Net::Transport_GlobalDeinit();
@@ -422,6 +424,7 @@ __declspec(dllexport) void ModOnFrame() {
     // local sample. ENet servicing itself runs on the dedicated network thread.
     Net::Session_Update();
     Net::NetplayPaletteRuntime_FrameUpdate();
+    PaletteAssetHook_FrameUpdate();
 
     // Process savestate hotkeys (F5 save, F6 load)
     Savestate_ProcessHotkeys();

@@ -135,6 +135,22 @@ static void ResetPracticeState() {
     }
 }
 
+void PracticeTools_SetPaused(bool paused) {
+    if (!s_initialized || s_paused == paused) {
+        return;
+    }
+
+    s_paused = paused;
+    s_stepRequested = false;
+    s_stepCounter = 0;
+
+    if (IsPracticeModeNow()) {
+        PushToast(s_paused ? "PAUSED" : "UNPAUSED",
+                  s_paused ? IM_COL32(255, 255, 100, 255) : IM_COL32(100, 255, 100, 255));
+        LOG_INFO("[Practice] %s", s_paused ? "PAUSED" : "UNPAUSED");
+    }
+}
+
 // ============================================================================
 // Lifecycle
 // ============================================================================
@@ -202,12 +218,7 @@ void PracticeTools_FrameUpdate() {
 
     // F7: Toggle pause
     if (f7Down && !s_f7WasDown) {
-        s_paused = !s_paused;
-        s_stepRequested = false;
-        s_stepCounter = 0;
-        PushToast(s_paused ? "PAUSED" : "UNPAUSED",
-                  s_paused ? IM_COL32(255, 255, 100, 255) : IM_COL32(100, 255, 100, 255));
-        LOG_INFO("[Practice] %s", s_paused ? "PAUSED" : "UNPAUSED");
+        PracticeTools_SetPaused(!s_paused);
     }
 
     // F8: Frame step (each key-down edge = request exactly 1 game frame advance)
@@ -300,9 +311,7 @@ void PracticeTools_RenderImGui() {
 
     bool paused = s_paused;
     if (ImGui::Checkbox("Paused (F7)", &paused)) {
-        s_paused = paused;
-        s_stepRequested = false;
-        s_stepCounter = 0;
+        PracticeTools_SetPaused(paused);
     }
 
     ImGui::SameLine();

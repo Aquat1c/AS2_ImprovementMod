@@ -27,6 +27,22 @@
 
 // Match mode handler (case 8 in main loop)
 #define ADDR_MATCH_MODE         (GAME_BASE + 0x0C8F60)  // sub_4C8F60
+#define ADDR_ASSET_LOAD_ALL_FROM_ARCHIVE (GAME_BASE + 0x14A460)  // Asset_LoadAllFromArchive
+#define ADDR_HANDLE_ALLOC       (GAME_BASE + 0x212DF0)  // sub_612DF0
+#define ADDR_HANDLE_RENDER_BIND (GAME_BASE + 0x2132E0)  // sub_6132E0
+#define ADDR_HANDLE_SET_SOURCE  (GAME_BASE + 0x2207A0)  // sub_6207A0
+#define ADDR_IMAGE_REGISTER_HANDLE (GAME_BASE + 0x220930)  // sub_620930
+#define ADDR_IMAGE_CREATE_FROM_DECODED_BMP (GAME_BASE + 0x23A9B0)  // sub_63A9B0
+#define ADDR_IMAGE_CREATE_FROM_FORMAT (GAME_BASE + 0x23AB70)  // sub_63AB70
+#define ADDR_IMAGE_PARSE_FROM_BUFFER (GAME_BASE + 0x23E730)  // sub_63E730
+#define ADDR_IMAGE_FORMAT_FREE  (GAME_BASE + 0x23E8C0)  // sub_63E8C0
+#define ADDR_IMAGE_CREATE_SURFACE (GAME_BASE + 0x245DC0)  // Image_Create
+#define ADDR_IMAGE_CREATE_SUBRECT (GAME_BASE + 0x245D10)  // Image_CreateSubRect
+#define ADDR_IMAGE_UPLOAD_TO_HANDLE (GAME_BASE + 0x2460C0)  // sub_6460C0
+#define ADDR_PIXELFORMAT_BUILD  (GAME_BASE + 0x246770)  // sub_646770
+#define ADDR_HANDLE_FREE        (GAME_BASE + 0x212FF0)  // Handle_Free
+#define ADDR_HANDLE_SYSTEM_ACTIVE 0x8FEA50  // g_HandleSystemActive
+#define ADDR_HANDLE_TABLE       (GAME_BASE + 0x4FEA6C)  // g_HandleTable[32768]
 
 // Input system
 #define ADDR_INPUT_POLL         (GAME_BASE + 0x161F50)  // sub_561F50 - Main input poll
@@ -452,6 +468,7 @@
 #define ENTITY_OFF_ANIM_INDEX   0x1004  // +4100, DWORD
 #define ENTITY_OFF_ANIM_DATA    0x1008  // +4104, animation data array
 #define ENTITY_OFF_BOX_ARRAY    0xA33F  // +41791, box processing array
+#define ENTITY_OFF_ASSET_HANDLE_TABLE 0x0834  // +2100 within player entity; decomp match loader passes match_base + 43172 for P1 table
 
 // Animation / box constants
 #define ANIM_DATA_STRIDE        104

@@ -8,6 +8,7 @@
 #include "input_system.h"
 #include "log_window.h"
 #include "mod_main.h"
+#include "palette_editor.h"
 #include "patches/input_override.h"
 #include "patches/tick_hooks.h"
 #include "game_console.h"
@@ -366,6 +367,7 @@ static void TabLog() {
 void ModMenu_Init() {
     g_menuOpen = true;
     g_currentTab = 0;
+    PaletteEditor_Init();
 }
 
 void ModMenu_Toggle() {
@@ -421,6 +423,10 @@ void ModMenu_Render() {
         }
         if (ImGui::BeginTabItem("Log")) {
             TabLog();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Palette")) {
+            PaletteEditor_Render();
             ImGui::EndTabItem();
         }
         if (g_showAdvanced) {

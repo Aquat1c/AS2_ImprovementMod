@@ -45,6 +45,7 @@ void PracticeTools_OnFrameAdvanced();
 bool PracticeTools_IsPracticeModeActive();
 bool PracticeTools_IsPaused();
 bool PracticeTools_IsControlSwapped();
+void PracticeTools_SetPaused(bool paused);
 
 // Push a toast notification to the in-game HUD.
 // Only visible in practice mode. Short messages, auto-fading.

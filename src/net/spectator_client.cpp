@@ -25,6 +25,17 @@ struct BufferedFrame {
     bool valid;
 };
 
+struct BufferedPaletteState {
+    bool     metadata_valid;
+    bool     bank_valid;
+    uint8_t  character_id;
+    uint8_t  base_palette;
+    uint8_t  flags;
+    uint32_t payload_crc;
+    uint16_t payload_size;
+    uint8_t  data[NETPLAY_PALETTE_BANK_SIZE];
+};
+
 constexpr int kFastForwardGapFrames = 30;
 constexpr int kHardSyncGapFrames = 180;
 constexpr DWORD kStatusIntervalMs = 250;
@@ -55,6 +66,8 @@ static DWORD s_lastStatusSentAt = 0;
 static DWORD s_stateEnteredAt = 0;
 static bool s_deferredDestroyHost = false;
 static char s_deferredDestroyReason[64] = "";
+static uint32_t s_paletteEpoch = 0;
+static BufferedPaletteState s_palette[2] = {};
 
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
@@ -105,6 +118,8 @@ static void ResetBuffer() {
     s_playbackRbFrame = -1;
     s_shouldFastForward = false;
     s_needsHardSync = false;
+    s_paletteEpoch = 0;
+    memset(s_palette, 0, sizeof(s_palette));
 }
 
 static void DestroyClientHostNow(const char* reason) {
@@ -555,6 +570,42 @@ void SpectatorClient_FrameUpdate() {
                         break;
 
                     case Spectator::PacketType::PaletteState:
+                        if (payloadLen >= sizeof(Spectator::PaletteStatePayload)) {
+                            const auto* palette = static_cast<const Spectator::PaletteStatePayload*>(payload);
+                            s_matchId = palette->match_id;
+                            s_paletteEpoch = palette->palette_epoch;
+                            for (int index = 0; index < 2; index++) {
+                                s_palette[index].metadata_valid = true;
+                                s_palette[index].character_id = palette->player[index].character_id;
+                                s_palette[index].base_palette = palette->player[index].base_palette;
+                                s_palette[index].flags = palette->player[index].flags;
+                                s_palette[index].payload_crc = palette->player[index].payload_crc;
+                                s_palette[index].payload_size = palette->player[index].payload_size;
+                                if (!palette->player[index].has_custom_data) {
+                                    s_palette[index].bank_valid = false;
+                                    memset(s_palette[index].data, 0, sizeof(s_palette[index].data));
+                                }
+                            }
+                        }
+                        break;
+
+                    case Spectator::PacketType::PaletteData:
+                        if (payloadLen >= sizeof(Spectator::PaletteDataPayload)) {
+                            const auto* palette = static_cast<const Spectator::PaletteDataPayload*>(payload);
+                            if (palette->game_slot < 2 &&
+                                palette->payload_size == NETPLAY_PALETTE_BANK_SIZE) {
+                                s_matchId = palette->match_id;
+                                s_paletteEpoch = palette->palette_epoch;
+                                BufferedPaletteState& slot = s_palette[palette->game_slot];
+                                slot.metadata_valid = true;
+                                slot.bank_valid = true;
+                                slot.character_id = palette->character_id;
+                                slot.base_palette = palette->base_palette;
+                                slot.payload_crc = palette->payload_crc;
+                                slot.payload_size = palette->payload_size;
+                                memcpy(slot.data, palette->payload, NETPLAY_PALETTE_BANK_SIZE);
+                            }
+                        }
                         break;
 
                     case Spectator::PacketType::Heartbeat:
