@@ -42,10 +42,11 @@ void RollbackDebug_FrameUpdate();
 void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc);
 
 /// Feed remote frame-progress telemetry for live frame skew diagnosis.
-void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_frame,
-                                           int32_t remote_game_frame,
-                                           int32_t remote_view_frame,
-                                           int32_t remote_confirmed_frame,
+void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_rb_frame,
+                                           int32_t remote_game_abs_frame,
+                                           int32_t remote_frame_origin_abs,
+                                           int32_t remote_rb_frame_last_received,
+                                           int32_t remote_rb_frame_confirmed,
                                            int32_t remote_predicted_frames,
                                            uint32_t remote_checksum);
 

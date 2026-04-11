@@ -43,7 +43,7 @@ struct GameplayBridgeSnapshot {
     int      remote_game_slot;
     int      active_delay;
     int      rollback_budget;
-    int32_t  current_frame;
+    int32_t  rb_frame_current;
     float    frames_ahead;
     float    gekko_avg_ping;
     float    gekko_jitter;

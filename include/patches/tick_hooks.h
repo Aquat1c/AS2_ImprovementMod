@@ -19,9 +19,22 @@ extern GetTick_t g_origGetTick;
 
 DWORD __cdecl Hook_GetTick();
 
+struct NetplayTickState {
+	bool     initialized;
+	uint32_t last_real_tick_ms;
+	double   virtual_tick_ms;
+	float    current_scale;
+	float    target_scale;
+	bool     pacing_active;
+};
+
 // Tick scale control
 void SetGlobalTickScale(float scale);
 float GetGlobalTickScale();
 void SetNetplayTickScale(float scale);
+void SetNetplayTickScaleTarget(float scale);
+void SetNetplayPacingActive(bool active);
+void ResetNetplayTickScaleState();
+void GetNetplayTickState(NetplayTickState* out);
 float GetNetplayTickScale();
 float GetEffectiveTickScale();

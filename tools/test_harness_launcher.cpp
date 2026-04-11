@@ -418,9 +418,23 @@ static void AnalyzeCurrentLogs(const char* gameDir, DWORD pid, const char* label
             if (strstr(line, "[AutoConnect]")) autoconnect = true;
             if (strstr(line, "Session connected") || strstr(line, "Connected to '") || strstr(line, "Connected to host")) connected = true;
             if (strstr(line, "Launching netplay CharSel") || strstr(line, "entered charsel") || strstr(line, "CHARSEL LOCKSTEP BEGIN")) charsel = true;
-            if (strstr(line, "LoadBarrier") || strstr(line, "loading barrier") || strstr(line, "BootstrapLoading")) loadBarrier = true;
-            if (strstr(line, "ROLLBACK HANDOFF") || strstr(line, "rollback handoff") || strstr(line, "handoffFrame=")) handoff = true;
-            if (strstr(line, "RollbackSession begin") || strstr(line, "Begin: start_frame=") || strstr(line, "=== SESSION BEGIN ===")) rollbackStart = true;
+            if (strstr(line, "LoadBarrier") ||
+                strstr(line, "loading barrier") ||
+                strstr(line, "BootstrapLoading") ||
+                strstr(line, "Load barrier freeze"))
+                loadBarrier = true;
+            if (strstr(line, "ROLLBACK HANDOFF") ||
+                strstr(line, "rollback handoff") ||
+                strstr(line, "handoffFrame=") ||
+                strstr(line, "=== BOOTSTRAP -> INTRO HANDOFF ===") ||
+                strstr(line, "=== INTERACTIVE RELEASE -> ROLLBACK START ==="))
+                handoff = true;
+            if (strstr(line, "RollbackSession begin") ||
+                strstr(line, "Begin: start_frame=") ||
+                strstr(line, "=== SESSION BEGIN ===") ||
+                strstr(line, "[RollbackSession] BEGIN:") ||
+                strstr(line, "GekkoNet session started"))
+                rollbackStart = true;
             if (strstr(line, "FSYNC")) {
                 frameSync = true;
                 frameSyncCount++;

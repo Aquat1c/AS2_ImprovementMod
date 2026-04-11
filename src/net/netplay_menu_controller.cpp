@@ -30,6 +30,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <algorithm>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +65,7 @@ static uint16_t      s_listenPort         = 10700;
 static char          s_remoteEndpoint[96] = "127.0.0.1:10700";
 static int           s_preferredDelay     = 0;
 static int           s_rollbackBudget     = 7;  // Max rollback frames
-static int           s_rollbackDelay      = 0;  // Input pipeline delay (CCCaster-style)
+static int           s_rollbackTolerance  = Net::ROLLBACK_TOLERANCE_DEFAULT;
 static Net::ConnectPreference s_connectPreference = Net::ConnectPreference::AutoDirectThenRelay;
 static bool          s_upnpEnabled        = true;
 static bool          s_stunEnabled        = true;
@@ -163,7 +165,7 @@ static void SaveSettings() {
     fprintf(f, "endpoint=%s\n", s_remoteEndpoint);
     fprintf(f, "delay=%d\n", s_preferredDelay);
     fprintf(f, "rollback=%d\n", s_rollbackBudget);
-    fprintf(f, "rollback_delay=%d\n", s_rollbackDelay);
+    fprintf(f, "rollback_tolerance=%d\n", s_rollbackTolerance);
     fprintf(f, "connect_mode=%d\n", (int)s_connectPreference);
     fprintf(f, "upnp=%d\n", s_upnpEnabled ? 1 : 0);
     fprintf(f, "stun=%d\n", s_stunEnabled ? 1 : 0);
@@ -220,10 +222,12 @@ static void LoadSettings() {
             if (d >= 0 && d <= 15) s_preferredDelay = d;
         } else if (_stricmp(key, "rollback") == 0) {
             int r = atoi(val);
-            if (r >= 2 && r <= 10) s_rollbackBudget = r;
-        } else if (_stricmp(key, "rollback_delay") == 0) {
-            int rd = atoi(val);
-            if (rd >= 0 && rd <= 15) s_rollbackDelay = rd;
+            if (r >= Net::ROLLBACK_BUDGET_MIN && r <= Net::ROLLBACK_BUDGET_MAX) s_rollbackBudget = r;
+        } else if (_stricmp(key, "rollback_tolerance") == 0) {
+            int rk = atoi(val);
+            if (rk >= Net::ROLLBACK_TOLERANCE_MIN && rk <= Net::ROLLBACK_TOLERANCE_MAX) {
+                s_rollbackTolerance = rk;
+            }
         } else if (_stricmp(key, "connect_mode") == 0) {
             int mode = atoi(val);
             if (mode >= (int)Net::ConnectPreference::AutoDirectThenRelay &&
@@ -269,7 +273,7 @@ static void LoadSettings() {
 
     fclose(f);
     LOG_NETPLAY(LOG_INFO,
-        "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_delay=%d "
+        "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_tol=%d "
         "mode=%s upnp=%d pcp=%d stun=%d punch=%d turn=%d ipv6=%d relay='%s' stun_srv='%s' turn_srv='%s' "
         "nat_timeouts=[%u/%u/%u] nat_log=%u",
         s_localNickname,
@@ -277,7 +281,7 @@ static void LoadSettings() {
         s_remoteEndpoint,
         s_preferredDelay,
         s_rollbackBudget,
-        s_rollbackDelay,
+        s_rollbackTolerance,
         Net::ConnectPreferenceName(s_connectPreference),
         s_upnpEnabled ? 1 : 0,
         s_pcpFallbackEnabled ? 1 : 0,
@@ -297,14 +301,14 @@ static void LoadSettings() {
 static void ApplyDelaySettingsToPolicy(const char* reason) {
     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
-    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
+    Net::DelayPolicy_SetRollbackToleranceK(s_rollbackTolerance);
 
     LOG_NETPLAY(LOG_INFO,
-        "[NetMenu] Applied delay policy settings (%s): pref=%d rb=%d rb_delay=%d active=%d",
+        "[NetMenu] Applied delay policy settings (%s): my_delay=%d rb=%d tol=%d active=%d",
         reason ? reason : "unspecified",
         s_preferredDelay,
         s_rollbackBudget,
-        s_rollbackDelay,
+        s_rollbackTolerance,
         Net::DelayPolicy_GetActiveDelay());
 }
 
@@ -1763,19 +1767,19 @@ static void HandleNavigationInput() {
                 }
                 if (changed) {
                     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
-                    SetStatus("Rollback frames: %d", s_rollbackBudget);
+                    SetStatus("Max rollback: %d", s_rollbackBudget);
                 }
             } else if (s_selectedIndex == 3) {
-                if (left && s_rollbackDelay > Net::DELAY_MIN) {
-                    s_rollbackDelay--;
+                if (left && s_rollbackTolerance > Net::ROLLBACK_TOLERANCE_MIN) {
+                    s_rollbackTolerance--;
                     changed = true;
-                } else if (right && s_rollbackDelay < Net::DELAY_MAX) {
-                    s_rollbackDelay++;
+                } else if (right && s_rollbackTolerance < Net::ROLLBACK_TOLERANCE_MAX) {
+                    s_rollbackTolerance++;
                     changed = true;
                 }
                 if (changed) {
-                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
-                    SetStatus("Rollback delay: %d", s_rollbackDelay);
+                    Net::DelayPolicy_SetRollbackToleranceK(s_rollbackTolerance);
+                    SetStatus("Recommendation bias: %d", s_rollbackTolerance);
                 }
             } else if (s_selectedIndex == 4) {
                 int mode = (int)s_connectPreference;
@@ -1824,16 +1828,15 @@ static void HandleNavigationInput() {
     // Left/Right for ConnectedSession: Rollback Frames (index 0) and Input Delay (index 1)
     if (s_state == MenuState::ConnectedSession) {
         if (s_selectedIndex == 0) {
-            // Rollback budget
+            // Max rollback
             if (InputSystem_JustPressed(0, INPUT_LEFT)) {
                 int cur = s_rollbackBudget;
                 if (cur > Net::ROLLBACK_BUDGET_MIN) {
                     s_rollbackBudget = cur - 1;
                     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
-                    // Auto-compute suggested rollback delay
-                    s_rollbackDelay = Net::DelayPolicy_ComputeSuggestedRollbackDelay();
-                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
-                    SetStatus("Rollback: %d  Delay: %d", s_rollbackBudget, s_rollbackDelay);
+                    SetStatus("Max rollback: %d  Rec: %d",
+                        s_rollbackBudget,
+                        Net::DelayPolicy_ComputeRecommendedMaxRollback());
                     SaveSettings();
                 }
             }
@@ -1842,27 +1845,27 @@ static void HandleNavigationInput() {
                 if (cur < Net::ROLLBACK_BUDGET_MAX) {
                     s_rollbackBudget = cur + 1;
                     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
-                    s_rollbackDelay = Net::DelayPolicy_ComputeSuggestedRollbackDelay();
-                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
-                    SetStatus("Rollback: %d  Delay: %d", s_rollbackBudget, s_rollbackDelay);
+                    SetStatus("Max rollback: %d  Rec: %d",
+                        s_rollbackBudget,
+                        Net::DelayPolicy_ComputeRecommendedMaxRollback());
                     SaveSettings();
                 }
             }
         } else if (s_selectedIndex == 1) {
-            // Input delay override
+            // My local gameplay delay
             if (InputSystem_JustPressed(0, INPUT_LEFT)) {
-                if (s_rollbackDelay > Net::DELAY_MIN) {
-                    s_rollbackDelay--;
-                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
-                    SetStatus("Input delay: %d", s_rollbackDelay);
+                if (s_preferredDelay > Net::DELAY_MIN) {
+                    s_preferredDelay--;
+                    Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
+                    SetStatus("Input delay: %d", s_preferredDelay);
                     SaveSettings();
                 }
             }
             if (InputSystem_JustPressed(0, INPUT_RIGHT)) {
-                if (s_rollbackDelay < Net::DELAY_MAX) {
-                    s_rollbackDelay++;
-                    Net::DelayPolicy_SetRollbackDelay(s_rollbackDelay);
-                    SetStatus("Input delay: %d", s_rollbackDelay);
+                if (s_preferredDelay < Net::DELAY_MAX) {
+                    s_preferredDelay++;
+                    Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
+                    SetStatus("Input delay: %d", s_preferredDelay);
                     SaveSettings();
                 }
             }
@@ -2360,24 +2363,36 @@ void GetSnapshot(MenuSnapshot* out) {
         endpointShort);
     CopyText(out->nat_status, sizeof(out->nat_status), natStatus);
 
+    Net::DelayPolicySnapshot delaySnap{};
+    Net::DelayPolicy_GetSnapshot(&delaySnap);
+
     // Peer info from session
     Net::SessionSnapshot sessionSnap{};
     Net::Session_GetSnapshot(&sessionSnap);
     if (sessionSnap.active) {
         CopyText(out->peer_nickname, sizeof(out->peer_nickname), sessionSnap.remote_peer.nickname);
-        out->rtt_ms = sessionSnap.stats.rtt_ms;
+        out->rtt_ms = delaySnap.measurement_valid ? delaySnap.measured_avg_ping_ms
+                                                  : sessionSnap.stats.rtt_ms;
         out->is_host = (sessionSnap.role == Net::SessionRole::Host);
         out->local_accepted  = sessionSnap.local_ready;
         out->remote_accepted = sessionSnap.remote_ready;
     }
 
     // Active delay from delay policy
-    out->active_delay = Net::DelayPolicy_GetActiveDelay();
+    out->active_delay = delaySnap.active_delay;
 
     // Rollback config
     out->rollback_budget = s_rollbackBudget;
-    out->rollback_delay = s_rollbackDelay;
-    out->recommended_delay = Net::DelayPolicy_ComputeRecommendedDelay();
+    out->rollback_tolerance = s_rollbackTolerance;
+    out->recommended_delay = delaySnap.recommended_delay;
+    out->recommended_max_rollback = delaySnap.recommended_max_rollback;
+    out->stall_threshold = delaySnap.stall_threshold;
+
+    const int expectedDepth =
+        (std::max)(0,
+            (int)ceilf(delaySnap.measured_one_way_frames) - delaySnap.remote_announced_delay);
+    out->stall_warning = delaySnap.measurement_valid &&
+                         (expectedDepth > s_rollbackBudget);
 
     // Local nickname
     CopyText(out->local_nickname, sizeof(out->local_nickname), s_localNickname);

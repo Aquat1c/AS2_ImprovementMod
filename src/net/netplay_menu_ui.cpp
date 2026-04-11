@@ -287,15 +287,15 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
 
     char delayVal[24];
     _snprintf_s(delayVal, sizeof(delayVal), _TRUNCATE, "< %d >", snap->preferred_delay);
-    RenderRow(y, "Input Delay", delayVal, snap->selected_index == 1, true, alpha); y += kSettingsStep;
+    RenderRow(y, "Input delay", delayVal, snap->selected_index == 1, true, alpha); y += kSettingsStep;
 
     char rbVal[24];
     _snprintf_s(rbVal, sizeof(rbVal), _TRUNCATE, "< %d >", snap->rollback_budget);
-    RenderRow(y, "Rollback Frames", rbVal, snap->selected_index == 2, true, alpha); y += kSettingsStep;
+    RenderRow(y, "Max rollback", rbVal, snap->selected_index == 2, true, alpha); y += kSettingsStep;
 
-    char rbdVal[24];
-    _snprintf_s(rbdVal, sizeof(rbdVal), _TRUNCATE, "< %d >", snap->rollback_delay);
-    RenderRow(y, "Rollback Delay", rbdVal, snap->selected_index == 3, true, alpha); y += kSettingsStep;
+    char tolVal[24];
+    _snprintf_s(tolVal, sizeof(tolVal), _TRUNCATE, "< %d >", snap->rollback_tolerance);
+    RenderRow(y, "Recommendation bias", tolVal, snap->selected_index == 3, true, alpha); y += kSettingsStep;
 
     char modeVal[24];
     _snprintf_s(modeVal, sizeof(modeVal), _TRUNCATE, "< %s >", ConnectModeLabel(snap->connection_mode));
@@ -360,15 +360,15 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
     {
         char rbVal[24];
         _snprintf_s(rbVal, sizeof(rbVal), _TRUNCATE, "< %d >", snap->rollback_budget);
-        RenderRow(y, "Rollback Frames", rbVal, snap->selected_index == 0, true, alpha);
+        RenderRow(y, "Max rollback", rbVal, snap->selected_index == 0, true, alpha);
         y += kRowStep;
     }
 
-    // Row 1: Input Delay (adjustable left/right)
+    // Row 1: Input delay (adjustable left/right)
     {
         char delVal[24];
-        _snprintf_s(delVal, sizeof(delVal), _TRUNCATE, "< %d >", snap->rollback_delay);
-        RenderRow(y, "Input Delay", delVal, snap->selected_index == 1, true, alpha);
+        _snprintf_s(delVal, sizeof(delVal), _TRUNCATE, "< %d >", snap->preferred_delay);
+        RenderRow(y, "Input delay", delVal, snap->selected_index == 1, true, alpha);
         y += kRowStep;
     }
 
@@ -409,12 +409,20 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
         RenderInfoLine(y, "Status", acceptBuf, alpha);
         y += kInfoStep;
     }
-    // Ping
+    // Ping / recommendations
     if (snap->rtt_ms > 0.0f) {
-        char pingBuf[48];
-        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms  (rec. delay: %d)",
-            snap->rtt_ms, snap->recommended_delay);
+        char pingBuf[72];
+        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms  rec D:%d RB:%d",
+            snap->rtt_ms, snap->recommended_delay, snap->recommended_max_rollback);
         RenderInfoLine(y, "Ping", pingBuf, alpha);
+        y += kInfoStep;
+    }
+    if (snap->stall_threshold > 0) {
+        char stallBuf[72];
+        _snprintf_s(stallBuf, sizeof(stallBuf), _TRUNCATE, "%d%s",
+            snap->stall_threshold,
+            snap->stall_warning ? "  (risk)" : "");
+        RenderInfoLine(y, "Stall Limit", stallBuf, alpha);
         y += kInfoStep;
     }
     // Score

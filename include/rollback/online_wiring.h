@@ -17,6 +17,8 @@
 
 #include <stdint.h>
 
+#include "net/netplay_phase_runtime.h"
+
 namespace Rollback {
 
 // ============================================================================
@@ -77,11 +79,21 @@ struct OnlineWiringSnapshot {
     bool     rollback_started;       // Has rollback session ever started this match
     bool     rollback_active;        // Is rollback session currently active
     bool     gameplay_active;        // Are we in playable gameplay right now
-    int32_t  handoff_frame;          // Frame at which bootstrap → gameplay occurred
+    bool     session_running;
+    bool     stepping_enabled;
+    bool     startup_barrier_armed;
+    bool     startup_barrier_released;
+    bool     lockstep_owner_active;
+    Net::MatchRollbackPhase phase;
+    float    target_tick_scale;
+    float    current_tick_scale;
+    int32_t  frame_origin_abs;       // Absolute engine frame where rollback rb_frame 0 begins
     uint32_t baseline_crc;           // Baseline CRC from bootstrap
     uint32_t config_hash;            // Config hash from pregame
     int      handoff_delay;          // Active delay at gameplay handoff
     int      handoff_budget;         // Rollback budget at handoff
+    int      remote_announced_delay;
+    int      stall_threshold;
     int      remote_inputs_received; // Total remote inputs processed
     int      packets_dispatched;     // Total gameplay packets dispatched
 };

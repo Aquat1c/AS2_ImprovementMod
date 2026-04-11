@@ -88,5 +88,14 @@ struct InputDebugInfo {
 
 extern InputDebugInfo g_inputDebug;
 
+struct TimesyncDebugInfo {
+    float frames_ahead;
+    float rate_adjust_ms;
+    int   stall_frame_count;
+    int   hard_skip_count;
+    bool  stalled;
+};
+
 void UpdateInputDebugInfo();
 void RenderInputDebugContent();
+void GetTimesyncDebugInfo(TimesyncDebugInfo* out);

@@ -125,11 +125,14 @@ static int __cdecl Hook_GetSyncInput(int frame, int16_t* out) {
  * Suppressed only while frontend lockstep owns frame stepping or while the
  * load barrier intentionally freezes gameplay at the Mode 8 boundary.
  *
- * Unlike the old dispatcher-driven rollback path, the current gameplay path is
- * bridge-driven from ModOnFrame and still relies on the game's normal Match
- * loop to advance. Do not suppress Frame_AdvanceSimulation for live gameplay.
+ * Live rollback remains dispatcher-driven through the game's normal match loop.
+ * Do not suppress Frame_AdvanceSimulation for active in-match rollback.
  */
 static int __cdecl Hook_AdvanceFrame() {
+    const bool loadBarrierFreeze = s_load_barrier_freeze;
+    const bool timesyncFreeze = s_timesync_freeze;
+    const bool practiceFreeze = PracticeTools_ShouldFreezeFrame();
+    const bool charselLockstep = Net::CharSelSync_IsLockstepActive();
     bool suppress = ShouldSuppressAdvanceFrame();
     if (suppress) {
         static uint32_t s_advSuppressCount = 0;
@@ -138,11 +141,26 @@ static int __cdecl Hook_AdvanceFrame() {
             Rollback::NetplayLog_Write("SYNC", -1,
                 "AdvanceFrame SUPPRESSED (#%u): lockstep=%d freeze=%d frameSim=%d frameDisp=%d",
                 s_advSuppressCount,
-                (int)Net::CharSelSync_IsLockstepActive(),
-                (int)IsGameplayFreezeActiveInternal(),
+                (int)charselLockstep,
+                (int)(loadBarrierFreeze || timesyncFreeze || practiceFreeze),
                 *(volatile int32_t*)ADDR_FRAME_SIMULATION,
                 *(volatile int32_t*)ADDR_FRAME_DISPLAY);
             Rollback::NetplayLog_Flush();
+        }
+
+        // Runtime freeze is a hold-for-this-frame pulse, not a sticky mode.
+        // The dispatcher/gate logic will re-arm it on the next held frame if
+        // we still need to stall, hard-skip, or wait for startup release.
+        if (timesyncFreeze) {
+            s_timesync_freeze = false;
+            Rollback::NetplayLog_Verbose("TSYNC", -1,
+                "Runtime freeze pulse CONSUMED by AdvanceFrame suppression: "
+                "load_barrier=%d practice=%d lockstep=%d frameSim=%d frameDisp=%d",
+                loadBarrierFreeze ? 1 : 0,
+                practiceFreeze ? 1 : 0,
+                charselLockstep ? 1 : 0,
+                *(volatile int32_t*)ADDR_FRAME_SIMULATION,
+                *(volatile int32_t*)ADDR_FRAME_DISPLAY);
         }
         return 0;
     }

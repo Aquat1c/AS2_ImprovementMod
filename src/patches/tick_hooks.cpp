@@ -2,20 +2,13 @@
 #include "log_window.h"
 
 #include <math.h>
+#include <string.h>
 
-// Original function pointer (set by hook_installer)
 GetTick_t g_origGetTick = nullptr;
 
-// Tick scaling state
 static volatile float g_manualTickScale = 1.0f;
-static volatile float g_netplayTickScale = 1.0f;
-static DWORD g_timeWarpBaseReal = 0;
-static double g_timeWarpBaseFake = 0.0;
-static float g_timeWarpLastScale = 1.0f;
-static bool g_timeWarpInitialized = false;
+static NetplayTickState g_netplayTickState{};
 static float g_lastLoggedEffectiveScale = 1.0f;
-
-extern bool GetVerboseLogging();
 
 static float ClampTickScale(float scale) {
     if (scale < 0.1f) scale = 0.1f;
@@ -23,53 +16,73 @@ static float ClampTickScale(float scale) {
     return scale;
 }
 
+static float SlewScale(float current, float target) {
+    static constexpr float kMaxScaleStepPerFrame = 0.0035f;
+    const float delta = target - current;
+    if (delta > kMaxScaleStepPerFrame) {
+        return current + kMaxScaleStepPerFrame;
+    }
+    if (delta < -kMaxScaleStepPerFrame) {
+        return current - kMaxScaleStepPerFrame;
+    }
+    return target;
+}
+
+static float DesiredNetplayScale() {
+    return g_netplayTickState.pacing_active
+        ? ClampTickScale(g_netplayTickState.target_scale)
+        : 1.0f;
+}
+
 static float ComputeEffectiveScale() {
-    return ClampTickScale((float)(g_manualTickScale * g_netplayTickScale));
+    return ClampTickScale((float)(g_manualTickScale * g_netplayTickState.current_scale));
 }
 
 DWORD __cdecl Hook_GetTick() {
     DWORD real = g_origGetTick ? g_origGetTick() : (GetTickCount() & 0x7FFFFFFF);
     real &= 0x7FFFFFFF;
 
+    if (!g_netplayTickState.initialized) {
+        g_netplayTickState.initialized = true;
+        g_netplayTickState.last_real_tick_ms = real;
+        g_netplayTickState.virtual_tick_ms = (double)real;
+        g_netplayTickState.current_scale = ClampTickScale(g_netplayTickState.current_scale);
+        if (g_netplayTickState.current_scale <= 0.0f) {
+            g_netplayTickState.current_scale = 1.0f;
+        }
+        g_netplayTickState.target_scale = ClampTickScale(g_netplayTickState.target_scale);
+        if (g_netplayTickState.target_scale <= 0.0f) {
+            g_netplayTickState.target_scale = 1.0f;
+        }
+    }
+
+    uint32_t realDeltaMs = 0;
+    if (real >= g_netplayTickState.last_real_tick_ms) {
+        realDeltaMs = real - g_netplayTickState.last_real_tick_ms;
+    }
+    if (realDeltaMs > 100) {
+        realDeltaMs = 100;
+    }
+    g_netplayTickState.last_real_tick_ms = real;
+
+    g_netplayTickState.current_scale = SlewScale(
+        ClampTickScale(g_netplayTickState.current_scale),
+        DesiredNetplayScale());
+
     const float effectiveScale = ComputeEffectiveScale();
-    const bool scaleIsNeutral = fabsf(effectiveScale - 1.0f) <= 0.001f;
-    if (fabsf(g_lastLoggedEffectiveScale - effectiveScale) > 0.001f) {
-        LOG_INFO("[TickHooks] Effective tick scale changed: %.3fx (manual=%.3fx netplay=%.3fx)",
-            effectiveScale, g_manualTickScale, g_netplayTickScale);
+    if (fabsf(g_lastLoggedEffectiveScale - effectiveScale) > 0.005f) {
+        LOG_INFO(
+            "[TickHooks] Effective tick scale changed: %.3fx (manual=%.3fx target=%.3fx current=%.3fx active=%d)",
+            effectiveScale,
+            g_manualTickScale,
+            g_netplayTickState.target_scale,
+            g_netplayTickState.current_scale,
+            g_netplayTickState.pacing_active ? 1 : 0);
         g_lastLoggedEffectiveScale = effectiveScale;
     }
 
-    // Fast path: default gameplay should match the game's original tick source exactly.
-    // Do not run through time-warp math unless a non-1.0 scale is actively requested.
-    if (scaleIsNeutral) {
-        g_timeWarpInitialized = false;
-        g_timeWarpLastScale = 1.0f;
-        return real;
-    }
-
-    if (!g_timeWarpInitialized) {
-        g_timeWarpBaseReal = real;
-        g_timeWarpBaseFake = (double)real;
-        g_timeWarpLastScale = effectiveScale;
-        g_timeWarpInitialized = true;
-        return real;
-    }
-
-    if (fabsf(g_timeWarpLastScale - effectiveScale) > 0.001f) {
-        const DWORD delta = (real - g_timeWarpBaseReal) & 0x7FFFFFFF;
-        g_timeWarpBaseFake += (double)delta * (double)g_timeWarpLastScale;
-        g_timeWarpBaseReal = real;
-        g_timeWarpBaseFake = floor(g_timeWarpBaseFake + 0.5);
-        g_timeWarpLastScale = effectiveScale;
-        return (DWORD)(((uint64_t)(g_timeWarpBaseFake + 0.5)) & 0x7FFFFFFF);
-    }
-
-    const DWORD baseReal = (g_timeWarpBaseReal & 0x7FFFFFFF);
-    const DWORD delta = (real - baseReal) & 0x7FFFFFFF;
-
-    const double scaledDelta = (double)delta * (double)effectiveScale;
-    const uint64_t fake64 = (uint64_t)(g_timeWarpBaseFake + scaledDelta + 0.5);
-    return (DWORD)(fake64 & 0x7FFFFFFF);
+    g_netplayTickState.virtual_tick_ms += (double)realDeltaMs * (double)effectiveScale;
+    return (DWORD)(((uint64_t)floor(g_netplayTickState.virtual_tick_ms)) & 0x7FFFFFFF);
 }
 
 void SetGlobalTickScale(float scale) {
@@ -81,11 +94,40 @@ float GetGlobalTickScale() {
 }
 
 void SetNetplayTickScale(float scale) {
-    g_netplayTickScale = ClampTickScale(scale);
+    const float clamped = ClampTickScale(scale);
+    g_netplayTickState.current_scale = clamped;
+    g_netplayTickState.target_scale = clamped;
+    g_netplayTickState.pacing_active = fabsf(clamped - 1.0f) > 0.001f;
+}
+
+void SetNetplayTickScaleTarget(float scale) {
+    g_netplayTickState.target_scale = ClampTickScale(scale);
+}
+
+void SetNetplayPacingActive(bool active) {
+    g_netplayTickState.pacing_active = active;
+    if (!active) {
+        g_netplayTickState.target_scale = 1.0f;
+    }
+}
+
+void ResetNetplayTickScaleState() {
+    memset(&g_netplayTickState, 0, sizeof(g_netplayTickState));
+    g_netplayTickState.current_scale = 1.0f;
+    g_netplayTickState.target_scale = 1.0f;
+    g_lastLoggedEffectiveScale = 1.0f;
+}
+
+void GetNetplayTickState(NetplayTickState* out) {
+    if (!out) {
+        return;
+    }
+
+    *out = g_netplayTickState;
 }
 
 float GetNetplayTickScale() {
-    return g_netplayTickScale;
+    return g_netplayTickState.current_scale;
 }
 
 float GetEffectiveTickScale() {

@@ -47,8 +47,8 @@ struct MatchBootstrapSnapshot {
 
     // Gameplay start
     bool     gameplay_start;
-    uint32_t start_frame;
-    int32_t  gameplay_start_sim_frame;
+    uint32_t bootstrap_frame_abs;
+    int32_t  gameplay_start_host_game_abs_frame;
 
     // Error
     char     error[128];

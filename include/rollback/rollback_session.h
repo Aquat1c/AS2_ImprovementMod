@@ -28,6 +28,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 namespace Rollback {
 
@@ -41,7 +42,7 @@ struct RollbackSessionConfig {
     int      initial_delay;      // Input delay for local player
     int      rollback_budget;    // Max prediction window (GekkoNet input_prediction_window)
     uint32_t baseline_checksum;  // CRC32 of baseline state (for verification)
-    int32_t  start_frame;        // Native gameplay frame where rollback ownership begins
+    int32_t  frame_origin_abs;   // Absolute engine frame where rollback rb_frame 0 begins
 };
 
 // ============================================================================
@@ -93,6 +94,13 @@ bool RollbackSession_PollSession();
 ///   Error   → session broken; dispatcher should return -1
 EventResult RollbackSession_ProcessNextEvent();
 
+/// True while a BeginFrame/UpdateSession batch still has pending events.
+bool RollbackSession_HasPendingFrame();
+
+/// Drain only non-advance pending events (Save/Load/Done) outside the dispatcher.
+/// Returns false if the pending stream still contains an Advance or the session is broken.
+bool RollbackSession_DrainPendingNonAdvanceEvents();
+
 /// Get the P1/P2 inputs from the last Advance event.
 /// Only valid after ProcessNextEvent returns Advance.
 void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2);
@@ -109,8 +117,17 @@ void RollbackSession_BufferGekkoPacket(const void* data, size_t len);
 // Queries
 // ============================================================================
 
-/// Current simulation frame (from last advance event).
+/// Current rollback-session-relative frame (rb_frame).
 int32_t RollbackSession_GetCurrentFrame();
+
+/// Absolute engine frame origin latched when rollback started.
+int32_t RollbackSession_GetFrameOriginAbs();
+
+/// Current engine frame derived from the active rollback frame origin.
+int32_t RollbackSession_GetCurrentGameAbsFrame();
+
+/// Convert a rollback-session-relative frame into the absolute engine frame domain.
+int32_t RollbackSession_RbFrameToGameAbs(int32_t rb_frame);
 
 /// Whether the current advance event is a rollback resimulation frame.
 bool RollbackSession_IsRollingBack();
@@ -138,10 +155,17 @@ bool RollbackSession_ShouldSuppressSideEffects();
 const char* RollbackSession_GetErrorReason();
 
 struct RollbackTimesyncTelemetry {
+    int32_t  rb_frame_current;
+    int32_t  rb_frame_last_confirmed;
+    int32_t  rb_frame_last_remote_received;
+    int32_t  game_abs_frame_current;
+    int32_t  frame_origin_abs;
     int32_t  rollback_count;
     int32_t  last_rollback_replay_length;
     int32_t  max_rollback_distance;
     int32_t  predicted_frames_outstanding;
+    float    frames_ahead;
+    float    gekko_avg_ping;
     float    gekko_jitter;
 };
 
@@ -166,14 +190,16 @@ struct RollbackSessionSnapshot {
     int      remote_player;
 
     // Frame state
-    int32_t  current_frame;
-    int32_t  last_confirmed_frame;
-    int32_t  last_remote_received_frame;
-    int32_t  last_saved_state_frame;
+    int32_t  frame_origin_abs;
+    int32_t  game_abs_frame_current;
+    int32_t  rb_frame_current;
+    int32_t  rb_frame_last_confirmed;
+    int32_t  rb_frame_last_remote_received;
+    int32_t  rb_frame_last_saved_state;
 
     // Rollback stats (from resim subsystem)
     int32_t  rollback_count;
-    int32_t  last_rollback_start_frame;
+    int32_t  rb_last_rollback_start_frame;
     int32_t  last_rollback_replay_length;
     int32_t  max_rollback_distance;
     int32_t  predicted_frames_outstanding;

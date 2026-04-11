@@ -136,8 +136,11 @@ struct MenuSnapshot {
     bool          is_host;
     int           active_delay;
     int           rollback_budget;
-    int           rollback_delay;       // Input pipeline delay (CCCaster-style)
-    int           recommended_delay;    // Auto-computed from RTT
+    int           rollback_tolerance;
+    int           recommended_delay;
+    int           recommended_max_rollback;
+    int           stall_threshold;
+    bool          stall_warning;
 
     // Accept state
     bool          local_accepted;

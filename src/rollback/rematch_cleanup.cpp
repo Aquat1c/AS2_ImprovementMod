@@ -129,6 +129,7 @@ void RematchCleanup_PrepareForNextMatch(const char* reason) {
     Rollback::NetplayLog_Write("REMATCH", -1,
         "Disabling digest/debug emission for the finished match");
     Rollback::RollbackDebug_SetDigestEnabled(false);
+    Rollback::RollbackDebug_ResetSession();
 
     ClearInputResidue();
 

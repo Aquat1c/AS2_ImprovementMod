@@ -10,10 +10,13 @@
  */
 
 #include "rollback/rollback_session.h"
+#include "rollback/frame_lineage.h"
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
 #include "net/session_manager.h"
+#include "net/match_lifecycle.h"
+#include "net/delay_policy.h"
 #include "net/protocol.h"
 #include "net/player_side_mapping.h"
 #include "input/input_system.h"
@@ -25,6 +28,7 @@
 #include <gekko_types.h>
 
 #include <string.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <algorithm>
 #include <math.h>
@@ -47,10 +51,14 @@ namespace Rollback {
 
 #pragma pack(push, 1)
 struct GekkoState {
+    // Explicit frame-domain metadata for rollback integration debugging.
+    uint32_t rb_frame;             // Rollback-session-relative frame from Gekko
+    uint32_t frame_origin_abs;     // Absolute engine frame where rb_frame 0 begins
+
     // Scattered globals (all outside main blob, verified against decompilation)
     uint32_t rng_seed;            // TLS _getptd()+0x14 — C runtime rand() state
-    uint32_t sim_frame;           // 0x816490 — simulation frame counter (= input_read_idx)
-    uint32_t display_frame;       // 0x81635C — display frame counter
+    uint32_t sim_frame;           // 0x816490 — absolute engine simulation frame (= input_read_idx)
+    uint32_t display_frame;       // 0x81635C — absolute engine display frame
     uint32_t game_mode;           // 0x81638C — current mode handler
     uint32_t substate;            // 0x816390 — sub-state within mode
     uint32_t substate_timer;      // 0x816394 — timer/counter for substates
@@ -152,6 +160,8 @@ static void AdapterFreeData(void* data_ptr) {
     free(data_ptr);
 }
 
+static void RefreshCachedNetworkTelemetry(bool includeFramesAhead);
+
 // ============================================================================
 // Internal State
 // ============================================================================
@@ -166,11 +176,93 @@ static int            s_remoteHandle   = -1;
 static int            s_activeDelay    = 0;
 static int            s_rollbackBudget = 7;
 static uint32_t       s_baselineChecksum = 0;
-static int32_t        s_startFrame     = 0;
-static int32_t        s_currentFrame   = 0;
-static int32_t        s_lastSavedFrame = -1;
+static int32_t        s_frameOriginAbs = 0;
+static int32_t        s_currentRbFrame = 0;
+static int32_t        s_lastSavedRbFrame = -1;
 static bool           s_rollingBack    = false;
 static bool           s_sessionRunning = false;  // true after GekkoSessionStarted event
+static float          s_cachedFramesAhead = 0.0f;
+static int32_t        s_cachedCurrentRbFrame = 0;
+static int32_t        s_cachedConfirmedRbFrame = -1;
+static int32_t        s_cachedLastRemoteReceivedRbFrame = -1;
+static float          s_cachedAvgPing = 0.0f;
+static float          s_cachedJitter = 0.0f;
+static bool           s_loggedFirstSaveEvent = false;
+static bool           s_loggedFirstLoadEvent = false;
+static bool           s_loggedFirstAdvanceEvent = false;
+static bool           s_loggedFirstNonZeroFramesAhead = false;
+static bool           s_waitingForAdvance = false;
+static int32_t        s_waitingAdvanceRbFrame = -1;
+static uint32_t       s_waitingForAdvanceCount = 0;
+
+static int32_t RbFrameToGameAbsFrame(int32_t rbFrame) {
+    return FrameLineage_GameAbsFromRb(s_frameOriginAbs, rbFrame);
+}
+
+// Gekko's bootstrap checkpoint is saved at rb_frame=-1, but at the first
+// interactive boundary the engine still reports the same absolute sim counter
+// for that bootstrap state and for Advance(0). Do not shift the whole
+// save/load domain by +1; only normalize the bootstrap checkpoint.
+static int32_t RbCheckpointFrameToGameAbsFrame(int32_t rbFrame) {
+    return FrameLineage_GameAbsFromCheckpoint(s_frameOriginAbs, rbFrame);
+}
+
+static int32_t CurrentGameAbsFrame() {
+    return RbFrameToGameAbsFrame(s_currentRbFrame);
+}
+
+static void LogFrameDomainMismatch(const char* label,
+                                   int32_t rbFrame,
+                                   int32_t expectedGameAbsFrame,
+                                   uint32_t capturedGameAbsFrame,
+                                   uint32_t inputWriteIdx,
+                                   uint32_t displayFrame) {
+    NetplayLog_Write("GEKKO", rbFrame,
+        "FRAME DOMAIN %s MISMATCH: rb_frame=%d expected_game_abs_frame=%d captured_game_abs_frame=%u "
+        "origin_abs=%d mode=%u sub=%u/%u phase=%s rolling_back=%d write_idx=%u display_frame=%u",
+        label ? label : "UNKNOWN",
+        rbFrame,
+        expectedGameAbsFrame,
+        capturedGameAbsFrame,
+        s_frameOriginAbs,
+        ReadMemory<uint32_t>(ADDR_GAME_MODE),
+        ReadMemory<uint32_t>(ADDR_SUB_STATE),
+        ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER),
+        Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+        s_rollingBack ? 1 : 0,
+        inputWriteIdx,
+        displayFrame);
+}
+
+static void RefreshCachedNetworkTelemetry(bool includeFramesAhead) {
+    if (!s_session) {
+        s_cachedFramesAhead = 0.0f;
+        s_cachedCurrentRbFrame = s_currentRbFrame;
+        s_cachedConfirmedRbFrame = -1;
+        s_cachedLastRemoteReceivedRbFrame = -1;
+        s_cachedAvgPing = 0.0f;
+        s_cachedJitter = 0.0f;
+        return;
+    }
+
+    if (includeFramesAhead) {
+        s_cachedFramesAhead = gekko_frames_ahead(s_session);
+    }
+    s_cachedCurrentRbFrame = gekko_current_frame(s_session);
+    s_cachedConfirmedRbFrame = gekko_min_received_frame(s_session);
+    s_cachedLastRemoteReceivedRbFrame =
+        (s_remoteHandle >= 0) ? gekko_last_received_frame(s_session, s_remoteHandle) : -1;
+
+    if (s_remoteHandle >= 0) {
+        GekkoNetworkStats stats{};
+        gekko_network_stats(s_session, s_remoteHandle, &stats);
+        s_cachedAvgPing = stats.avg_ping;
+        s_cachedJitter = stats.jitter;
+    } else {
+        s_cachedAvgPing = 0.0f;
+        s_cachedJitter = 0.0f;
+    }
+}
 
 // Two-phase event processing state
 static GekkoGameEvent** s_events       = nullptr;
@@ -212,6 +304,9 @@ static MatchHandler_t g_matchHandler = (MatchHandler_t)ADDR_MATCH_MODE;
 // ============================================================================
 
 static bool CaptureState(GekkoState* state) {
+    state->rb_frame          = (uint32_t)s_currentRbFrame;
+    state->frame_origin_abs  = (uint32_t)s_frameOriginAbs;
+
     // Scattered globals
     state->rng_seed          = DetVer_GetRngSeed();
     state->sim_frame         = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
@@ -326,19 +421,38 @@ static bool RestoreState(const GekkoState* state) {
 // ============================================================================
 
 static void HandleSaveEvent(GekkoGameEvent* ev) {
-    int frame = ev->data.save.frame;
+    const int32_t rbFrame = ev->data.save.frame;
+    const int32_t gameAbsFrame = RbCheckpointFrameToGameAbsFrame(rbFrame);
     GekkoState* state = (GekkoState*)ev->data.save.state;
 
     if (!CaptureState(state)) {
-        LOG_ERROR("[RollbackSession] Save event FAILED at frame %d", frame);
+        LOG_ERROR("[RollbackSession] Save event FAILED at rb_frame %d", rbFrame);
         return;
     }
+    state->rb_frame = (uint32_t)rbFrame;
+    state->frame_origin_abs = (uint32_t)s_frameOriginAbs;
 
-    // Override the sim_frame in the saved state to match GekkoNet's frame.
-    // Critical fix from old code: the engine's sim_frame_counter may drift
-    // relative to GekkoNet's internal frame tracking. We force them to match
-    // so that on load, the engine frame counter is consistent.
-    state->sim_frame = (uint32_t)frame;
+#ifndef NDEBUG
+    assert(rbFrame >= -1);
+    assert(gameAbsFrame >= s_frameOriginAbs);
+#endif
+    if ((int32_t)state->frame_origin_abs != s_frameOriginAbs) {
+        NetplayLog_Write("GEKKO", rbFrame,
+            "WARN: Save metadata origin mismatch: rb_frame=%d state_origin_abs=%u local_origin_abs=%d phase=%s",
+            rbFrame,
+            state->frame_origin_abs,
+            s_frameOriginAbs,
+            Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+    }
+    if ((int32_t)state->sim_frame != gameAbsFrame) {
+        LogFrameDomainMismatch(
+            "SAVE",
+            rbFrame,
+            gameAbsFrame,
+            state->sim_frame,
+            state->input_write_idx,
+            state->display_frame);
+    }
 
     *ev->data.save.state_len = sizeof(GekkoState);
 
@@ -347,53 +461,94 @@ static void HandleSaveEvent(GekkoGameEvent* ev) {
     uint32_t fullChecksum = CalcCRC32(state->main_state, GS_MAIN_SIZE);
     *ev->data.save.checksum = fullChecksum;
 
-    s_lastSavedFrame = frame;
+    s_lastSavedRbFrame = rbFrame;
     s_saveEventCount++;
 
     // Per-section hashes for debugging desyncs
     uint32_t inputHash = CalcCRC32(state->input_p1, GS_INPUT_SIZE)
                        ^ CalcCRC32(state->input_p2, GS_INPUT_SIZE);
-    NetplayLog_Write("GEKKO", frame,
-        "SAVE: frame=%d full=0x%08X inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
-        frame, fullChecksum, inputHash, state->rng_seed,
+    NetplayLog_Write("GEKKO", rbFrame,
+        "SAVE: rb_frame=%d game_abs_frame=%d origin_abs=%d full=0x%08X inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
+        rbFrame, gameAbsFrame, s_frameOriginAbs, fullChecksum, inputHash, state->rng_seed,
         state->game_mode, state->substate, state->substate_timer,
         state->fpu_cw, state->mxcsr);
+    if (!s_loggedFirstSaveEvent) {
+        s_loggedFirstSaveEvent = true;
+        NetplayLog_Write("GEKKO", rbFrame,
+            "FIRST SAVE EVENT: rb_frame=%d game_abs_frame=%d engine_sim_after_capture=%u origin_abs=%d",
+            rbFrame,
+            gameAbsFrame,
+            state->sim_frame,
+            s_frameOriginAbs);
+    }
 }
 
 static void HandleLoadEvent(GekkoGameEvent* ev) {
-    int frame = ev->data.load.frame;
+    const int32_t rbFrame = ev->data.load.frame;
+    const int32_t expectedGameAbsFrame = RbCheckpointFrameToGameAbsFrame(rbFrame);
     const GekkoState* state = (const GekkoState*)ev->data.load.state;
 
     if (!RestoreState(state)) {
-        LOG_ERROR("[RollbackSession] Load event FAILED at frame %d", frame);
+        LOG_ERROR("[RollbackSession] Load event FAILED at rb_frame %d", rbFrame);
         return;
     }
 
-    // Force engine frame counter to match loaded state
-    WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, (uint32_t)frame);
+    // Gekko load events are rb_frame-domain, but the restored engine state is the
+    // post-frame checkpoint for that rb_frame. Keep the engine counter absolute.
+#ifndef NDEBUG
+    assert(rbFrame >= -1);
+    assert(expectedGameAbsFrame >= s_frameOriginAbs);
+#endif
+    if ((int32_t)state->frame_origin_abs != s_frameOriginAbs) {
+        NetplayLog_Write("GEKKO", rbFrame,
+            "WARN: Load metadata origin mismatch: rb_frame=%d state_origin_abs=%u local_origin_abs=%d",
+            rbFrame,
+            state->frame_origin_abs,
+            s_frameOriginAbs);
+    }
+    if ((int32_t)state->sim_frame != expectedGameAbsFrame) {
+        LogFrameDomainMismatch(
+            "LOAD",
+            rbFrame,
+            expectedGameAbsFrame,
+            state->sim_frame,
+            state->input_write_idx,
+            state->display_frame);
+    }
+    WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, (uint32_t)expectedGameAbsFrame);
 
     s_loadEventCount++;
 
     uint32_t mainHash = CalcCRC32(state->main_state, GS_MAIN_SIZE);
     uint32_t inputHash = CalcCRC32(state->input_p1, GS_INPUT_SIZE)
                        ^ CalcCRC32(state->input_p2, GS_INPUT_SIZE);
-    NetplayLog_Write("GEKKO", frame,
-        "LOAD: frame=%d full=0x%08X inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
-        frame, mainHash, inputHash, state->rng_seed,
+    NetplayLog_Write("GEKKO", rbFrame,
+        "LOAD: rb_frame=%d game_abs_frame=%d origin_abs=%d full=0x%08X inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
+        rbFrame, expectedGameAbsFrame, s_frameOriginAbs, mainHash, inputHash, state->rng_seed,
         state->game_mode, state->substate, state->substate_timer,
         state->fpu_cw, state->mxcsr);
+    if (!s_loggedFirstLoadEvent) {
+        s_loggedFirstLoadEvent = true;
+        NetplayLog_Write("GEKKO", rbFrame,
+            "FIRST LOAD EVENT: rb_frame=%d game_abs_frame=%d engine_sim_after_write=%u origin_abs=%d",
+            rbFrame,
+            expectedGameAbsFrame,
+            ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER),
+            s_frameOriginAbs);
+    }
 }
 
 // Rollback sequence tracking (shared across calls)
 static int32_t s_rbSequenceStart = -1;
 
 static void HandleAdvanceEvent(GekkoGameEvent* ev) {
-    int frame = ev->data.adv.frame;
+    const int32_t rbFrame = ev->data.adv.frame;
+    const int32_t gameAbsFrame = RbFrameToGameAbsFrame(rbFrame);
     bool rolling_back = ev->data.adv.rolling_back;
     const uint8_t* inputs = ev->data.adv.inputs;
     unsigned int input_len = ev->data.adv.input_len;
 
-    s_currentFrame = frame;
+    s_currentRbFrame = rbFrame;
     s_rollingBack = rolling_back;
 
     // GekkoNet provides inputs as [P1_input (2 bytes) | P2_input (2 bytes)]
@@ -403,14 +558,13 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
         memcpy(&raw_p1, inputs, 2);
         memcpy(&raw_p2, inputs + 2, 2);
     } else {
-        NetplayLog_Write("GEKKO", frame,
-            "WARN: Advance frame=%d has insufficient input data (len=%u, rolling_back=%d)",
-            frame, input_len, rolling_back);
+        NetplayLog_Write("GEKKO", rbFrame,
+            "WARN: Advance has insufficient input data: rb_frame=%d game_abs_frame=%d len=%u rolling_back=%d",
+            rbFrame, gameAbsFrame, input_len, rolling_back);
     }
 
-    // Sync engine frame counter with GekkoNet's frame number.
-    // The match handler reads this to index into input buffers.
-    WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, (uint32_t)frame);
+    // Gekko advance events are rb_frame-domain; engine memory must stay absolute.
+    WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, (uint32_t)gameAbsFrame);
 
     // Store for GetAdvanceInputs (read by input_override.cpp for normal frames)
     s_advP1 = raw_p1;
@@ -423,15 +577,17 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
     const uint16_t remoteByGameSlot = (s_localPlayer == 0) ? raw_p2 : raw_p1;
     if (!s_loggedInputBridge) {
         s_loggedInputBridge = true;
-        NetplayLog_Write("GEKKO", frame,
+        NetplayLog_Write("GEKKO", rbFrame,
             "SDL->Rollback bridge ACTIVE: local_slot=P%d remote_slot=P%d "
             "local_input_sourced_from=PlayerMapping_ReadLocalInput "
             "remote_input_sourced_from=GekkoData stream",
             s_localPlayer + 1,
             s_remotePlayer + 1);
     }
-    NetplayLog_Verbose("GEKKO", frame,
-        "Advance map: game[P1=0x%04X P2=0x%04X] local[P%d=0x%04X] remote[P%d=0x%04X] rb=%d",
+    NetplayLog_Verbose("GEKKO", rbFrame,
+        "Advance map: rb_frame=%d game_abs_frame=%d game[P1=0x%04X P2=0x%04X] local[P%d=0x%04X] remote[P%d=0x%04X] rolling_back=%d",
+        rbFrame,
+        gameAbsFrame,
         raw_p1,
         raw_p2,
         s_localPlayer + 1,
@@ -446,15 +602,35 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
     InputSystem_WriteToGameBuffersBothPlayers();
 
     s_advanceEventCount++;
+    if (!s_loggedFirstAdvanceEvent) {
+        s_loggedFirstAdvanceEvent = true;
+        NetplayLog_Write("GEKKO", rbFrame,
+            "FIRST ADVANCE EVENT: rb_frame=%d game_abs_frame=%d engine_sim_after_write=%u origin_abs=%d rolling_back=%d",
+            rbFrame,
+            gameAbsFrame,
+            ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER),
+            s_frameOriginAbs,
+            rolling_back ? 1 : 0);
+    }
+    if (s_advanceEventCount <= 10) {
+        NetplayLog_Write("GEKKO", rbFrame,
+            "ADVANCE DETAIL #%d: rb_frame=%d game_abs_frame=%d confirmed_rb=%d remote_rb=%d rolling_back=%d",
+            s_advanceEventCount,
+            rbFrame,
+            gameAbsFrame,
+            s_cachedConfirmedRbFrame,
+            s_cachedLastRemoteReceivedRbFrame,
+            rolling_back ? 1 : 0);
+    }
 
     if (rolling_back) {
         // Track rollback sequence start
         if (s_rbSequenceStart < 0) {
-            s_rbSequenceStart = frame;
+            s_rbSequenceStart = rbFrame;
             s_totalRollbacks++;
-            NetplayLog_Write("GEKKO", frame,
-                "ROLLBACK START: frame=%d rng=0x%08X mode=%u sub=%u",
-                frame, DetVer_GetRngSeed(),
+            NetplayLog_Write("GEKKO", rbFrame,
+                "ROLLBACK START: rb_frame=%d game_abs_frame=%d rng=0x%08X mode=%u sub=%u",
+                rbFrame, gameAbsFrame, DetVer_GetRngSeed(),
                 ReadMemory<uint32_t>(ADDR_GAME_MODE),
                 ReadMemory<uint32_t>(ADDR_SUB_STATE));
         }
@@ -467,27 +643,32 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
         //   3. Handle all per-frame bookkeeping
         // We do NOT call g_matchHandler directly — that skips critical game logic.
 
-        NetplayLog_Write("GEKKO", frame,
-            "ADVANCE(rollback): frame=%d P1=0x%04X P2=0x%04X rng=0x%08X",
-            frame, raw_p1, raw_p2, DetVer_GetRngSeed());
+        NetplayLog_Write("GEKKO", rbFrame,
+            "ADVANCE(rollback): rb_frame=%d game_abs_frame=%d P1=0x%04X P2=0x%04X rng=0x%08X",
+            rbFrame, gameAbsFrame, raw_p1, raw_p2, DetVer_GetRngSeed());
     } else {
         // Normal advance — will be processed by game's own match handler
         // after the input dispatcher returns 0.
         if (s_rbSequenceStart >= 0) {
             // End of rollback sequence
-            int depth = frame - s_rbSequenceStart;
+            int depth = rbFrame - s_rbSequenceStart;
             s_lastRollbackLength = depth;
             if (depth > s_maxRollbackDepth) s_maxRollbackDepth = depth;
-            NetplayLog_Write("GEKKO", frame,
-                "ROLLBACK COMPLETE: start=%d depth=%d total=%d max=%d rng=0x%08X",
-                s_rbSequenceStart, depth, s_totalRollbacks, s_maxRollbackDepth,
+            NetplayLog_Write("GEKKO", rbFrame,
+                "ROLLBACK COMPLETE: start_rb=%d end_rb=%d game_abs_frame=%d depth=%d total=%d max=%d rng=0x%08X",
+                s_rbSequenceStart,
+                rbFrame,
+                gameAbsFrame,
+                depth,
+                s_totalRollbacks,
+                s_maxRollbackDepth,
                 DetVer_GetRngSeed());
             s_rbSequenceStart = -1;
         }
 
-        NetplayLog_Write("GEKKO", frame,
-            "ADVANCE(normal): frame=%d P1=0x%04X P2=0x%04X rng=0x%08X writeIdx=%u",
-            frame, raw_p1, raw_p2, DetVer_GetRngSeed(),
+        NetplayLog_Write("GEKKO", rbFrame,
+            "ADVANCE(normal): rb_frame=%d game_abs_frame=%d P1=0x%04X P2=0x%04X rng=0x%08X writeIdx=%u",
+            rbFrame, gameAbsFrame, raw_p1, raw_p2, DetVer_GetRngSeed(),
             ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX));
     }
 }
@@ -608,6 +789,11 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     gkConfig.desync_detection = true;
     gkConfig.check_distance = 60;  // Check every 60 frames
 
+#ifndef NDEBUG
+    assert((int)gkConfig.input_prediction_window == config.rollback_budget);
+    assert(config.frame_origin_abs >= 0);
+#endif
+
     gekko_start(s_session, &gkConfig);
 
     // Set transport adapter (must be static — GekkoNet holds the pointer)
@@ -645,7 +831,11 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
         return false;
     }
 
-    // Set input delay
+    // Set input delay for the LOCAL handle only.
+#ifndef NDEBUG
+    assert(s_localHandle >= 0);
+    assert(s_localHandle != s_remoteHandle);
+#endif
     gekko_set_local_delay(s_session, s_localHandle, (unsigned char)config.initial_delay);
 
     // Store config
@@ -654,11 +844,25 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_activeDelay      = config.initial_delay;
     s_rollbackBudget   = config.rollback_budget;
     s_baselineChecksum = config.baseline_checksum;
-    s_startFrame       = config.start_frame;
-    s_currentFrame     = config.start_frame;
-    s_lastSavedFrame   = -1;
+    s_frameOriginAbs   = config.frame_origin_abs;
+    s_currentRbFrame   = 0;
+    s_lastSavedRbFrame = -1;
     s_rollingBack      = false;
+    s_sessionRunning   = false;
     s_hasInjectedInput = false;
+    s_cachedFramesAhead = 0.0f;
+    s_cachedCurrentRbFrame = 0;
+    s_cachedConfirmedRbFrame = -1;
+    s_cachedLastRemoteReceivedRbFrame = -1;
+    s_cachedAvgPing = 0.0f;
+    s_cachedJitter = 0.0f;
+    s_loggedFirstSaveEvent = false;
+    s_loggedFirstLoadEvent = false;
+    s_loggedFirstAdvanceEvent = false;
+    s_loggedFirstNonZeroFramesAhead = false;
+    s_waitingForAdvance = false;
+    s_waitingAdvanceRbFrame = -1;
+    s_waitingForAdvanceCount = 0;
 
     // Reset event processing state
     s_events       = nullptr;
@@ -679,6 +883,9 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_loadEventCount    = 0;
     s_advanceEventCount = 0;
     s_loggedInputBridge = false;
+    s_rbSequenceStart   = -1;
+
+    StateHistory_Reset();
 
     // Clear receive buffer
     for (int i = 0; i < s_recvCount; i++) {
@@ -692,22 +899,36 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     // Suppress pause during rollback gameplay
     InputSystem_SetPauseBlocked(true);
 
-    LOG_INFO("[RollbackSession] BEGIN (GekkoNet): local=P%d(h%d) remote=P%d(h%d) "
-             "delay=%d prediction_window=%d state_size=%zu",
-        s_localPlayer + 1, s_localHandle,
-        s_remotePlayer + 1, s_remoteHandle,
-        config.initial_delay, (int)gkConfig.input_prediction_window,
-        sizeof(GekkoState));
+    const char* localRole = (s_localPlayer == 0) ? "P1" : "P2";
+    const int visibleDelay = Net::DelayPolicy_GetActiveDelay();
+    const int effectiveDelay = Net::DelayPolicy_GetEffectiveLocalDelay();
+    const int protectionWindow = Net::DelayPolicy_GetProtectionWindow();
+    LOG_INFO("[RollbackSession] BEGIN: local=%s(h%d) visible_delay=%u effective_delay=%u max_rollback=%u protection_window=%u stall_threshold=%u frame_origin_abs=%d rb_start=0 state_size=%u",
+        localRole,
+        s_localHandle,
+        (unsigned)visibleDelay,
+        (unsigned)effectiveDelay,
+        (unsigned)config.rollback_budget,
+        (unsigned)protectionWindow,
+        (unsigned)Net::DelayPolicy_GetStallThreshold(),
+        s_frameOriginAbs,
+        (unsigned)sizeof(GekkoState));
 
-    NetplayLog_Write("GEKKO", s_startFrame,
-        "BEGIN: local=P%d(h%d) remote=P%d(h%d) delay=%d window=%d state_kb=%zu baseline=0x%08X",
+    NetplayLog_Write("GEKKO", 0,
+        "BEGIN: rb_start=0 frame_origin_abs=%d local=P%d(h%d) remote=P%d(h%d) visible_delay=%d effective_delay=%d window=%d stall_threshold=%d state_kb=%zu baseline=0x%08X",
+        s_frameOriginAbs,
         s_localPlayer + 1, s_localHandle,
         s_remotePlayer + 1, s_remoteHandle,
-        config.initial_delay, (int)gkConfig.input_prediction_window,
+        visibleDelay,
+        effectiveDelay,
+        protectionWindow,
+        Net::DelayPolicy_GetStallThreshold(),
         sizeof(GekkoState) / 1024, config.baseline_checksum);
 
-    NetplayLog_Write("GEKKO", s_startFrame,
+    NetplayLog_Write("GEKKO", 0,
         "Timesync metric: framesAhead>0 means local ahead, framesAhead<0 means local behind");
+    NetplayLog_Write("GEKKO", 0,
+        "Frame domains: rb_frame starts at 0, game_abs_frame = frame_origin_abs + rb_frame");
 
     return true;
 }
@@ -715,9 +936,15 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
 void RollbackSession_End() {
     if (!s_active) return;
 
-    NetplayLog_Write("GEKKO", s_currentFrame,
-        "END: frame=%d saves=%d loads=%d advances=%d rollbacks=%d max_depth=%d sent=%d recv=%d",
-        s_currentFrame, s_saveEventCount, s_loadEventCount, s_advanceEventCount,
+    const int32_t finalRbFrame = s_currentRbFrame;
+    const int32_t finalGameAbsFrame = CurrentGameAbsFrame();
+
+    NetplayLog_Write("GEKKO", s_currentRbFrame,
+        "END: rb_frame=%d game_abs_frame=%d origin_abs=%d saves=%d loads=%d advances=%d rollbacks=%d max_depth=%d sent=%d recv=%d",
+        s_currentRbFrame,
+        CurrentGameAbsFrame(),
+        s_frameOriginAbs,
+        s_saveEventCount, s_loadEventCount, s_advanceEventCount,
         s_totalRollbacks, s_maxRollbackDepth, s_localInputsSent, s_remoteInputsRecv);
 
     // Destroy GekkoNet session
@@ -744,14 +971,33 @@ void RollbackSession_End() {
     s_hasInjectedInput = false;
     s_sessionBroken = false;
     s_sessionError[0] = '\0';
+    s_cachedFramesAhead = 0.0f;
+    s_cachedCurrentRbFrame = 0;
+    s_cachedConfirmedRbFrame = -1;
+    s_cachedLastRemoteReceivedRbFrame = -1;
+    s_cachedAvgPing = 0.0f;
+    s_cachedJitter = 0.0f;
+    s_frameOriginAbs = 0;
+    s_currentRbFrame = 0;
+    s_lastSavedRbFrame = -1;
+    s_rbSequenceStart = -1;
+    s_loggedFirstSaveEvent = false;
+    s_loggedFirstLoadEvent = false;
+    s_loggedFirstAdvanceEvent = false;
+    s_loggedFirstNonZeroFramesAhead = false;
+    s_waitingForAdvance = false;
+    s_waitingAdvanceRbFrame = -1;
+    s_waitingForAdvanceCount = 0;
+
+    StateHistory_Reset();
 
     // Clear netplay input overrides
     InputSystem_ClearNetplayInput(0);
     InputSystem_ClearNetplayInput(1);
     InputSystem_SetPauseBlocked(false);
 
-    LOG_INFO("[RollbackSession] END: frame=%d rollbacks=%d max_depth=%d",
-        s_currentFrame, s_totalRollbacks, s_maxRollbackDepth);
+    LOG_INFO("[RollbackSession] END: rb_frame=%d game_abs_frame=%d rollbacks=%d max_depth=%d",
+        finalRbFrame, finalGameAbsFrame, s_totalRollbacks, s_maxRollbackDepth);
 }
 
 bool RollbackSession_IsActive() {
@@ -780,24 +1026,91 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
         return;
     }
 
+    const int32_t currentRbBeforeUpdate = gekko_current_frame(s_session);
+    const bool continuingWaitingFrame =
+        s_waitingForAdvance && currentRbBeforeUpdate == s_waitingAdvanceRbFrame;
+
     // Step 2: Feed local input to GekkoNet
-    gekko_add_local_input(s_session, s_localHandle, &localInput);
-    s_localInputsSent++;
+#ifndef NDEBUG
+    assert(!s_frameStarted);
+#endif
+    if (!continuingWaitingFrame) {
+        gekko_add_local_input(s_session, s_localHandle, &localInput);
+        s_localInputsSent++;
+    } else if (s_waitingForAdvanceCount <= 5 || (s_waitingForAdvanceCount % 120) == 0) {
+        NetplayLog_Write("GEKKO", currentRbBeforeUpdate,
+            "BeginFrame retry without re-submitting local input: rb_frame=%d game_abs_frame=%d "
+            "remote_rb=%d confirmed_rb=%d phase=%s",
+            currentRbBeforeUpdate,
+            RbFrameToGameAbsFrame(currentRbBeforeUpdate),
+            s_cachedLastRemoteReceivedRbFrame,
+            s_cachedConfirmedRbFrame,
+            Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+    }
 
     // Step 3: Update GekkoNet session — this produces game events
     s_events = gekko_update_session(s_session, &s_eventCount);
+    RefreshCachedNetworkTelemetry(true);
     s_eventIdx = 0;
     s_frameStarted = true;
 
-    NetplayLog_Write("GEKKO", s_currentFrame,
-        "BeginFrame: input=0x%04X events=%d recvBuf=%d",
-        localInput, s_eventCount, s_recvCount);
+    if (s_eventCount == 0 && s_cachedCurrentRbFrame == currentRbBeforeUpdate) {
+        s_waitingForAdvance = true;
+        s_waitingAdvanceRbFrame = currentRbBeforeUpdate;
+        s_waitingForAdvanceCount++;
+
+        if (s_waitingForAdvanceCount <= 5 || (s_waitingForAdvanceCount % 120) == 0) {
+            NetplayLog_Write("GEKKO", currentRbBeforeUpdate,
+                "No gameplay events produced: rb_frame=%d game_abs_frame=%d remote_rb=%d confirmed_rb=%d "
+                "frames_ahead=%.2f phase=%s wait_count=%u",
+                currentRbBeforeUpdate,
+                RbFrameToGameAbsFrame(currentRbBeforeUpdate),
+                s_cachedLastRemoteReceivedRbFrame,
+                s_cachedConfirmedRbFrame,
+                s_cachedFramesAhead,
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+                s_waitingForAdvanceCount);
+        }
+    } else if (s_waitingForAdvance) {
+        NetplayLog_Write("GEKKO", s_cachedCurrentRbFrame,
+            "Recovered from no-event wait: previous_rb_frame=%d current_rb_frame=%d current_game_abs_frame=%d "
+            "remote_rb=%d confirmed_rb=%d wait_count=%u",
+            s_waitingAdvanceRbFrame,
+            s_cachedCurrentRbFrame,
+            RbFrameToGameAbsFrame(s_cachedCurrentRbFrame),
+            s_cachedLastRemoteReceivedRbFrame,
+            s_cachedConfirmedRbFrame,
+            s_waitingForAdvanceCount);
+        s_waitingForAdvance = false;
+        s_waitingAdvanceRbFrame = -1;
+        s_waitingForAdvanceCount = 0;
+    }
+
+    if (!s_loggedFirstNonZeroFramesAhead &&
+        fabsf(s_cachedFramesAhead) > 0.01f) {
+        s_loggedFirstNonZeroFramesAhead = true;
+        NetplayLog_Write("TIMESYNC", s_cachedCurrentRbFrame,
+            "FIRST NONZERO FRAMES_AHEAD: rb_frame=%d game_abs_frame=%d frames_ahead=%.2f origin_abs=%d",
+            s_cachedCurrentRbFrame,
+            RbFrameToGameAbsFrame(s_cachedCurrentRbFrame),
+            s_cachedFramesAhead,
+            s_frameOriginAbs);
+    }
+
+    NetplayLog_Write("GEKKO", s_cachedCurrentRbFrame,
+        "BeginFrame: rb_frame=%d game_abs_frame=%d input=0x%04X events=%d recvBuf=%d",
+        s_cachedCurrentRbFrame,
+        RbFrameToGameAbsFrame(s_cachedCurrentRbFrame),
+        localInput,
+        s_eventCount,
+        s_recvCount);
 }
 
 bool RollbackSession_PollSession() {
     if (!s_active || !s_session) return true;
 
     gekko_network_poll(s_session);
+    RefreshCachedNetworkTelemetry(false);
     HandleSessionEvents();
     return !s_sessionBroken;
 }
@@ -808,6 +1121,9 @@ EventResult RollbackSession_ProcessNextEvent() {
         s_events = nullptr;
         s_eventCount = 0;
         s_eventIdx = 0;
+        s_waitingForAdvance = false;
+        s_waitingAdvanceRbFrame = -1;
+        s_waitingForAdvanceCount = 0;
         return EventResult::Error;
     }
 
@@ -836,25 +1152,125 @@ EventResult RollbackSession_ProcessNextEvent() {
 
             case GekkoAdvanceEvent:
                 HandleAdvanceEvent(ev);
+                s_waitingForAdvance = false;
+                s_waitingAdvanceRbFrame = -1;
+                s_waitingForAdvanceCount = 0;
                 // Return Advance for EVERY advance event (both normal and rollback).
                 // The game's own loop will call its match handler + input processing.
                 return EventResult::Advance;
 
             default:
-                NetplayLog_Write("GEKKO", s_currentFrame,
-                    "ProcessNextEvent: unknown event type=%d at idx=%d/%d",
-                    (int)ev->type, s_eventIdx - 1, s_eventCount);
+                NetplayLog_Write("GEKKO", s_currentRbFrame,
+                    "ProcessNextEvent: unknown event type=%d at idx=%d/%d rb_frame=%d game_abs_frame=%d",
+                    (int)ev->type,
+                    s_eventIdx - 1,
+                    s_eventCount,
+                    s_currentRbFrame,
+                    CurrentGameAbsFrame());
                 continue;
         }
     }
 
     // No more events
+    const bool hadEvents = s_eventCount > 0;
+    const int processedEventCount = s_eventCount;
     s_frameStarted = false;
     s_rollingBack = false;
-    NetplayLog_Write("GEKKO", s_currentFrame,
-        "ProcessNextEvent: Done (processed %d events, saves=%d loads=%d advances=%d)",
-        s_eventCount, s_saveEventCount, s_loadEventCount, s_advanceEventCount);
+    s_events = nullptr;
+    s_eventCount = 0;
+    s_eventIdx = 0;
+    if (hadEvents) {
+        s_waitingForAdvance = false;
+        s_waitingAdvanceRbFrame = -1;
+        s_waitingForAdvanceCount = 0;
+    }
+    NetplayLog_Write("GEKKO", s_currentRbFrame,
+        "ProcessNextEvent: Done rb_frame=%d game_abs_frame=%d (processed %d events, saves=%d loads=%d advances=%d)",
+        s_currentRbFrame,
+        CurrentGameAbsFrame(),
+        processedEventCount,
+        s_saveEventCount,
+        s_loadEventCount,
+        s_advanceEventCount);
     return EventResult::Done;
+}
+
+bool RollbackSession_HasPendingFrame() {
+    return s_frameStarted;
+}
+
+bool RollbackSession_DrainPendingNonAdvanceEvents() {
+    if (s_sessionBroken) {
+        return false;
+    }
+
+    if (!s_active || !s_session || !s_frameStarted) {
+        return true;
+    }
+
+    const int remainingBefore = s_eventCount - s_eventIdx;
+    if (remainingBefore <= 0) {
+        s_frameStarted = false;
+        s_rollingBack = false;
+        s_events = nullptr;
+        s_eventCount = 0;
+        s_eventIdx = 0;
+        s_waitingForAdvance = false;
+        s_waitingAdvanceRbFrame = -1;
+        s_waitingForAdvanceCount = 0;
+        return true;
+    }
+
+    NetplayLog_Write("GEKKO", s_currentRbFrame,
+        "Draining pending non-advance events outside dispatcher: remaining=%d phase=%s",
+        remainingBefore,
+        Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+
+    while (s_eventIdx < s_eventCount) {
+        GekkoGameEvent* ev = s_events[s_eventIdx];
+        if (!ev || ev->type == GekkoEmptyGameEvent) {
+            s_eventIdx++;
+            continue;
+        }
+
+        if (ev->type == GekkoAdvanceEvent) {
+            NetplayLog_Write("GEKKO", s_currentRbFrame,
+                "Pending advance left undrained outside dispatcher: idx=%d/%d rb_frame=%d phase=%s",
+                s_eventIdx,
+                s_eventCount,
+                s_currentRbFrame,
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+            return false;
+        }
+
+        s_eventIdx++;
+        if (ev->type == GekkoSaveEvent) {
+            HandleSaveEvent(ev);
+        } else if (ev->type == GekkoLoadEvent) {
+            HandleLoadEvent(ev);
+        } else {
+            NetplayLog_Write("GEKKO", s_currentRbFrame,
+                "Skipping unexpected non-advance event while draining: type=%d idx=%d/%d",
+                (int)ev->type,
+                s_eventIdx - 1,
+                s_eventCount);
+        }
+    }
+
+    s_frameStarted = false;
+    s_rollingBack = false;
+    s_events = nullptr;
+    s_eventCount = 0;
+    s_eventIdx = 0;
+    s_waitingForAdvance = false;
+    s_waitingAdvanceRbFrame = -1;
+    s_waitingForAdvanceCount = 0;
+
+    NetplayLog_Write("GEKKO", s_currentRbFrame,
+        "Pending non-advance drain COMPLETE: rb_frame=%d game_abs_frame=%d",
+        s_currentRbFrame,
+        CurrentGameAbsFrame());
+    return true;
 }
 
 void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2) {
@@ -871,11 +1287,11 @@ void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
 
     if (s_recvCount >= MAX_PENDING_RECV) {
         NetplayLog_Write("GEKKO", -1,
-            "WARN: Receive buffer full (%d packets), dropping len=%zu queued=%d frame=%d remote_recv=%d",
+            "WARN: Receive buffer full (%d packets), dropping len=%zu queued=%d rb_frame=%d remote_recv=%d",
             MAX_PENDING_RECV,
             len,
             s_recvCount,
-            s_currentFrame,
+            s_currentRbFrame,
             s_remoteInputsRecv);
         return;
     }
@@ -895,7 +1311,19 @@ void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
 // ============================================================================
 
 int32_t RollbackSession_GetCurrentFrame() {
-    return s_currentFrame;
+    return s_currentRbFrame;
+}
+
+int32_t RollbackSession_GetFrameOriginAbs() {
+    return s_frameOriginAbs;
+}
+
+int32_t RollbackSession_GetCurrentGameAbsFrame() {
+    return CurrentGameAbsFrame();
+}
+
+int32_t RollbackSession_RbFrameToGameAbs(int32_t rb_frame) {
+    return RbFrameToGameAbsFrame(rb_frame);
 }
 
 bool RollbackSession_IsRollingBack() {
@@ -908,7 +1336,7 @@ bool RollbackSession_IsSessionRunning() {
 
 float RollbackSession_FramesAhead() {
     if (!s_active || !s_session) return 0.0f;
-    return gekko_frames_ahead(s_session);
+    return s_cachedFramesAhead;
 }
 
 int RollbackSession_GetActiveDelay() {
@@ -934,9 +1362,13 @@ bool RollbackSession_SetLocalDelay(int delay) {
     gekko_set_local_delay(s_session, s_localHandle, (unsigned char)delay);
     s_activeDelay = delay;
 
-    NetplayLog_Write("GEKKO", s_currentFrame,
-        "Local delay updated: %d -> %d (handle=%d)",
-        prevDelay, s_activeDelay, s_localHandle);
+    NetplayLog_Write("GEKKO", s_currentRbFrame,
+        "Local effective delay updated: rb_frame=%d game_abs_frame=%d %d -> %d (handle=%d)",
+        s_currentRbFrame,
+        CurrentGameAbsFrame(),
+        prevDelay,
+        s_activeDelay,
+        s_localHandle);
     return true;
 }
 
@@ -956,11 +1388,18 @@ void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
 
+    const int32_t currentRbFrame = s_cachedCurrentRbFrame;
+
+    out->rb_frame_current = currentRbFrame;
+    out->rb_frame_last_confirmed = s_cachedConfirmedRbFrame;
+    out->rb_frame_last_remote_received = s_cachedLastRemoteReceivedRbFrame;
+    out->game_abs_frame_current = RbFrameToGameAbsFrame(currentRbFrame);
+    out->frame_origin_abs = s_frameOriginAbs;
     out->rollback_count = s_totalRollbacks;
     out->last_rollback_replay_length = s_lastRollbackLength;
     out->max_rollback_distance = s_maxRollbackDepth;
 
-    const float framesAhead = RollbackSession_FramesAhead();
+    const float framesAhead = s_cachedFramesAhead;
     int predictedOutstanding = 0;
     if (framesAhead > 0.0f) {
         predictedOutstanding = (int)ceilf(framesAhead);
@@ -972,12 +1411,9 @@ void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
         predictedOutstanding = s_rollbackBudget;
     }
     out->predicted_frames_outstanding = predictedOutstanding;
-
-    if (s_session && s_remoteHandle >= 0) {
-        GekkoNetworkStats stats{};
-        gekko_network_stats(s_session, s_remoteHandle, &stats);
-        out->gekko_jitter = stats.jitter;
-    }
+    out->frames_ahead = framesAhead;
+    out->gekko_avg_ping = s_cachedAvgPing;
+    out->gekko_jitter = s_cachedJitter;
 }
 
 // ============================================================================
@@ -1002,8 +1438,10 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->remote_player = s_remotePlayer;
 
     // Frame state
-    out->current_frame = s_currentFrame;
-    const float framesAhead = RollbackSession_FramesAhead();
+    out->frame_origin_abs = s_frameOriginAbs;
+    out->rb_frame_current = s_cachedCurrentRbFrame;
+    out->game_abs_frame_current = RbFrameToGameAbsFrame(out->rb_frame_current);
+    const float framesAhead = s_cachedFramesAhead;
     int predictedOutstanding = 0;
     if (framesAhead > 0.0f) {
         predictedOutstanding = (int)ceilf(framesAhead);
@@ -1015,17 +1453,13 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
         predictedOutstanding = s_rollbackBudget;
     }
 
-    out->last_confirmed_frame = s_currentFrame - predictedOutstanding;
-    if (out->last_confirmed_frame < s_startFrame) {
-        out->last_confirmed_frame = s_startFrame;
-    }
-    out->last_remote_received_frame =
-        (s_remoteInputsRecv > 0) ? out->last_confirmed_frame : -1;
-    out->last_saved_state_frame = s_lastSavedFrame;
+    out->rb_frame_last_confirmed = s_cachedConfirmedRbFrame;
+    out->rb_frame_last_remote_received = s_cachedLastRemoteReceivedRbFrame;
+    out->rb_frame_last_saved_state = s_lastSavedRbFrame;
 
     // Rollback stats
     out->rollback_count = s_totalRollbacks;
-    out->last_rollback_start_frame = s_lastRollbackFrame;
+    out->rb_last_rollback_start_frame = s_lastRollbackFrame;
     out->last_rollback_replay_length = s_lastRollbackLength;
     out->max_rollback_distance = s_maxRollbackDepth;
     out->predicted_frames_outstanding = predictedOutstanding;
@@ -1054,12 +1488,8 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->remote_inputs_received = s_remoteInputsRecv;
 
     // GekkoNet network stats
-    if (s_session && s_remoteHandle >= 0) {
-        GekkoNetworkStats stats{};
-        gekko_network_stats(s_session, s_remoteHandle, &stats);
-        out->gekko_avg_ping = stats.avg_ping;
-        out->gekko_jitter = stats.jitter;
-    }
+    out->gekko_avg_ping = s_cachedAvgPing;
+    out->gekko_jitter = s_cachedJitter;
 }
 
 } // namespace Rollback

@@ -744,10 +744,10 @@ static void UpdateBootstrapReady() {
     if ((s_logTickCounter % 120) == 0) {
         DWORD elapsed = s_phaseStartTime ? (GetTickCount() - s_phaseStartTime) : 0;
         LOG_NETPLAY(LOG_INFO,
-            "[PregameSync] BootstrapReady: gameplayStart=%s startFrame=%u startSimFrame=%d elapsed=%lums",
+            "[PregameSync] BootstrapReady: gameplayStart=%s bootstrap_frame_abs=%u host_game_abs_frame=%d elapsed=%lums",
             bSnap.gameplay_start ? "yes" : "no",
-            bSnap.start_frame,
-            bSnap.gameplay_start_sim_frame,
+            bSnap.bootstrap_frame_abs,
+            bSnap.gameplay_start_host_game_abs_frame,
             elapsed);
     }
 

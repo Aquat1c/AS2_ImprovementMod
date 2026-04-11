@@ -102,9 +102,9 @@ static int32_t         s_remoteBaselineSimFrame = -1;
 
 // Gameplay start
 static bool            s_gameplayStart      = false;
-static uint32_t        s_startFrame         = 0;
+static uint32_t        s_bootstrapFrameAbs  = 0;
 static bool            s_gameplayStartSent  = false;
-static int32_t         s_gameplayStartSimFrame = -1;
+static int32_t         s_gameplayStartHostGameAbsFrame = -1;
 
 // Timeout tracking
 static DWORD           s_loadStartTime      = 0;
@@ -136,10 +136,8 @@ static void SetError(const char* fmt, ...) {
 
 static void ResetRemoteDelayData() {
     memset(&s_remoteDelayData, 0, sizeof(s_remoteDelayData));
-    s_remoteDelayData.min_acceptable = DELAY_MIN;
-    s_remoteDelayData.max_acceptable = DELAY_MAX;
-    s_remoteDelayData.rollback_budget = ROLLBACK_BUDGET_DEFAULT;
-    s_remoteDelayData.rollback_delay = 0;
+    s_remoteDelayData.local_input_delay = DELAY_DEFAULT_PREF;
+    s_remoteDelayData.max_rollback = ROLLBACK_BUDGET_DEFAULT;
 }
 
 static void CaptureGameplayContext(uint8_t* mode, uint8_t* substate, int32_t* simFrame) {
@@ -188,21 +186,29 @@ static void SendConfig() {
     payload.rng_seed = s_config.rng_seed;
     payload.session_seed = s_config.session_seed;
 
-    // Delay negotiation: include local preferences
+    // Announce only the local peer's gameplay delay and rollback budget.
     DelayNegotiationData delayData{};
     DelayPolicy_BuildNegotiationData(&delayData);
-    payload.delay_configured  = (uint8_t)delayData.configured_delay;
-    payload.delay_recommended = (uint8_t)delayData.recommended_delay;
-    payload.delay_rollback    = (uint8_t)delayData.rollback_budget;
-    payload.delay_rollback_delay = (uint8_t)delayData.rollback_delay;
+    payload.my_input_delay = (uint8_t)delayData.local_input_delay;
+    payload.my_max_rollback = (uint8_t)delayData.max_rollback;
 
-    BarrierProtocol_SendPacket(PacketType::ConfigExchange,
-                              &payload, sizeof(payload));
+    const bool sent = BarrierProtocol_SendPacket(PacketType::ConfigExchange,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        LOG_WARN("[MatchBoot] Failed to send ConfigExchange");
+        Rollback::NetplayLog_Write(
+            "BARRIER", -1,
+            "ERROR: ConfigExchange queue failed: hash=0x%08X my_delay=%d my_max_rb=%d",
+            LockedMatchConfig_Hash(&s_config),
+            delayData.local_input_delay,
+            delayData.max_rollback);
+        return;
+    }
 
     s_configSent = true;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent config (hash=0x%08X delay_cfg=%d delay_rec=%d rb=%d rb_delay=%d)",
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent config (hash=0x%08X my_delay=%d my_max_rb=%d)",
         LockedMatchConfig_Hash(&s_config),
-        delayData.configured_delay, delayData.recommended_delay, delayData.rollback_budget, delayData.rollback_delay);
+        delayData.local_input_delay, delayData.max_rollback);
 }
 
 static void SendConfigAck(uint32_t hash, bool accepted) {
@@ -210,20 +216,29 @@ static void SendConfigAck(uint32_t hash, bool accepted) {
     payload.config_hash = hash;
     payload.accepted = accepted ? 1 : 0;
 
-    // Include join's delay preferences for negotiation
+    // Announce only the local peer's gameplay delay and rollback budget.
     DelayNegotiationData delayData{};
     DelayPolicy_BuildNegotiationData(&delayData);
-    payload.delay_configured  = (uint8_t)delayData.configured_delay;
-    payload.delay_recommended = (uint8_t)delayData.recommended_delay;
-    payload.delay_rollback    = (uint8_t)delayData.rollback_budget;
-    payload.delay_rollback_delay = (uint8_t)delayData.rollback_delay;
+    payload.my_input_delay = (uint8_t)delayData.local_input_delay;
+    payload.my_max_rollback = (uint8_t)delayData.max_rollback;
 
-    BarrierProtocol_SendPacket(PacketType::ConfigAck,
-                              &payload, sizeof(payload));
+    const bool sent = BarrierProtocol_SendPacket(PacketType::ConfigAck,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        LOG_WARN("[MatchBoot] Failed to send ConfigAck");
+        Rollback::NetplayLog_Write(
+            "BARRIER", -1,
+            "ERROR: ConfigAck queue failed: hash=0x%08X accepted=%d my_delay=%d my_max_rb=%d",
+            hash,
+            accepted ? 1 : 0,
+            delayData.local_input_delay,
+            delayData.max_rollback);
+        return;
+    }
 
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent ConfigAck: hash=0x%08X accepted=%d delay_cfg=%d delay_rec=%d rb=%d rb_delay=%d",
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent ConfigAck: hash=0x%08X accepted=%d my_delay=%d my_max_rb=%d",
         hash, accepted ? 1 : 0,
-        delayData.configured_delay, delayData.recommended_delay, delayData.rollback_budget, delayData.rollback_delay);
+        delayData.local_input_delay, delayData.max_rollback);
 }
 
 static void SendLoadBarrier() {
@@ -237,8 +252,22 @@ static void SendLoadBarrier() {
     s_localLoadSubstate = payload.substate;
     s_localLoadSimFrame = (int32_t)payload.sim_frame;
 
-    BarrierProtocol_SendPacket(PacketType::LoadBarrier,
-                              &payload, sizeof(payload));
+    const bool sent = BarrierProtocol_SendPacket(PacketType::LoadBarrier,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        LOG_WARN("[MatchBoot] Failed to send LoadBarrier");
+        Rollback::NetplayLog_Write(
+            "BARRIER", s_localLoadSimFrame,
+            "ERROR: LoadBarrier queue failed: phase=%s local=%u/%u/%d remote=%u/%u/%d",
+            BootPhaseName(s_phase),
+            s_localLoadMode,
+            s_localLoadSubstate,
+            s_localLoadSimFrame,
+            s_remoteLoadMode,
+            s_remoteLoadSubstate,
+            s_remoteLoadSimFrame);
+        return;
+    }
 
     s_loadBarrierSent = true;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent LoadBarrier: mode=%u sub=%u simFrame=%d",
@@ -268,8 +297,20 @@ static void SendBaselineReady() {
     s_localBaselineSubstate = payload.substate;
     s_localBaselineSimFrame = (int32_t)payload.sim_frame;
 
-    BarrierProtocol_SendPacket(PacketType::BaselineReady,
-                              &payload, sizeof(payload));
+    const bool sent = BarrierProtocol_SendPacket(PacketType::BaselineReady,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        LOG_WARN("[MatchBoot] Failed to send BaselineReady");
+        Rollback::NetplayLog_Write(
+            "BASELINE", s_localBaselineSimFrame,
+            "ERROR: BaselineReady queue failed: local=%u/%u/%d remote_ready=%d phase=%s",
+            s_localBaselineMode,
+            s_localBaselineSubstate,
+            s_localBaselineSimFrame,
+            s_remoteBaselineReady ? 1 : 0,
+            BootPhaseName(s_phase));
+        return;
+    }
 
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent BaselineReady: mode=%u sub=%u simFrame=%d",
         payload.mode, payload.substate, s_localBaselineSimFrame);
@@ -279,16 +320,37 @@ static void SendBaselineDigest(uint32_t crc) {
     BaselineDigestPayload payload{};
     payload.crc32 = crc;
 
-    BarrierProtocol_SendPacket(PacketType::BaselineDigest,
-                              &payload, sizeof(payload));
+    const bool sent = BarrierProtocol_SendPacket(PacketType::BaselineDigest,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        LOG_WARN("[MatchBoot] Failed to send BaselineDigest");
+        Rollback::NetplayLog_Write(
+            "BASELINE", s_localBaselineSimFrame,
+            "ERROR: BaselineDigest queue failed: digest=0x%08X local_main=0x%08X remote_main=0x%08X phase=%s",
+            crc,
+            s_localBaselineCRC,
+            s_remoteBaselineCRC,
+            BootPhaseName(s_phase));
+        return;
+    }
 
     s_baselineDigestSent = true;
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent BaselineDigest: crc=0x%08X", crc);
 }
 
 static void SendBaselineBreakdown(const BaselineBreakdownPayload& payload) {
-    BarrierProtocol_SendPacket(PacketType::BaselineBreakdown,
-                              &payload, sizeof(payload));
+    const bool sent = BarrierProtocol_SendPacket(PacketType::BaselineBreakdown,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        LOG_WARN("[MatchBoot] Failed to send BaselineBreakdown");
+        Rollback::NetplayLog_Write(
+            "BASELINE", (int32_t)payload.sim_frame,
+            "ERROR: BaselineBreakdown queue failed: main=0x%08X digest=0x%08X phase=%s",
+            payload.main_crc,
+            BaselineSync_ComputeAgreementDigest(payload),
+            BootPhaseName(s_phase));
+        return;
+    }
     LOG_NETPLAY(LOG_INFO,
         "[MatchBoot] Sent BaselineBreakdown: main=0x%08X header=0x%08X context=0x%08X rng=0x%08X sim=%u display=%u",
         payload.main_crc,
@@ -299,19 +361,31 @@ static void SendBaselineBreakdown(const BaselineBreakdownPayload& payload) {
         payload.display_frame);
 }
 
-static void SendGameplayStart(uint32_t frame) {
+static bool SendGameplayStart(uint32_t frame) {
     GameplayStartPayload payload{};
-    payload.start_frame = frame;
-    payload.host_sim_frame = (uint32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    payload.bootstrap_frame_abs = frame;
+    payload.host_game_abs_frame = (uint32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
 
-    s_gameplayStartSimFrame = (int32_t)payload.host_sim_frame;
+    s_gameplayStartHostGameAbsFrame = (int32_t)payload.host_game_abs_frame;
 
-    BarrierProtocol_SendPacket(PacketType::GameplayStart,
-                              &payload, sizeof(payload));
+    const bool sent = BarrierProtocol_SendPacket(PacketType::GameplayStart,
+                                                 &payload, sizeof(payload));
+    if (!sent) {
+        LOG_WARN("[MatchBoot] Failed to send GameplayStart");
+        Rollback::NetplayLog_Write(
+            "HANDOFF", s_gameplayStartHostGameAbsFrame,
+            "ERROR: GameplayStart queue failed: bootstrap_frame_abs=%u host_game_abs_frame=%d phase=%s baseline_agreed=%d",
+            frame,
+            s_gameplayStartHostGameAbsFrame,
+            BootPhaseName(s_phase),
+            s_baselineAgreed ? 1 : 0);
+        return false;
+    }
 
     s_gameplayStartSent = true;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent GameplayStart: frame=%u hostSimFrame=%d",
-        frame, s_gameplayStartSimFrame);
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent GameplayStart: bootstrap_frame_abs=%u host_game_abs_frame=%d",
+        frame, s_gameplayStartHostGameAbsFrame);
+    return true;
 }
 
 // ============================================================================
@@ -334,8 +408,10 @@ static void UpdateConfigExchange() {
         if (s_remoteDelayReceived) {
             DelayPolicy_NegotiateSession(&s_remoteDelayData);
         }
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted early config (hash=0x%08X) agreed_delay=%d",
-            hash, DelayPolicy_GetAgreedDelay());
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted early config (hash=0x%08X remote_delay=%d stall_threshold=%d)",
+            hash,
+            DelayPolicy_GetRemoteAnnouncedDelay(),
+            DelayPolicy_GetStallThreshold());
     }
 }
 
@@ -515,10 +591,11 @@ static void UpdateBaseline() {
 static void UpdateReady() {
     // Host sends GameplayStart when baseline is agreed
     if (s_isHost && !s_gameplayStartSent) {
-        s_startFrame = 0;
-        SendGameplayStart(s_startFrame);
-        s_gameplayStart = true;
-        s_phase = BootPhase::Done;
+        s_bootstrapFrameAbs = 0;
+        if (SendGameplayStart(s_bootstrapFrameAbs)) {
+            s_gameplayStart = true;
+            s_phase = BootPhase::Done;
+        }
     }
     // Join: GameplayStart was already received (stored by OnGameplayStart)
     if (!s_isHost && s_gameplayStart) {
@@ -622,7 +699,8 @@ void MatchBootstrap_BeginBaseline() {
     s_baselineDigestSent = false;
     s_gameplayStart = false;
     s_gameplayStartSent = false;
-    s_gameplayStartSimFrame = -1;
+    s_bootstrapFrameAbs = 0;
+    s_gameplayStartHostGameAbsFrame = -1;
 
     s_baselineStartTime = GetTickCount();
     s_phase = BootPhase::Baseline;
@@ -667,7 +745,8 @@ void MatchBootstrap_Abort() {
     s_remoteBaselineSimFrame = -1;
     s_gameplayStart = false;
     s_gameplayStartSent = false;
-    s_gameplayStartSimFrame = -1;
+    s_bootstrapFrameAbs = 0;
+    s_gameplayStartHostGameAbsFrame = -1;
     BaselineSync_Reset();
     LOG_NETPLAY(LOG_INFO, "[MatchBoot] Aborted (all state reset)");
 }
@@ -723,14 +802,11 @@ void MatchBootstrap_OnConfigExchange(const ConfigExchangePayload* p) {
             receivedHash, (unsigned)s_phase);
 
         // Store host's delay negotiation data
-        s_remoteDelayData.configured_delay  = p->delay_configured;
-        s_remoteDelayData.recommended_delay = p->delay_recommended;
-        s_remoteDelayData.rollback_budget   = p->delay_rollback;
-        s_remoteDelayData.rollback_delay    = p->delay_rollback_delay;
+        s_remoteDelayData.local_input_delay = p->my_input_delay;
+        s_remoteDelayData.max_rollback = p->my_max_rollback;
         s_remoteDelayReceived = true;
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join received host delay: cfg=%d rec=%d rb=%d rb_delay=%d range=[%d,%d]",
-            p->delay_configured, p->delay_recommended, p->delay_rollback, p->delay_rollback_delay,
-            s_remoteDelayData.min_acceptable, s_remoteDelayData.max_acceptable);
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join received host config: remote_delay=%d remote_max_rb=%d",
+            p->my_input_delay, p->my_max_rollback);
 
         // Only agree+ack if we are already in ConfigExchange phase.
         // If we haven't entered yet, UpdateConfigExchange will handle it.
@@ -738,8 +814,10 @@ void MatchBootstrap_OnConfigExchange(const ConfigExchangePayload* p) {
             s_configAgreed = true;
             SendConfigAck(receivedHash, true);
             DelayPolicy_NegotiateSession(&s_remoteDelayData);
-            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted config (hash=0x%08X) agreed_delay=%d",
-                receivedHash, DelayPolicy_GetAgreedDelay());
+            LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted config (hash=0x%08X remote_delay=%d stall_threshold=%d)",
+                receivedHash,
+                DelayPolicy_GetRemoteAnnouncedDelay(),
+                DelayPolicy_GetStallThreshold());
         }
     }
 }
@@ -751,19 +829,23 @@ void MatchBootstrap_OnConfigAck(const ConfigAckPayload* p) {
 
     if (p->accepted && p->config_hash == localHash) {
         // Store join's delay negotiation data
-        s_remoteDelayData.configured_delay  = p->delay_configured;
-        s_remoteDelayData.recommended_delay = p->delay_recommended;
-        s_remoteDelayData.rollback_budget   = p->delay_rollback;
-        s_remoteDelayData.rollback_delay    = p->delay_rollback_delay;
+        s_remoteDelayData.local_input_delay = p->my_input_delay;
+        s_remoteDelayData.max_rollback = p->my_max_rollback;
         s_remoteDelayReceived = true;
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Host received join delay: cfg=%d rec=%d rb=%d rb_delay=%d range=[%d,%d]",
-            p->delay_configured, p->delay_recommended, p->delay_rollback, p->delay_rollback_delay,
-            s_remoteDelayData.min_acceptable, s_remoteDelayData.max_acceptable);
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Host received join config: remote_delay=%d remote_max_rb=%d",
+            p->my_input_delay, p->my_max_rollback);
 
         s_configAgreed = true;
         DelayPolicy_NegotiateSession(&s_remoteDelayData);
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Config agreed (hash=0x%08X phase=%u) agreed_delay=%d",
-            localHash, (unsigned)s_phase, DelayPolicy_GetAgreedDelay());
+        LOG_NETPLAY(LOG_INFO,
+            "[MatchBoot] Config agreed (hash=0x%08X phase=%u local_delay=%d local_max_rb=%d remote_delay=%d remote_max_rb=%d stall_threshold=%d)",
+            localHash,
+            (unsigned)s_phase,
+            DelayPolicy_GetConfiguredDelay(),
+            DelayPolicy_GetRollbackBudget(),
+            DelayPolicy_GetRemoteAnnouncedDelay(),
+            DelayPolicy_GetRemoteAnnouncedMaxRollback(),
+            DelayPolicy_GetStallThreshold());
     } else {
         SetError("Config rejected by peer (local=0x%08X remote=0x%08X)",
             localHash, p->config_hash);
@@ -865,7 +947,7 @@ void MatchBootstrap_OnBaselineBreakdown(const BaselineBreakdownPayload* p) {
 void MatchBootstrap_OnGameplayStart(const GameplayStartPayload* p) {
     if (!p) return;
 
-    s_startFrame = p->start_frame;
+    s_bootstrapFrameAbs = p->bootstrap_frame_abs;
     s_gameplayStart = true;
     // NOTE: Do NOT set s_phase = BootPhase::Done here.
     // On the Join side, this packet can arrive in the same Session_Update()
@@ -876,11 +958,11 @@ void MatchBootstrap_OnGameplayStart(const GameplayStartPayload* p) {
     // The phase transitions naturally: Baseline → Ready (via agreement) →
     // Done (host: UpdateReady sends GameplayStart; join: PregameSync reads
     // gameplay_start from the snapshot).
-    s_gameplayStartSimFrame = (int32_t)p->host_sim_frame;
+    s_gameplayStartHostGameAbsFrame = (int32_t)p->host_game_abs_frame;
     LOG_NETPLAY(LOG_INFO,
-        "[MatchBoot] GameplayStart received: frame=%u hostSimFrame=%d localSimFrame=%u",
-        p->start_frame,
-        s_gameplayStartSimFrame,
+        "[MatchBoot] GameplayStart received: bootstrap_frame_abs=%u host_game_abs_frame=%d local_game_abs_frame=%u",
+        p->bootstrap_frame_abs,
+        s_gameplayStartHostGameAbsFrame,
         ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER));
 }
 
@@ -909,8 +991,8 @@ void MatchBootstrap_GetSnapshot(MatchBootstrapSnapshot* out) {
     out->local_baseline_sim_frame = s_localBaselineSimFrame;
     out->remote_baseline_sim_frame = s_remoteBaselineSimFrame;
     out->gameplay_start = s_gameplayStart;
-    out->start_frame = s_startFrame;
-    out->gameplay_start_sim_frame = s_gameplayStartSimFrame;
+    out->bootstrap_frame_abs = s_bootstrapFrameAbs;
+    out->gameplay_start_host_game_abs_frame = s_gameplayStartHostGameAbsFrame;
     strncpy_s(out->error, sizeof(out->error), s_error, _TRUNCATE);
 }
 

@@ -79,7 +79,7 @@ void GameplayBridge_GetSnapshot(GameplayBridgeSnapshot* out) {
     out->remote_game_slot = PlayerMapping_GetRemoteGameSlot();
     out->active_delay = Rollback::RollbackSession_GetActiveDelay();
     out->rollback_budget = Rollback::RollbackSession_GetRollbackBudget();
-    out->current_frame = Rollback::RollbackSession_GetCurrentFrame();
+    out->rb_frame_current = Rollback::RollbackSession_GetCurrentFrame();
     out->frames_ahead = Rollback::RollbackSession_FramesAhead();
 
     // GekkoNet network stats from rollback session
@@ -137,8 +137,9 @@ bool GameplayBridge_StartSession(const Rollback::RollbackSessionConfig& config) 
     LOG_INFO("[GameplayBridge] Session started: local=P%d remote=P%d delay=%d budget=%d",
         config.local_player + 1, config.remote_player + 1,
         config.initial_delay, config.rollback_budget);
-    Rollback::NetplayLog_Write("BRIDGE", config.start_frame,
-        "Session started: local=P%d remote=P%d delay=%d budget=%d baseline=0x%08X",
+    Rollback::NetplayLog_Write("BRIDGE", 0,
+        "Session started: rb_start=0 origin_abs=%d local=P%d remote=P%d delay=%d budget=%d baseline=0x%08X",
+        config.frame_origin_abs,
         config.local_player + 1, config.remote_player + 1,
         config.initial_delay, config.rollback_budget, config.baseline_checksum);
 

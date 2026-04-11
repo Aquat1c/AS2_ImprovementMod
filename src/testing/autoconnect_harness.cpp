@@ -206,15 +206,15 @@ static void FlushToSharedMemory(const char* phaseName, uint32_t phaseOrdinal, ui
         Rollback::RollbackSessionSnapshot rbSnap{};
         Rollback::RollbackSession_GetSnapshot(&rbSnap);
         if (rbSnap.active) {
-            s_shm->rb_local_frame    = rbSnap.current_frame;
-            s_shm->rb_remote_frame   = rbSnap.last_remote_received_frame;
-            s_shm->rb_frames_ahead   = (float)(rbSnap.current_frame - rbSnap.last_remote_received_frame);
+            s_shm->rb_local_frame    = rbSnap.rb_frame_current;
+            s_shm->rb_remote_frame   = rbSnap.rb_frame_last_remote_received;
+            s_shm->rb_frames_ahead   = (float)(rbSnap.rb_frame_current - rbSnap.rb_frame_last_remote_received);
             s_shm->rb_state          = rbSnap.is_rolling_back ? 2 : 1;
-            s_shm->rb_advance_count  = (uint32_t)rbSnap.current_frame;
+            s_shm->rb_advance_count  = (uint32_t)rbSnap.rb_frame_current;
 
             s_shm->total_rollbacks        = (uint32_t)rbSnap.rollback_count;
             s_shm->max_rollback_depth     = (uint32_t)rbSnap.max_rollback_distance;
-            s_shm->total_frames           = (uint32_t)rbSnap.current_frame;
+            s_shm->total_frames           = (uint32_t)rbSnap.rb_frame_current;
         }
     }
 

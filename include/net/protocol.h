@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 3;
+constexpr uint16_t PROTOCOL_VERSION = 4;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 
@@ -80,9 +80,9 @@ enum class PacketType : uint16_t {
     // release requires mutual ready+ack.
     GekkoReady      = 24,   // Startup barrier control (ready/ack)
 
-    // Mid-match delay changes (reliable, channel 0)
-    DelayChangeReq  = 21,   // Request to change input delay
-    DelayChangeAck  = 22,   // Acknowledge delay change request
+    // Obsolete delay-change packets (kept reserved; no live send sites)
+    DelayChangeReq  = 21,
+    DelayChangeAck  = 22,
 
     // Debug / diagnostics (unreliable, channel 2)
     Ping            = 30,   // Application-level ping (supplements ENet RTT)
@@ -133,12 +133,13 @@ struct StateDigestPayload {
 };
 
 struct FrameSyncStatusPayload {
-    int32_t  current_frame;     // Sender's logical rollback frame
-    int32_t  game_frame;        // Sender's native sim frame counter
-    int32_t  remote_view_frame; // Sender's latest confirmed frame for the peer
-    int32_t  confirmed_frame;   // Sender's fully confirmed frame
-    int32_t  predicted_frames;  // Sender's outstanding predicted frames
-    uint32_t checksum;          // Sender's current state checksum
+    int32_t  rb_frame_current;              // Sender's current rollback-session-relative frame
+    int32_t  game_abs_frame_current;        // Sender's current absolute engine frame
+    int32_t  frame_origin_abs;              // Sender's absolute rollback origin
+    int32_t  rb_frame_last_remote_received; // Sender's latest remote progress in rb_frame domain
+    int32_t  rb_frame_confirmed;            // Sender's fully confirmed rollback frame
+    int32_t  predicted_frames;              // Sender's outstanding predicted frames
+    uint32_t checksum;                      // Sender's current state checksum
 };
 
 // Initial session sync payloads
@@ -205,21 +206,21 @@ struct ConfigExchangePayload {
     uint8_t  time_limit;
     uint32_t rng_seed;
     uint32_t session_seed;
-    // Delay negotiation (sender's preferences)
-    uint8_t  delay_configured;   // 0 = auto, 1-15 = manual preference
-    uint8_t  delay_recommended;  // Auto-computed from RTT measurement
-    uint8_t  delay_rollback;     // Rollback budget (frames)
-    uint8_t  delay_rollback_delay; // Input pipeline delay for rollback mode
+    // Local rollback configuration announcement
+    uint8_t  my_input_delay;     // Sender's local gameplay input delay
+    uint8_t  my_max_rollback;    // Sender's input prediction window / max rollback
+    uint8_t  _delay_pad0;
+    uint8_t  _delay_pad1;
 };
 
 struct ConfigAckPayload {
     uint32_t config_hash;        // CRC32 of the LockedMatchConfig peer built
     uint8_t  accepted;           // 1 = matches, 0 = mismatch
-    // Delay negotiation (join's preferences)
-    uint8_t  delay_configured;   // 0 = auto, 1-15 = manual preference
-    uint8_t  delay_recommended;  // Auto-computed from RTT measurement
-    uint8_t  delay_rollback;     // Rollback budget (frames)
-    uint8_t  delay_rollback_delay; // Input pipeline delay for rollback mode
+    // Local rollback configuration announcement
+    uint8_t  my_input_delay;     // Sender's local gameplay input delay
+    uint8_t  my_max_rollback;    // Sender's input prediction window / max rollback
+    uint8_t  _delay_pad0;
+    uint8_t  _delay_pad1;
 };
 
 struct LoadBarrierPayload {
@@ -278,15 +279,15 @@ struct BaselineBreakdownPayload {
 };
 
 struct GameplayStartPayload {
-    uint32_t start_frame;        // Bootstrap baseline frame (typically 0)
-    uint32_t host_sim_frame;     // Host native sim frame when start was sent
+    uint32_t bootstrap_frame_abs;   // Absolute engine frame of the restored bootstrap baseline
+    uint32_t host_game_abs_frame;   // Host absolute engine frame when GameplayStart was sent
 };
 
 struct GekkoReadyPayload {
     uint8_t  flags;              // GEKKO_READY_FLAG_*
     uint8_t  phase;              // Sender MatchLifecyclePhase at send time
     uint16_t _pad;
-    int32_t  rollback_frame;     // Sender rollback frame at send time
+    int32_t  game_abs_frame;     // Sender absolute engine frame at startup barrier send time
 };
 
 struct CharSelFrameInputPayload {
@@ -306,13 +307,13 @@ struct WinScreenFrameInputPayload {
 };
 
 struct DelayChangeReqPayload {
-    uint8_t  new_delay;          // Requested input delay (1-15)
+    uint8_t  new_delay;          // Obsolete reserved payload
     uint8_t  _pad[3];
 };
 
 struct DelayChangeAckPayload {
-    uint8_t  acked_delay;        // Acknowledged delay value
-    uint8_t  accepted;           // 1 = accepted, 0 = counter-proposed
+    uint8_t  acked_delay;        // Obsolete reserved payload
+    uint8_t  accepted;           // Obsolete reserved payload
     uint8_t  _pad[2];
 };
 

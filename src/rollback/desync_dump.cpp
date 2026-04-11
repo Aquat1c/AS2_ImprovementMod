@@ -259,7 +259,7 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
             st.wYear, st.wMonth, st.wDay,
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     fprintf(f, "PID:        %lu\n", GetCurrentProcessId());
-    fprintf(f, "Frame:      %d\n", params.frame);
+    fprintf(f, "RB Frame:   %d\n", params.frame);
     fprintf(f, "Local CRC:  0x%08X\n", params.local_crc);
     fprintf(f, "Remote CRC: 0x%08X\n", params.remote_crc);
     fprintf(f, "\n");
@@ -268,9 +268,11 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
     RollbackSessionSnapshot snap{};
     RollbackSession_GetSnapshot(&snap);
     fprintf(f, "--- Rollback Session ---\n");
-    fprintf(f, "  current_frame:      %d\n", snap.current_frame);
-    fprintf(f, "  confirmed_frame:    %d\n", snap.last_confirmed_frame);
-    fprintf(f, "  remote_frame:       %d\n", snap.last_remote_received_frame);
+    fprintf(f, "  frame_origin_abs:   %d\n", snap.frame_origin_abs);
+    fprintf(f, "  game_abs_frame:     %d\n", snap.game_abs_frame_current);
+    fprintf(f, "  rb_frame_current:   %d\n", snap.rb_frame_current);
+    fprintf(f, "  rb_confirmed:       %d\n", snap.rb_frame_last_confirmed);
+    fprintf(f, "  rb_remote_recv:     %d\n", snap.rb_frame_last_remote_received);
     fprintf(f, "  rollback_count:     %d\n", snap.rollback_count);
     fprintf(f, "  max_rollback_dist:  %d\n", snap.max_rollback_distance);
     fprintf(f, "  predicted_frames:   %d\n", snap.predicted_frames_outstanding);

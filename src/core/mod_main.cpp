@@ -271,7 +271,6 @@ static void DeferredInit() {
     Rollback::NetplayLog_Init();
     Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
     Rollback::NetplayLog_SetVerbose(g_config.verboseLogging);
-    Rollback::StressHooks_Init();
     Rollback::OnlineWiring_Init();
 
     // Initialize scripted input runner
@@ -343,7 +342,6 @@ __declspec(dllexport) void ModShutdown() {
         PracticeTools_Shutdown();
         SIR_Shutdown();
         Rollback::OnlineWiring_Shutdown();
-        Rollback::StressHooks_Shutdown();
         Rollback::NetplayLog_Shutdown();
         Rollback::RollbackDebug_Shutdown();
         Rollback::RollbackSession_Shutdown();
@@ -432,7 +430,7 @@ __declspec(dllexport) void ModOnFrame() {
 
     // Drive gameplay bridge per-frame (rollback session + delay policy consumption)
     // The bridge is the single entry point for per-frame gameplay runtime.
-    if (Net::GameplayBridge_IsSessionActive() && Rollback::OnlineWiring_IsGameplayActive()) {
+    if (Net::GameplayBridge_IsSessionActive()) {
         Net::GameplayBridge_FrameUpdate();
         Rollback::RollbackDebug_FrameUpdate();
     }
@@ -591,10 +589,13 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     if (rollbackActive) {
         Rollback::RollbackSessionSnapshot rbSnap{};
         Rollback::RollbackSession_GetSnapshot(&rbSnap);
+        if (rbSnap.gekko_avg_ping > 0.0f) {
+            out->ping_ms = rbSnap.gekko_avg_ping;
+        }
         out->delay_frames = rbSnap.active_delay;
-        out->rollback_frames = rbSnap.last_rollback_replay_length;
-        out->local_frame = rbSnap.current_frame;
-        out->remote_frame = rbSnap.last_remote_received_frame;
+        out->rollback_frames = rbSnap.rollback_budget;
+        out->local_frame = rbSnap.rb_frame_current;
+        out->remote_frame = rbSnap.rb_frame_last_remote_received;
     } else {
         // Pre-match: use delay policy values
         out->delay_frames = Net::DelayPolicy_GetActiveDelay();

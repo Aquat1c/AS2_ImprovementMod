@@ -8,11 +8,13 @@
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
 #include "rollback/desync_dump.h"
+#include "rollback/online_wiring.h"
 #include "net/delay_policy.h"
 #include "net/sync_policy.h"
 #include "net/session_manager.h"
 #include "net/protocol.h"
 #include "as2_constants.h"
+#include "patches/input_override.h"
 #include "patches/memory_utils.h"
 #include "ui/log_window.h"
 #include "imgui.h"
@@ -52,12 +54,13 @@ static int32_t  s_checksumHistoryFrame[kChecksumHistorySize] = {};
 static uint32_t s_checksumHistoryCrc[kChecksumHistorySize] = {};
 
 // Last remote frame-status telemetry
-static int32_t  s_remoteStatusFrame          = -1;
-static int32_t  s_remoteStatusGameFrame      = -1;
-static int32_t  s_remoteStatusViewFrame      = -1;
-static int32_t  s_remoteStatusConfirmedFrame = -1;
-static int32_t  s_remoteStatusPredicted      = 0;
-static uint32_t s_remoteStatusChecksum       = 0;
+static int32_t  s_remoteStatusRbFrameCurrent          = -1;
+static int32_t  s_remoteStatusGameAbsFrameCurrent     = -1;
+static int32_t  s_remoteStatusFrameOriginAbs          = -1;
+static int32_t  s_remoteStatusRbFrameLastReceived     = -1;
+static int32_t  s_remoteStatusRbFrameConfirmed        = -1;
+static int32_t  s_remoteStatusPredicted               = 0;
+static uint32_t s_remoteStatusChecksum                = 0;
 
 // Current frame checksum (cached)
 static uint32_t s_currentChecksum   = 0;
@@ -102,10 +105,11 @@ static void ResetSessionState() {
     s_lastDigestFrame = -1;
     s_statusSent = 0;
     s_statusRecv = 0;
-    s_remoteStatusFrame = -1;
-    s_remoteStatusGameFrame = -1;
-    s_remoteStatusViewFrame = -1;
-    s_remoteStatusConfirmedFrame = -1;
+    s_remoteStatusRbFrameCurrent = -1;
+    s_remoteStatusGameAbsFrameCurrent = -1;
+    s_remoteStatusFrameOriginAbs = -1;
+    s_remoteStatusRbFrameLastReceived = -1;
+    s_remoteStatusRbFrameConfirmed = -1;
     s_remoteStatusPredicted = 0;
     s_remoteStatusChecksum = 0;
     s_currentChecksum = 0;
@@ -175,21 +179,23 @@ void RollbackDebug_FrameUpdate() {
     if (!RollbackSession_IsActive()) return;
     if (RollbackSession_IsRollingBack()) return;  // Don't log during resim
 
-    int32_t frame = RollbackSession_GetCurrentFrame();
+    const int32_t rbFrame = RollbackSession_GetCurrentFrame();
+    const int32_t gameAbsFrame = RollbackSession_GetCurrentGameAbsFrame();
+    const int32_t frameOriginAbs = RollbackSession_GetFrameOriginAbs();
 
     // Compute deterministic gameplay-core checksum.
     s_currentChecksum = ComputeGameplayDigestChecksum();
 
-    StoreChecksumForFrame(frame, s_currentChecksum);
-    DesyncDump_StoreChecksum(frame, s_currentChecksum);
+    StoreChecksumForFrame(rbFrame, s_currentChecksum);
+    DesyncDump_StoreChecksum(rbFrame, s_currentChecksum);
 
     // Send state digest at configured interval
     if (s_digestEnabled && s_digestInterval > 0 &&
-        (frame % s_digestInterval == 0) && frame > 0 &&
+        (rbFrame % s_digestInterval == 0) && rbFrame > 0 &&
         Net::Session_IsConnected()) {
 
         Net::StateDigestPayload digest;
-        digest.frame_number = (uint32_t)frame;
+        digest.frame_number = (uint32_t)rbFrame;
         digest.crc32 = s_currentChecksum;
 
         Net::Session_SendPacket(
@@ -200,23 +206,27 @@ void RollbackDebug_FrameUpdate() {
         );
 
         s_digestsSent++;
-        s_lastDigestFrame = frame;
+        s_lastDigestFrame = rbFrame;
 
-        NetplayLog_Verbose("DIGEST", frame,
-            "Sent: crc=0x%08X", s_currentChecksum);
+        NetplayLog_Verbose("DIGEST", rbFrame,
+            "Sent: rb_frame=%d game_abs_frame=%d origin_abs=%d crc=0x%08X",
+            rbFrame,
+            gameAbsFrame,
+            frameOriginAbs,
+            s_currentChecksum);
     }
 
     if (s_digestEnabled && s_statusInterval > 0 &&
-        (frame % s_statusInterval == 0) && Net::Session_IsConnected()) {
+        (rbFrame % s_statusInterval == 0) && Net::Session_IsConnected()) {
 
         Net::FrameSyncStatusPayload status{};
-        status.current_frame = frame;
-        status.game_frame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-
         RollbackSessionSnapshot rbSnap{};
         RollbackSession_GetSnapshot(&rbSnap);
-        status.confirmed_frame = rbSnap.last_confirmed_frame;
-        status.remote_view_frame = rbSnap.last_confirmed_frame;
+        status.rb_frame_current = rbFrame;
+        status.game_abs_frame_current = gameAbsFrame;
+        status.frame_origin_abs = frameOriginAbs;
+        status.rb_frame_last_remote_received = rbSnap.rb_frame_last_remote_received;
+        status.rb_frame_confirmed = rbSnap.rb_frame_last_confirmed;
         status.predicted_frames = rbSnap.predicted_frames_outstanding;
         status.checksum = s_currentChecksum;
 
@@ -229,25 +239,28 @@ void RollbackDebug_FrameUpdate() {
 
         s_statusSent++;
 
-        NetplayLog_Verbose("FSYNC", frame,
-            "Sent status: game=%d remote_view=%d confirmed=%d predicted=%d crc=0x%08X",
-            status.game_frame,
-            status.remote_view_frame,
-            status.confirmed_frame,
+        NetplayLog_Verbose("FSYNC", rbFrame,
+            "Sent status: rb_frame=%d game_abs_frame=%d origin_abs=%d remote_received_rb=%d confirmed_rb=%d predicted=%d crc=0x%08X",
+            status.rb_frame_current,
+            status.game_abs_frame_current,
+            status.frame_origin_abs,
+            status.rb_frame_last_remote_received,
+            status.rb_frame_confirmed,
             status.predicted_frames,
             status.checksum);
     }
 
     // Rate-limited diagnostics log (every 300 frames = ~5 seconds)
-    if (frame > 0 && frame % 300 == 0) {
+    if (rbFrame > 0 && rbFrame % 300 == 0) {
         RollbackSessionSnapshot snap;
         RollbackSession_GetSnapshot(&snap);
 
-        LOG_INFO("[RollbackDebug] f=%d conf=%d remote=%d "
+        LOG_INFO("[RollbackDebug] rb=%d game_abs=%d origin=%d conf=%d remote=%d "
                  "rb=%d maxrb=%d pred=%d misp=%d "
                  "delay=%d budget=%d crc=0x%08X",
-            snap.current_frame, snap.last_confirmed_frame,
-            snap.last_remote_received_frame,
+            snap.rb_frame_current, snap.game_abs_frame_current, snap.frame_origin_abs,
+            snap.rb_frame_last_confirmed,
+            snap.rb_frame_last_remote_received,
             snap.rollback_count, snap.max_rollback_distance,
             snap.predicted_frames_outstanding, snap.total_mispredictions,
             snap.active_delay, snap.rollback_budget,
@@ -270,23 +283,23 @@ void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc) {
     const int settleLagFrames = (std::max)(
         kMinimumSettleLagFrames,
         RollbackSession_GetRollbackBudget() + RollbackSession_GetActiveDelay() + 2);
-    const int32_t localSettledFrame = snap.current_frame - settleLagFrames;
+    const int32_t localSettledFrame = snap.rb_frame_current - settleLagFrames;
 
-    if (frame > snap.last_confirmed_frame || frame > localSettledFrame) {
+    if (frame > snap.rb_frame_last_confirmed || frame > localSettledFrame) {
         NetplayLog_Verbose("DIGEST", frame,
-            "Skip compare: frame not locally settled (frame=%d confirmed=%d settled=%d current=%d)",
+            "Skip compare: frame not locally settled (rb_frame=%d confirmed_rb=%d settled_rb=%d current_rb=%d)",
             frame,
-            snap.last_confirmed_frame,
+            snap.rb_frame_last_confirmed,
             localSettledFrame,
-            snap.current_frame);
+            snap.rb_frame_current);
         return;
     }
 
-    if (s_remoteStatusConfirmedFrame >= 0 && frame > s_remoteStatusConfirmedFrame) {
+    if (s_remoteStatusRbFrameConfirmed >= 0 && frame > s_remoteStatusRbFrameConfirmed) {
         NetplayLog_Verbose("DIGEST", frame,
-            "Skip compare: frame not remotely confirmed yet (frame=%d remote_confirmed=%d)",
+            "Skip compare: frame not remotely confirmed yet (rb_frame=%d remote_confirmed_rb=%d)",
             frame,
-            s_remoteStatusConfirmedFrame);
+            s_remoteStatusRbFrameConfirmed);
         return;
     }
 
@@ -326,17 +339,19 @@ void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc) {
     }
 }
 
-void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_frame,
-                                           int32_t remote_game_frame,
-                                           int32_t remote_view_frame,
-                                           int32_t remote_confirmed_frame,
+void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_rb_frame,
+                                           int32_t remote_game_abs_frame,
+                                           int32_t remote_frame_origin_abs,
+                                           int32_t remote_rb_frame_last_received,
+                                           int32_t remote_rb_frame_confirmed,
                                            int32_t remote_predicted_frames,
                                            uint32_t remote_checksum) {
     s_statusRecv++;
-    s_remoteStatusFrame = remote_frame;
-    s_remoteStatusGameFrame = remote_game_frame;
-    s_remoteStatusViewFrame = remote_view_frame;
-    s_remoteStatusConfirmedFrame = remote_confirmed_frame;
+    s_remoteStatusRbFrameCurrent = remote_rb_frame;
+    s_remoteStatusGameAbsFrameCurrent = remote_game_abs_frame;
+    s_remoteStatusFrameOriginAbs = remote_frame_origin_abs;
+    s_remoteStatusRbFrameLastReceived = remote_rb_frame_last_received;
+    s_remoteStatusRbFrameConfirmed = remote_rb_frame_confirmed;
     s_remoteStatusPredicted = remote_predicted_frames;
     s_remoteStatusChecksum = remote_checksum;
 
@@ -344,46 +359,57 @@ void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_frame,
         return;
     }
 
-    const int32_t localFrame = RollbackSession_GetCurrentFrame();
-    const int32_t localGameFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-    const int32_t frameDelta = localFrame - remote_frame;
-    const int32_t gameDelta = localGameFrame - remote_game_frame;
-    const bool remoteViewValid = (remote_view_frame >= 0);
-    const int32_t remoteViewDelta = remoteViewValid ? (localFrame - remote_view_frame) : 0;
+    const int32_t localRbFrame = RollbackSession_GetCurrentFrame();
+    const int32_t localGameAbsFrame = RollbackSession_GetCurrentGameAbsFrame();
+    const int32_t localFrameOriginAbs = RollbackSession_GetFrameOriginAbs();
+    const int32_t rbFrameDelta = localRbFrame - remote_rb_frame;
+    const int32_t gameAbsDelta = localGameAbsFrame - remote_game_abs_frame;
+    const int32_t originDelta = localFrameOriginAbs - remote_frame_origin_abs;
+    const bool remoteReceivedValid = (remote_rb_frame_last_received >= 0);
+    const int32_t remoteReceivedDelta =
+        remoteReceivedValid ? (localRbFrame - remote_rb_frame_last_received) : 0;
 
-    NetplayLog_Verbose("FSYNC", localFrame,
-        "Remote status: remote_frame=%d remote_game=%d remote_view=%d confirmed=%d predicted=%d "
-        "frame_delta=%d game_delta=%d remote_view_delta=%d crc=0x%08X",
-        remote_frame,
-        remote_game_frame,
-        remote_view_frame,
-        remote_confirmed_frame,
+    NetplayLog_Verbose("FSYNC", localRbFrame,
+        "Remote status: remote_rb=%d remote_game_abs=%d remote_origin_abs=%d remote_received_rb=%d confirmed_rb=%d predicted=%d "
+        "rb_delta=%d game_abs_delta=%d origin_delta=%d remote_received_delta=%d crc=0x%08X",
+        remote_rb_frame,
+        remote_game_abs_frame,
+        remote_frame_origin_abs,
+        remote_rb_frame_last_received,
+        remote_rb_frame_confirmed,
         remote_predicted_frames,
-        frameDelta,
-        gameDelta,
-        remoteViewDelta,
+        rbFrameDelta,
+        gameAbsDelta,
+        originDelta,
+        remoteReceivedDelta,
         remote_checksum);
 
-    const int frameSkewThreshold = (std::max)(RollbackSession_GetRollbackBudget() + 2, 6);
-    const int gameSkewThreshold = 30;
-    const int remoteViewSkewThreshold = (std::max)(RollbackSession_GetRollbackBudget() + 4, 8);
+    const int rbFrameSkewThreshold = (std::max)(RollbackSession_GetRollbackBudget() + 2, 6);
+    const int gameAbsSkewThreshold = 30;
+    const int remoteReceivedSkewThreshold = (std::max)(RollbackSession_GetRollbackBudget() + 4, 8);
 
-    const bool frameSkew = (frameDelta > frameSkewThreshold || frameDelta < -frameSkewThreshold);
-    const bool gameSkew = (gameDelta > gameSkewThreshold || gameDelta < -gameSkewThreshold);
-    const bool remoteViewSkew =
-        remoteViewValid &&
-        (remoteViewDelta > remoteViewSkewThreshold || remoteViewDelta < -remoteViewSkewThreshold);
+    const bool rbFrameSkew =
+        (rbFrameDelta > rbFrameSkewThreshold || rbFrameDelta < -rbFrameSkewThreshold);
+    const bool gameAbsSkew =
+        (gameAbsDelta > gameAbsSkewThreshold || gameAbsDelta < -gameAbsSkewThreshold);
+    const bool originSkew = (originDelta != 0);
+    const bool remoteReceivedSkew =
+        remoteReceivedValid &&
+        (remoteReceivedDelta > remoteReceivedSkewThreshold ||
+         remoteReceivedDelta < -remoteReceivedSkewThreshold);
 
-    if (frameSkew || gameSkew || remoteViewSkew) {
-        NetplayLog_Write("FSYNC", localFrame,
-            "SKEW: local_frame=%d remote_frame=%d local_game=%d remote_game=%d remote_view=%d "
-            "confirmed=%d predicted=%d local_crc=0x%08X remote_crc=0x%08X",
-            localFrame,
-            remote_frame,
-            localGameFrame,
-            remote_game_frame,
-            remote_view_frame,
-            remote_confirmed_frame,
+    if (rbFrameSkew || gameAbsSkew || originSkew || remoteReceivedSkew) {
+        NetplayLog_Write("FSYNC", localRbFrame,
+            "SKEW: local_rb=%d remote_rb=%d local_game_abs=%d remote_game_abs=%d local_origin_abs=%d remote_origin_abs=%d "
+            "remote_received_rb=%d confirmed_rb=%d predicted=%d local_crc=0x%08X remote_crc=0x%08X",
+            localRbFrame,
+            remote_rb_frame,
+            localGameAbsFrame,
+            remote_game_abs_frame,
+            localFrameOriginAbs,
+            remote_frame_origin_abs,
+            remote_rb_frame_last_received,
+            remote_rb_frame_confirmed,
             remote_predicted_frames,
             s_currentChecksum,
             remote_checksum);
@@ -461,21 +487,56 @@ void RollbackDebug_RenderImGui(bool* p_open) {
 
         // Frame info
         ImGui::Separator();
-        ImGui::Text("Current Frame:    %d", snap.current_frame);
-        ImGui::Text("Confirmed Frame:  %d", snap.last_confirmed_frame);
-        ImGui::Text("Remote Received:  %d", snap.last_remote_received_frame);
-        ImGui::Text("Last Saved State: %d", snap.last_saved_state_frame);
+        ImGui::Text("Frame Origin Abs: %d", snap.frame_origin_abs);
+        ImGui::Text("Game Abs Frame:   %d", snap.game_abs_frame_current);
+        ImGui::Text("RB Current:       %d", snap.rb_frame_current);
+        ImGui::Text("RB Confirmed:     %d", snap.rb_frame_last_confirmed);
+        ImGui::Text("RB Remote Recv:   %d", snap.rb_frame_last_remote_received);
+        ImGui::Text("RB Last Saved:    %d", snap.rb_frame_last_saved_state);
 
         // Policy
         ImGui::Separator();
         ImGui::Text("Active Delay:     %d", snap.active_delay);
         ImGui::Text("Rollback Budget:  %d", snap.rollback_budget);
 
+        // Timesync / delay diagnostics
+        Net::DelayPolicySnapshot delaySnap{};
+        Net::DelayPolicy_GetSnapshot(&delaySnap);
+        OnlineWiringSnapshot wiringSnap{};
+        OnlineWiring_GetSnapshot(&wiringSnap);
+        TimesyncDebugInfo tsDebug{};
+        GetTimesyncDebugInfo(&tsDebug);
+
+        ImGui::Separator();
+        ImGui::Text("Timesync & Delay");
+        ImGui::Text("Rollback Phase:    %s", Net::MatchRollbackPhaseName(wiringSnap.phase));
+        ImGui::Text("Session Running:   %s", wiringSnap.session_running ? "yes" : "no");
+        ImGui::Text("Stepping Enabled:  %s", wiringSnap.stepping_enabled ? "yes" : "no");
+        ImGui::Text("Startup Armed:     %s", wiringSnap.startup_barrier_armed ? "yes" : "no");
+        ImGui::Text("Startup Released:  %s", wiringSnap.startup_barrier_released ? "yes" : "no");
+        ImGui::Text("Frames Ahead:     %.2f", tsDebug.frames_ahead);
+        ImGui::Text("Filtered Adjust:  %.2f ms", tsDebug.rate_adjust_ms);
+        ImGui::Text("Tick Target:      %.3f", wiringSnap.target_tick_scale);
+        ImGui::Text("Tick Current:     %.3f", wiringSnap.current_tick_scale);
+        ImGui::Text("Stall Frames:     %d", tsDebug.stall_frame_count);
+        ImGui::Text("Emergency Holds:  %d", tsDebug.hard_skip_count);
+        ImGui::Text("Stalled:          %s", tsDebug.stalled ? "yes" : "no");
+        ImGui::Text("Local Delay:      %d", delaySnap.active_delay);
+        ImGui::Text("Effective Delay:  %d", delaySnap.effective_local_delay);
+        ImGui::Text("Max rollback:     %d", delaySnap.rollback_budget);
+        ImGui::Text("Remote Delay:     %d", delaySnap.remote_announced_delay);
+        ImGui::Text("Protection Win:   %d", delaySnap.protection_window);
+        ImGui::Text("Stall Threshold:  %d", wiringSnap.stall_threshold);
+        ImGui::Text("Avg Ping:         %.1f ms", snap.gekko_avg_ping);
+        ImGui::Text("Jitter:           %.1f ms", snap.gekko_jitter);
+        ImGui::Text("Rec Delay:        %d", delaySnap.recommended_delay);
+        ImGui::Text("Rec Max RB:       %d", delaySnap.recommended_max_rollback);
+
         // Rollback stats
         ImGui::Separator();
         ImGui::Text("Rollback Count:   %d", snap.rollback_count);
         ImGui::Text("Max Depth:        %d", snap.max_rollback_distance);
-        ImGui::Text("Last RB Frame:    %d", snap.last_rollback_start_frame);
+        ImGui::Text("Last RB Start:    %d", snap.rb_last_rollback_start_frame);
         ImGui::Text("Last RB Length:   %d", snap.last_rollback_replay_length);
         ImGui::Text("Predicted Outstanding: %d", snap.predicted_frames_outstanding);
 
