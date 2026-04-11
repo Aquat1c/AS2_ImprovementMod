@@ -21,6 +21,9 @@ enum class MenuState : uint32_t {
     DirectConnectEntry,  // Host / Join selection
     HostEntry,           // Host config (port, start)
     JoinEntry,           // Join config (endpoint, recent peers)
+    SpectateEntry,       // Spectator client connect entry
+    SpectatorConnecting, // Spectator sidecar connect in progress
+    SpectatorConnected,  // Spectator sidecar stream active
     SettingsCategoryMenu,// Settings category selection
     SettingsEntry,       // Individual settings
     Connecting,          // Waiting for peer
@@ -38,6 +41,9 @@ inline const char* MenuStateName(MenuState state) {
         case MenuState::DirectConnectEntry:   return "DirectConnect";
         case MenuState::HostEntry:            return "HostEntry";
         case MenuState::JoinEntry:            return "JoinEntry";
+        case MenuState::SpectateEntry:        return "SpectateEntry";
+        case MenuState::SpectatorConnecting:  return "SpectatorConnecting";
+        case MenuState::SpectatorConnected:   return "SpectatorConnected";
         case MenuState::SettingsCategoryMenu: return "SettingsCategory";
         case MenuState::SettingsEntry:        return "SettingsEntry";
         case MenuState::Connecting:           return "Connecting";
@@ -90,7 +96,9 @@ enum class TextEditField : uint32_t {
     None = 0,
     Nickname,
     RemoteEndpoint,
+    SpectatorEndpoint,
     ListenPort,
+    SpectatorPort,
     RelayEndpoint,
     StunEndpoint,
 };
@@ -122,6 +130,7 @@ struct MenuSnapshot {
     // Connection config (editable by user)
     uint16_t      listen_port;
     char          remote_endpoint[96];
+    char          spectator_endpoint[96];
     int           preferred_delay;
     int           connection_mode;     // Net::ConnectPreference
     bool          upnp_enabled;
@@ -131,6 +140,24 @@ struct MenuSnapshot {
     char          relay_endpoint[96];
     char          stun_endpoint[96];
     char          nat_status[128];
+    bool          spectators_enabled;
+    uint16_t      spectator_listen_port;
+    int           connected_spectators;
+    bool          palette_sync_enabled;
+    bool          remote_palette_preview_enabled;
+    char          spectator_status[128];
+    char          palette_status[128];
+
+    // Spectator client diagnostics
+    bool          spectator_client_active;
+    uint32_t      spectator_client_match_id;
+    uint32_t      spectator_client_buffered_frames;
+    int32_t       spectator_client_buffer_start;
+    int32_t       spectator_client_buffer_end;
+    int32_t       spectator_client_playback_frame;
+    bool          spectator_client_should_fast_forward;
+    bool          spectator_client_needs_hard_sync;
+    char          spectator_client_status[128];
 
     // Session display
     bool          is_host;

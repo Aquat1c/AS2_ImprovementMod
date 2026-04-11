@@ -1326,6 +1326,7 @@ void Session_GetSnapshot(SessionSnapshot* out) {
     out->active = (s_state != SessionState::Idle);
     out->state  = s_state;
     out->role   = s_role;
+    memcpy(out->local_nickname, s_config.nickname, sizeof(out->local_nickname));
     out->remote_peer = s_remotePeer;
     out->stats  = s_stats;
     out->local_ready  = s_localReady;

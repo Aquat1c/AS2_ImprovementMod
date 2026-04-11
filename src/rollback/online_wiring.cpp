@@ -38,6 +38,8 @@
 #include "net/charsel_sync.h"
 #include "net/winscreen_sync.h"
 #include "net/pause_handler.h"
+#include "net/spectator_runtime.h"
+#include "net/netplay_palette_runtime.h"
 #include "input/input_system.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
@@ -416,6 +418,28 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
             break;
         }
 
+        case Net::PacketType::PaletteConfig: {
+            if (payloadLen < sizeof(Net::PaletteConfigPayload)) {
+                LogGameplayPacketAnomaly("Short PaletteConfig", type, payloadLen,
+                                         sizeof(Net::PaletteConfigPayload));
+                break;
+            }
+            Net::NetplayPaletteRuntime_OnRemoteConfig(
+                static_cast<const Net::PaletteConfigPayload*>(payload));
+            break;
+        }
+
+        case Net::PacketType::PaletteAck: {
+            if (payloadLen < sizeof(Net::PaletteAckPayload)) {
+                LogGameplayPacketAnomaly("Short PaletteAck", type, payloadLen,
+                                         sizeof(Net::PaletteAckPayload));
+                break;
+            }
+            Net::NetplayPaletteRuntime_OnRemoteAck(
+                static_cast<const Net::PaletteAckPayload*>(payload));
+            break;
+        }
+
         default:
             // Check for win screen / pause packets
             if (type == Net::PacketType::WinScreenConfirm) {
@@ -657,6 +681,8 @@ static bool TryStartRollbackSession() {
         Net::DelayPolicy_GetStallThreshold(),
         s_baselineCRC);
 
+    Net::SpectatorRuntime_OnRollbackStarted(rbConfig.frame_origin_abs);
+
     return true;
 }
 
@@ -705,6 +731,8 @@ static void StopRollbackSession(const char* reason) {
     s_gameplayActive = false;
     s_liveReleaseArmed = false;
     ResetStartupBarrierState(reason ? reason : "rollback stop");
+    Net::SpectatorRuntime_OnMatchEnd(reason ? reason : "rollback stop");
+    Net::NetplayPaletteRuntime_OnMatchEnd(reason ? reason : "rollback stop");
 
     NetplayLog_Write("TEARDOWN", frame,
         "=== ROLLBACK SESSION ENDED ===");
@@ -1190,6 +1218,11 @@ void OnlineWiring_OnGameplayStart() {
         return;
     }
 
+    const Net::LockedMatchConfig* config = Net::PregameSync_GetLockedConfig();
+    if (config) {
+        Net::SpectatorRuntime_OnMatchBegin(config);
+    }
+
     if (!PrepareBaselineForInteractiveRelease()) {
         NetplayLog_Write("HANDOFF", GetStartupLogFrame(),
             "ERROR: failed to prepare interactive-release startup handoff");
@@ -1230,6 +1263,8 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     s_rollbackBeginPending = false;
     s_frameOriginAbs = -1;
     Net::NetplayPacing_ResetSession("disconnect");
+    Net::SpectatorRuntime_OnDisconnect(reason ? reason : "disconnect");
+    Net::NetplayPaletteRuntime_OnDisconnect(reason ? reason : "disconnect");
 
     // Reset set tracker on session end
     Net::SetTracker_Reset();
@@ -1282,6 +1317,8 @@ void OnlineWiring_OnRematch() {
     s_lastRollbackBudget = -1;
     Net::NetplayPacing_ResetSession("rematch");
     ResetStartupBarrierState("rematch");
+    Net::SpectatorRuntime_OnMatchEnd("rematch");
+    Net::NetplayPaletteRuntime_OnMatchEnd("rematch");
 
     NetplayLog_Write("POSTMATCH", -1,
         "Post-cleanup wiring state: started=%d active=%d gameplay=%d frame_origin_abs=%d baseline=0x%08X config=0x%08X recv=%d dispatched=%d",
@@ -1319,6 +1356,8 @@ void OnlineWiring_OnReturnToSession() {
     s_backgroundPollFailures = 0;
     Net::NetplayPacing_ResetSession("return to session");
     ResetStartupBarrierState("return to session");
+    Net::SpectatorRuntime_OnMatchEnd("return to session");
+    Net::NetplayPaletteRuntime_OnMatchEnd("return to session");
     NetplayLog_Write("POSTMATCH", -1,
         "Rollback cleanup complete for return-to-session route");
 }

@@ -14,6 +14,7 @@
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
+#include "net/spectator_runtime.h"
 #include "net/session_manager.h"
 #include "net/match_lifecycle.h"
 #include "net/delay_policy.h"
@@ -671,6 +672,14 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
             rbFrame, gameAbsFrame, raw_p1, raw_p2, DetVer_GetRngSeed(),
             ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX));
     }
+
+    Net::SpectatorRuntime_OnGameplayFrame(
+        rbFrame,
+        gameAbsFrame,
+        raw_p1,
+        raw_p2,
+        rolling_back,
+        s_cachedConfirmedRbFrame);
 }
 
 static void HandleSessionEvents() {
@@ -781,6 +790,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     // Configure GekkoNet
     GekkoConfig gkConfig{};
     gkConfig.num_players = 2;
+    // Spectators are handled by the sidecar spectator runtime.
     gkConfig.max_spectators = 0;
     gkConfig.input_size = sizeof(uint16_t);  // 2 bytes per player
     gkConfig.state_size = sizeof(GekkoState);

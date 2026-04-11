@@ -25,6 +25,9 @@
 #include "rollback/netplay_log.h"
 #include "rollback/stress_hooks.h"
 #include "rollback/online_wiring.h"
+#include "net/spectator_runtime.h"
+#include "net/spectator_client.h"
+#include "net/netplay_palette_runtime.h"
 #include "net/enet_transport.h"
 #include "net/session_manager.h"
 #include "net/mode_ownership.h"
@@ -243,6 +246,9 @@ static void DeferredInit() {
     // Initialize networking
     Net::Transport_GlobalInit();
     Net::Session_Init();
+    Net::NetplayPaletteRuntime_Init();
+    Net::SpectatorRuntime_Init();
+    Net::SpectatorClient_Init();
 
     // Initialize netplay menu controller and mode ownership hooks
     NetMenu::Init();
@@ -352,6 +358,9 @@ __declspec(dllexport) void ModShutdown() {
         Net::PregameSync_Shutdown();
         NetMenu::Shutdown();
         ModeOwnership::Remove();
+        Net::SpectatorClient_Shutdown();
+        Net::SpectatorRuntime_Shutdown();
+        Net::NetplayPaletteRuntime_Shutdown();
         Net::Session_Shutdown();
         Net::Transport_GlobalDeinit();
         Savestate_Shutdown();
@@ -412,6 +421,7 @@ __declspec(dllexport) void ModOnFrame() {
     // rollback/pregame decisions so gameplay uses the newest packets and
     // local sample. ENet servicing itself runs on the dedicated network thread.
     Net::Session_Update();
+    Net::NetplayPaletteRuntime_FrameUpdate();
 
     // Process savestate hotkeys (F5 save, F6 load)
     Savestate_ProcessHotkeys();
@@ -427,6 +437,8 @@ __declspec(dllexport) void ModOnFrame() {
 
     // Update online wiring (manages rollback session lifecycle)
     Rollback::OnlineWiring_FrameUpdate();
+    Net::SpectatorRuntime_FrameUpdate();
+    Net::SpectatorClient_FrameUpdate();
 
     // Drive gameplay bridge per-frame (rollback session + delay policy consumption)
     // The bridge is the single entry point for per-frame gameplay runtime.

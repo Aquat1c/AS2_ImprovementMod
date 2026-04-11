@@ -218,8 +218,9 @@ static const char* ConnectModeLabel(int mode) {
 static void RenderMenuRoot(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     int y = kRowStartY;
     RenderRow(y, "Direct Play", "Host / Join", snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Settings",    "Config",      snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Close Menu",  nullptr,       snap->selected_index == 2, true, alpha);
+    RenderRow(y, "Spectate",    "Watch stream", snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, "Settings",    "Config",       snap->selected_index == 2, true, alpha); y += kRowStep;
+    RenderRow(y, "Close Menu",  nullptr,          snap->selected_index == 3, true, alpha);
 }
 
 static void RenderDirectConnect(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
@@ -273,8 +274,34 @@ static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     RenderInfoLine(y, "NAT", snap->nat_status, alpha);
 }
 
+static void RenderSpectateEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
+    int y = kRowStartY;
+    RenderRow(y, "Connect", "Spectator stream", snap->selected_index == 0, true, alpha); y += kRowStep;
+
+    char endpointVal[128];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::SpectatorEndpoint) {
+        FormatEditBufferWithCursor(endpointVal, sizeof(endpointVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(endpointVal, sizeof(endpointVal), _TRUNCATE, "%s", snap->spectator_endpoint);
+    }
+    RenderRow(y, "Stream Endpoint", endpointVal, snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, "Back", nullptr, snap->selected_index == 2, true, alpha);
+    y += kRowStep + 8;
+
+    char serverBuf[64];
+    _snprintf_s(serverBuf, sizeof(serverBuf), _TRUNCATE, "%s @ %u (%d)",
+        snap->spectators_enabled ? "On" : "Off",
+        snap->spectator_listen_port,
+        snap->connected_spectators);
+    RenderInfoLine(y, "Server", serverBuf, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Status", snap->spectator_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Palette", snap->palette_status, alpha);
+}
+
 static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
-    constexpr int kSettingsStep = 18;
+    constexpr int kSettingsStep = 15;
     int y = kRowStartY;
 
     char nickVal[64];
@@ -324,9 +351,79 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
     }
     RenderRow(y, "STUN Server", stunVal, snap->selected_index == 10, true, alpha); y += kSettingsStep;
 
-    RenderRow(y, "Back", nullptr, snap->selected_index == 11, true, alpha);
+    RenderRow(y, "Spectator Server", snap->spectators_enabled ? "< On >" : "< Off >", snap->selected_index == 11, true, alpha); y += kSettingsStep;
 
-    RenderInfoLine(kFooterTop - kInfoStep, "NAT", snap->nat_status, alpha);
+    char spectatorPortVal[16];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::SpectatorPort) {
+        FormatEditBufferWithCursor(spectatorPortVal, sizeof(spectatorPortVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(spectatorPortVal, sizeof(spectatorPortVal), _TRUNCATE, "%u", snap->spectator_listen_port);
+    }
+    RenderRow(y, "Spectator Port", spectatorPortVal, snap->selected_index == 12, true, alpha); y += kSettingsStep;
+
+    RenderRow(y, "Palette Sync", snap->palette_sync_enabled ? "< On >" : "< Off >", snap->selected_index == 13, true, alpha); y += kSettingsStep;
+    RenderRow(y, "Remote Preview", snap->remote_palette_preview_enabled ? "< On >" : "< Off >", snap->selected_index == 14, true, alpha); y += kSettingsStep;
+    RenderRow(y, "Back", nullptr, snap->selected_index == 15, true, alpha);
+}
+
+static void RenderSpectatorConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
+    int y = kRowStartY;
+    RenderRow(y, "Cancel", "Stop", snap->selected_index == 0, true, alpha);
+    y += kRowStep + 8;
+
+    RenderInfoLine(y, "Endpoint", snap->spectator_endpoint, alpha);
+    y += kInfoStep;
+    if (snap->spectator_client_match_id != 0) {
+        char matchBuf[24];
+        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, "0x%08X", snap->spectator_client_match_id);
+        RenderInfoLine(y, "Match", matchBuf, alpha);
+        y += kInfoStep;
+    }
+    RenderInfoLine(y, "Status", snap->spectator_client_status, alpha);
+}
+
+static void RenderSpectatorConnected(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
+    int y = kRowStartY;
+    RenderRow(y, "Disconnect", "Leave stream", snap->selected_index == 0, true, alpha);
+    y += kRowStep + 8;
+
+    RenderInfoLine(y, "Endpoint", snap->spectator_endpoint, alpha);
+    y += kInfoStep;
+
+    if (snap->spectator_client_match_id != 0) {
+        char matchBuf[24];
+        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, "0x%08X", snap->spectator_client_match_id);
+        RenderInfoLine(y, "Match", matchBuf, alpha);
+        y += kInfoStep;
+    }
+
+    if (snap->spectator_client_buffered_frames > 0) {
+        char bufferBuf[64];
+        _snprintf_s(bufferBuf, sizeof(bufferBuf), _TRUNCATE, "%u  [%d..%d]",
+            snap->spectator_client_buffered_frames,
+            snap->spectator_client_buffer_start,
+            snap->spectator_client_buffer_end);
+        RenderInfoLine(y, "Buffer", bufferBuf, alpha);
+        y += kInfoStep;
+    }
+
+    if (snap->spectator_client_playback_frame >= 0) {
+        char playbackBuf[48];
+        _snprintf_s(playbackBuf, sizeof(playbackBuf), _TRUNCATE, "%d",
+            snap->spectator_client_playback_frame);
+        RenderInfoLine(y, "Playback", playbackBuf, alpha);
+        y += kInfoStep;
+    }
+
+    const char* mode = "Live edge stable";
+    if (snap->spectator_client_needs_hard_sync) {
+        mode = "Hard sync requested";
+    } else if (snap->spectator_client_should_fast_forward) {
+        mode = "Fast forwarding";
+    }
+    RenderInfoLine(y, "Catch-up", mode, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Status", snap->spectator_client_status, alpha);
 }
 
 static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha) {
@@ -511,6 +608,10 @@ static void RenderDisconnectError(const NetMenu::MenuSnapshot* snap, uint8_t alp
 
 static const char* GetHeaderTitle(const NetMenu::MenuSnapshot* snap) {
     switch (snap->state) {
+        case NetMenu::MenuState::SpectateEntry:
+        case NetMenu::MenuState::SpectatorConnecting:
+        case NetMenu::MenuState::SpectatorConnected:
+            return "Spectator";
         case NetMenu::MenuState::SettingsEntry:
         case NetMenu::MenuState::SettingsCategoryMenu:
             return "Settings";
@@ -525,6 +626,9 @@ static const char* GetHeaderSubtitle(const NetMenu::MenuSnapshot* snap) {
         case NetMenu::MenuState::DirectConnectEntry:  return "Direct Connect";
         case NetMenu::MenuState::HostEntry:           return "Host";
         case NetMenu::MenuState::JoinEntry:           return "Join";
+        case NetMenu::MenuState::SpectateEntry:       return "Connect";
+        case NetMenu::MenuState::SpectatorConnecting: return "Connecting...";
+        case NetMenu::MenuState::SpectatorConnected:  return "Streaming";
         case NetMenu::MenuState::SettingsCategoryMenu: return "Categories";
         case NetMenu::MenuState::SettingsEntry:       return "Settings";
         case NetMenu::MenuState::Connecting:          return "Connecting...";
@@ -599,6 +703,9 @@ void Render(const NetMenu::MenuSnapshot* snap) {
         case NetMenu::MenuState::DirectConnectEntry: RenderDirectConnect(snap, alpha);    break;
         case NetMenu::MenuState::HostEntry:          RenderHostEntry(snap, alpha);        break;
         case NetMenu::MenuState::JoinEntry:          RenderJoinEntry(snap, alpha);        break;
+        case NetMenu::MenuState::SpectateEntry:      RenderSpectateEntry(snap, alpha);    break;
+        case NetMenu::MenuState::SpectatorConnecting:RenderSpectatorConnecting(snap, alpha); break;
+        case NetMenu::MenuState::SpectatorConnected: RenderSpectatorConnected(snap, alpha); break;
         case NetMenu::MenuState::SettingsEntry:      RenderSettings(snap, alpha);         break;
         case NetMenu::MenuState::Connecting:
         case NetMenu::MenuState::Handshake:          RenderConnecting(snap, alpha);       break;

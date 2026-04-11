@@ -13,6 +13,7 @@
 #include "net/match_lifecycle.h"
 #include "net/pause_handler.h"
 #include "net/winscreen_sync.h"
+#include "net/netplay_palette_runtime.h"
 #include "net/barrier_protocol.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
@@ -350,6 +351,22 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             }
             break;
 
+        case PacketType::PaletteConfig:
+            if (payloadLen >= sizeof(PaletteConfigPayload)) {
+                NetplayPaletteRuntime_OnRemoteConfig(static_cast<const PaletteConfigPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short PaletteConfig", type, payloadLen, sizeof(PaletteConfigPayload));
+            }
+            break;
+
+        case PacketType::PaletteAck:
+            if (payloadLen >= sizeof(PaletteAckPayload)) {
+                NetplayPaletteRuntime_OnRemoteAck(static_cast<const PaletteAckPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short PaletteAck", type, payloadLen, sizeof(PaletteAckPayload));
+            }
+            break;
+
         default:
             // Handle cross-phase packets that can arrive at any time
             if (type == PacketType::PauseQuit) {
@@ -592,6 +609,8 @@ static void UpdateFrontendLocked() {
     // otherwise Hook_InputDispatcher will keep treating later states as
     // frontend-owned and stall the bootstrap handoff.
     CharSelSync_Abort();
+
+    NetplayPaletteRuntime_OnLockedMatchConfig(&s_lockedConfig);
 
     SetPhase(PregamePhase::ConfigExchange, "config ready");
     MatchBootstrap_BeginConfigExchange(&s_lockedConfig);
@@ -910,6 +929,7 @@ bool PregameSync_Begin() {
     s_remoteSyncConfirmed = false;
     s_lastAnnounceSendTime = 0;
     s_lastConfirmSendTime = 0;
+    NetplayPaletteRuntime_OnDisconnect("pregame begin reset");
 
     // Start with initial session sync (announce → exchange → confirmed → charsel)
     SetStatusFmt("Synchronizing session...");
@@ -946,6 +966,7 @@ void PregameSync_Abort(const char* reason) {
     s_remoteSyncConfirmed = false;
     s_lastAnnounceSendTime = 0;
     s_lastConfirmSendTime = 0;
+    NetplayPaletteRuntime_OnDisconnect(reason ? reason : "pregame abort");
 }
 
 PregamePhase PregameSync_GetPhase() {

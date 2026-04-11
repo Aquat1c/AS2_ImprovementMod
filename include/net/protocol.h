@@ -21,6 +21,7 @@ namespace Net {
 constexpr uint16_t PROTOCOL_VERSION = 4;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
+constexpr int      NETPLAY_PALETTE_MAX_PAYLOAD = 128;
 
 // ============================================================================
 // ENet Channel Assignments
@@ -70,6 +71,10 @@ enum class PacketType : uint16_t {
     WinScreenConfirm    = 41,  // Legacy win screen one-shot confirm signal
     PauseQuit           = 42,  // Pause menu quit signal
     WinScreenFrameInput = 43,  // Mode 9 lockstep frame input with redundancy
+
+    // Palette metadata control-plane (reliable, channel 0)
+    PaletteConfig      = 50,
+    PaletteAck         = 51,
 
     // Gameplay (unreliable, channel 1)
     GameplayInput   = 20,   // Legacy mod-owned rollback input sync (DEAD — no send site)
@@ -306,6 +311,28 @@ struct WinScreenFrameInputPayload {
     uint16_t _pad;
 };
 
+struct PaletteConfigPayload {
+    uint32_t epoch;
+    uint32_t config_hash;
+    uint8_t  game_slot;          // 0 = P1, 1 = P2
+    uint8_t  character_id;
+    uint8_t  base_palette;
+    uint8_t  flags;
+    uint32_t payload_crc;
+    uint16_t payload_size;
+    uint16_t _pad;
+    uint8_t  payload[NETPLAY_PALETTE_MAX_PAYLOAD];
+};
+
+struct PaletteAckPayload {
+    uint32_t epoch;
+    uint32_t config_hash;
+    uint8_t  game_slot;
+    uint8_t  accepted;
+    uint16_t payload_size;
+    uint32_t payload_crc;
+};
+
 struct DelayChangeReqPayload {
     uint8_t  new_delay;          // Obsolete reserved payload
     uint8_t  _pad[3];
@@ -322,6 +349,11 @@ struct DelayChangeAckPayload {
 // GekkoReadyPayload flags
 constexpr uint8_t GEKKO_READY_FLAG_READY = 1 << 0;  // Local reached post-intro interactive boundary
 constexpr uint8_t GEKKO_READY_FLAG_ACK   = 1 << 1;  // Local has observed peer READY
+
+constexpr uint8_t NETPLAY_PALETTE_FLAG_TRANSPORT_ENABLED = 1 << 0;
+constexpr uint8_t NETPLAY_PALETTE_FLAG_REMOTE_PREVIEW_ENABLED = 1 << 1;
+constexpr uint8_t NETPLAY_PALETTE_FLAG_HAS_CUSTOM_DATA = 1 << 2;
+constexpr uint8_t NETPLAY_PALETTE_FLAG_SPECTATOR_PROPAGATE = 1 << 3;
 
 // NatInfoPayload flags
 constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;
@@ -369,6 +401,8 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::WinScreenConfirm:    return "WinScreenConfirm";
         case PacketType::PauseQuit:           return "PauseQuit";
         case PacketType::WinScreenFrameInput: return "WinScreenFrameInput";
+        case PacketType::PaletteConfig:       return "PaletteConfig";
+        case PacketType::PaletteAck:          return "PaletteAck";
         case PacketType::Ping:           return "Ping";
         case PacketType::Pong:           return "Pong";
         case PacketType::StateDigest:    return "StateDigest";

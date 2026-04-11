@@ -28,6 +28,7 @@ struct SessionSnapshot {
     bool            active;
     SessionState    state;
     SessionRole     role;
+    char            local_nickname[24];
     PeerInfo        remote_peer;
     ConnectionStats stats;
     bool            local_ready;
