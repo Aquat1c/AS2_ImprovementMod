@@ -1511,7 +1511,6 @@ static bool LaunchOfflineVsDebug() {
     ModeOwnership::ClearVanillaNetplayFlags();
     WriteU8(ADDR_P1_CPU_FLAG, 0);
     WriteU8(ADDR_P2_CPU_FLAG, 0);
-    WriteU8(ADDR_CHARSEL_ENABLE, 1);
 
     int result = ModeOwnership::CallOriginalSetGameMode(MODE_CHARSEL, 1);
     ModeOwnership::ResetCharSelFields();
@@ -1537,7 +1536,6 @@ static bool LaunchNetplayCharSel() {
     ModeOwnership::ClearVanillaNetplayFlags();
     WriteU8(ADDR_P1_CPU_FLAG, 0);
     WriteU8(ADDR_P2_CPU_FLAG, 0);
-    WriteU8(ADDR_CHARSEL_ENABLE, 1);
     WriteU8(ADDR_STAGESEL_ENABLE, 1);
 
     // Enforce Stage Select via sync policy (will persist across mode changes)

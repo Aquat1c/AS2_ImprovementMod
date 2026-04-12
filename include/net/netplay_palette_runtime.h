@@ -18,7 +18,8 @@ namespace Net {
 enum class NetplayPaletteBankSource : uint8_t {
     LiveMemory = 0,
     VanillaSource = 1,
-    SavedCustom = 2,
+    AppliedCustom = 2,
+    SavedCustom = 3,
 };
 
 struct NetplayPaletteBank {
@@ -64,7 +65,8 @@ struct NetplayPaletteLocalContext {
     bool     match_active;
     bool     transport_enabled;
     bool     remote_preview_enabled;
-    bool     has_custom_bank;
+    bool     has_applied_custom_bank;
+    bool     has_saved_custom_bank;
     bool     has_vanilla_bank;
     bool     has_live_bank;
     bool     asset_loaded;
@@ -103,9 +105,11 @@ bool NetplayPaletteRuntime_SetLocalCustomBank(const NetplayPaletteBank* bank, bo
 bool NetplayPaletteRuntime_ClearLocalCustomBank(bool delete_from_disk);
 bool NetplayPaletteRuntime_SetOfflineEditorGameSlot(uint8_t game_slot);
 void NetplayPaletteRuntime_GetLocalContext(NetplayPaletteLocalContext* out);
+bool NetplayPaletteRuntime_HasLocalCustomBankFor(uint8_t character_id, uint8_t base_palette);
 
 bool NetplayPaletteRuntime_CopyAssetOverrideBank(uint8_t game_slot, NetplayPaletteBank* out);
 bool NetplayPaletteRuntime_CopySpectatorBank(uint8_t game_slot, NetplayPaletteBank* out);
+void NetplayPaletteRuntime_RequestFrontendReload(uint8_t game_slot);
 
 void NetplayPaletteRuntime_OnAssetBankCaptured(uint8_t game_slot,
                                               uint8_t base_palette,

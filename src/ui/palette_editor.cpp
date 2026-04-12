@@ -56,6 +56,7 @@ static float                   s_saturationScale = 1.0f;
 static float                   s_valueScale = 1.0f;
 static float                   s_alphaScale = 1.0f;
 static float                   s_gridCellSize = 24.0f;
+static float                   s_pickerScale = 1.0f;
 static uint8_t                 s_hoveredIndex = 0xFF;
 static NetplayPaletteBank      s_workingBank = {};
 static PaletteHistoryEntry     s_undoHistory[kHistoryDepth] = {};
@@ -96,6 +97,16 @@ static int ClampInt(int value, int minValue, int maxValue) {
     return value;
 }
 
+static float ClampFloat(float value, float minValue, float maxValue) {
+    if (value < minValue) {
+        return minValue;
+    }
+    if (value > maxValue) {
+        return maxValue;
+    }
+    return value;
+}
+
 static uint8_t FloatToByte(float value) {
     return (uint8_t)(Clamp01(value) * 255.0f + 0.5f);
 }
@@ -117,6 +128,8 @@ static const char* BankSourceLabel(NetplayPaletteBankSource source) {
             return "Live Memory";
         case NetplayPaletteBankSource::VanillaSource:
             return "Vanilla Source";
+        case NetplayPaletteBankSource::AppliedCustom:
+            return "Applied Custom";
         case NetplayPaletteBankSource::SavedCustom:
             return "Saved Custom";
         default:
@@ -130,8 +143,10 @@ static bool IsSourceAvailable(const NetplayPaletteLocalContext& context, Netplay
             return context.has_live_bank;
         case NetplayPaletteBankSource::VanillaSource:
             return context.has_vanilla_bank;
+        case NetplayPaletteBankSource::AppliedCustom:
+            return context.has_applied_custom_bank;
         case NetplayPaletteBankSource::SavedCustom:
-            return context.has_custom_bank;
+            return context.has_saved_custom_bank;
         default:
             return false;
     }
@@ -141,7 +156,10 @@ static NetplayPaletteBankSource GetDefaultSource(const NetplayPaletteLocalContex
     if (context.has_live_bank) {
         return NetplayPaletteBankSource::LiveMemory;
     }
-    if (context.has_custom_bank) {
+    if (context.has_applied_custom_bank) {
+        return NetplayPaletteBankSource::AppliedCustom;
+    }
+    if (context.has_saved_custom_bank) {
         return NetplayPaletteBankSource::SavedCustom;
     }
     return NetplayPaletteBankSource::VanillaSource;
@@ -990,10 +1008,10 @@ static void RenderPaletteSummary(const NetplayPaletteLocalContext& context) {
         ImGui::TextDisabled("Editor preset: %s", s_loadedPresetName);
     }
 
-    ImGui::TextDisabled("Live:%s  Vanilla:%s  Saved:%s  Asset:%s",
+    ImGui::TextDisabled("Live:%s  Applied:%s  Saved:%s  Asset:%s",
         context.has_live_bank ? "yes" : "no",
-        context.has_vanilla_bank ? "yes" : "no",
-        context.has_custom_bank ? "yes" : "no",
+        context.has_applied_custom_bank ? "yes" : "no",
+        context.has_saved_custom_bank ? "yes" : "no",
         context.asset_loaded ? "yes" : "no");
 }
 
@@ -1032,23 +1050,35 @@ static void RenderPaletteToolbar(const NetplayPaletteLocalContext& context) {
         }
     }
 
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ModUI_Scale(180.0f));
+    if (ImGui::SliderFloat("Picker Scale", &s_pickerScale, 0.75f, 1.75f, "%.2fx")) {
+        s_pickerScale = ClampFloat(s_pickerScale, 0.75f, 1.75f);
+    }
+
     if (ImGui::BeginTable("PaletteCommandBar", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableNextColumn();
         ImGui::TextDisabled("Sources");
         ImGui::BeginDisabled(!context.has_live_bank);
-        if (ImGui::Button("Load Live Memory")) {
+        if (ImGui::Button("Load Live")) {
             ReloadWorkingBank(NetplayPaletteBankSource::LiveMemory);
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!context.has_vanilla_bank);
-        if (ImGui::Button("Load Vanilla Source")) {
+        if (ImGui::Button("Load Vanilla")) {
             ReloadWorkingBank(NetplayPaletteBankSource::VanillaSource);
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::BeginDisabled(!context.has_custom_bank);
-        if (ImGui::Button("Load Saved Custom")) {
+        ImGui::BeginDisabled(!context.has_applied_custom_bank);
+        if (ImGui::Button("Load Applied")) {
+            ReloadWorkingBank(NetplayPaletteBankSource::AppliedCustom);
+        }
+        ImGui::EndDisabled();
+
+        ImGui::BeginDisabled(!context.has_saved_custom_bank);
+        if (ImGui::Button("Load Saved")) {
             ReloadWorkingBank(NetplayPaletteBankSource::SavedCustom);
         }
         ImGui::EndDisabled();
@@ -1096,7 +1126,11 @@ static void RenderPaletteGrid(const NetplayPaletteLocalContext& context) {
     const int rowCount = (visibleCount + 15) / 16;
     s_hoveredIndex = 0xFF;
     ImGui::TextDisabled("Click select  Ctrl start range  Shift end range  Drag a box to swap  Right-click for quick tools");
-    ImGui::BeginChild("PaletteGrid", ImVec2(0, ModUI_Scale(460.0f)), true, ImGuiWindowFlags_HorizontalScrollbar);
+    float gridHeight = ImGui::GetContentRegionAvail().y;
+    if (gridHeight < ModUI_Scale(280.0f)) {
+        gridHeight = ModUI_Scale(280.0f);
+    }
+    ImGui::BeginChild("PaletteGrid", ImVec2(0, gridHeight), true, ImGuiWindowFlags_HorizontalScrollbar);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     for (int row = 0; row < rowCount; ++row) {
         if (s_showGridLabels) {
@@ -1265,13 +1299,17 @@ static void RenderSelectedTools(const NetplayPaletteLocalContext& context) {
 
     if (ImGui::BeginTable("SelectedTools", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableNextColumn();
-        ImGuiColorEditFlags pickerFlags = ImGuiColorEditFlags_DisplayRGB |
-            ImGuiColorEditFlags_InputRGB |
-            ImGuiColorEditFlags_PickerHueWheel |
+        ImGuiColorEditFlags pickerFlags = ImGuiColorEditFlags_DisplayHSV |
+            ImGuiColorEditFlags_PickerHueBar |
             ImGuiColorEditFlags_AlphaBar;
         if (!s_showAlpha) {
             pickerFlags |= ImGuiColorEditFlags_NoAlpha;
         }
+        const float pickerWidth = ClampFloat(
+            ImGui::GetContentRegionAvail().x * s_pickerScale,
+            ModUI_Scale(180.0f),
+            ModUI_Scale(420.0f));
+        ImGui::PushItemWidth(pickerWidth);
         if (ImGui::ColorPicker4("##SelectedPicker",
                 selectedColor,
                 pickerFlags,
@@ -1280,6 +1318,7 @@ static void RenderSelectedTools(const NetplayPaletteLocalContext& context) {
             SetEntryColor(s_selectedIndex, selectedColor);
             FinishBankEdit(context);
         }
+        ImGui::PopItemWidth();
 
         ImGui::TableNextColumn();
 
@@ -1307,25 +1346,37 @@ static void RenderSelectedTools(const NetplayPaletteLocalContext& context) {
             s_rangeEnd = s_selectedIndex;
         }
 
-        int red = (int)s_workingBank.data[s_selectedIndex * 4 + 2];
-        int green = (int)s_workingBank.data[s_selectedIndex * 4 + 1];
-        int blue = (int)s_workingBank.data[s_selectedIndex * 4 + 0];
-        int alpha = (int)s_workingBank.data[s_selectedIndex * 4 + 3];
-        bool channelsChanged = false;
-        channelsChanged |= ImGui::DragInt("R", &red, 1.0f, 0, 255);
-        channelsChanged |= ImGui::DragInt("G", &green, 1.0f, 0, 255);
-        channelsChanged |= ImGui::DragInt("B", &blue, 1.0f, 0, 255);
+        float hue = 0.0f;
+        float saturation = 0.0f;
+        float brightness = 0.0f;
+        ImGui::ColorConvertRGBtoHSV(selectedColor[0], selectedColor[1], selectedColor[2], hue, saturation, brightness);
+        float hueDegrees = hue * 360.0f;
+        float saturationPct = saturation * 100.0f;
+        float brightnessPct = brightness * 100.0f;
+        float alphaPct = selectedColor[3] * 100.0f;
+
+        bool hsbaChanged = false;
+        hsbaChanged |= ImGui::SliderFloat("Hue", &hueDegrees, 0.0f, 360.0f, "%.1f deg");
+        hsbaChanged |= ImGui::SliderFloat("Saturation", &saturationPct, 0.0f, 100.0f, "%.1f%%");
+        hsbaChanged |= ImGui::SliderFloat("Brightness", &brightnessPct, 0.0f, 100.0f, "%.1f%%");
         if (s_showAlpha) {
-            channelsChanged |= ImGui::DragInt("A", &alpha, 1.0f, 0, 255);
+            hsbaChanged |= ImGui::SliderFloat("Alpha", &alphaPct, 0.0f, 100.0f, "%.1f%%");
         }
-        if (channelsChanged && BeginBankEdit()) {
-            float color[4] = {
-                ClampInt(red, 0, 255) / 255.0f,
-                ClampInt(green, 0, 255) / 255.0f,
-                ClampInt(blue, 0, 255) / 255.0f,
-                ClampInt(alpha, 0, 255) / 255.0f,
-            };
-            SetEntryColor(s_selectedIndex, color);
+        if (hsbaChanged && BeginBankEdit()) {
+            while (hueDegrees < 0.0f) {
+                hueDegrees += 360.0f;
+            }
+            while (hueDegrees >= 360.0f) {
+                hueDegrees -= 360.0f;
+            }
+            ImGui::ColorConvertHSVtoRGB(hueDegrees / 360.0f,
+                Clamp01(saturationPct / 100.0f),
+                Clamp01(brightnessPct / 100.0f),
+                selectedColor[0],
+                selectedColor[1],
+                selectedColor[2]);
+            selectedColor[3] = Clamp01(alphaPct / 100.0f);
+            SetEntryColor(s_selectedIndex, selectedColor);
             FinishBankEdit(context);
         }
 
@@ -1433,7 +1484,7 @@ static void RenderRangeTools(const NetplayPaletteLocalContext& context) {
 
     ImGui::Separator();
     ImGui::Text("Gradient");
-    ImGuiColorEditFlags gradientFlags = ImGuiColorEditFlags_DisplayRGB | ImGuiColorEditFlags_InputRGB;
+    ImGuiColorEditFlags gradientFlags = ImGuiColorEditFlags_DisplayHSV;
     if (!s_showAlpha) {
         gradientFlags |= ImGuiColorEditFlags_NoAlpha;
     }
@@ -1495,7 +1546,7 @@ static void RenderSourceCompare(const NetplayPaletteLocalContext& context) {
         ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, ModUI_Scale(120.0f));
         ImGui::TableHeadersRow();
 
-        for (int sourceIndex = 0; sourceIndex < 3; ++sourceIndex) {
+        for (int sourceIndex = 0; sourceIndex < 4; ++sourceIndex) {
             const NetplayPaletteBankSource source = (NetplayPaletteBankSource)sourceIndex;
             NetplayPaletteBank bank{};
             if (!NetplayPaletteRuntime_CopyLocalBankForSource(source, &bank)) {
@@ -1535,11 +1586,11 @@ static void RenderSourceCompare(const NetplayPaletteLocalContext& context) {
         ImGui::EndTable();
     }
 
-    ImGui::TextDisabled("Current source: %s  |  Live:%s  Vanilla:%s  Saved:%s",
+    ImGui::TextDisabled("Current source: %s  |  Live:%s  Applied:%s  Saved:%s",
         BankSourceLabel(s_loadedSource),
         context.has_live_bank ? "yes" : "no",
-        context.has_vanilla_bank ? "yes" : "no",
-        context.has_custom_bank ? "yes" : "no");
+        context.has_applied_custom_bank ? "yes" : "no",
+        context.has_saved_custom_bank ? "yes" : "no");
 }
 
 static void RenderPresetTools() {
@@ -1680,6 +1731,7 @@ void PaletteEditor_Init() {
     s_highlightGrid = false;
     s_hideEmptyTail = true;
     s_gridCellSize = 24.0f;
+    s_pickerScale = 1.0f;
     s_presetCount = 0;
     s_selectedPreset = -1;
     s_presetCharacter = 0xFF;
@@ -1715,7 +1767,10 @@ void PaletteEditor_Render() {
 
     RenderOfflineSlotSelector(snapshot, context);
 
-    if ((!s_hasWorkingBank && (context.has_live_bank || context.has_custom_bank || context.has_vanilla_bank)) ||
+    if ((!s_hasWorkingBank && (context.has_live_bank ||
+            context.has_applied_custom_bank ||
+            context.has_saved_custom_bank ||
+            context.has_vanilla_bank)) ||
         context.game_slot != s_loadedGameSlot ||
         context.character_id != s_loadedCharacter ||
         context.base_palette != s_loadedBasePalette ||

@@ -253,8 +253,20 @@
 #define ADDR_DINPUT_KB_DEVICE   0x9D09C0
 #define ADDR_DINPUT_FALLBACK    0x9D09B0
 
+#define ADDR_SYS_GET_WINDOW_HANDLE (GAME_BASE + 0x220C70)
+
 #define ADDR_DINPUT_KB_REFRESH  (GAME_BASE + 0x230130)
 #define ADDR_DINPUT_JOY_REFRESH (GAME_BASE + 0x2302F0)
+
+// Vanilla shell-hotkey suppression state.
+// On NT-family Windows the game installs an external message hook DLL and on
+// older Win9x it uses SPI_SETSCREENSAVERRUNNING; both are gated by this flag.
+#define ADDR_SHELL_HOTKEY_SUPPRESS_FLAG  0x9E5B74
+#define ADDR_SHELL_HOTKEY_AUX_HOOK       0x9E5B78
+#define ADDR_SHELL_HOTKEY_MSG_HOOK       0x9E5B7C
+#define ADDR_SHELL_HOTKEY_HOOK_MODULE    0x9E5C8C
+#define ADDR_SHELL_HOTKEY_TEMP_DLL_PATH  0x9E5B84
+#define ADDR_SHELL_HOTKEY_TEMP_DLL_OWNED 0x9E5C88
 
 #define JOY_DOWN    0x0001
 #define JOY_UP      0x0002
@@ -594,10 +606,13 @@
 // In-Match Settings (vanilla pause menu)
 // ============================================================================
 
-// BYTE2(dword_8E93B8) — Character Select enable/disable toggle (0 or 1)
-// When 0, charsel sub-items 3-6 are grayed out and some AI behaviors skip.
-// Must be forced to 1 during mod-owned netplay to prevent desync.
-#define ADDR_CHARSEL_ENABLE     0x8E93BA
+// BYTE2(dword_8E93B8) — Training dummy behavior master toggle.
+// In training pause settings, this is the 3rd menu option the user toggles to
+// enable or disable the dummy action group. When 0, the related dummy-action
+// options are grayed out and the training dummy stays passive.
+// This is persisted in the game's config and must not be reused as a generic
+// char-select or netplay flag.
+#define ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE 0x8E93BA
 
 // BYTE2(dword_8E93EC) — Stage Select enable/disable toggle (0 or 1)
 // When 0, stage is auto-picked from character's home stage lookup table.

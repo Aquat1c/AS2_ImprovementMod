@@ -234,6 +234,10 @@ bool NetplayPaletteStorage_GetBank(uint8_t characterId,
     return true;
 }
 
+bool NetplayPaletteStorage_HasBank(uint8_t characterId, uint8_t basePalette) {
+    return IsValidBasePalette(basePalette) && LoadEntry(characterId, basePalette);
+}
+
 bool NetplayPaletteStorage_SaveBank(const NetplayPaletteBank* bank) {
     if (!bank || !bank->valid || !IsValidBasePalette(bank->base_palette)) {
         return false;

@@ -16,6 +16,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <ctype.h>
+#include <string>
+#include <unordered_set>
+#include <vector>
 #include <DbgHelp.h>  // For stack walking
 
 #pragma comment(lib, "dbghelp.lib")
@@ -80,6 +84,14 @@ struct MatchHudData {
     bool     is_host;
 };
 typedef bool (*ModGetMatchHudData_t)(MatchHudData* out);
+
+struct LoadedUserModDLL {
+    std::string name;
+    std::string dllPath;
+    HMODULE module = nullptr;
+    ModShutdown_t shutdown = nullptr;
+    bool initCalled = false;
+};
 
 // Crash diagnostic function types (loaded from mod DLL on demand)
 typedef void (*ModGetRngStats_t)(uint32_t*, uint32_t*, uint32_t*, uint32_t*);
@@ -434,12 +446,214 @@ static int g_presentCallCount = 0;
 static bool g_imguiInitialized = false;
 static HWND g_gameWindow = nullptr;
 static HWND g_gameParentWindow = nullptr;
-static WNDPROC g_originalWndProc = nullptr;
+static WNDPROC g_proxyOriginalWndProc = nullptr;
+static WNDPROC g_imguiOriginalWndProc = nullptr;
+static HWND g_pendingFocusReclaimWindow = nullptr;
+static DWORD g_pendingFocusReclaimEarliestTick = 0;
 static IDirect3DDevice9* g_pDevice = nullptr;
 static bool g_imguiDrawDataReady = false;
 
 // Menu state
 static bool g_showMenu = true;
+static bool g_winKeyPressed = false;
+static bool g_winKeyChordUsed = false;
+static bool g_altShiftLayoutToggleActive = false;
+static UINT g_relayedWinKeyVk = 0;
+static int g_relayedWinKeyMessageBudget = 0;
+static DWORD g_relayedWinKeyExpiryTick = 0;
+static std::vector<LoadedUserModDLL> g_loadedUserModDLLs;
+
+static constexpr UINT kMsgRelayStandaloneWinKey = WM_APP + 0x51;
+static constexpr DWORD kStartupFocusReclaimDelayMs = 3000;
+static constexpr bool kEnableHotkeyTraceLogs = false;
+static constexpr bool kEnableInputMessageLogs = false;
+
+static constexpr uintptr_t kAddrShellHotkeySuppressFlag = 0x009E5B74;
+static constexpr uintptr_t kAddrShellHotkeyAuxHook = 0x009E5B78;
+static constexpr uintptr_t kAddrShellHotkeyMsgHook = 0x009E5B7C;
+static constexpr uintptr_t kAddrShellHotkeyHookModule = 0x009E5C8C;
+
+static void QueueDeferredFocusReclaim(HWND hWnd, const char* reason) {
+    if (!hWnd) {
+        return;
+    }
+
+    g_pendingFocusReclaimWindow = hWnd;
+    g_pendingFocusReclaimEarliestTick = GetTickCount() + kStartupFocusReclaimDelayMs;
+
+    ProxyLog("[FOCUS] Deferred focus reclaim queued for hwnd=0x%p earliest=%lu reason=%s",
+             hWnd,
+             (unsigned long)g_pendingFocusReclaimEarliestTick,
+             reason ? reason : "unknown");
+}
+
+static void TryProcessDeferredFocusReclaim() {
+    if (!g_pendingFocusReclaimWindow) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if ((LONG)(now - g_pendingFocusReclaimEarliestTick) < 0) {
+        return;
+    }
+
+    HWND hWnd = g_pendingFocusReclaimWindow;
+    g_pendingFocusReclaimWindow = nullptr;
+    g_pendingFocusReclaimEarliestTick = 0;
+
+    if (!IsWindow(hWnd)) {
+        ProxyLog("[FOCUS] Deferred focus reclaim dropped because the target window no longer exists");
+        return;
+    }
+
+    HWND foregroundWindow = GetForegroundWindow();
+    DWORD foregroundPid = 0;
+    if (foregroundWindow) {
+        GetWindowThreadProcessId(foregroundWindow, &foregroundPid);
+    }
+
+    if (foregroundWindow && foregroundPid != GetCurrentProcessId()) {
+        ProxyLog("[FOCUS] Deferred focus reclaim skipped because foreground belongs to another process: hwnd=0x%p fg=0x%p pid=%lu",
+                 hWnd,
+                 foregroundWindow,
+                 (unsigned long)foregroundPid);
+        return;
+    }
+
+    if (foregroundWindow == hWnd && GetFocus() == hWnd) {
+        ProxyLog("[FOCUS] Deferred focus reclaim no longer needed for hwnd=0x%p", hWnd);
+        return;
+    }
+
+    SetForegroundWindow(hWnd);
+    SetFocus(hWnd);
+    ProxyLog("[FOCUS] Deferred focus reclaim attempted for hwnd=0x%p fg=0x%p active=0x%p focus=0x%p",
+             hWnd,
+             GetForegroundWindow(),
+             GetActiveWindow(),
+             GetFocus());
+}
+
+static bool IsShellHotkeyTraceMessage(UINT msg, WPARAM wParam) {
+    if (!kEnableHotkeyTraceLogs) {
+        return false;
+    }
+
+    if (msg == WM_ACTIVATEAPP || msg == WM_INPUTLANGCHANGEREQUEST || msg == WM_INPUTLANGCHANGE ||
+        msg == WM_IME_SETCONTEXT || msg == WM_IME_NOTIFY || msg == WM_IME_COMPOSITION ||
+        msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_ENDCOMPOSITION ||
+        msg == WM_SYSCHAR || msg == WM_MENUCHAR || msg == WM_HOTKEY) {
+        return true;
+    }
+
+    if (msg == WM_SYSCOMMAND) {
+        const WPARAM command = (wParam & 0xFFF0u);
+        return command == SC_TASKLIST || command == SC_KEYMENU;
+    }
+
+    if (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP || msg == WM_KEYDOWN || msg == WM_KEYUP) {
+        return wParam == VK_LWIN || wParam == VK_RWIN || wParam == VK_MENU || wParam == VK_LMENU ||
+               wParam == VK_RMENU || wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT;
+    }
+
+    return false;
+}
+
+static const char* DescribeShellHotkeyTraceMessage(UINT msg, WPARAM wParam) {
+    switch (msg) {
+    case WM_ACTIVATEAPP:
+        return "WM_ACTIVATEAPP";
+    case WM_INPUTLANGCHANGEREQUEST:
+        return "WM_INPUTLANGCHANGEREQUEST";
+    case WM_INPUTLANGCHANGE:
+        return "WM_INPUTLANGCHANGE";
+    case WM_IME_SETCONTEXT:
+        return "WM_IME_SETCONTEXT";
+    case WM_IME_NOTIFY:
+        return "WM_IME_NOTIFY";
+    case WM_IME_COMPOSITION:
+        return "WM_IME_COMPOSITION";
+    case WM_IME_STARTCOMPOSITION:
+        return "WM_IME_STARTCOMPOSITION";
+    case WM_IME_ENDCOMPOSITION:
+        return "WM_IME_ENDCOMPOSITION";
+    case WM_SYSCHAR:
+        return "WM_SYSCHAR";
+    case WM_MENUCHAR:
+        return "WM_MENUCHAR";
+    case WM_HOTKEY:
+        return "WM_HOTKEY";
+    case WM_SYSCOMMAND:
+        return ((wParam & 0xFFF0u) == SC_TASKLIST) ? "WM_SYSCOMMAND/SC_TASKLIST" :
+               ((wParam & 0xFFF0u) == SC_KEYMENU) ? "WM_SYSCOMMAND/SC_KEYMENU" :
+               "WM_SYSCOMMAND";
+    case WM_SYSKEYDOWN:
+        return "WM_SYSKEYDOWN";
+    case WM_SYSKEYUP:
+        return "WM_SYSKEYUP";
+    case WM_KEYDOWN:
+        return "WM_KEYDOWN";
+    case WM_KEYUP:
+        return "WM_KEYUP";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void LogShellHotkeyTraceState(const char* stage, HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (!IsShellHotkeyTraceMessage(msg, wParam)) {
+        return;
+    }
+
+    const HWND foregroundWindow = GetForegroundWindow();
+    const DWORD windowThreadId = hWnd ? GetWindowThreadProcessId(hWnd, nullptr) : 0;
+    const DWORD foregroundThreadId = foregroundWindow ? GetWindowThreadProcessId(foregroundWindow, nullptr) : 0;
+    const HKL windowLayout = windowThreadId ? GetKeyboardLayout(windowThreadId) : nullptr;
+    const HKL foregroundLayout = foregroundThreadId ? GetKeyboardLayout(foregroundThreadId) : nullptr;
+    int* suppressFlag = reinterpret_cast<int*>(kAddrShellHotkeySuppressFlag);
+    HHOOK* auxHookHandle = reinterpret_cast<HHOOK*>(kAddrShellHotkeyAuxHook);
+    HHOOK* hookHandle = reinterpret_cast<HHOOK*>(kAddrShellHotkeyMsgHook);
+    HMODULE* hookModule = reinterpret_cast<HMODULE*>(kAddrShellHotkeyHookModule);
+
+    ProxyLog("[HOTKEYTRACE][%s] %s hwnd=0x%p wParam=0x%08X lParam=0x%08X fg=0x%p active=0x%p focus=0x%p currentWndProc=0x%p wndThread=%lu wndLayout=0x%p fgThread=%lu fgLayout=0x%p showMenu=%d imgui=%d suppress=%d aux=0x%p msgHook=0x%p module=0x%p",
+             stage ? stage : "unknown",
+             DescribeShellHotkeyTraceMessage(msg, wParam),
+             hWnd,
+             (unsigned int)wParam,
+             (unsigned int)lParam,
+             foregroundWindow,
+             GetActiveWindow(),
+             GetFocus(),
+             hWnd ? (void*)GetWindowLongPtrW(hWnd, GWLP_WNDPROC) : nullptr,
+             (unsigned long)windowThreadId,
+             windowLayout,
+             (unsigned long)foregroundThreadId,
+             foregroundLayout,
+             g_showMenu ? 1 : 0,
+             g_imguiInitialized ? 1 : 0,
+             *suppressFlag,
+             *auxHookHandle,
+             *hookHandle,
+             *hookModule);
+
+    if (msg == WM_ACTIVATEAPP || msg == WM_INPUTLANGCHANGEREQUEST || msg == WM_INPUTLANGCHANGE ||
+        msg == WM_IME_SETCONTEXT || msg == WM_IME_NOTIFY || msg == WM_IME_COMPOSITION ||
+        msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_ENDCOMPOSITION ||
+        (foregroundWindow && foregroundWindow != hWnd)) {
+        char foregroundClass[128] = {};
+        char foregroundTitle[128] = {};
+        if (foregroundWindow) {
+            GetClassNameA(foregroundWindow, foregroundClass, sizeof(foregroundClass));
+            GetWindowTextA(foregroundWindow, foregroundTitle, sizeof(foregroundTitle));
+        }
+
+        ProxyLog("[HOTKEYTRACE][%s][FG] hwnd=0x%p class='%s' title='%s'",
+                 stage ? stage : "unknown",
+                 foregroundWindow,
+                 foregroundClass,
+                 foregroundTitle);
+    }
+}
 
 static bool IsExclusiveModOverlayActive() {
     return g_pModWantsExclusiveOverlay ? g_pModWantsExclusiveOverlay() : false;
@@ -1099,7 +1313,7 @@ void InitConsole() {
     
     if (AllocConsole()) {
         g_consoleAllocated = true;
-        SetConsoleTitleA("Alice Senki 2 - Mod Debug Console");
+        SetConsoleTitleA("Alice Senki 2 - Improvement Mod Debug Console");
         g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
         
         // Enable ANSI colors (Windows 10+)
@@ -1118,10 +1332,43 @@ void InitConsole() {
         
         printf("\033[36m");
         printf("========================================\n");
-        printf("  Alice Senki 2 - Rollback Mod v0.3\n");
+        printf("  Alice Senki 2 - Improvement Mod v0.3\n");
         printf("  Debug Console\n");
         printf("========================================\n");
         printf("\033[0m\n");
+    }
+}
+
+void ShutdownConsole(bool logMessage = true) {
+    if (!g_consoleAllocated) {
+        return;
+    }
+
+    if (logMessage) {
+        ProxyLog("[CONSOLE] Closing debug console");
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+
+    FILE* fp = nullptr;
+    freopen_s(&fp, "NUL", "w", stdout);
+    freopen_s(&fp, "NUL", "w", stderr);
+
+    FreeConsole();
+    g_hConsole = INVALID_HANDLE_VALUE;
+    g_consoleAllocated = false;
+}
+
+void ToggleConsole() {
+    if (g_consoleAllocated) {
+        ShutdownConsole();
+        return;
+    }
+
+    InitConsole();
+    if (g_consoleAllocated) {
+        ProxyLog("[CONSOLE] Debug console opened");
     }
 }
 
@@ -1992,8 +2239,261 @@ void ApplyBorderlessFullscreen(HWND hWnd, IDirect3DDevice9* pDevice) {
 
 // Forward declaration for toggle function
 void ToggleBorderlessFullscreen(HWND hWnd);
+static bool IsAltVirtualKey(WPARAM wParam) {
+    return wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU;
+}
+
+static bool IsWinVirtualKey(WPARAM wParam) {
+    return wParam == VK_LWIN || wParam == VK_RWIN;
+}
+
+static bool IsShiftVirtualKey(WPARAM wParam) {
+    return wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT;
+}
+
+static bool IsFirstModifierKeydown(UINT uMsg, LPARAM lParam) {
+    return (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) && (lParam & 0x40000000u) == 0;
+}
+
+static bool IsGameWindowInputActive(HWND hWnd) {
+    if (!hWnd || IsIconic(hWnd)) {
+        return false;
+    }
+
+    return GetForegroundWindow() == hWnd || GetActiveWindow() == hWnd || GetFocus() == hWnd;
+}
+
+static void ClearRelayedWinKeyState() {
+    g_relayedWinKeyVk = 0;
+    g_relayedWinKeyMessageBudget = 0;
+    g_relayedWinKeyExpiryTick = 0;
+}
+
+static bool ConsumeRelayedWinKeyMessage(UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (!IsWinVirtualKey(wParam) || g_relayedWinKeyMessageBudget <= 0) {
+        return false;
+    }
+
+    const DWORD now = GetTickCount();
+    if ((LONG)(now - g_relayedWinKeyExpiryTick) > 0) {
+        ClearRelayedWinKeyState();
+        return false;
+    }
+
+    if (g_relayedWinKeyVk != 0 && wParam != g_relayedWinKeyVk) {
+        return false;
+    }
+
+    if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN && uMsg != WM_KEYUP && uMsg != WM_SYSKEYUP) {
+        return false;
+    }
+
+    if (kEnableInputMessageLogs) {
+        ProxyLog("[HOOKEDWNDPROC] Consumed relayed Win key %s vk=0x%02X lParam=0x%08X remaining=%d",
+                 (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) ? "down" : "up",
+                 (unsigned int)wParam,
+                 (unsigned int)lParam,
+                 g_relayedWinKeyMessageBudget - 1);
+    }
+
+    --g_relayedWinKeyMessageBudget;
+    if (g_relayedWinKeyMessageBudget <= 0 || uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) {
+        ClearRelayedWinKeyState();
+    }
+
+    return true;
+}
+
+static bool RelayStandaloneWinKeyToShell(UINT virtualKey) {
+    if (!IsWinVirtualKey(virtualKey)) {
+        virtualKey = VK_LWIN;
+    }
+
+    INPUT inputs[2] = {};
+    const WORD scanCode = (WORD)MapVirtualKeyW(virtualKey, MAPVK_VK_TO_VSC);
+
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = (WORD)virtualKey;
+    inputs[0].ki.wScan = scanCode;
+    inputs[0].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = (WORD)virtualKey;
+    inputs[1].ki.wScan = scanCode;
+    inputs[1].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+
+    g_relayedWinKeyVk = virtualKey;
+    g_relayedWinKeyMessageBudget = 2;
+    g_relayedWinKeyExpiryTick = GetTickCount() + 250;
+
+    const UINT sent = SendInput(2, inputs, sizeof(INPUT));
+    if (sent != 2) {
+        const DWORD error = GetLastError();
+        ProxyLog("[HOOKEDWNDPROC] ERROR: failed to relay standalone Win key via SendInput vk=0x%02X sent=%u err=%lu",
+                 (unsigned int)virtualKey,
+                 sent,
+                 error);
+        ClearRelayedWinKeyState();
+        return false;
+    }
+
+    if (kEnableInputMessageLogs) {
+        ProxyLog("[HOOKEDWNDPROC] Relayed standalone Win key to shell via SendInput vk=0x%02X",
+                 (unsigned int)virtualKey);
+    }
+    return true;
+}
+
+static HKL GetNextLoadedKeyboardLayout(HKL currentLayout) {
+    HKL layouts[16] = {};
+    const int layoutCount = GetKeyboardLayoutList((int)(sizeof(layouts) / sizeof(layouts[0])), layouts);
+    if (layoutCount <= 0) {
+        return nullptr;
+    }
+
+    for (int index = 0; index < layoutCount; ++index) {
+        if (layouts[index] == currentLayout) {
+            return layouts[(index + 1) % layoutCount];
+        }
+    }
+
+    return layouts[0];
+}
+
+static bool HandleStandaloneWinKey(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (ConsumeRelayedWinKeyMessage(uMsg, wParam, lParam)) {
+        return true;
+    }
+
+    const bool gameWindowInputActive = IsGameWindowInputActive(hWnd);
+    if (!IsWinVirtualKey(wParam)) {
+        if (gameWindowInputActive && g_winKeyPressed && (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN)) {
+            g_winKeyChordUsed = true;
+        }
+        return false;
+    }
+
+    if (!gameWindowInputActive) {
+        return false;
+    }
+
+    if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) {
+        if ((lParam & 0x40000000u) == 0) {
+            g_winKeyPressed = true;
+            g_winKeyChordUsed = false;
+        }
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[HOOKEDWNDPROC] Captured Win key down vk=0x%02X lParam=0x%08X",
+                     (unsigned int)wParam, (unsigned int)lParam);
+        }
+        return true;
+    }
+
+    if (uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) {
+        const bool shouldOpenStartMenu = g_winKeyPressed && !g_winKeyChordUsed;
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[HOOKEDWNDPROC] Captured Win key up vk=0x%02X lParam=0x%08X standalone=%d",
+                     (unsigned int)wParam, (unsigned int)lParam, shouldOpenStartMenu ? 1 : 0);
+        }
+        g_winKeyPressed = false;
+        g_winKeyChordUsed = false;
+        if (shouldOpenStartMenu) {
+            if (kEnableInputMessageLogs) {
+                ProxyLog("[HOOKEDWNDPROC] Queueing standalone Win key relay to shell");
+            }
+            if (!PostMessageW(hWnd, kMsgRelayStandaloneWinKey, wParam, 0)) {
+                ProxyLog("[HOOKEDWNDPROC] WARNING: PostMessage relay failed (err=%lu), attempting immediate shell relay",
+                         GetLastError());
+                RelayStandaloneWinKeyToShell((UINT)wParam);
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool HandleAltShiftLayoutToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    const bool isAlt = IsAltVirtualKey(wParam);
+    const bool isShift = IsShiftVirtualKey(wParam);
+
+    if (!isAlt && !isShift) {
+        return false;
+    }
+
+    if (uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) {
+        g_altShiftLayoutToggleActive = false;
+        return false;
+    }
+
+    if (!IsFirstModifierKeydown(uMsg, lParam)) {
+        return false;
+    }
+
+    const bool altDown = isAlt || (GetKeyState(VK_MENU) & 0x8000) != 0;
+    const bool shiftDown = isShift || (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (!altDown || !shiftDown || g_altShiftLayoutToggleActive) {
+        return false;
+    }
+
+    const HKL beforeLayout = GetKeyboardLayout(0);
+    const HKL nextLayout = GetNextLoadedKeyboardLayout(beforeLayout);
+    const HKL requestedLayout = nextLayout ? nextLayout : (HKL)HKL_NEXT;
+    if (kEnableInputMessageLogs) {
+        ProxyLog("[WNDPROC] Alt+Shift layout toggle request: current=0x%p next=0x%p",
+                 (void*)beforeLayout, (void*)requestedLayout);
+    }
+    DefWindowProcW(hWnd, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)requestedLayout);
+    const HKL previousLayout = requestedLayout == (HKL)HKL_NEXT
+        ? ActivateKeyboardLayout((HKL)HKL_NEXT, KLF_SETFORPROCESS)
+        : ActivateKeyboardLayout(requestedLayout, KLF_SETFORPROCESS);
+    const HKL afterLayout = GetKeyboardLayout(0);
+    if (kEnableInputMessageLogs) {
+        ProxyLog("[WNDPROC] Alt+Shift layout toggle: before=0x%p previous=0x%p after=0x%p",
+                 (void*)beforeLayout, (void*)previousLayout, (void*)afterLayout);
+    }
+    if (afterLayout && afterLayout != beforeLayout) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] Alt+Shift layout toggle changed active HKL - bypassing vanilla");
+        }
+        PostMessageW(hWnd, WM_INPUTLANGCHANGE, 0, (LPARAM)afterLayout);
+    } else {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] Alt+Shift layout toggle did not change HKL - bypassing vanilla anyway");
+        }
+    }
+
+    g_altShiftLayoutToggleActive = true;
+    return true;
+}
 
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const bool traceShellHotkey = IsShellHotkeyTraceMessage(msg, wParam);
+    if (traceShellHotkey) {
+        LogShellHotkeyTraceState("HookedWndProc-enter", hWnd, msg, wParam, lParam);
+    }
+
+    if (msg == kMsgRelayStandaloneWinKey) {
+        RelayStandaloneWinKeyToShell((UINT)wParam);
+        return 0;
+    }
+
+    if (HandleStandaloneWinKey(hWnd, msg, wParam, lParam)) {
+        if (traceShellHotkey) {
+            ProxyLog("[HOTKEYTRACE][HookedWndProc-standalone-win] %s result=0x00000000",
+                     DescribeShellHotkeyTraceMessage(msg, wParam));
+        }
+        return 0;
+    }
+
+    if (HandleAltShiftLayoutToggle(hWnd, msg, wParam, lParam)) {
+        if (traceShellHotkey) {
+            ProxyLog("[HOTKEYTRACE][HookedWndProc-altshift] %s result=0x00000000",
+                     DescribeShellHotkeyTraceMessage(msg, wParam));
+        }
+        return 0;
+    }
+
     // Toggle menu with F1
     if (msg == WM_KEYDOWN && wParam == VK_F1) {
         g_showMenu = !g_showMenu;
@@ -2180,17 +2680,36 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         
         if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, scaledWParam, scaledLParam)) {
+            if (traceShellHotkey) {
+                ProxyLog("[HOTKEYTRACE][HookedWndProc-imgui-consumed] %s wantCaptureKeyboard=%d wantTextInput=%d",
+                         DescribeShellHotkeyTraceMessage(msg, wParam),
+                         ImGui::GetIO().WantCaptureKeyboard ? 1 : 0,
+                         ImGui::GetIO().WantTextInput ? 1 : 0);
+            }
             return true;
         }
     }
     
-    // Call original WndProc - must be valid!
-    if (g_originalWndProc && (ULONG_PTR)g_originalWndProc > 0x10000) {
-        return CallWindowProcA(g_originalWndProc, hWnd, msg, wParam, lParam);
+    // Always chain through CallWindowProc. Previous wndproc values may be
+    // special handles rather than raw code pointers.
+    if (g_imguiOriginalWndProc) {
+        LRESULT result = CallWindowProcW(g_imguiOriginalWndProc, hWnd, msg, wParam, lParam);
+        if (traceShellHotkey) {
+            ProxyLog("[HOTKEYTRACE][HookedWndProc-exit] %s result=0x%p",
+                     DescribeShellHotkeyTraceMessage(msg, wParam),
+                     (void*)result);
+        }
+        return result;
     }
     
     // Fallback to default window procedure
-    return DefWindowProcA(hWnd, msg, wParam, lParam);
+    LRESULT result = DefWindowProcW(hWnd, msg, wParam, lParam);
+    if (traceShellHotkey) {
+        ProxyLog("[HOTKEYTRACE][HookedWndProc-fallback] %s result=0x%p",
+                 DescribeShellHotkeyTraceMessage(msg, wParam),
+                 (void*)result);
+    }
+    return result;
 }
 
 // ============================================================================
@@ -2261,17 +2780,14 @@ bool InitImGui(IDirect3DDevice9* pDevice, HWND hWnd) {
     ProxyLog("[IMGUI] ImGui_ImplDX9_Init SUCCESS");
     
     // Hook window procedure for ImGui input
-    WNDPROC currentWndProc = (WNDPROC)GetWindowLongPtrA(hImGuiWindow, GWLP_WNDPROC);
+    WNDPROC currentWndProc = (WNDPROC)GetWindowLongPtrW(hImGuiWindow, GWLP_WNDPROC);
     ProxyLog("[IMGUI] Current WndProc before hook: 0x%08X", (DWORD)(ULONG_PTR)currentWndProc);
     
     // Hook the WndProc to capture input for ImGui
-    g_originalWndProc = (WNDPROC)SetWindowLongPtrA(hImGuiWindow, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
-    ProxyLog("[IMGUI] SetWindowLongPtr returned: 0x%08X", (DWORD)(ULONG_PTR)g_originalWndProc);
-    
-    // Check if the original WndProc looks valid (should be in a code section)
-    if ((ULONG_PTR)g_originalWndProc < 0x10000 || (ULONG_PTR)g_originalWndProc >= 0x80000000) {
-        ProxyLog("[IMGUI] WARNING: Original WndProc 0x%p looks invalid! Using DefWindowProc fallback.", g_originalWndProc);
-        g_originalWndProc = nullptr; // Force fallback to DefWindowProc
+    g_imguiOriginalWndProc = (WNDPROC)SetWindowLongPtrW(hImGuiWindow, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
+    ProxyLog("[IMGUI] SetWindowLongPtr returned: 0x%08X", (DWORD)(ULONG_PTR)g_imguiOriginalWndProc);
+    if (!g_imguiOriginalWndProc) {
+        ProxyLog("[IMGUI] WARNING: Failed to capture previous WndProc, falling back to default chaining");
     }
     
     g_gameWindow = hImGuiWindow;
@@ -2288,9 +2804,10 @@ void ShutdownImGui() {
     ProxyLog("[IMGUI] Shutting down ImGui...");
     g_imguiDrawDataReady = false;
     
-    if (g_originalWndProc && g_gameWindow) {
-        SetWindowLongPtrA(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)g_originalWndProc);
+    if (g_imguiOriginalWndProc && g_gameWindow) {
+        SetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)g_imguiOriginalWndProc);
     }
+    g_imguiOriginalWndProc = nullptr;
     
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -2462,7 +2979,7 @@ void RenderImGui() {
     // Main menu bar
     const bool exclusiveOverlay = IsExclusiveModOverlayActive();
     if (g_showMenu && !exclusiveOverlay && ImGui::BeginMainMenuBar()) {
-        ImGui::Text("Alice Senki 2 - Rollback Mod v0.3");
+        ImGui::Text("Alice Senki 2 - Improvement Mod v0.3");
         ImGui::Separator();
         if (ImGui::BeginMenu("Options")) {
             ImGui::MenuItem("Show Menu", "F1", &g_showMenu);
@@ -2473,6 +2990,9 @@ void RenderImGui() {
                 }
             }
             ImGui::MenuItem("Keep Aspect Ratio", nullptr, &g_keepAspectRatio);
+            if (ImGui::MenuItem(g_consoleAllocated ? "Close Debug Console" : "Open Debug Console")) {
+                ToggleConsole();
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit Game")) {
                 PostQuitMessage(0);
@@ -2746,6 +3266,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* pDevice,
                               HWND hDestWindowOverride, 
                               const RGNDATA* pDirtyRegion) {
     g_presentCallCount++;
+    TryProcessDeferredFocusReclaim();
     
     // --- Device-lost recovery ---
     if (g_deviceLost) {
@@ -3141,8 +3662,21 @@ HRESULT WINAPI HookedSwapChainPresent(IDirect3DSwapChain9* pSwapChain,
 // ============================================================================
 // Window Procedure Hook (Subclassing)
 // ============================================================================
-
 LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    const bool traceShellHotkey = IsShellHotkeyTraceMessage(uMsg, wParam);
+    if (traceShellHotkey) {
+        LogShellHotkeyTraceState("ProxyWndProc-enter", hWnd, uMsg, wParam, lParam);
+    }
+
+    if (uMsg == kMsgRelayStandaloneWinKey) {
+        RelayStandaloneWinKeyToShell((UINT)wParam);
+        return 0;
+    }
+
+    if (ConsumeRelayedWinKeyMessage(uMsg, wParam, lParam)) {
+        return 0;
+    }
+
     // Track minimize / restore for rendering throttle and device-lost handling
     if (uMsg == WM_SIZE) {
         if (wParam == SIZE_MINIMIZED) {
@@ -3158,9 +3692,109 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 
     if (uMsg == WM_ACTIVATEAPP) {
         if (wParam == FALSE) {
-            ProxyLog("[WNDPROC] App deactivated (alt-tab / focus lost)");
+            if (kEnableInputMessageLogs) {
+                ProxyLog("[WNDPROC] App deactivated (alt-tab / focus lost)");
+            }
+            g_winKeyPressed = false;
+            g_winKeyChordUsed = false;
+            g_altShiftLayoutToggleActive = false;
         } else {
-            ProxyLog("[WNDPROC] App activated (focus gained)");
+            if (kEnableInputMessageLogs) {
+                ProxyLog("[WNDPROC] App activated (focus gained)");
+            }
+        }
+    }
+
+    if ((uMsg == WM_KEYDOWN || uMsg == WM_KEYUP) && IsWinVirtualKey(wParam)) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] %s vk=0x%02X lParam=0x%08X - bypassing vanilla and calling DefWindowProc",
+                     uMsg == WM_KEYDOWN ? "WM_KEYDOWN" : "WM_KEYUP",
+                     (unsigned int)wParam, (unsigned int)lParam);
+        }
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+
+    if (HandleAltShiftLayoutToggle(hWnd, uMsg, wParam, lParam)) {
+        if (traceShellHotkey) {
+            ProxyLog("[HOTKEYTRACE][ProxyWndProc-altshift] %s result=0x00000000",
+                     DescribeShellHotkeyTraceMessage(uMsg, wParam));
+        }
+        return 0;
+    }
+
+    if (uMsg == WM_INPUTLANGCHANGEREQUEST) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_INPUTLANGCHANGEREQUEST flags=0x%08X hkl=0x%p - forcing DefWindowProc",
+                     (unsigned int)wParam, (void*)lParam);
+        }
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+
+    if (uMsg == WM_INPUTLANGCHANGE) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_INPUTLANGCHANGE charset=0x%08X hkl=0x%p",
+                     (unsigned int)wParam, (void*)lParam);
+        }
+    }
+
+    if (uMsg == WM_IME_SETCONTEXT) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_IME_SETCONTEXT active=%d shown=0x%08X",
+                     wParam ? 1 : 0,
+                     (unsigned int)lParam);
+        }
+    }
+
+    if (uMsg == WM_IME_NOTIFY) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_IME_NOTIFY command=0x%08X data=0x%08X",
+                     (unsigned int)wParam,
+                     (unsigned int)lParam);
+        }
+    }
+
+    if (uMsg == WM_IME_COMPOSITION) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_IME_COMPOSITION flags=0x%08X",
+                     (unsigned int)lParam);
+        }
+    }
+
+    if (uMsg == WM_IME_STARTCOMPOSITION) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_IME_STARTCOMPOSITION");
+        }
+    }
+
+    if (uMsg == WM_IME_ENDCOMPOSITION) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_IME_ENDCOMPOSITION");
+        }
+    }
+
+    if (uMsg == WM_SYSCOMMAND && ((wParam & 0xFFF0u) == SC_TASKLIST)) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_SYSCOMMAND SC_TASKLIST - forcing DefWindowProc");
+        }
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+
+    if (uMsg == WM_SYSCOMMAND && ((wParam & 0xFFF0u) == SC_KEYMENU)) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] WM_SYSCOMMAND SC_KEYMENU - bypassing vanilla and forcing DefWindowProc");
+        }
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+
+    if ((uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP || uMsg == WM_KEYDOWN || uMsg == WM_KEYUP)
+        && (wParam == VK_LWIN || wParam == VK_RWIN || wParam == VK_MENU || wParam == VK_LMENU
+            || wParam == VK_RMENU || wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT)) {
+        if (kEnableInputMessageLogs) {
+            ProxyLog("[WNDPROC] %s vk=0x%02X lParam=0x%08X",
+                     uMsg == WM_SYSKEYDOWN ? "WM_SYSKEYDOWN" :
+                     uMsg == WM_SYSKEYUP ? "WM_SYSKEYUP" :
+                     uMsg == WM_KEYDOWN ? "WM_KEYDOWN" : "WM_KEYUP",
+                     (unsigned int)wParam, (unsigned int)lParam);
         }
     }
 
@@ -3350,11 +3984,24 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 
     // CallWindowProc can handle both function pointers and class atoms
     // It will correctly dispatch to the original procedure
-    if (g_originalWndProc) {
-        return CallWindowProcW(g_originalWndProc, hWnd, uMsg, wParam, lParam);
+    if (g_proxyOriginalWndProc) {
+        LRESULT result = CallWindowProcW(g_proxyOriginalWndProc, hWnd, uMsg, wParam, lParam);
+        if (traceShellHotkey) {
+            ProxyLog("[HOTKEYTRACE][ProxyWndProc-exit] %s result=0x%p original=0x%p",
+                     DescribeShellHotkeyTraceMessage(uMsg, wParam),
+                     (void*)result,
+                     g_proxyOriginalWndProc);
+        }
+        return result;
     }
     
-    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    LRESULT result = DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    if (traceShellHotkey) {
+        ProxyLog("[HOTKEYTRACE][ProxyWndProc-fallback] %s result=0x%p",
+                 DescribeShellHotkeyTraceMessage(uMsg, wParam),
+                 (void*)result);
+    }
+    return result;
 }
 
 // ============================================================================
@@ -3406,6 +4053,11 @@ LONG WINAPI HookedSetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong) {
     }
 
     // Log the call
+    if (nIndex == GWL_WNDPROC) {
+        ProxyLog("[HOOK] SetWindowLongA GWL_WNDPROC hwnd=0x%p new=0x%08X currentBefore=0x%p",
+                 hWnd, dwNewLong, hWnd ? (void*)GetWindowLongPtrW(hWnd, GWLP_WNDPROC) : nullptr);
+    }
+
     if (!g_internalResize && (nIndex == GWL_STYLE || nIndex == GWL_EXSTYLE)) {
         ProxyLog("[HOOK] SetWindowLongA(0x%p, %d) NewVal=0x%08X", hWnd, nIndex, dwNewLong);
     }
@@ -3426,7 +4078,13 @@ LONG WINAPI HookedSetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong) {
         }
     }
     
-    return g_pOriginalSetWindowLongA(hWnd, nIndex, dwNewLong);
+    LONG previousValue = g_pOriginalSetWindowLongA(hWnd, nIndex, dwNewLong);
+    if (nIndex == GWL_WNDPROC) {
+        ProxyLog("[HOOK] SetWindowLongA GWL_WNDPROC previous=0x%08X currentAfter=0x%p",
+                 previousValue,
+                 hWnd ? (void*)GetWindowLongPtrW(hWnd, GWLP_WNDPROC) : nullptr);
+    }
+    return previousValue;
 }
 
 // ============================================================================
@@ -3446,6 +4104,11 @@ LONG WINAPI HookedSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong) {
         return g_pOriginalSetWindowLongW(hWnd, nIndex, dwNewLong);
     }
 
+    if (nIndex == GWL_WNDPROC) {
+        ProxyLog("[HOOK] SetWindowLongW GWL_WNDPROC hwnd=0x%p new=0x%08X currentBefore=0x%p",
+                 hWnd, dwNewLong, hWnd ? (void*)GetWindowLongPtrW(hWnd, GWLP_WNDPROC) : nullptr);
+    }
+
     // If we are in borderless mode
     if (g_isCurrentlyBorderless && !g_internalResize) {
         // If setting style (GWL_STYLE = -16)
@@ -3460,7 +4123,13 @@ LONG WINAPI HookedSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong) {
         }
     }
     
-    return g_pOriginalSetWindowLongW(hWnd, nIndex, dwNewLong);
+    LONG previousValue = g_pOriginalSetWindowLongW(hWnd, nIndex, dwNewLong);
+    if (nIndex == GWL_WNDPROC) {
+        ProxyLog("[HOOK] SetWindowLongW GWL_WNDPROC previous=0x%08X currentAfter=0x%p",
+                 previousValue,
+                 hWnd ? (void*)GetWindowLongPtrW(hWnd, GWLP_WNDPROC) : nullptr);
+    }
+    return previousValue;
 }
 
 // ============================================================================
@@ -3951,7 +4620,7 @@ public:
             
             // Hook the window procedure to prevent style changes
             // Use SetWindowLongPtrW and store the original for CallWindowProcW
-            if (hFocusWindow && !g_originalWndProc) {
+            if (hFocusWindow && !g_proxyOriginalWndProc) {
                 g_gameWindow = hFocusWindow;
 
                 // Set a clearer title for multi-instance testing/debugging.
@@ -3972,8 +4641,8 @@ public:
                 ProxyLog("[CREATEDEVICE] Current window WndProc: 0x%p", (void*)currentWndProc);
                 
                 // Hook the window procedure
-                g_originalWndProc = (WNDPROC)SetWindowLongPtrW(hFocusWindow, GWLP_WNDPROC, (LONG_PTR)ProxyWndProc);
-                ProxyLog("[CREATEDEVICE] Hooked WndProc: Original=0x%p, New=0x%p", g_originalWndProc, ProxyWndProc);
+                g_proxyOriginalWndProc = (WNDPROC)SetWindowLongPtrW(hFocusWindow, GWLP_WNDPROC, (LONG_PTR)ProxyWndProc);
+                ProxyLog("[CREATEDEVICE] Hooked WndProc: Original=0x%p, New=0x%p", g_proxyOriginalWndProc, ProxyWndProc);
                 
                 // Validate the hook worked
                 LONG_PTR newWndProc = GetWindowLongPtrW(hFocusWindow, GWLP_WNDPROC);
@@ -4018,11 +4687,11 @@ public:
                 pBackBuffer->Release();
             }
             
-            // Reclaim focus for the game window (console may have stolen it)
+            // Avoid manipulating foreground focus during startup. The game's
+            // DirectInput bootstrap is fragile while the title loop is still
+            // creating devices, so defer this until the window has settled.
             if (hFocusWindow) {
-                SetForegroundWindow(hFocusWindow);
-                SetFocus(hFocusWindow);
-                ProxyLog("[CREATEDEVICE] Reclaimed focus for game window");
+                QueueDeferredFocusReclaim(hFocusWindow, "CreateDevice startup");
             }
             
         } else {
@@ -4067,7 +4736,246 @@ bool LoadRealD3D9() {
 // Load Mod DLL
 // ============================================================================
 
-bool LoadModDLL() {
+static char* TrimProxyStringInPlace(char* text) {
+    if (!text) {
+        return text;
+    }
+
+    while (*text && isspace((unsigned char)*text)) {
+        ++text;
+    }
+
+    char* end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) {
+        --end;
+    }
+    *end = '\0';
+    return text;
+}
+
+static bool IsValidProxyModFolderName(const char* name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return false;
+    }
+
+    for (const unsigned char* cursor = (const unsigned char*)name; *cursor; ++cursor) {
+        if (isspace(*cursor) || *cursor == '\\' || *cursor == '/' || *cursor == ':' ||
+            *cursor == '*' || *cursor == '?' || *cursor == '"' || *cursor == '<' ||
+            *cursor == '>' || *cursor == '|') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static std::string LowercaseProxyString(const char* text) {
+    std::string lower = text ? text : "";
+    for (char& ch : lower) {
+        ch = (char)tolower((unsigned char)ch);
+    }
+    return lower;
+}
+
+static bool ProxyFileExists(const char* path) {
+    const DWORD attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static bool ProxyDirectoryExists(const char* path) {
+    const DWORD attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static bool TryInvokeLoadedUserModInit(HMODULE module, HMODULE gameModule, const char* modName) {
+    auto initFn = (ModInit_t)GetProcAddress(module, "ModInit");
+    if (!initFn) {
+        return false;
+    }
+
+    __try {
+        initFn(gameModule);
+        return true;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        ProxyLog("[MODLOADER] ERROR: %s threw during ModInit", modName ? modName : "<unknown>");
+        return false;
+    }
+}
+
+static void TryInvokeLoadedUserModShutdown(ModShutdown_t shutdown, const char* modName) {
+    if (!shutdown) {
+        return;
+    }
+
+    __try {
+        shutdown();
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        ProxyLog("[MODLOADER] ERROR: %s threw during ModShutdown", modName ? modName : "<unknown>");
+    }
+}
+
+static void LoadConfiguredUserModDLLs(HMODULE gameModule) {
+    if (!g_loadedUserModDLLs.empty()) {
+        return;
+    }
+
+    char configPath[MAX_PATH] = {};
+    snprintf(configPath, MAX_PATH, "%s\\mods\\mods.ini", g_dllDir);
+
+    FILE* file = nullptr;
+    if (fopen_s(&file, configPath, "rb") != 0 || !file) {
+        ProxyLog("[MODLOADER] No config found at %s", configPath);
+        return;
+    }
+
+    std::unordered_set<std::string> seenMods;
+    std::vector<LoadedUserModDLL> orderedMods;
+    bool inModsSection = false;
+    char line[512] = {};
+    while (fgets(line, sizeof(line), file)) {
+        char* cursor = line;
+        if ((unsigned char)cursor[0] == 0xEF &&
+            (unsigned char)cursor[1] == 0xBB &&
+            (unsigned char)cursor[2] == 0xBF) {
+            cursor += 3;
+        }
+
+        char* comment = strchr(cursor, ';');
+        if (comment) {
+            *comment = '\0';
+        }
+
+        char* trimmed = TrimProxyStringInPlace(cursor);
+        if (!trimmed[0]) {
+            continue;
+        }
+
+        if (trimmed[0] == '[') {
+            char* closing = strchr(trimmed, ']');
+            if (!closing) {
+                inModsSection = false;
+                continue;
+            }
+
+            *closing = '\0';
+            inModsSection = _stricmp(trimmed + 1, "Mods") == 0;
+            continue;
+        }
+
+        if (!inModsSection) {
+            continue;
+        }
+
+        char* equals = strchr(trimmed, '=');
+        if (!equals) {
+            continue;
+        }
+
+        *equals = '\0';
+        char* modName = TrimProxyStringInPlace(trimmed);
+        char* enabledValue = TrimProxyStringInPlace(equals + 1);
+        if (!modName[0] || enabledValue[0] != '1') {
+            continue;
+        }
+
+        if (!IsValidProxyModFolderName(modName)) {
+            ProxyLog("[MODLOADER] Ignoring invalid mod folder name '%s'", modName);
+            continue;
+        }
+
+        const std::string dedupeKey = LowercaseProxyString(modName);
+        if (!seenMods.insert(dedupeKey).second) {
+            ProxyLog("[MODLOADER] Ignoring duplicate mod entry '%s'", modName);
+            continue;
+        }
+
+        char rootPath[MAX_PATH] = {};
+        char dllPath[MAX_PATH] = {};
+        snprintf(rootPath, MAX_PATH, "%s\\mods\\%s", g_dllDir, modName);
+        snprintf(dllPath, MAX_PATH, "%s\\%s.dll", rootPath, modName);
+
+        if (!ProxyDirectoryExists(rootPath)) {
+            ProxyLog("[MODLOADER] Enabled mod folder missing: %s", rootPath);
+            continue;
+        }
+
+        LoadedUserModDLL mod;
+        mod.name = modName;
+        mod.dllPath = dllPath;
+        orderedMods.push_back(std::move(mod));
+    }
+
+    fclose(file);
+
+    if (orderedMods.empty()) {
+        ProxyLog("[MODLOADER] Config loaded from %s (no enabled mods)", configPath);
+        return;
+    }
+
+    ProxyLog("[MODLOADER] Config loaded from %s (%u enabled mod%s)",
+             configPath,
+             (unsigned)orderedMods.size(),
+             orderedMods.size() == 1 ? "" : "s");
+    for (size_t index = 0; index < orderedMods.size(); ++index) {
+        ProxyLog("[MODLOADER] Priority %u (top-to-bottom): %s",
+                 (unsigned)(index + 1),
+                 orderedMods[index].name.c_str());
+    }
+
+    for (LoadedUserModDLL& mod : orderedMods) {
+        if (!ProxyFileExists(mod.dllPath.c_str())) {
+            ProxyLog("[MODLOADER] %s: file overrides only (no DLL at %s)",
+                     mod.name.c_str(),
+                     mod.dllPath.c_str());
+            continue;
+        }
+
+        ProxyLog("[MODLOADER] Loading DLL mod: %s", mod.dllPath.c_str());
+        mod.module = LoadLibraryA(mod.dllPath.c_str());
+        if (!mod.module) {
+            ProxyLog("[MODLOADER] WARNING: failed to load %s (err=%lu)",
+                     mod.dllPath.c_str(),
+                     GetLastError());
+            continue;
+        }
+
+        auto setLogDir = (ModSetLogDir_t)GetProcAddress(mod.module, "ModSetLogDir");
+        if (setLogDir && g_logDir[0]) {
+            setLogDir(g_logDir);
+        }
+
+        mod.shutdown = (ModShutdown_t)GetProcAddress(mod.module, "ModShutdown");
+        mod.initCalled = TryInvokeLoadedUserModInit(mod.module, gameModule, mod.name.c_str());
+
+        ProxyLog("[MODLOADER] Loaded DLL mod: %s", mod.dllPath.c_str());
+        g_loadedUserModDLLs.push_back(std::move(mod));
+    }
+}
+
+static void UnloadConfiguredUserModDLLs() {
+    for (size_t index = g_loadedUserModDLLs.size(); index > 0; --index) {
+        LoadedUserModDLL& mod = g_loadedUserModDLLs[index - 1];
+        if (!mod.module) {
+            continue;
+        }
+
+        TryInvokeLoadedUserModShutdown(mod.shutdown, mod.name.c_str());
+
+        ProxyLog("[MODLOADER] Unloading DLL mod: %s", mod.dllPath.c_str());
+        FreeLibrary(mod.module);
+        mod.module = nullptr;
+    }
+
+    g_loadedUserModDLLs.clear();
+}
+
+bool LoadCoreModDLL() {
     if (g_hModDLL) return true;
     
     // Load SDL3 first
@@ -4082,7 +4990,7 @@ bool LoadModDLL() {
         ProxyLog("[MOD] SDL3.dll loaded from: %s", sdlPath);
     }
     
-    // Load mod DLL
+    // Load core rollback DLL after its shared dependencies.
     char modPath[MAX_PATH];
     snprintf(modPath, MAX_PATH, "%s\\as2_rollback.dll", g_dllDir);
     
@@ -4158,7 +5066,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             }
             
             // Load mod DLL
-            LoadModDLL();
+            LoadCoreModDLL();
             
             // Load persistent display settings (borderless, window size, aspect)
             DisplayConfig_Load();
@@ -4170,6 +5078,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
                 GetModuleFileNameA(gameModule, gamePath, MAX_PATH);
                 ProxyLog("[INIT] Calling ModInit with game module: 0x%p (%s)", gameModule, gamePath);
                 g_pModInit(gameModule);
+                LoadConfiguredUserModDLLs(gameModule);
+            } else {
+                LoadConfiguredUserModDLLs(GetModuleHandleA(NULL));
             }
             
             // If test harness autoconnect config exists, force windowed mode
@@ -4194,6 +5105,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             
             ShutdownImGui();
             UninstallDeviceHooks();
+
+            UnloadConfiguredUserModDLLs();
             
             if (g_pModShutdown) {
                 g_pModShutdown();
@@ -4212,10 +5125,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
                 g_logFile = nullptr;
             }
             
-            if (g_consoleAllocated) {
-                FreeConsole();
-                g_consoleAllocated = false;
-            }
+            ShutdownConsole(false);
             break;
     }
     return TRUE;

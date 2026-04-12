@@ -24,6 +24,7 @@
 #include "net/protocol.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
+#include "patches/charsel_palette_select.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
@@ -295,6 +296,7 @@ void CharSelSync_Begin() {
         "=== CHARSEL LOCKSTEP BEGIN (role=%s delay=%d) ===",
         s_isHost ? "Host" : "Join", s_inputDelay);
     Rollback::NetplayLog_Flush();
+    CharSelPaletteSelect_OnCharSelBegin(true, s_isHost ? 0 : 1);
     LOG_NETPLAY(LOG_INFO, "[CharSelSync] Begin (role=%s)",
         s_isHost ? "Host" : "Join");
 }
@@ -327,6 +329,8 @@ void CharSelSync_BeginStagePhase() {
     s_lastResendTime         = 0;
     s_lastTargetedResendTime = 0;
 
+    CharSelPaletteSelect_EndFrontend();
+
     // Activate the stage select input merge module
     StageSelSync_Begin();
 
@@ -345,6 +349,7 @@ void CharSelSync_Abort() {
     s_inStagePhase = false;
     s_bothCharsLocked = false;
     s_bothStageLocked = false;
+    CharSelPaletteSelect_EndFrontend();
     StageSelSync_Abort();
     LOG_NETPLAY(LOG_INFO, "[CharSelSync] Aborted");
 }
@@ -516,29 +521,18 @@ void CharSelSync_FrameUpdate() {
     if (!s_active) return;
 
     uint32_t mode = GetGameMode();
+    const uint8_t localGameSlot = s_isHost ? 0 : 1;
+    const uintptr_t localCursorAddr = s_isHost ? ADDR_CHARSEL_P1_CURSOR : ADDR_CHARSEL_P2_CURSOR;
 
     // Only poll game memory when actually in charsel mode
     if (mode == MODE_CHARSEL) {
-        uint8_t p1Confirm = ReadU8(ADDR_CHARSEL_P1_CONFIRM, 0);
-        uint8_t p2Confirm = ReadU8(ADDR_CHARSEL_P2_CONFIRM, 0);
-
-        // Detect local character confirmation (P1 for Host, P2 for Join)
-        if (s_isHost) {
-            if (p1Confirm && !s_localCharConfirmed) {
-                s_localCharConfirmed = true;
-                Rollback::NetplayLog_Write("CHARSEL", -1,
-                    "Local (Host/P1) character confirmed: cursor=%u char=%u",
-                    ReadU8(ADDR_CHARSEL_P1_CURSOR, 0),
-                    LookupCharId(ReadU8(ADDR_CHARSEL_P1_CURSOR, 0)));
-            }
-        } else {
-            if (p2Confirm && !s_localCharConfirmed) {
-                s_localCharConfirmed = true;
-                Rollback::NetplayLog_Write("CHARSEL", -1,
-                    "Local (Join/P2) character confirmed: cursor=%u char=%u",
-                    ReadU8(ADDR_CHARSEL_P2_CURSOR, 0),
-                    LookupCharId(ReadU8(ADDR_CHARSEL_P2_CURSOR, 0)));
-            }
+        if (CharSelPaletteSelect_IsSelectionLocked(localGameSlot) && !s_localCharConfirmed) {
+            s_localCharConfirmed = true;
+            Rollback::NetplayLog_Write("CHARSEL", -1,
+                "Local character finalized: cursor=%u char=%u slot=P%d",
+                ReadU8(localCursorAddr, 0),
+                LookupCharId(ReadU8(localCursorAddr, 0)),
+                localGameSlot + 1);
         }
 
         // Send lock packet when local character is confirmed
@@ -728,11 +722,14 @@ void CharSelSync_GetSnapshot(CharSelSyncSnapshot* out) {
     out->active = s_active;
     out->in_stage_phase = s_inStagePhase;
 
+    const uintptr_t localCursorAddr = s_isHost ? ADDR_CHARSEL_P1_CURSOR : ADDR_CHARSEL_P2_CURSOR;
+    const uintptr_t remoteCursorAddr = s_isHost ? ADDR_CHARSEL_P2_CURSOR : ADDR_CHARSEL_P1_CURSOR;
+
     // Read current game state for snapshot
-    out->local_cursor = ReadU8(ADDR_CHARSEL_P1_CURSOR, 0);
-    out->local_confirmed = ReadU8(ADDR_CHARSEL_P1_CONFIRM, 0);
-    out->remote_cursor = ReadU8(ADDR_CHARSEL_P2_CURSOR, 0);
-    out->remote_confirmed = ReadU8(ADDR_CHARSEL_P2_CONFIRM, 0);
+    out->local_cursor = ReadU8(localCursorAddr, 0);
+    out->local_confirmed = s_localCharConfirmed ? 1 : 0;
+    out->remote_cursor = ReadU8(remoteCursorAddr, 0);
+    out->remote_confirmed = s_remoteCharLocked ? 1 : 0;
     out->both_characters_locked = s_bothCharsLocked;
 
     // P1/P2 character IDs from cached lock-time values (game memory may be

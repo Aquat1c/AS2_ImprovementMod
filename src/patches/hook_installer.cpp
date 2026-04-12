@@ -5,6 +5,7 @@
 #include "patches/locale_patch.h"
 #include "patches/filesystem_patch.h"
 #include "patches/palette_asset_hook.h"
+#include "patches/charsel_palette_select.h"
 #include "training/practice_tools.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -75,6 +76,67 @@ bool InstallHooks() {
     } else {
         LOG_INFO("Hooked Win32 GetKeyboardState (prevents Alt+Shift issues)");
     }
+
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(&ClipCursor),
+            reinterpret_cast<void*>(&Hook_ClipCursor),
+            reinterpret_cast<void**>(&g_origClipCursor));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook ClipCursor! Status: %d (continuing anyway)", status);
+    } else {
+        LOG_INFO("Hooked Win32 ClipCursor (prevents mouse trapping)");
+    }
+
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(&GetProcAddress),
+            reinterpret_cast<void*>(&Hook_GetProcAddress),
+            reinterpret_cast<void**>(&g_origGetProcAddress));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook GetProcAddress! Status: %d (continuing anyway)", status);
+    } else {
+        LOG_INFO("Hooked Win32 GetProcAddress (blocks vanilla SetMSGHookDll helper hook)");
+    }
+
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(&SystemParametersInfoA),
+            reinterpret_cast<void*>(&Hook_SystemParametersInfoA),
+            reinterpret_cast<void**>(&g_origSystemParametersInfoA));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook SystemParametersInfoA! Status: %d (continuing anyway)", status);
+    } else {
+        LOG_INFO("Hooked Win32 SystemParametersInfoA (blocks legacy shell hotkey suppression)");
+    }
+
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    FARPROC winNlsEnableIme = user32 ? GetProcAddress(user32, "WINNLSEnableIME") : nullptr;
+    if (!winNlsEnableIme) {
+        LOG_WARN("Failed to resolve WINNLSEnableIME from user32.dll (continuing anyway)");
+    } else {
+        status = MH_CreateHook(
+                reinterpret_cast<void*>(winNlsEnableIme),
+                reinterpret_cast<void*>(&Hook_WINNLSEnableIME),
+                reinterpret_cast<void**>(&g_origWINNLSEnableIME));
+        if (status != MH_OK) {
+            LOG_WARN("Failed to hook WINNLSEnableIME! Status: %d (continuing anyway)", status);
+        } else {
+            LOG_INFO("Hooked Win32 WINNLSEnableIME (prevents vanilla IME disable)");
+        }
+    }
+
+    void* dinputSetCooperativeLevelTarget = InputOverride_GetDInputKeyboardSetCooperativeLevelTarget();
+    if (!dinputSetCooperativeLevelTarget) {
+        LOG_WARN("Failed to locate DInput keyboard SetCooperativeLevel (continuing anyway)");
+    } else {
+        status = MH_CreateHook(
+                dinputSetCooperativeLevelTarget,
+                reinterpret_cast<void*>(&Hook_DInputKeyboardSetCooperativeLevel),
+                reinterpret_cast<void**>(&g_origDInputKeyboardSetCooperativeLevel));
+        if (status != MH_OK) {
+            LOG_WARN("Failed to hook DInput keyboard SetCooperativeLevel! Status: %d (continuing anyway)", status);
+        } else {
+            LOG_INFO("Hooked DInput keyboard SetCooperativeLevel (clears exclusive/NOWINKEY flags)");
+        }
+    }
     
     LOG_INFO("ADDR_INPUT_PROCESS = 0x%08X (sub_562060)", ADDR_INPUT_PROCESS);
     status = MH_CreateHook(
@@ -123,45 +185,9 @@ bool InstallHooks() {
     }
     
     // --- Filesystem hooks ---
-    
-    status = MH_CreateHook(
-            reinterpret_cast<void*>(&CreateFileA),
-            reinterpret_cast<void*>(&Hook_CreateFileA),
-            reinterpret_cast<void**>(&g_origCreateFileA));
-    if (status != MH_OK) {
-        LOG_WARN("Failed to hook CreateFileA! Status: %d (continuing anyway)", status);
-    } else {
-        LOG_INFO("Hooked CreateFileA (Shift-JIS path conversion)");
-    }
-    
-    status = MH_CreateHook(
-            reinterpret_cast<void*>(&DeleteFileA),
-            reinterpret_cast<void*>(&Hook_DeleteFileA),
-            reinterpret_cast<void**>(&g_origDeleteFileA));
-    if (status != MH_OK) {
-        LOG_WARN("Failed to hook DeleteFileA! Status: %d (continuing anyway)", status);
-    } else {
-        LOG_INFO("Hooked DeleteFileA (Shift-JIS path conversion)");
-    }
-    
-    status = MH_CreateHook(
-            reinterpret_cast<void*>(&FindFirstFileA),
-            reinterpret_cast<void*>(&Hook_FindFirstFileA),
-            reinterpret_cast<void**>(&g_origFindFirstFileA));
-    if (status != MH_OK) {
-        LOG_WARN("Failed to hook FindFirstFileA! Status: %d (continuing anyway)", status);
-    } else {
-        LOG_INFO("Hooked FindFirstFileA (Shift-JIS path conversion)");
-    }
-    
-    status = MH_CreateHook(
-            reinterpret_cast<void*>(&GetFileAttributesA),
-            reinterpret_cast<void*>(&Hook_GetFileAttributesA),
-            reinterpret_cast<void**>(&g_origGetFileAttributesA));
-    if (status != MH_OK) {
-        LOG_WARN("Failed to hook GetFileAttributesA! Status: %d (continuing anyway)", status);
-    } else {
-        LOG_INFO("Hooked GetFileAttributesA (Shift-JIS path conversion)");
+
+    if (!FilesystemPatch_InstallHooks()) {
+        LOG_WARN("Failed to install filesystem hooks! File overrides may not work correctly");
     }
     
     status = MH_CreateHook(
@@ -202,6 +228,10 @@ bool InstallHooks() {
     if (!PaletteAssetHook_Install()) {
         LOG_WARN("Failed to install character palette asset hook (continuing anyway)");
     }
+
+    if (!Net::CharSelPaletteSelect_Install()) {
+        LOG_WARN("Failed to install char-select palette flow hooks (continuing anyway)");
+    }
     
     // --- Enable all hooks ---
     
@@ -212,6 +242,13 @@ bool InstallHooks() {
     }
     
     LOG_INFO("Input hooks installed and enabled!");
+
+    InputOverride_EnsureDInputKeyboardCooperativeLevel("hook activation");
+
+    if (g_origClipCursor) {
+        g_origClipCursor(nullptr);
+        LOG_INFO("Released any existing cursor clip after hook activation");
+    }
 
     // --- Vanilla netplay suppression hooks ---
     // These must be installed AFTER MH_EnableHook(MH_ALL_HOOKS) since

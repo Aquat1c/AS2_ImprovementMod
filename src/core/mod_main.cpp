@@ -17,6 +17,7 @@
 #include "patches/unlock_patch.h"
 #include "patches/input_override.h"
 #include "patches/hook_installer.h"
+#include "patches/filesystem_patch.h"
 #include "patches/palette_asset_hook.h"
 #include "patches/tick_hooks.h"
 #include "rollback/determinism_verify.h"
@@ -418,6 +419,11 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
         LOG_INFO("Mod DLL base: 0x%p", selfModule);
     }
 
+    FilesystemPatch_Init(gameModule);
+    if (!FilesystemPatch_InstallHooks()) {
+        LOG_WARN("Filesystem hooks failed during ModInit; file overrides will be unavailable");
+    }
+
     LOG_INFO("Initialization deferred - will complete when game is ready...");
 
     // Cache autoconnect config immediately at DLL load time.
@@ -451,8 +457,13 @@ __declspec(dllexport) void ModShutdown() {
         Net::Transport_GlobalDeinit();
         Savestate_Shutdown();
         DetVer_Shutdown();
+        FilesystemPatch_Shutdown();
         RemoveHooks();
+        InputOverride_Shutdown();
         InputSystem_Shutdown();
+    } else {
+        FilesystemPatch_Shutdown();
+        RemoveHooks();
     }
 
     timeEndPeriod(1);

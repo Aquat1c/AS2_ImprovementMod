@@ -15,6 +15,7 @@
 #include "net/stagesel_sync.h"
 #include "net/winscreen_sync.h"
 #include "net/player_side_mapping.h"
+#include "patches/charsel_palette_select.h"
 #include "core/game_state.h"
 #include "rollback/rollback_session.h"
 #include "rollback/online_wiring.h"
@@ -24,6 +25,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 // ============================================================================
 // Original function pointer storage (populated by hook_installer)
@@ -36,6 +38,11 @@ InputDispatcher_t g_origInputDispatcher = nullptr;
 DInputKBRefresh_t g_origDInputKBRefresh = nullptr;
 DInputJoyRefresh_t g_origDInputJoyRefresh = nullptr;
 GetKeyboardState_t g_origGetKeyboardState = nullptr;
+ClipCursor_t g_origClipCursor = nullptr;
+GetProcAddress_t g_origGetProcAddress = nullptr;
+SystemParametersInfoA_t g_origSystemParametersInfoA = nullptr;
+WINNLSEnableIME_t g_origWINNLSEnableIME = nullptr;
+DInputSetCooperativeLevel_t g_origDInputKeyboardSetCooperativeLevel = nullptr;
 
 // ============================================================================
 // Module config access
@@ -84,6 +91,17 @@ static int AbortRollbackDispatcher(const char* fallbackReason) {
 
 static int g_hookCallCount = 0;
 static int g_lastInputUpdateFrame = -1;
+static bool s_shellHotkeyPatchLogged = false;
+static bool s_shellHotkeyBlockLogged = false;
+static bool s_legacyShellHotkeyBlockLogged = false;
+static bool s_imeDisableBlockLogged = false;
+static bool s_shellHotkeyStateLogged = false;
+static bool s_mouseClipBlockLogged = false;
+static bool s_dinputKeyboardWindowMissingLogged = false;
+static void* s_lastDInputKeyboardDevice = nullptr;
+static HWND s_lastDInputKeyboardWindow = nullptr;
+static bool s_dinputKeyboardCoopApplied = false;
+static uint32_t s_dinputKeyboardCoopHookLogCount = 0;
 
 InputDebugInfo g_inputDebug = {};
 
@@ -104,16 +122,369 @@ static inline bool ShouldHoldCharSelUntilLockstep(uint32_t mode, uint32_t substa
            !Net::CharSelSync_IsLockstepActive();
 }
 
+static constexpr DWORD kDInputCoopExclusive = 0x00000001u;
+static constexpr DWORD kDInputCoopNonexclusive = 0x00000002u;
+static constexpr DWORD kDInputCoopForeground = 0x00000004u;
+static constexpr DWORD kDInputCoopBackground = 0x00000008u;
+static constexpr DWORD kDInputCoopNoWinKey = 0x00000010u;
+
+struct DInputKeyboardDeviceVTable {
+    void* QueryInterface;
+    void* AddRef;
+    void* Release;
+    void* GetCapabilities;
+    void* EnumObjects;
+    void* GetProperty;
+    void* SetProperty;
+    HRESULT (STDMETHODCALLTYPE *Acquire)(void* device);
+    HRESULT (STDMETHODCALLTYPE *Unacquire)(void* device);
+    void* GetDeviceState;
+    void* GetDeviceData;
+    void* SetDataFormat;
+    void* SetEventNotification;
+    HRESULT (STDMETHODCALLTYPE *SetCooperativeLevel)(void* device, HWND hWnd, DWORD dwFlags);
+};
+
+static void* GetDInputKeyboardDevice() {
+    return *reinterpret_cast<void**>(ADDR_DINPUT_KB_DEVICE);
+}
+
+static DInputKeyboardDeviceVTable* GetDInputKeyboardDeviceVTable(void* device) {
+    return device ? *reinterpret_cast<DInputKeyboardDeviceVTable**>(device) : nullptr;
+}
+
+static HWND GetGameWindowHandle() {
+    auto getWindowHandle = reinterpret_cast<GetWindowHandle_t>(ADDR_SYS_GET_WINDOW_HANDLE);
+    return getWindowHandle ? reinterpret_cast<HWND>(getWindowHandle()) : nullptr;
+}
+
+static DWORD SanitizeDInputKeyboardCooperativeFlags(DWORD flags) {
+    DWORD sanitized = flags & ~(kDInputCoopExclusive | kDInputCoopNoWinKey);
+    sanitized |= kDInputCoopNonexclusive;
+    if ((sanitized & (kDInputCoopForeground | kDInputCoopBackground)) == 0) {
+        sanitized |= kDInputCoopForeground;
+    }
+    return sanitized;
+}
+
+void* InputOverride_GetDInputKeyboardSetCooperativeLevelTarget() {
+    void* device = GetDInputKeyboardDevice();
+    DInputKeyboardDeviceVTable* vtable = GetDInputKeyboardDeviceVTable(device);
+    return (vtable && vtable->SetCooperativeLevel)
+        ? reinterpret_cast<void*>(vtable->SetCooperativeLevel)
+        : nullptr;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_DInputKeyboardSetCooperativeLevel(void* device, HWND hWnd, DWORD dwFlags) {
+    const DWORD sanitizedFlags = SanitizeDInputKeyboardCooperativeFlags(dwFlags);
+    HWND targetWindow = hWnd ? hWnd : GetGameWindowHandle();
+
+    if (s_dinputKeyboardCoopHookLogCount < 8
+            && (sanitizedFlags != dwFlags || targetWindow != hWnd)) {
+        ++s_dinputKeyboardCoopHookLogCount;
+        LOG_INFO("[Input] Sanitized DInput keyboard SetCooperativeLevel: hwnd=0x%p -> 0x%p flags=0x%08lX -> 0x%08lX",
+                 hWnd,
+                 targetWindow,
+                 static_cast<unsigned long>(dwFlags),
+                 static_cast<unsigned long>(sanitizedFlags));
+    }
+
+    if (!g_origDInputKeyboardSetCooperativeLevel) {
+        return E_FAIL;
+    }
+
+    return g_origDInputKeyboardSetCooperativeLevel(device, targetWindow, sanitizedFlags);
+}
+
+void InputOverride_EnsureDInputKeyboardCooperativeLevel(const char* reason) {
+    void* device = GetDInputKeyboardDevice();
+    DInputKeyboardDeviceVTable* vtable = GetDInputKeyboardDeviceVTable(device);
+    HWND gameWindow = GetGameWindowHandle();
+
+    if (!device || !vtable || !vtable->Acquire || !vtable->Unacquire || !vtable->SetCooperativeLevel) {
+        return;
+    }
+
+    if (!gameWindow) {
+        if (!s_dinputKeyboardWindowMissingLogged) {
+            LOG_WARN("[Input] Could not resolve game HWND for DInput keyboard cooperative-level fix");
+            s_dinputKeyboardWindowMissingLogged = true;
+        }
+        return;
+    }
+
+    if (GetForegroundWindow() != gameWindow && GetActiveWindow() != gameWindow) {
+        return;
+    }
+
+    if (device == s_lastDInputKeyboardDevice
+            && gameWindow == s_lastDInputKeyboardWindow
+            && s_dinputKeyboardCoopApplied) {
+        return;
+    }
+
+    const DWORD desiredFlags = kDInputCoopNonexclusive | kDInputCoopForeground;
+    const HRESULT hrUnacquire = vtable->Unacquire(device);
+    const HRESULT hrSet = vtable->SetCooperativeLevel(device, gameWindow, desiredFlags);
+    const HRESULT hrAcquire = vtable->Acquire(device);
+
+    LOG_INFO("[Input] DInput keyboard cooperative-level fix (%s): device=0x%p hwnd=0x%p flags=0x%08lX unacquire=0x%08lX set=0x%08lX acquire=0x%08lX",
+             reason ? reason : "unknown",
+             device,
+             gameWindow,
+             static_cast<unsigned long>(desiredFlags),
+             static_cast<unsigned long>(hrUnacquire),
+             static_cast<unsigned long>(hrSet),
+             static_cast<unsigned long>(hrAcquire));
+
+    s_lastDInputKeyboardDevice = device;
+    s_lastDInputKeyboardWindow = gameWindow;
+    s_dinputKeyboardCoopApplied = SUCCEEDED(hrSet);
+    s_dinputKeyboardWindowMissingLogged = false;
+}
+
+static bool ClearVanillaShellHotkeySuppression() {
+    int* suppressFlag = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_SUPPRESS_FLAG);
+    HHOOK* auxHookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_AUX_HOOK);
+    HHOOK* hookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_MSG_HOOK);
+    HMODULE* hookModule = reinterpret_cast<HMODULE*>(ADDR_SHELL_HOTKEY_HOOK_MODULE);
+    int* tempDllOwned = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_TEMP_DLL_OWNED);
+    char* tempDllPath = reinterpret_cast<char*>(ADDR_SHELL_HOTKEY_TEMP_DLL_PATH);
+
+    bool changed = false;
+
+    if (*suppressFlag != 0) {
+        *suppressFlag = 0;
+        changed = true;
+    }
+
+    if (*auxHookHandle) {
+        UnhookWindowsHookEx(*auxHookHandle);
+        *auxHookHandle = nullptr;
+        changed = true;
+    }
+
+    if (*hookHandle) {
+        UnhookWindowsHookEx(*hookHandle);
+        *hookHandle = nullptr;
+        changed = true;
+    }
+
+    if (*hookModule) {
+        FreeLibrary(*hookModule);
+        *hookModule = nullptr;
+        changed = true;
+    }
+
+    if (*tempDllOwned) {
+        if (tempDllPath[0]) {
+            DeleteFileA(tempDllPath);
+            tempDllPath[0] = '\0';
+        }
+        *tempDllOwned = 0;
+        changed = true;
+    }
+
+    return changed;
+}
+
+static void LogVanillaShellHotkeyState(const char* reason) {
+    int* suppressFlag = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_SUPPRESS_FLAG);
+    HHOOK* auxHookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_AUX_HOOK);
+    HHOOK* hookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_MSG_HOOK);
+    HMODULE* hookModule = reinterpret_cast<HMODULE*>(ADDR_SHELL_HOTKEY_HOOK_MODULE);
+    int* tempDllOwned = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_TEMP_DLL_OWNED);
+    char* tempDllPath = reinterpret_cast<char*>(ADDR_SHELL_HOTKEY_TEMP_DLL_PATH);
+
+    LOG_INFO("[Input] Shell hotkey state (%s): suppress=%d aux=0x%p msg=0x%p module=0x%p owned=%d path='%s' fg=0x%p active=0x%p focus=0x%p",
+             reason ? reason : "unknown",
+             *suppressFlag,
+             *auxHookHandle,
+             *hookHandle,
+             *hookModule,
+             *tempDllOwned,
+             tempDllPath,
+             GetForegroundWindow(),
+             GetActiveWindow(),
+             GetFocus());
+}
+
+static void EnsureVanillaShellHotkeysEnabled() {
+    const bool changed = ClearVanillaShellHotkeySuppression();
+
+    if (changed && !s_shellHotkeyPatchLogged) {
+        LOG_INFO("[Input] Disabled vanilla system hotkey suppression (Win key / Alt+Shift fix)");
+        s_shellHotkeyPatchLogged = true;
+    }
+
+    if (changed || !s_shellHotkeyStateLogged) {
+        LogVanillaShellHotkeyState(changed ? "EnsureVanillaShellHotkeysEnabled changed" : "EnsureVanillaShellHotkeysEnabled initial");
+        s_shellHotkeyStateLogged = true;
+    }
+}
+
+static bool IsReservedSystemScanCode(int keyCode) {
+    return keyCode == 0x2A || // DIK_LSHIFT
+           keyCode == 0x36 || // DIK_RSHIFT
+           keyCode == 0x38 || // DIK_LMENU
+           keyCode == 0xB8 || // DIK_RMENU
+           keyCode == 0xDB || // DIK_LWIN
+           keyCode == 0xDC || // DIK_RWIN
+           keyCode == 0xDD;   // DIK_APPS
+}
+
+static void FilterReservedSystemVirtualKeys(PBYTE keyState) {
+    if (!keyState) {
+        return;
+    }
+
+    const int blockedKeys[] = {
+        VK_LWIN, VK_RWIN, VK_APPS,
+        VK_MENU, VK_LMENU, VK_RMENU,
+        VK_SHIFT, VK_LSHIFT, VK_RSHIFT,
+    };
+
+    for (int vk : blockedKeys) {
+        keyState[vk] = 0;
+    }
+}
+
+static void FilterReservedSystemDirectInputKeys(uint8_t* keyBuffer) {
+    if (!keyBuffer) {
+        return;
+    }
+
+    const uint8_t blockedScancodes[] = {
+        0x2A, 0x36, 0x38, 0xB8, 0xDB, 0xDC, 0xDD,
+    };
+
+    for (uint8_t scancode : blockedScancodes) {
+        keyBuffer[scancode] = 0;
+    }
+}
+
+static bool IsSetMSGHookDllLookup(LPCSTR procName) {
+    return procName && !IS_INTRESOURCE(procName) && std::strcmp(procName, "SetMSGHookDll") == 0;
+}
+
+FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
+    if (IsSetMSGHookDllLookup(lpProcName)) {
+        ClearVanillaShellHotkeySuppression();
+        LogVanillaShellHotkeyState("Hook_GetProcAddress blocked SetMSGHookDll");
+
+        if (!s_shellHotkeyBlockLogged) {
+            LOG_INFO("[Input] Blocked vanilla SetMSGHookDll export lookup before helper hook install");
+            s_shellHotkeyBlockLogged = true;
+        }
+
+        return nullptr;
+    }
+
+    return g_origGetProcAddress(hModule, lpProcName);
+}
+
+BOOL WINAPI Hook_SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni) {
+    if (uiAction == 0x61u) {
+        LogVanillaShellHotkeyState("Hook_SystemParametersInfoA blocked 0x61");
+
+        if (!s_legacyShellHotkeyBlockLogged) {
+            LOG_INFO("[Input] Blocked legacy SystemParametersInfoA(0x61) shell hotkey suppression");
+            s_legacyShellHotkeyBlockLogged = true;
+        }
+
+        return TRUE;
+    }
+
+    if (uiAction == 0x2000u || uiAction == 0x2001u || uiAction == 0x11u) {
+        const BOOL result = g_origSystemParametersInfoA(uiAction, uiParam, pvParam, fWinIni);
+        DWORD value = pvParam ? *reinterpret_cast<DWORD*>(pvParam) : 0;
+        LOG_INFO("[Input] Observed SystemParametersInfoA action=0x%X uiParam=%u pvParam=0x%p value=%lu fWinIni=0x%X result=%d",
+                 uiAction,
+                 uiParam,
+                 pvParam,
+                 value,
+                 fWinIni,
+                 result ? 1 : 0);
+        LogVanillaShellHotkeyState("Hook_SystemParametersInfoA pass-through");
+        return result;
+    }
+
+    return g_origSystemParametersInfoA(uiAction, uiParam, pvParam, fWinIni);
+}
+
+BOOL WINAPI Hook_WINNLSEnableIME(HWND hWnd, BOOL fEnable) {
+    if (!fEnable) {
+        LogVanillaShellHotkeyState("Hook_WINNLSEnableIME blocked FALSE");
+
+        if (!s_imeDisableBlockLogged) {
+            LOG_INFO("[Input] Prevented vanilla WINNLSEnableIME(FALSE) for the game window");
+            s_imeDisableBlockLogged = true;
+        }
+
+        return TRUE;
+    }
+
+    return g_origWINNLSEnableIME(hWnd, fEnable);
+}
+
+BOOL WINAPI Hook_ClipCursor(const RECT* lpRect) {
+    if (!lpRect) {
+        return g_origClipCursor ? g_origClipCursor(nullptr) : ::ClipCursor(nullptr);
+    }
+
+    if (g_origClipCursor) {
+        g_origClipCursor(nullptr);
+    } else {
+        ::ClipCursor(nullptr);
+    }
+
+    if (!s_mouseClipBlockLogged) {
+        LOG_INFO("[Input] Blocked game cursor clipping to keep the mouse free for the rest of the desktop");
+        s_mouseClipBlockLogged = true;
+    }
+
+    return TRUE;
+}
+
 // ============================================================================
 // Frame-based input update tracking
 // ============================================================================
 
 static void EnsureInputUpdated() {
+    EnsureVanillaShellHotkeysEnabled();
+
     int currentFrame = ReadMemory<int>(ADDR_SIM_FRAME_COUNTER);
     if (currentFrame != g_lastInputUpdateFrame) {
         InputSystem_Update();
         g_lastInputUpdateFrame = currentFrame;
     }
+}
+
+void InputOverride_Shutdown() {
+    if (ClearVanillaShellHotkeySuppression()) {
+        LOG_INFO("[Input] Exit cleanup removed vanilla shell hotkey suppression state");
+    }
+
+    g_hookCallCount = 0;
+    g_lastInputUpdateFrame = -1;
+    s_shellHotkeyPatchLogged = false;
+    s_shellHotkeyBlockLogged = false;
+    s_legacyShellHotkeyBlockLogged = false;
+    s_imeDisableBlockLogged = false;
+    s_shellHotkeyStateLogged = false;
+    s_mouseClipBlockLogged = false;
+    s_dinputKeyboardWindowMissingLogged = false;
+    s_lastDInputKeyboardDevice = nullptr;
+    s_lastDInputKeyboardWindow = nullptr;
+    s_dinputKeyboardCoopApplied = false;
+    s_dinputKeyboardCoopHookLogCount = 0;
+    s_rollbackSessionWasActive = false;
+    if (g_origClipCursor) {
+        g_origClipCursor(nullptr);
+    } else {
+        ::ClipCursor(nullptr);
+    }
+    ZeroMemory(&g_inputDebug, sizeof(g_inputDebug));
 }
 
 static bool  s_rollbackFrameStarted = false;
@@ -267,7 +638,12 @@ BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
     }
 
     if (ModConfig_UseSDLInput() && lpKeyState) {
-        memset(lpKeyState, 0, 256);
+        if (g_origGetKeyboardState) {
+            g_origGetKeyboardState(lpKeyState);
+        } else {
+            memset(lpKeyState, 0, 256);
+        }
+
         EnsureInputUpdated();
 
         const uint16_t input = InputSystem_GetInput(0);
@@ -276,6 +652,9 @@ BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
             lpKeyState[vk] = pressed ? 0x80 : 0x00;
         };
 
+        // Preserve the real system modifier state (Win/Alt/Shift/Ctrl, input
+        // language toggles, etc.) and only rewrite the keys the game uses for
+        // its default keyboard action map.
         setPressed(VK_UP,    (input & INPUT_UP) != 0);
         setPressed(VK_DOWN,  (input & INPUT_DOWN) != 0);
         setPressed(VK_LEFT,  (input & INPUT_LEFT) != 0);
@@ -293,10 +672,14 @@ BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
         setPressed(VK_SPACE,  (input & INPUT_SELECT) != 0);
         setPressed(VK_BACK,   (input & INPUT_SELECT) != 0);
 
+        FilterReservedSystemVirtualKeys(lpKeyState);
+
         return TRUE;
     }
-    
-    return g_origGetKeyboardState(lpKeyState);
+
+    const BOOL result = g_origGetKeyboardState(lpKeyState);
+    FilterReservedSystemVirtualKeys(lpKeyState);
+    return result;
 }
 
 // ============================================================================
@@ -305,14 +688,19 @@ BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState) {
 
 int __cdecl Hook_DInputKBRefresh() {
     EnsureInputUpdated();
+    InputOverride_EnsureDInputKeyboardCooperativeLevel("DInputKBRefresh");
+
+    uint8_t* keyBuffer = reinterpret_cast<uint8_t*>(ADDR_DINPUT_KEYBOARD);
     
     if (ModConfig_UseSDLInput()) {
-        uint8_t* keyBuffer = reinterpret_cast<uint8_t*>(ADDR_DINPUT_KEYBOARD);
         memset(keyBuffer, 0, 256);
+        FilterReservedSystemDirectInputKeys(keyBuffer);
         return 0;
     }
-    
-    return g_origDInputKBRefresh();
+
+    const int result = g_origDInputKBRefresh();
+    FilterReservedSystemDirectInputKeys(keyBuffer);
+    return result;
 }
 
 // ============================================================================
@@ -371,6 +759,12 @@ int __cdecl Hook_KeyboardState(int keyCode) {
     g_inputDebug.lastKeyCode = keyCode;
     
     EnsureInputUpdated();
+
+    if (IsReservedSystemScanCode(keyCode)) {
+        g_inputDebug.lastOrigResult = 0;
+        g_inputDebug.lastFinalResult = 0;
+        return 0;
+    }
 
     if (InputSystem_IsBindingActive() || NetMenu::ConsumesGameInput()) {
         g_inputDebug.lastOrigResult = 0;
@@ -625,6 +1019,13 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_charsel_produced_this_loop = false;  // Reset for next iteration
             Rollback::NetplayLog_Write("INPUT", -1,
                 "Frame gate: produced_this_loop reset, returning -1 (frame#%u)", s_dispatchCount);
+            Rollback::NetplayLog_Flush();
+            return -1;
+        }
+
+        if (!Net::CharSelPaletteSelect_IsCatalogReady()) {
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "Step 0: Waiting for palette catalog sync before charsel lockstep advances");
             Rollback::NetplayLog_Flush();
             return -1;
         }
@@ -1860,6 +2261,14 @@ int __cdecl Hook_InputProcess(int gameState) {
     }
 
     if (ShouldHoldCharSelUntilLockstep(gameMode, subState)) {
+        clearLiveInputBuffers();
+        return result;
+    }
+
+    if (gameMode == MODE_CHARSEL &&
+        IsCharSelDispatcherLockstepSubstate(subState) &&
+        Net::CharSelSync_IsLockstepActive() &&
+        !Net::CharSelPaletteSelect_IsCatalogReady()) {
         clearLiveInputBuffers();
         return result;
     }

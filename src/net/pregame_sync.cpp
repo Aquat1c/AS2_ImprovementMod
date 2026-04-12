@@ -22,6 +22,7 @@
 #include "net/netplay_menu_controller.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
+#include "patches/charsel_palette_select.h"
 #include "patches/input_sync_hooks.h"
 #include "patches/memory_utils.h"
 #include "rollback/online_wiring.h"
@@ -256,8 +257,11 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
             break;
 
         case PacketType::CharSelInput:
-            // Legacy state-driven charsel sync — no longer used.
-            // Input-driven lockstep uses CharSelFrameInput instead.
+            if (payloadLen >= sizeof(CharSelInputPayload)) {
+                CharSelPaletteSelect_OnRemoteCatalog(static_cast<const CharSelInputPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short CharSelInput", type, payloadLen, sizeof(CharSelInputPayload));
+            }
             break;
 
         case PacketType::CharSelFrameInput:

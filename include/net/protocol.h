@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 5;
+constexpr uint16_t PROTOCOL_VERSION = 6;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -55,7 +55,7 @@ enum class PacketType : uint16_t {
     NatTraversalSignal = 34, // Exchange ICE description/candidates over session control
 
     // Pre-game sync (reliable, channel 0)
-    CharSelInput    = 11,   // CharSel cursor/confirm state exchange
+    CharSelInput    = 11,   // CharSel custom-palette availability catalog exchange
     CharSelLock     = 12,   // Both confirmed — lock character selections
     StageSync       = 13,   // Stage selection exchange/lock
     ConfigExchange  = 14,   // LockedMatchConfig proposed by host
@@ -185,10 +185,9 @@ struct NatTraversalSignalPayload {
 // Pre-game sync payloads
 
 struct CharSelInputPayload {
-    uint8_t  cursor;             // Grid index (0-20)
-    uint8_t  confirmed;          // 0 = browsing, 1 = confirmed
-    uint8_t  palette;            // Palette selection (0-7)
+    uint8_t  game_slot;          // 0 = P1, 1 = P2
     uint8_t  _pad;
+    uint16_t custom_masks[256];  // Bit N set => stored custom bank exists for base palette N
 };
 
 struct CharSelLockPayload {
@@ -373,6 +372,8 @@ constexpr uint8_t NETPLAY_PALETTE_FLAG_SPECTATOR_PROPAGATE = 1 << 3;
 
 static_assert(sizeof(PacketType) + sizeof(PaletteDataPayload) <= MAX_PACKET_SIZE,
     "PaletteDataPayload must fit inside one transport packet");
+static_assert(sizeof(PacketType) + sizeof(CharSelInputPayload) <= MAX_PACKET_SIZE,
+    "CharSelInputPayload must fit inside one transport packet");
 
 // NatInfoPayload flags
 constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;

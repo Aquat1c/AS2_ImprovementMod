@@ -1,0 +1,36 @@
+/**
+ * Alice Senki 2 - Character Select Palette Flow
+ *
+ * Replaces the vanilla direct button-to-palette confirm path with a
+ * two-step flow:
+ *   1. pick a character
+ *   2. scroll palettes left/right and confirm with any attack button
+ *
+ * The module is shared across offline modes and the netplay frontend.
+ */
+
+#pragma once
+
+#include "net/protocol.h"
+
+#include <stdint.h>
+
+namespace Net {
+
+bool CharSelPaletteSelect_Install();
+
+void CharSelPaletteSelect_OnCharSelBegin(bool netplay, uint8_t local_game_slot);
+void CharSelPaletteSelect_EndFrontend();
+void CharSelPaletteSelect_OnRemoteCatalog(const CharSelInputPayload* payload);
+void CharSelPaletteSelect_OnLocalCatalogChanged();
+
+bool CharSelPaletteSelect_IsCatalogReady();
+bool CharSelPaletteSelect_IsSelectionLocked(uint8_t game_slot);
+bool CharSelPaletteSelect_ShouldPreviewCustomBank(uint8_t game_slot,
+                                                 uint8_t character_id,
+                                                 uint8_t base_palette);
+bool CharSelPaletteSelect_ShouldUseCustomBank(uint8_t game_slot,
+                                              uint8_t character_id,
+                                              uint8_t base_palette);
+
+} // namespace Net

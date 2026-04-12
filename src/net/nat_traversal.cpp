@@ -372,7 +372,7 @@ static void TryUpnpMapping(uint16_t port) {
         portStr,
         portStr,
         s_upnpLanAddr,
-        "AS2 Rollback Mod",
+        "AS2 Improvement Mod",
         "UDP",
         nullptr,
         "0");

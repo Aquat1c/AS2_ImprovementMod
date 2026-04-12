@@ -3,6 +3,7 @@
 #include "core/game_state.h"
 #include "net/netplay_palette_storage.h"
 #include "net/player_side_mapping.h"
+#include "patches/charsel_palette_select.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "patches/memory_utils.h"
@@ -65,6 +66,9 @@ struct PlayerRuntime {
     bool               live_bank_loaded;
     NetplayPaletteBank local_custom_bank;
     bool               local_custom_loaded;
+    NetplayPaletteBank saved_custom_bank;
+    bool               saved_custom_loaded;
+    bool               local_visual_override_enabled;
     NetplayPaletteBank remote_custom_bank;
     bool               remote_custom_loaded;
 };
@@ -160,6 +164,17 @@ static bool IsValidGameSlot(int gameSlot) {
     return gameSlot >= 0 && gameSlot < 2;
 }
 
+static int GetFrontendPreviewLocalSlot() {
+    if (s_matchActive ||
+        GetGameMode() != MODE_CHARSEL ||
+        GetGameType() != GAMETYPE_NETPLAY ||
+        !Session_IsConnected()) {
+        return -1;
+    }
+
+    return Session_GetRole() == SessionRole::Host ? 0 : 1;
+}
+
 static bool HasOfflineLocalContext() {
     return !s_matchActive &&
            (s_player[0].valid || s_player[1].valid);
@@ -192,6 +207,30 @@ static bool IsIgnoredOfflinePaletteGameType(uint32_t gameType) {
     return gameType == GAMETYPE_NETPLAY ||
            gameType == GAMETYPE_REPLAY ||
            gameType == GAMETYPE_DEMO;
+}
+
+static bool IsSupportedFrontendPaletteContext(uint32_t gameMode, uint32_t gameType) {
+    if (gameMode == MODE_CHARSEL && gameType == GAMETYPE_NETPLAY) {
+        return true;
+    }
+
+    return !IsIgnoredOfflinePaletteGameType(gameType) &&
+           IsOfflinePaletteEditingGameType(gameType);
+}
+
+static bool ShouldRetainFrontendPaletteContext() {
+    const uint32_t gameType = GetGameType();
+    const uint32_t gameMode = GetGameMode();
+
+    if (gameType == GAMETYPE_NETPLAY) {
+        return gameMode == MODE_CHARSEL;
+    }
+
+    if (IsIgnoredOfflinePaletteGameType(gameType)) {
+        return false;
+    }
+
+    return IsOfflinePaletteContextRetentionMode(gameMode);
 }
 
 static int FindFirstValidOfflineGameSlot() {
@@ -252,10 +291,91 @@ static int ResolveCharacterIdFromArchivePath(const char* archivePath) {
     return -1;
 }
 
+static bool HasCurrentLocalCustomBank(const PlayerRuntime& player) {
+    return player.local_custom_loaded &&
+           player.local_custom_bank.valid &&
+           player.local_custom_bank.character_id == player.character_id &&
+           player.local_custom_bank.base_palette == player.base_palette;
+}
+
+static bool HasCurrentSavedCustomBank(const PlayerRuntime& player) {
+    return player.saved_custom_loaded &&
+           player.saved_custom_bank.valid &&
+           player.saved_custom_bank.character_id == player.character_id &&
+           player.saved_custom_bank.base_palette == player.base_palette;
+}
+
+static bool ShouldUseSelectedCustomBank(int gameSlot) {
+    return IsValidGameSlot(gameSlot) &&
+           s_player[gameSlot].valid &&
+           CharSelPaletteSelect_ShouldUseCustomBank(
+               (uint8_t)gameSlot,
+               s_player[gameSlot].character_id,
+               s_player[gameSlot].base_palette);
+}
+
+static bool HasForcedLocalVisualCustomBank(int gameSlot) {
+    if (!IsValidGameSlot(gameSlot)) {
+        return false;
+    }
+
+    const PlayerRuntime& player = s_player[gameSlot];
+    if (!player.valid ||
+        !player.local_visual_override_enabled ||
+        !HasCurrentLocalCustomBank(player)) {
+        return false;
+    }
+
+    if (!s_matchActive) {
+        return true;
+    }
+
+    return gameSlot == s_localGameSlot;
+}
+
+static bool ShouldUsePreviewCustomBank(int gameSlot) {
+    if (!IsValidGameSlot(gameSlot) || !s_player[gameSlot].valid) {
+        return false;
+    }
+
+    if (GetGameMode() != MODE_CHARSEL) {
+        return false;
+    }
+
+    if (GetGameType() == GAMETYPE_NETPLAY) {
+        const int localPreviewSlot = GetFrontendPreviewLocalSlot();
+        if (!IsValidGameSlot(localPreviewSlot) || gameSlot != localPreviewSlot) {
+            return false;
+        }
+    }
+
+    return CharSelPaletteSelect_ShouldPreviewCustomBank(
+        (uint8_t)gameSlot,
+        s_player[gameSlot].character_id,
+        s_player[gameSlot].base_palette);
+}
+
+static bool ShouldUseVisualCustomBank(int gameSlot) {
+    if (!IsValidGameSlot(gameSlot) || !s_player[gameSlot].valid) {
+        return false;
+    }
+
+    if (HasForcedLocalVisualCustomBank(gameSlot)) {
+        return true;
+    }
+
+    if (!s_matchActive && GetGameMode() == MODE_CHARSEL) {
+        return ShouldUsePreviewCustomBank(gameSlot);
+    }
+
+    return ShouldUseSelectedCustomBank(gameSlot);
+}
+
 static bool LocalTransportHasCustomBank() {
     return IsValidGameSlot(s_localGameSlot) &&
            s_enabled &&
-           s_player[s_localGameSlot].local_custom_loaded;
+           s_player[s_localGameSlot].local_custom_loaded &&
+           ShouldUseSelectedCustomBank(s_localGameSlot);
 }
 
 static bool HasVisualOverrideForGameSlot(int gameSlot) {
@@ -265,6 +385,10 @@ static bool HasVisualOverrideForGameSlot(int gameSlot) {
 
     const PlayerRuntime& player = s_player[gameSlot];
     if (!player.valid) {
+        return false;
+    }
+
+    if (!ShouldUseVisualCustomBank(gameSlot)) {
         return false;
     }
 
@@ -290,7 +414,7 @@ static uint8_t BuildLocalFlags() {
     if (LocalTransportHasCustomBank()) {
         flags |= NETPLAY_PALETTE_FLAG_HAS_CUSTOM_DATA;
     }
-    if (IsValidGameSlot(s_localGameSlot) && s_player[s_localGameSlot].local_custom_loaded) {
+    if (LocalTransportHasCustomBank()) {
         flags |= NETPLAY_PALETTE_FLAG_SPECTATOR_PROPAGATE;
     }
     return flags;
@@ -333,11 +457,19 @@ static void RefreshLocalStoredBank() {
     }
 
     PlayerRuntime& local = s_player[s_localGameSlot];
-    ZeroBank(&local.local_custom_bank);
-    local.local_custom_loaded = NetplayPaletteStorage_GetBank(
+    local.local_visual_override_enabled = false;
+    ZeroBank(&local.saved_custom_bank);
+    local.saved_custom_loaded = NetplayPaletteStorage_GetBank(
         local.character_id,
         local.base_palette,
-        &local.local_custom_bank);
+        &local.saved_custom_bank);
+
+    ZeroBank(&local.local_custom_bank);
+    local.local_custom_loaded = false;
+    if (local.saved_custom_loaded) {
+        local.local_custom_bank = local.saved_custom_bank;
+        local.local_custom_loaded = true;
+    }
 }
 
 static void RefreshStoredBankForSlot(uint8_t gameSlot) {
@@ -346,35 +478,43 @@ static void RefreshStoredBankForSlot(uint8_t gameSlot) {
     }
 
     PlayerRuntime& player = s_player[gameSlot];
-    ZeroBank(&player.local_custom_bank);
-    player.local_custom_loaded = NetplayPaletteStorage_GetBank(
+    player.local_visual_override_enabled = false;
+    ZeroBank(&player.saved_custom_bank);
+    player.saved_custom_loaded = NetplayPaletteStorage_GetBank(
         player.character_id,
         player.base_palette,
-        &player.local_custom_bank);
+        &player.saved_custom_bank);
+
+    ZeroBank(&player.local_custom_bank);
+    player.local_custom_loaded = false;
+    if (player.saved_custom_loaded) {
+        player.local_custom_bank = player.saved_custom_bank;
+        player.local_custom_loaded = true;
+    }
 }
 
 static void MaybeArmOfflineLocalContext(uint8_t gameSlot,
                                         uint8_t characterId,
                                         uint8_t basePalette) {
+    const uint32_t gameMode = GetGameMode();
     const uint32_t gameType = GetGameType();
     if (s_matchActive) {
         LOG_INFO("[Palette] Offline context skip: slot=P%d char=%u base=%u reason=match-active mode=%u sub=%u type=%u",
             gameSlot + 1,
             characterId,
             basePalette,
-            (unsigned)GetGameMode(),
+            (unsigned)gameMode,
             (unsigned)GetSubstate(),
             (unsigned)gameType);
         return;
     }
 
-    if (IsIgnoredOfflinePaletteGameType(gameType) ||
-        !IsOfflinePaletteEditingGameType(gameType)) {
+    if (!IsSupportedFrontendPaletteContext(gameMode, gameType)) {
         LOG_INFO("[Palette] Offline context skip: slot=P%d char=%u base=%u reason=game-type mode=%u sub=%u type=%u",
             gameSlot + 1,
             characterId,
             basePalette,
-            (unsigned)GetGameMode(),
+            (unsigned)gameMode,
             (unsigned)GetSubstate(),
             (unsigned)gameType);
         return;
@@ -612,9 +752,7 @@ void NetplayPaletteRuntime_FrameUpdate() {
     }
 
     if (!s_matchActive) {
-        if (HasOfflineLocalContext() &&
-            (IsIgnoredOfflinePaletteGameType(GetGameType()) ||
-             !IsOfflinePaletteContextRetentionMode(GetGameMode()))) {
+        if (HasOfflineLocalContext() && !ShouldRetainFrontendPaletteContext()) {
             LOG_INFO("[Palette] Clearing offline context: mode=%u sub=%u type=%u has_p1=%d has_p2=%d",
                 (unsigned)GetGameMode(),
                 (unsigned)GetSubstate(),
@@ -963,8 +1101,10 @@ bool NetplayPaletteRuntime_CopyLocalBankForSource(NetplayPaletteBankSource sourc
             return CopyBank(player.live_bank, out);
         case NetplayPaletteBankSource::VanillaSource:
             return CopyBank(player.vanilla_bank, out);
-        case NetplayPaletteBankSource::SavedCustom:
+        case NetplayPaletteBankSource::AppliedCustom:
             return CopyBank(player.local_custom_bank, out);
+        case NetplayPaletteBankSource::SavedCustom:
+            return CopyBank(player.saved_custom_bank, out);
         default:
             return false;
     }
@@ -977,6 +1117,10 @@ bool NetplayPaletteRuntime_SetLocalCustomBank(const NetplayPaletteBank* bank, bo
     }
 
     PlayerRuntime& player = s_player[editableSlot];
+    const bool hadVisualOverride = HasVisualOverrideForGameSlot(editableSlot);
+    const bool hadCatalogEntry = NetplayPaletteRuntime_HasLocalCustomBankFor(
+        player.character_id,
+        player.base_palette);
     NetplayPaletteBank updatedBank = *bank;
     updatedBank.valid = true;
     updatedBank.character_id = player.character_id;
@@ -988,20 +1132,49 @@ bool NetplayPaletteRuntime_SetLocalCustomBank(const NetplayPaletteBank* bank, bo
         player.local_custom_bank.base_palette == updatedBank.base_palette &&
         player.local_custom_bank.crc32 == updatedBank.crc32 &&
         memcmp(player.local_custom_bank.data, updatedBank.data, NETPLAY_PALETTE_BANK_SIZE) == 0;
-    if (unchanged) {
-        return !persistToDisk || NetplayPaletteStorage_SaveBank(&updatedBank);
+
+    if (!unchanged) {
+        player.local_custom_bank = updatedBank;
+        player.local_custom_loaded = true;
     }
 
-    player.local_custom_bank = updatedBank;
-    player.local_custom_loaded = true;
+    player.local_visual_override_enabled = true;
 
-    const bool saved = !persistToDisk || NetplayPaletteStorage_SaveBank(&player.local_custom_bank);
-    MarkPaletteChanged((uint8_t)editableSlot, true, persistToDisk ? "local custom saved" : "local custom updated");
-    RequestLiveReload((uint8_t)editableSlot, "local custom updated");
-    SetStatus(persistToDisk
-            ? "Saved custom palette for P%d"
-            : "Updated live palette for P%d",
-        editableSlot + 1);
+    bool saved = true;
+    if (persistToDisk) {
+        saved = NetplayPaletteStorage_SaveBank(&player.local_custom_bank);
+        if (saved) {
+            player.saved_custom_bank = player.local_custom_bank;
+            player.saved_custom_loaded = true;
+        }
+    }
+
+    const bool hasVisualOverride = HasVisualOverrideForGameSlot(editableSlot);
+    const bool hasCatalogEntry = NetplayPaletteRuntime_HasLocalCustomBankFor(
+        player.character_id,
+        player.base_palette);
+    const bool visualStateChanged = !unchanged || hadVisualOverride != hasVisualOverride;
+
+    if (visualStateChanged) {
+        MarkPaletteChanged((uint8_t)editableSlot,
+            true,
+            persistToDisk ? "local custom saved" : "local custom updated");
+        RequestLiveReload((uint8_t)editableSlot, "local custom updated");
+    }
+
+    if (hadCatalogEntry != hasCatalogEntry) {
+        CharSelPaletteSelect_OnLocalCatalogChanged();
+    }
+
+    if (persistToDisk) {
+        SetStatus(saved
+                ? "Saved custom palette for P%d"
+                : "Failed to save custom palette for P%d",
+            editableSlot + 1);
+    } else {
+        SetStatus("Updated live palette for P%d", editableSlot + 1);
+    }
+
     return saved;
 }
 
@@ -1012,18 +1185,52 @@ bool NetplayPaletteRuntime_ClearLocalCustomBank(bool deleteFromDisk) {
     }
 
     PlayerRuntime& player = s_player[editableSlot];
+    const bool hadVisualOverride = HasVisualOverrideForGameSlot(editableSlot);
+    const bool hadCatalogEntry = NetplayPaletteRuntime_HasLocalCustomBankFor(
+        player.character_id,
+        player.base_palette);
     if (!player.local_custom_loaded) {
-        return !deleteFromDisk ||
+        if (!deleteFromDisk) {
+            return true;
+        }
+
+        const bool deleted = !deleteFromDisk ||
             NetplayPaletteStorage_DeleteBank(player.character_id, player.base_palette);
+        ZeroBank(&player.saved_custom_bank);
+        player.saved_custom_loaded = false;
+        const bool hasCatalogEntry = NetplayPaletteRuntime_HasLocalCustomBankFor(
+            player.character_id,
+            player.base_palette);
+        if (hadCatalogEntry != hasCatalogEntry) {
+            CharSelPaletteSelect_OnLocalCatalogChanged();
+        }
+        return deleted;
     }
 
     ZeroBank(&player.local_custom_bank);
     player.local_custom_loaded = false;
+    player.local_visual_override_enabled = false;
 
     const bool deleted = !deleteFromDisk ||
         NetplayPaletteStorage_DeleteBank(player.character_id, player.base_palette);
-    MarkPaletteChanged((uint8_t)editableSlot, true, deleteFromDisk ? "local custom deleted" : "local custom cleared");
-    RequestLiveReload((uint8_t)editableSlot, "local custom cleared");
+    if (deleteFromDisk) {
+        ZeroBank(&player.saved_custom_bank);
+        player.saved_custom_loaded = false;
+    }
+
+    const bool hasVisualOverride = HasVisualOverrideForGameSlot(editableSlot);
+    const bool hasCatalogEntry = NetplayPaletteRuntime_HasLocalCustomBankFor(
+        player.character_id,
+        player.base_palette);
+    if (hadVisualOverride != hasVisualOverride) {
+        MarkPaletteChanged((uint8_t)editableSlot,
+            true,
+            deleteFromDisk ? "local custom deleted" : "local custom cleared");
+        RequestLiveReload((uint8_t)editableSlot, "local custom cleared");
+    }
+    if (hadCatalogEntry != hasCatalogEntry) {
+        CharSelPaletteSelect_OnLocalCatalogChanged();
+    }
     SetStatus("Cleared custom palette for P%d", editableSlot + 1);
     return deleted;
 }
@@ -1051,7 +1258,8 @@ void NetplayPaletteRuntime_GetLocalContext(NetplayPaletteLocalContext* out) {
     if (IsValidGameSlot(editableSlot)) {
         const PlayerRuntime& player = s_player[editableSlot];
         out->available = player.valid;
-        out->has_custom_bank = player.local_custom_loaded;
+        out->has_applied_custom_bank = HasCurrentLocalCustomBank(player);
+        out->has_saved_custom_bank = HasCurrentSavedCustomBank(player);
         out->has_vanilla_bank = player.vanilla_bank.valid;
         out->has_live_bank = player.live_bank_loaded;
         out->asset_loaded = player.asset_loaded;
@@ -1063,12 +1271,35 @@ void NetplayPaletteRuntime_GetLocalContext(NetplayPaletteLocalContext* out) {
     CopyText(out->status, sizeof(out->status), s_status);
 }
 
+bool NetplayPaletteRuntime_HasLocalCustomBankFor(uint8_t characterId, uint8_t basePalette) {
+    if (NetplayPaletteStorage_HasBank(characterId, basePalette)) {
+        return true;
+    }
+
+    for (int gameSlot = 0; gameSlot < 2; ++gameSlot) {
+        const PlayerRuntime& player = s_player[gameSlot];
+        if (!player.valid || !HasCurrentLocalCustomBank(player)) {
+            continue;
+        }
+
+        if (player.local_custom_bank.character_id == characterId &&
+            player.local_custom_bank.base_palette == basePalette) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool NetplayPaletteRuntime_CopyAssetOverrideBank(uint8_t gameSlot, NetplayPaletteBank* out) {
     if (!IsValidGameSlot(gameSlot) || !out) {
         return false;
     }
 
     if (!s_matchActive) {
+        if (!ShouldUseVisualCustomBank(gameSlot)) {
+            return false;
+        }
         return CopyBank(s_player[gameSlot].local_custom_bank, out);
     }
 
@@ -1077,10 +1308,17 @@ bool NetplayPaletteRuntime_CopyAssetOverrideBank(uint8_t gameSlot, NetplayPalett
     }
 
     if (gameSlot == (uint8_t)s_localGameSlot) {
+        if (!ShouldUseVisualCustomBank(gameSlot)) {
+            return false;
+        }
         return CopyBank(s_player[gameSlot].local_custom_bank, out);
     }
 
     if (!s_remotePreviewEnabled) {
+        return false;
+    }
+
+    if (!ShouldUseSelectedCustomBank(gameSlot)) {
         return false;
     }
 
@@ -1093,11 +1331,21 @@ bool NetplayPaletteRuntime_CopySpectatorBank(uint8_t gameSlot, NetplayPaletteBan
     }
 
     if (!s_matchActive) {
+        if (!ShouldUseVisualCustomBank(gameSlot)) {
+            return false;
+        }
         return CopyBank(s_player[gameSlot].local_custom_bank, out);
     }
 
     if (gameSlot == (uint8_t)s_localGameSlot) {
+        if (!ShouldUseVisualCustomBank(gameSlot)) {
+            return false;
+        }
         return CopyBank(s_player[gameSlot].local_custom_bank, out);
+    }
+
+    if (!ShouldUseSelectedCustomBank(gameSlot)) {
+        return false;
     }
 
     return CopyBank(s_player[gameSlot].remote_custom_bank, out);
@@ -1216,6 +1464,29 @@ void NetplayPaletteRuntime_OnLiveBankObserved(uint8_t gameSlot,
         archivePath ? archivePath : "(null)",
         patchPath ? patchPath : "(null)",
         (unsigned)assetCount);
+}
+
+void NetplayPaletteRuntime_RequestFrontendReload(uint8_t gameSlot) {
+    if (!s_initialized || s_matchActive || !IsValidGameSlot(gameSlot)) {
+        return;
+    }
+
+    if (GetGameMode() != MODE_CHARSEL) {
+        return;
+    }
+
+    if (GetGameType() == GAMETYPE_NETPLAY) {
+        const int localPreviewSlot = GetFrontendPreviewLocalSlot();
+        if (!IsValidGameSlot(localPreviewSlot) || gameSlot != localPreviewSlot) {
+            return;
+        }
+    }
+
+    if (!s_player[gameSlot].valid || !s_player[gameSlot].asset_loaded) {
+        return;
+    }
+
+    RequestLiveReload(gameSlot, "charsel preview change");
 }
 
 bool NetplayPaletteRuntime_ConsumeLiveReloadRequest(NetplayPaletteReloadRequest* out) {

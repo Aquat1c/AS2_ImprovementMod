@@ -13,6 +13,11 @@
 
 #include <windows.h>
 
+void FilesystemPatch_Init(HMODULE gameModule);
+bool FilesystemPatch_InstallHooks();
+void FilesystemPatch_LoadEnabledModDLLs();
+void FilesystemPatch_Shutdown();
+
 // Hook functions — install via MinHook targeting the Win32 originals.
 HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess,
     DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecAttr,
