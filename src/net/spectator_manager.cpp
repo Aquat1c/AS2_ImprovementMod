@@ -42,6 +42,8 @@ static char s_redirectEndpoint[96] = "";
 static char s_status[128] = "Spectator server disabled.";
 static std::unordered_map<ENetPeer*, PeerState> s_peers;
 
+constexpr int kMaxEventsPerFrame = 64;
+
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
         return;
@@ -377,7 +379,9 @@ void SpectatorManager_FrameUpdate() {
     }
 
     ENetEvent event{};
-    while (enet_host_service(s_server, &event, 0) > 0) {
+    int processedEvents = 0;
+    while (processedEvents < kMaxEventsPerFrame && enet_host_service(s_server, &event, 0) > 0) {
+        processedEvents++;
         switch (event.type) {
             case ENET_EVENT_TYPE_CONNECT: {
                 PeerState state{};

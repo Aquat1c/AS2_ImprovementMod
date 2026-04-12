@@ -537,7 +537,10 @@ static bool ShouldAttemptJoinSpectatorProbe(const char* errorText) {
     }
 
     if (ContainsInsensitive(errorText, "protocol version mismatch") ||
-        ContainsInsensitive(errorText, "build hash mismatch")) {
+        ContainsInsensitive(errorText, "version mismatch") ||
+        ContainsInsensitive(errorText, "build hash mismatch") ||
+        ContainsInsensitive(errorText, "build mismatch") ||
+        ContainsInsensitive(errorText, "version/build mismatch")) {
         return false;
     }
 

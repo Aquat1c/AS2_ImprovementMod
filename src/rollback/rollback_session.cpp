@@ -97,6 +97,17 @@ struct BufferedPacket {
     size_t len;
 };
 
+enum AdapterAllocationKind {
+    ADAPTER_ALLOC_PAYLOAD = 0x44594C50,
+    ADAPTER_ALLOC_ADDR    = 0x52444441,
+    ADAPTER_ALLOC_RESULT  = 0x544C5352,
+};
+
+struct AdapterAllocationHeader {
+    AdapterAllocationKind kind;
+    AdapterAllocationHeader* next;
+};
+
 static BufferedPacket s_recvBuffer[MAX_PENDING_RECV];
 static int            s_recvCount = 0;
 
@@ -106,6 +117,66 @@ static int             s_recvResultCount = 0;
 
 // Dummy peer address (we only have one peer)
 static uint8_t s_peerAddrData[4] = { 1, 0, 0, 0 };
+static AdapterAllocationHeader* s_recvAddrFreeList = nullptr;
+static AdapterAllocationHeader* s_recvResultFreeList = nullptr;
+
+static void* AdapterAlloc(AdapterAllocationKind kind, size_t size) {
+    AdapterAllocationHeader** freeList = nullptr;
+    if (kind == ADAPTER_ALLOC_ADDR) {
+        freeList = &s_recvAddrFreeList;
+    } else if (kind == ADAPTER_ALLOC_RESULT) {
+        freeList = &s_recvResultFreeList;
+    }
+
+    AdapterAllocationHeader* header = nullptr;
+    if (freeList && *freeList) {
+        header = *freeList;
+        *freeList = header->next;
+    } else {
+        header = (AdapterAllocationHeader*)malloc(sizeof(AdapterAllocationHeader) + size);
+        if (!header) {
+            return nullptr;
+        }
+    }
+
+    header->kind = kind;
+    header->next = nullptr;
+    return header + 1;
+}
+
+static void AdapterReleaseAllocation(void* data_ptr) {
+    if (!data_ptr) {
+        return;
+    }
+
+    AdapterAllocationHeader* header = ((AdapterAllocationHeader*)data_ptr) - 1;
+    switch (header->kind) {
+        case ADAPTER_ALLOC_ADDR:
+            header->next = s_recvAddrFreeList;
+            s_recvAddrFreeList = header;
+            break;
+
+        case ADAPTER_ALLOC_RESULT:
+            header->next = s_recvResultFreeList;
+            s_recvResultFreeList = header;
+            break;
+
+        case ADAPTER_ALLOC_PAYLOAD:
+        default:
+            free(header);
+            break;
+    }
+}
+
+static void ReleaseBufferedPacket(BufferedPacket* packet) {
+    if (!packet) {
+        return;
+    }
+
+    AdapterReleaseAllocation(packet->data);
+    packet->data = nullptr;
+    packet->len = 0;
+}
 
 // ============================================================================
 // GekkoNet Transport Adapter (ENet ↔ GekkoNet)
@@ -135,16 +206,29 @@ static GekkoNetResult** AdapterReceiveData(int* length) {
     // Convert buffered packets to GekkoNetResult array
     s_recvResultCount = 0;
     for (int i = 0; i < s_recvCount && s_recvResultCount < MAX_PENDING_RECV; i++) {
-        GekkoNetResult* result = (GekkoNetResult*)malloc(sizeof(GekkoNetResult));
-        if (!result) continue;
-
-        result->addr.data = malloc(4);
-        if (result->addr.data) {
-            memcpy(result->addr.data, s_peerAddrData, 4);
+        GekkoNetResult* result = (GekkoNetResult*)AdapterAlloc(ADAPTER_ALLOC_RESULT, sizeof(GekkoNetResult));
+        if (!result) {
+            ReleaseBufferedPacket(&s_recvBuffer[i]);
+            continue;
         }
-        result->addr.size = 4;
+
+        memset(result, 0, sizeof(*result));
+
+        void* addrData = AdapterAlloc(ADAPTER_ALLOC_ADDR, sizeof(s_peerAddrData));
+        if (!addrData) {
+            AdapterReleaseAllocation(result);
+            ReleaseBufferedPacket(&s_recvBuffer[i]);
+            continue;
+        }
+
+        memcpy(addrData, s_peerAddrData, sizeof(s_peerAddrData));
+        result->addr.data = addrData;
+        result->addr.size = sizeof(s_peerAddrData);
         result->data = s_recvBuffer[i].data;  // Transfer ownership
         result->data_len = (unsigned int)s_recvBuffer[i].len;
+
+        s_recvBuffer[i].data = nullptr;
+        s_recvBuffer[i].len = 0;
 
         s_recvResults[s_recvResultCount++] = result;
     }
@@ -158,7 +242,7 @@ static GekkoNetResult** AdapterReceiveData(int* length) {
 
 /// Called by GekkoNet to free memory we allocated.
 static void AdapterFreeData(void* data_ptr) {
-    free(data_ptr);
+    AdapterReleaseAllocation(data_ptr);
 }
 
 static void RefreshCachedNetworkTelemetry(bool includeFramesAhead);
@@ -899,7 +983,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
 
     // Clear receive buffer
     for (int i = 0; i < s_recvCount; i++) {
-        free(s_recvBuffer[i].data);
+        ReleaseBufferedPacket(&s_recvBuffer[i]);
     }
     s_recvCount = 0;
     s_recvResultCount = 0;
@@ -965,7 +1049,7 @@ void RollbackSession_End() {
 
     // Clear receive buffer
     for (int i = 0; i < s_recvCount; i++) {
-        free(s_recvBuffer[i].data);
+        ReleaseBufferedPacket(&s_recvBuffer[i]);
     }
     s_recvCount = 0;
     s_recvResultCount = 0;
@@ -1306,7 +1390,7 @@ void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
         return;
     }
 
-    void* copy = malloc(len);
+    void* copy = AdapterAlloc(ADAPTER_ALLOC_PAYLOAD, len);
     if (!copy) return;
     memcpy(copy, data, len);
 

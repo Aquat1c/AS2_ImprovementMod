@@ -794,6 +794,7 @@ static bool g_isCurrentlyBorderless = true;
 
 // Log file and console
 static FILE* g_logFile = nullptr;
+static unsigned int g_logLinesSinceFlush = 0;
 static HANDLE g_hConsole = INVALID_HANDLE_VALUE;
 static bool g_consoleAllocated = false;
 
@@ -1443,6 +1444,8 @@ void ToggleConsole() {
 // ============================================================================
 
 void ProxyLog(const char* fmt, ...) {
+    static const unsigned int kProxyLogFlushEveryLines = 64;
+
     // Open log file if not open
     if (!g_logFile) {
         // Create dated log folder: logs/<YYYY-MM-DD_HH-MM-SS>/
@@ -1458,6 +1461,10 @@ void ProxyLog(const char* fmt, ...) {
         char logPath[MAX_PATH];
         snprintf(logPath, MAX_PATH, "%s\\d3d9_proxy_%lu.log", g_logDir, GetCurrentProcessId());
         g_logFile = fopen(logPath, "w");
+        if (g_logFile) {
+            setvbuf(g_logFile, nullptr, _IOFBF, 256 * 1024);
+            g_logLinesSinceFlush = 0;
+        }
     }
     
     // Get timestamp
@@ -1477,7 +1484,19 @@ void ProxyLog(const char* fmt, ...) {
     // Write to log file
     if (g_logFile) {
         fprintf(g_logFile, "%s %s\n", timestamp, buffer);
-        fflush(g_logFile);
+        g_logLinesSinceFlush++;
+
+        const bool criticalLog =
+            strstr(buffer, "ERROR") ||
+            strstr(buffer, "FAILED") ||
+            strstr(buffer, "FATAL") ||
+            strstr(buffer, "CRASH") ||
+            strstr(buffer, "EXCEPTION");
+
+        if (criticalLog || g_logLinesSinceFlush >= kProxyLogFlushEveryLines) {
+            fflush(g_logFile);
+            g_logLinesSinceFlush = 0;
+        }
     }
     
     // Write to console with colors
@@ -5091,6 +5110,7 @@ static void PerformProxyShutdown(bool fastProcessExit) {
         fflush(g_logFile);
         fclose(g_logFile);
         g_logFile = nullptr;
+        g_logLinesSinceFlush = 0;
     }
 
     ShutdownConsole(false);

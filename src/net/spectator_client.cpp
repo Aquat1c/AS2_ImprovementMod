@@ -38,6 +38,7 @@ struct BufferedPaletteState {
 
 constexpr int kFastForwardGapFrames = 30;
 constexpr int kHardSyncGapFrames = 180;
+constexpr int kMaxEventsPerFrame = 64;
 constexpr DWORD kStatusIntervalMs = 250;
 constexpr DWORD kConnectTimeoutMs = 3000;
 constexpr DWORD kHandshakeTimeoutMs = 3000;
@@ -447,7 +448,10 @@ void SpectatorClient_FrameUpdate() {
 
     bool stopProcessing = false;
     ENetEvent event{};
-    while (s_clientHost && !stopProcessing && enet_host_service(s_clientHost, &event, 0) > 0) {
+    int processedEvents = 0;
+    while (s_clientHost && !stopProcessing && processedEvents < kMaxEventsPerFrame &&
+           enet_host_service(s_clientHost, &event, 0) > 0) {
+        processedEvents++;
         switch (event.type) {
             case ENET_EVENT_TYPE_CONNECT: {
                 Spectator::HelloPayload hello{};

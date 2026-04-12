@@ -8,12 +8,14 @@
 #include "net/session_manager.h"
 #include "net/network_thread.h"
 #include "net/nat_traversal.h"
+#include "patches/memory_utils.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <vector>
 
 namespace Net {
 
@@ -45,8 +47,17 @@ static uint32_t       s_lastOutboundDropCount = 0;
 static DWORD          s_lastQueueSpikeLogAt   = 0;
 static DWORD          s_lastDrainLagLogAt     = 0;
 static DWORD          s_lastSessionUpdateTick = 0;
+static bool           s_localBuildHashCached  = false;
+static uint32_t       s_localBuildHash        = 0;
 
 constexpr int MAX_DEFERRED_CONTROL_PACKETS = 64;
+
+struct BuildFingerprintComponent {
+    char     name[16];
+    uint32_t crc32;
+    uint32_t size_bytes;
+    uint32_t present;
+};
 
 struct DeferredControlPacket {
     PacketType type;
@@ -84,6 +95,34 @@ static void SetError(const char* msg) {
     SetState(SessionState::Failed);
 }
 
+static bool IsCompatibilityDisconnectData(uint32_t data) {
+    return data == static_cast<uint32_t>(DisconnectReason::VersionMismatch);
+}
+
+static void RequestCompatibilityDisconnect(const char* packetName,
+                                          const char* remoteNickname,
+                                          uint16_t remoteProtocolVersion,
+                                          uint32_t remoteBuildHash,
+                                          const char* reason) {
+    if (s_activeSessionToken == 0) {
+        return;
+    }
+
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Requesting compatibility disconnect: packet=%s nick=%s remote_ver=%u remote_hash=0x%08X data=%u reason=%s token=%u",
+        packetName ? packetName : "?",
+        remoteNickname && remoteNickname[0] ? remoteNickname : "(unknown)",
+        remoteProtocolVersion,
+        remoteBuildHash,
+        static_cast<uint32_t>(DisconnectReason::VersionMismatch),
+        reason ? reason : "?",
+        s_activeSessionToken);
+    NetworkThread_RequestDisconnect(
+        s_activeSessionToken,
+        static_cast<uint32_t>(DisconnectReason::VersionMismatch),
+        false);
+}
+
 static void ResetState() {
     s_state = SessionState::Idle;
     s_role  = SessionRole::None;
@@ -107,6 +146,283 @@ static void ResetState() {
     s_lastDrainLagLogAt = 0;
     s_lastSessionUpdateTick = 0;
     Nat_ClearRemoteHint();
+}
+
+static bool ReadEntireFile(const char* path, std::vector<uint8_t>* outBytes) {
+    if (!path || !path[0] || !outBytes) {
+        return false;
+    }
+
+    HANDLE file = CreateFileA(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart < 0) {
+        CloseHandle(file);
+        return false;
+    }
+
+    if (static_cast<unsigned long long>(fileSize.QuadPart) >
+        static_cast<unsigned long long>(SIZE_MAX)) {
+        CloseHandle(file);
+        return false;
+    }
+
+    const size_t size = static_cast<size_t>(fileSize.QuadPart);
+    outBytes->assign(size, 0);
+
+    size_t totalRead = 0;
+    while (totalRead < size) {
+        const DWORD toRead = static_cast<DWORD>(
+            (size - totalRead) > static_cast<size_t>(0x400000)
+                ? 0x400000
+                : (size - totalRead));
+        DWORD chunkRead = 0;
+        if (!ReadFile(file, outBytes->data() + totalRead, toRead, &chunkRead, nullptr) ||
+            chunkRead == 0) {
+            CloseHandle(file);
+            return false;
+        }
+        totalRead += static_cast<size_t>(chunkRead);
+    }
+
+    CloseHandle(file);
+    return true;
+}
+
+static bool GetSessionModuleDirectory(char* outDir, size_t outCap) {
+    if (!outDir || outCap == 0) {
+        return false;
+    }
+
+    HMODULE selfModule = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&GetSessionModuleDirectory),
+            &selfModule)) {
+        return false;
+    }
+
+    char modulePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(selfModule, modulePath, MAX_PATH) == 0) {
+        return false;
+    }
+
+    char* lastSlash = strrchr(modulePath, '\\');
+    if (!lastSlash) {
+        lastSlash = strrchr(modulePath, '/');
+    }
+    if (!lastSlash) {
+        return false;
+    }
+
+    *lastSlash = '\0';
+    strncpy_s(outDir, outCap, modulePath, _TRUNCATE);
+    return true;
+}
+
+static bool BuildFingerprintFromFile(const char* dir,
+                                     const char* fileName,
+                                     const char* label,
+                                     BuildFingerprintComponent* outComponent) {
+    if (!dir || !fileName || !label || !outComponent) {
+        return false;
+    }
+
+    char path[MAX_PATH] = {};
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", dir, fileName);
+
+    std::vector<uint8_t> bytes;
+    if (!ReadEntireFile(path, &bytes)) {
+        Rollback::NetplayLog_Write(
+            "SESSION", -1,
+            "ERROR: Exact build lock failed to read %s at %s",
+            label,
+            path);
+        return false;
+    }
+
+    if (bytes.size() > static_cast<size_t>(UINT32_MAX)) {
+        Rollback::NetplayLog_Write(
+            "SESSION", -1,
+            "ERROR: Exact build lock file too large for %s at %s (%zu bytes)",
+            label,
+            path,
+            bytes.size());
+        return false;
+    }
+
+    memset(outComponent, 0, sizeof(*outComponent));
+    strncpy_s(outComponent->name, sizeof(outComponent->name), label, _TRUNCATE);
+    outComponent->crc32 = bytes.empty() ? 0u : CalcCRC32(bytes.data(), bytes.size());
+    outComponent->size_bytes = static_cast<uint32_t>(bytes.size());
+    outComponent->present = 1;
+    return true;
+}
+
+static bool ComputeLocalBuildHash(uint32_t* outHash) {
+    if (!outHash) {
+        return false;
+    }
+
+    if (s_localBuildHashCached) {
+        *outHash = s_localBuildHash;
+        return true;
+    }
+
+    char moduleDir[MAX_PATH] = {};
+    if (!GetSessionModuleDirectory(moduleDir, sizeof(moduleDir))) {
+        Rollback::NetplayLog_Write(
+            "SESSION", -1,
+            "ERROR: Exact build lock failed to resolve session module directory");
+        return false;
+    }
+
+    BuildFingerprintComponent components[3] = {};
+    if (!BuildFingerprintFromFile(moduleDir, "as2_rollback.dll", "as2_rollback", &components[0]) ||
+        !BuildFingerprintFromFile(moduleDir, "d3d9.dll", "d3d9", &components[1]) ||
+        !BuildFingerprintFromFile(moduleDir, "wsock32.dll", "wsock32", &components[2])) {
+        return false;
+    }
+
+    s_localBuildHash = CalcCRC32(components, sizeof(components));
+    s_localBuildHashCached = true;
+
+    Rollback::NetplayLog_Write(
+        "SESSION", -1,
+        "Local exact build hash=0x%08X components=[%s crc=0x%08X size=%u, %s crc=0x%08X size=%u, %s crc=0x%08X size=%u]",
+        s_localBuildHash,
+        components[0].name,
+        components[0].crc32,
+        components[0].size_bytes,
+        components[1].name,
+        components[1].crc32,
+        components[1].size_bytes,
+        components[2].name,
+        components[2].crc32,
+        components[2].size_bytes);
+
+    *outHash = s_localBuildHash;
+    return true;
+}
+
+static void CopyHandshakeNickname(const char* source,
+                                  size_t sourceLen,
+                                  char* destination,
+                                  size_t destinationCap) {
+    if (!destination || destinationCap == 0) {
+        return;
+    }
+
+    memset(destination, 0, destinationCap);
+    if (!source || sourceLen == 0) {
+        return;
+    }
+
+    size_t copyLen = sourceLen;
+    if (copyLen >= destinationCap) {
+        copyLen = destinationCap - 1;
+    }
+    memcpy(destination, source, copyLen);
+}
+
+static bool ProcessHandshakeIdentity(const char* packetName,
+                                     uint16_t protocolVersion,
+                                     uint32_t buildHash,
+                                     const char* nickname,
+                                     size_t nicknameLen,
+                                     uint16_t listenPort) {
+    char remoteNickname[sizeof(s_remotePeer.nickname) + 1] = {};
+    CopyHandshakeNickname(nickname, nicknameLen, remoteNickname, sizeof(remoteNickname));
+
+    LOG_INFO("[Session] Received %s (nick=%s, ver=%u, hash=0x%08X, port=%u)",
+             packetName, remoteNickname, protocolVersion, buildHash, listenPort);
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Received %s: nick=%s ver=%u hash=0x%08X listen_port=%u local_ver=%u local_hash=0x%08X state=%s role=%s",
+        packetName,
+        remoteNickname,
+        protocolVersion,
+        buildHash,
+        listenPort,
+        PROTOCOL_VERSION,
+        s_config.build_hash,
+        SessionStateName(s_state),
+        SessionRoleName(s_role));
+
+    if (protocolVersion != PROTOCOL_VERSION) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Rejecting %s from nick=%s: protocol mismatch local=%u remote=%u local_hash=0x%08X remote_hash=0x%08X",
+            packetName,
+            remoteNickname,
+            PROTOCOL_VERSION,
+            protocolVersion,
+            s_config.build_hash,
+            buildHash);
+        RequestCompatibilityDisconnect(
+            packetName,
+            remoteNickname,
+            protocolVersion,
+            buildHash,
+            "protocol mismatch");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Protocol version mismatch: local=%u remote=%u",
+                 PROTOCOL_VERSION, protocolVersion);
+        SetError(msg);
+        return false;
+    }
+
+    if (buildHash != s_config.build_hash) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Rejecting %s from nick=%s: build mismatch local=0x%08X remote=0x%08X local_ver=%u remote_ver=%u",
+            packetName,
+            remoteNickname,
+            s_config.build_hash,
+            buildHash,
+            PROTOCOL_VERSION,
+            protocolVersion);
+        RequestCompatibilityDisconnect(
+            packetName,
+            remoteNickname,
+            protocolVersion,
+            buildHash,
+            "build mismatch");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Build hash mismatch: local=0x%08X remote=0x%08X",
+                 s_config.build_hash, buildHash);
+        SetError(msg);
+        return false;
+    }
+
+    s_remotePeer.valid = true;
+    s_remotePeer.protocol_version = protocolVersion;
+    s_remotePeer.build_hash = buildHash;
+    s_remotePeer.listen_port = listenPort;
+    memset(s_remotePeer.nickname, 0, sizeof(s_remotePeer.nickname));
+    strncpy_s(s_remotePeer.nickname, sizeof(s_remotePeer.nickname), remoteNickname, _TRUNCATE);
+
+    LOG_INFO("[Session] %s accepted (nick=%s, ver=%u, hash=0x%08X)",
+             packetName,
+             s_remotePeer.nickname,
+             s_remotePeer.protocol_version,
+             s_remotePeer.build_hash);
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Accepted %s: nick=%s ver=%u hash=0x%08X listen_port=%u",
+        packetName,
+        s_remotePeer.nickname,
+        s_remotePeer.protocol_version,
+        s_remotePeer.build_hash,
+        s_remotePeer.listen_port);
+    return true;
 }
 
 static bool DeferControlPacket(uint8_t channelID, PacketType type,
@@ -495,45 +811,19 @@ static bool ProcessHelloPayload(const void* payload, size_t len) {
         Rollback::NetplayLog_Write("SESSION", -1,
             "Hello payload too small: got=%zu expected=%zu state=%s role=%s",
             len, sizeof(HelloPayload), SessionStateName(s_state), SessionRoleName(s_role));
+        RequestCompatibilityDisconnect("Hello", "(unknown)", 0, 0, "hello payload too small");
         SetError("Hello payload too small");
         return false;
     }
 
     const HelloPayload* hello = static_cast<const HelloPayload*>(payload);
-
-    if (hello->protocol_version != PROTOCOL_VERSION) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Protocol version mismatch: local=%u remote=%u",
-                 PROTOCOL_VERSION, hello->protocol_version);
-        SetError(msg);
-        return false;
-    }
-
-    if (hello->build_hash != 0 && s_config.build_hash != 0 &&
-        hello->build_hash != s_config.build_hash) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Build hash mismatch: local=0x%08X remote=0x%08X",
-                 s_config.build_hash, hello->build_hash);
-        SetError(msg);
-        return false;
-    }
-
-    s_remotePeer.valid = true;
-    s_remotePeer.protocol_version = hello->protocol_version;
-    s_remotePeer.build_hash = hello->build_hash;
-    s_remotePeer.listen_port = hello->listen_port;
-    memset(s_remotePeer.nickname, 0, sizeof(s_remotePeer.nickname));
-    memcpy(s_remotePeer.nickname, hello->nickname, sizeof(hello->nickname));
-
-    LOG_INFO("[Session] Remote peer: nick=%s, ver=%u, hash=0x%08X",
-             s_remotePeer.nickname, s_remotePeer.protocol_version, s_remotePeer.build_hash);
-    Rollback::NetplayLog_Write("SESSION", -1,
-        "Remote Hello accepted: nick=%s ver=%u hash=0x%08X listen_port=%u",
-        s_remotePeer.nickname,
-        s_remotePeer.protocol_version,
-        s_remotePeer.build_hash,
-        s_remotePeer.listen_port);
-    return true;
+    return ProcessHandshakeIdentity(
+        "Hello",
+        hello->protocol_version,
+        hello->build_hash,
+        hello->nickname,
+        sizeof(hello->nickname),
+        hello->listen_port);
 }
 
 static bool ProcessHelloAckPayload(const void* payload, size_t len) {
@@ -541,19 +831,19 @@ static bool ProcessHelloAckPayload(const void* payload, size_t len) {
         Rollback::NetplayLog_Write("SESSION", -1,
             "HelloAck payload too small: got=%zu expected=%zu state=%s role=%s",
             len, sizeof(HelloAckPayload), SessionStateName(s_state), SessionRoleName(s_role));
+        RequestCompatibilityDisconnect("HelloAck", "(unknown)", 0, 0, "hello-ack payload too small");
         SetError("HelloAck payload too small");
         return false;
     }
 
     const HelloAckPayload* ack = static_cast<const HelloAckPayload*>(payload);
-
-    HelloPayload asHello;
-    asHello.protocol_version = ack->protocol_version;
-    asHello.build_hash = ack->build_hash;
-    asHello.listen_port = ack->listen_port;
-    memcpy(asHello.nickname, ack->nickname, sizeof(asHello.nickname));
-
-    return ProcessHelloPayload(&asHello, sizeof(asHello));
+    return ProcessHandshakeIdentity(
+        "HelloAck",
+        ack->protocol_version,
+        ack->build_hash,
+        ack->nickname,
+        sizeof(ack->nickname),
+        ack->listen_port);
 }
 
 // ============================================================================
@@ -591,6 +881,21 @@ static void OnTransportDisconnect(uintptr_t peerToken, uint32_t data, DWORD tran
         s_activeSessionToken,
         (unsigned long)consumeLagMs);
     s_peerToken = 0;
+
+    if (IsCompatibilityDisconnectData(data) &&
+        s_state != SessionState::Idle &&
+        s_state != SessionState::Failed &&
+        s_state != SessionState::Disconnecting) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Compatibility disconnect received: peer=0x%llX data=%u state=%s role=%s token=%u",
+            (unsigned long long)peerToken,
+            data,
+            SessionStateName(s_state),
+            SessionRoleName(s_role),
+            s_activeSessionToken);
+        SetError("Remote peer rejected session due to version/build mismatch");
+        return;
+    }
 
     if ((s_state == SessionState::Connecting || s_state == SessionState::Handshaking) &&
         TryRelayFallback("transport-disconnect")) {
@@ -961,24 +1266,28 @@ bool Session_StartHost(const SessionConfig* config) {
     }
 
     memcpy(&s_config, config, sizeof(s_config));
+    if (!ComputeLocalBuildHash(&s_config.build_hash)) {
+        SetError("Failed to compute exact local build fingerprint");
+        return false;
+    }
     s_role = SessionRole::Host;
 
     Rollback::NetplayLog_Write("SESSION", -1,
         "StartHost: listen_port=%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u "
         "upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d ipv6=%d pref_direct=%d "
         "backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d",
-        config->listen_port,
-        config->nickname,
-        config->build_hash,
-        config->connect_timeout_ms,
-        config->handshake_timeout_ms,
-        config->nat.enable_upnp ? 1 : 0,
-        config->nat.enable_pcp_fallback ? 1 : 0,
-        config->nat.enable_stun ? 1 : 0,
-        config->nat.enable_hole_punch ? 1 : 0,
-        config->nat.enable_turn ? 1 : 0,
-        config->nat.allow_ipv6_endpoint ? 1 : 0,
-        config->nat.prefer_portforwarded_direct ? 1 : 0,
+        s_config.listen_port,
+        s_config.nickname,
+        s_config.build_hash,
+        s_config.connect_timeout_ms,
+        s_config.handshake_timeout_ms,
+        s_config.nat.enable_upnp ? 1 : 0,
+        s_config.nat.enable_pcp_fallback ? 1 : 0,
+        s_config.nat.enable_stun ? 1 : 0,
+        s_config.nat.enable_hole_punch ? 1 : 0,
+        s_config.nat.enable_turn ? 1 : 0,
+        s_config.nat.allow_ipv6_endpoint ? 1 : 0,
+        s_config.nat.prefer_portforwarded_direct ? 1 : 0,
         Nat_IsUpnpBackendAvailable() ? 1 : 0,
         Nat_IsPcpBackendAvailable() ? 1 : 0,
         Nat_IsStunBackendAvailable() ? 1 : 0,
@@ -1039,30 +1348,34 @@ bool Session_StartJoin(const SessionConfig* config) {
     }
 
     memcpy(&s_config, config, sizeof(s_config));
+    if (!ComputeLocalBuildHash(&s_config.build_hash)) {
+        SetError("Failed to compute exact local build fingerprint");
+        return false;
+    }
     s_role = SessionRole::Join;
 
-    const bool relayConfigured = HasRelayConfigured(config);
+    const bool relayConfigured = HasRelayConfigured(&s_config);
 
     Rollback::NetplayLog_Write("SESSION", -1,
         "StartJoin: target=%s:%u relay=%s:%u mode=%s nick=%s hash=0x%08X "
         "connect_timeout=%u handshake_timeout=%u upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d "
         "ipv6=%d pref_direct=%d backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d",
-        config->target_host,
-        config->target_port,
-        config->nat.relay_host,
-        config->nat.relay_port,
-        ConnectPreferenceName(config->connect_preference),
-        config->nickname,
-        config->build_hash,
-        config->connect_timeout_ms,
-        config->handshake_timeout_ms,
-        config->nat.enable_upnp ? 1 : 0,
-        config->nat.enable_pcp_fallback ? 1 : 0,
-        config->nat.enable_stun ? 1 : 0,
-        config->nat.enable_hole_punch ? 1 : 0,
-        config->nat.enable_turn ? 1 : 0,
-        config->nat.allow_ipv6_endpoint ? 1 : 0,
-        config->nat.prefer_portforwarded_direct ? 1 : 0,
+        s_config.target_host,
+        s_config.target_port,
+        s_config.nat.relay_host,
+        s_config.nat.relay_port,
+        ConnectPreferenceName(s_config.connect_preference),
+        s_config.nickname,
+        s_config.build_hash,
+        s_config.connect_timeout_ms,
+        s_config.handshake_timeout_ms,
+        s_config.nat.enable_upnp ? 1 : 0,
+        s_config.nat.enable_pcp_fallback ? 1 : 0,
+        s_config.nat.enable_stun ? 1 : 0,
+        s_config.nat.enable_hole_punch ? 1 : 0,
+        s_config.nat.enable_turn ? 1 : 0,
+        s_config.nat.allow_ipv6_endpoint ? 1 : 0,
+        s_config.nat.prefer_portforwarded_direct ? 1 : 0,
         Nat_IsUpnpBackendAvailable() ? 1 : 0,
         Nat_IsPcpBackendAvailable() ? 1 : 0,
         Nat_IsStunBackendAvailable() ? 1 : 0,

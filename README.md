@@ -183,7 +183,7 @@ Idle -> Connecting -> Handshaking -> Connected -> Ready -> Disconnecting -> Idle
 
 **Roles:** Host or Join (client).
 
-**Handshake:** Uses `Hello`/`HelloAck` packets carrying protocol version, build hash, and nickname (24 bytes max). Version and build hash mismatches trigger immediate disconnect.
+**Handshake:** Uses `Hello`/`HelloAck` packets carrying protocol version, an exact local mod build fingerprint, and nickname (24 bytes max). Protocol or build mismatches trigger immediate disconnect before gameplay setup.
 
 **Deferred packets:** Up to 64 control packets are buffered before the packet callback is registered, then flushed on registration.
 
@@ -217,7 +217,7 @@ Defined in `protocol.h` (457 lines). Protocol version 6 with 40+ packet types.
 - **Debug:** Ping, Pong, StateDigest, FrameSyncStatus
 
 **Key payloads:**
-- `HelloPayload`: Protocol version, build hash (uint32), nickname[24], listen port
+- `HelloPayload`: Protocol version, exact local mod build fingerprint (uint32), nickname[24], listen port
 - `ConfigExchangePayload`: Character IDs, palettes, stage, round count, time limit, RNG seed, session seed, delay/rollback configuration
 - `BaselineDigestPayload`: CRC32 of baseline savestate for agreement verification
 - `BaselineBreakdownPayload`: Per-region CRCs (main, header, context, effects, summons, entities, input buffers) for mismatch diagnosis

@@ -107,14 +107,14 @@ enum class PacketType : uint16_t {
 
 struct HelloPayload {
     uint16_t protocol_version;   // Must match PROTOCOL_VERSION
-    uint32_t build_hash;         // Compile-time build identifier
+    uint32_t build_hash;         // Exact local mod build fingerprint
     char     nickname[24];       // Null-terminated UTF-8 nickname
     uint16_t listen_port;        // Port this peer is listening on
 };
 
 struct HelloAckPayload {
     uint16_t protocol_version;
-    uint32_t build_hash;
+    uint32_t build_hash;         // Exact local mod build fingerprint
     char     nickname[24];
     uint16_t listen_port;
 };

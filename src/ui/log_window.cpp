@@ -10,6 +10,8 @@
 
 #include "log_window.h"
 #include "imgui.h"
+#include <algorithm>
+#include <deque>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -43,7 +45,7 @@ struct RateLimitEntry {
 // Internal State
 // ============================================================================
 
-static std::vector<LogEntry> g_logEntries;
+static std::deque<LogEntry> g_logEntries;
 static std::mutex g_logMutex;
 static int g_maxEntries = 1000;
 static bool g_autoScroll = true;
@@ -141,7 +143,6 @@ const char* LogWindow_GetLogDir(void) {
 
 void LogWindow_Init(void) {
     g_logEntries.clear();
-    g_logEntries.reserve(g_maxEntries);
     
     // Use PID-stamped log filenames so two game instances don't clobber each other.
     DWORD pid = GetCurrentProcessId();
@@ -227,6 +228,28 @@ static void GetTimestamp(char* timeBuf, size_t timeBufLen) {
     strftime(timeBuf, timeBufLen, "%H:%M:%S", tm_info);
 }
 
+static void TrimLogEntriesLocked() {
+    while ((int)g_logEntries.size() > g_maxEntries) {
+        g_logEntries.pop_front();
+    }
+}
+
+static void BuildRenderSnapshot(std::vector<LogEntry>& entriesToRender) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    const size_t renderLimit = 100;
+    const size_t snapshotCount = (std::min)(g_logEntries.size(), renderLimit);
+    const size_t start = g_logEntries.size() - snapshotCount;
+    entriesToRender.reserve(snapshotCount);
+
+    for (size_t i = start; i < g_logEntries.size(); i++) {
+        const LogEntry& entry = g_logEntries[i];
+        if (entry.level >= g_minLevel) {
+            entriesToRender.push_back(entry);
+        }
+    }
+}
+
 void LogWindow_LogV(LogLevel level, const char* fmt, va_list args) {
     if (level < g_minLevel) return;
     
@@ -280,7 +303,7 @@ void LogWindow_LogV(LogLevel level, const char* fmt, va_list args) {
         
         // Remove oldest entries if at capacity
         while ((int)g_logEntries.size() >= g_maxEntries) {
-            g_logEntries.erase(g_logEntries.begin());
+            g_logEntries.pop_front();
         }
         
         g_logEntries.push_back(entry);
@@ -570,16 +593,7 @@ void LogWindow_Render(bool* pOpen) {
     
     // Copy entries while holding lock, then render without lock
     std::vector<LogEntry> entriesToRender;
-    {
-        std::lock_guard<std::mutex> lock(g_logMutex);
-        // Only copy last 100 entries for performance
-        size_t start = g_logEntries.size() > 100 ? g_logEntries.size() - 100 : 0;
-        for (size_t i = start; i < g_logEntries.size(); i++) {
-            if (g_logEntries[i].level >= g_minLevel) {
-                entriesToRender.push_back(g_logEntries[i]);
-            }
-        }
-    }
+    BuildRenderSnapshot(entriesToRender);
     
     // Render without holding lock
     for (const auto& entry : entriesToRender) {
@@ -633,15 +647,7 @@ void LogWindow_RenderContent(void) {
     ImGui::BeginChild("LogContent", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
     
     std::vector<LogEntry> entriesToRender;
-    {
-        std::lock_guard<std::mutex> lock(g_logMutex);
-        size_t start = g_logEntries.size() > 100 ? g_logEntries.size() - 100 : 0;
-        for (size_t i = start; i < g_logEntries.size(); i++) {
-            if (g_logEntries[i].level >= g_minLevel) {
-                entriesToRender.push_back(g_logEntries[i]);
-            }
-        }
-    }
+    BuildRenderSnapshot(entriesToRender);
     
     for (const auto& entry : entriesToRender) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "[%s]", entry.timestamp.c_str());
@@ -674,7 +680,9 @@ int LogWindow_GetCount(void) {
 }
 
 void LogWindow_SetMaxEntries(int max) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
     g_maxEntries = max > 0 ? max : 100;
+    TrimLogEntriesLocked();
 }
 
 void LogWindow_SetAutoScroll(bool enabled) {

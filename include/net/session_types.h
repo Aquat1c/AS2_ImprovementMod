@@ -172,7 +172,7 @@ struct SessionConfig {
     uint16_t listen_port;
     char     target_host[96];     // Join target host/IP
     uint16_t target_port;
-    uint32_t build_hash;
+    uint32_t build_hash;          // Exact local mod build fingerprint
     uint32_t connect_timeout_ms;  // How long to wait for connection (default 5000)
     uint32_t handshake_timeout_ms; // How long to wait for handshake (default 3000)
     ConnectPreference connect_preference;

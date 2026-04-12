@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #pragma comment(lib, "winhttp.lib")
@@ -26,25 +27,65 @@ namespace MenuUtils {
 static char           s_publicIP[48]         = "";
 static char           s_yourAddress[96]      = "";
 static volatile LONG  s_publicIPState        = 0;  // 0=idle, 1=fetching, 2=done, 3=failed
+static volatile LONG  s_publicIPGeneration   = 0;
 static HANDLE         s_ipThread             = NULL;
 static char           s_clipboardFlash[48]   = "";
 static DWORD          s_clipboardFlashTime   = 0;
+
+struct PublicIPThreadContext {
+    LONG generation;
+};
+
+static LONG GetCurrentPublicIPGeneration() {
+    return InterlockedCompareExchange(&s_publicIPGeneration, 0, 0);
+}
+
+static bool IsPublicIPGenerationCurrent(LONG generation) {
+    return GetCurrentPublicIPGeneration() == generation;
+}
+
+static void CompletePublicIPFetch(LONG generation, LONG state, const char* ipText) {
+    if (!IsPublicIPGenerationCurrent(generation)) {
+        return;
+    }
+
+    if (state == 2 && ipText && ipText[0]) {
+        strncpy_s(s_publicIP, sizeof(s_publicIP), ipText, _TRUNCATE);
+    }
+
+    InterlockedExchange(&s_publicIPState, state);
+}
+
+static void ReapPublicIPThreadIfFinished() {
+    if (!s_ipThread) {
+        return;
+    }
+
+    if (WaitForSingleObject(s_ipThread, 0) == WAIT_OBJECT_0) {
+        CloseHandle(s_ipThread);
+        s_ipThread = NULL;
+    }
+}
 
 // ============================================================================
 // Public IP Lookup
 // ============================================================================
 
-static DWORD WINAPI FetchPublicIPThread(LPVOID) {
+static DWORD WINAPI FetchPublicIPThread(LPVOID param) {
+    PublicIPThreadContext* context = static_cast<PublicIPThreadContext*>(param);
+    const LONG generation = context ? context->generation : 0;
+    free(context);
+
     HINTERNET hSession = WinHttpOpen(L"AS2Rollback/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { InterlockedExchange(&s_publicIPState, 3); return 1; }
+    if (!hSession) { CompletePublicIPFetch(generation, 3, nullptr); return 1; }
 
     HINTERNET hConnect = WinHttpConnect(hSession, L"api.ipify.org",
         INTERNET_DEFAULT_HTTP_PORT, 0);
     if (!hConnect) {
         WinHttpCloseHandle(hSession);
-        InterlockedExchange(&s_publicIPState, 3);
+        CompletePublicIPFetch(generation, 3, nullptr);
         return 1;
     }
 
@@ -53,7 +94,7 @@ static DWORD WINAPI FetchPublicIPThread(LPVOID) {
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        InterlockedExchange(&s_publicIPState, 3);
+        CompletePublicIPFetch(generation, 3, nullptr);
         return 1;
     }
 
@@ -65,7 +106,7 @@ static DWORD WINAPI FetchPublicIPThread(LPVOID) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        InterlockedExchange(&s_publicIPState, 3);
+        CompletePublicIPFetch(generation, 3, nullptr);
         return 1;
     }
 
@@ -92,10 +133,9 @@ static DWORD WINAPI FetchPublicIPThread(LPVOID) {
         while (bytesRead > 0 && (buf[bytesRead - 1] == '\n' ||
                buf[bytesRead - 1] == '\r' || buf[bytesRead - 1] == ' '))
             buf[--bytesRead] = '\0';
-        strncpy_s(s_publicIP, sizeof(s_publicIP), buf, _TRUNCATE);
-        InterlockedExchange(&s_publicIPState, 2);
+        CompletePublicIPFetch(generation, 2, buf);
     } else {
-        InterlockedExchange(&s_publicIPState, 3);
+        CompletePublicIPFetch(generation, 3, nullptr);
     }
 
     WinHttpCloseHandle(hRequest);
@@ -105,13 +145,25 @@ static DWORD WINAPI FetchPublicIPThread(LPVOID) {
 }
 
 void BeginPublicIPFetch() {
+    ReapPublicIPThreadIfFinished();
+
     LONG state = InterlockedCompareExchange(&s_publicIPState, 1, 0);
     if (state == 2) return;  // already have it
-    if (state == 1) return;  // already fetching
-    // state was 0 or 3 (idle or failed) — start fetch
-    if (state == 3) InterlockedExchange(&s_publicIPState, 1);
-    s_ipThread = CreateThread(NULL, 0, FetchPublicIPThread, NULL, 0, NULL);
-    if (!s_ipThread) InterlockedExchange(&s_publicIPState, 3);
+    if (state == 1 && s_ipThread) return;  // already fetching
+
+    PublicIPThreadContext* context = static_cast<PublicIPThreadContext*>(malloc(sizeof(PublicIPThreadContext)));
+    if (!context) {
+        InterlockedExchange(&s_publicIPState, 3);
+        return;
+    }
+
+    context->generation = InterlockedIncrement(&s_publicIPGeneration);
+    InterlockedExchange(&s_publicIPState, 1);
+    s_ipThread = CreateThread(NULL, 0, FetchPublicIPThread, context, 0, NULL);
+    if (!s_ipThread) {
+        free(context);
+        InterlockedExchange(&s_publicIPState, 3);
+    }
 }
 
 IPFetchState GetPublicIPState() {
@@ -237,9 +289,10 @@ void CopyDisplayText(char* dst, size_t cap, const char* src, size_t maxChars) {
 // ============================================================================
 
 void Cleanup() {
+    InterlockedIncrement(&s_publicIPGeneration);
+    ReapPublicIPThreadIfFinished();
+
     if (s_ipThread) {
-        // Give the thread a moment to finish, then abandon.
-        WaitForSingleObject(s_ipThread, 1000);
         CloseHandle(s_ipThread);
         s_ipThread = NULL;
     }
