@@ -117,6 +117,9 @@ static ModGetMatchHudData_t g_pModGetMatchHudData = nullptr;
 static ModWantsExclusiveOverlay_t g_pModWantsExclusiveOverlay = nullptr;
 static bool g_imguiContextShared = false;
 static bool g_gameExiting = false;  // Track if game is exiting
+static bool g_quitMessagePosted = false;
+static bool g_fastExitRequested = false;
+static bool g_proxyShutdownComplete = false;
 
 // ============================================================================
 // Always-on HUD (no ImGui dependency)
@@ -473,6 +476,8 @@ static constexpr uintptr_t kAddrShellHotkeyAuxHook = 0x009E5B78;
 static constexpr uintptr_t kAddrShellHotkeyMsgHook = 0x009E5B7C;
 static constexpr uintptr_t kAddrShellHotkeyHookModule = 0x009E5C8C;
 
+void ShutdownConsole(bool logMessage = true);
+
 static void QueueDeferredFocusReclaim(HWND hWnd, const char* reason) {
     if (!hWnd) {
         return;
@@ -532,6 +537,67 @@ static void TryProcessDeferredFocusReclaim() {
              GetForegroundWindow(),
              GetActiveWindow(),
              GetFocus());
+}
+
+static void NotifyGameExitOnce(int exitCode, const char* reason) {
+    if (g_gameExiting) {
+        return;
+    }
+
+    g_gameExiting = true;
+
+    if (exitCode == 0) {
+        g_fastExitRequested = true;
+        ProxyLog("[SHUTDOWN] Fast exit requested reason=%s", reason ? reason : "unknown");
+        ShutdownConsole(false);
+    }
+
+    if (g_pModOnGameExit) {
+        g_pModOnGameExit(exitCode, reason);
+    }
+}
+
+static HWND ResolvePrimaryGameWindow(HWND fallbackWindow = nullptr) {
+    const HWND candidates[] = {
+        g_gameParentWindow,
+        g_gameWindow,
+        fallbackWindow
+    };
+
+    for (HWND candidate : candidates) {
+        if (candidate && IsWindow(candidate)) {
+            return candidate;
+        }
+    }
+
+    return nullptr;
+}
+
+static void PostQuitMessageOnce(const char* reason) {
+    if (g_quitMessagePosted) {
+        return;
+    }
+
+    g_quitMessagePosted = true;
+    ProxyLog("[SHUTDOWN] Posting WM_QUIT reason=%s", reason ? reason : "unknown");
+    PostQuitMessage(0);
+}
+
+static void RequestGameShutdown(const char* reason, HWND fallbackWindow = nullptr) {
+    NotifyGameExitOnce(0, reason);
+
+    HWND targetWindow = ResolvePrimaryGameWindow(fallbackWindow);
+    if (targetWindow) {
+        ProxyLog("[SHUTDOWN] Requesting WM_CLOSE on hwnd=0x%p reason=%s",
+                 targetWindow,
+                 reason ? reason : "unknown");
+        PostMessageW(targetWindow, WM_CLOSE, 0, 0);
+        return;
+    }
+
+    ProxyLog("[SHUTDOWN] No live window available for WM_CLOSE reason=%s",
+             reason ? reason : "unknown");
+    PostQuitMessageOnce(reason);
 }
 
 static bool IsShellHotkeyTraceMessage(UINT msg, WPARAM wParam) {
@@ -1339,7 +1405,7 @@ void InitConsole() {
     }
 }
 
-void ShutdownConsole(bool logMessage = true) {
+void ShutdownConsole(bool logMessage) {
     if (!g_consoleAllocated) {
         return;
     }
@@ -2473,6 +2539,19 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         LogShellHotkeyTraceState("HookedWndProc-enter", hWnd, msg, wParam, lParam);
     }
 
+    if (msg == WM_CLOSE) {
+        ProxyLog("[IMGUIWNDPROC] WM_CLOSE received hwnd=0x%p", hWnd);
+        NotifyGameExitOnce(0, "WM_CLOSE - Normal exit");
+    } else if (msg == WM_DESTROY) {
+        ProxyLog("[IMGUIWNDPROC] WM_DESTROY received hwnd=0x%p", hWnd);
+        NotifyGameExitOnce(0, "WM_DESTROY");
+        PostQuitMessageOnce("HookedWndProc WM_DESTROY");
+    } else if (msg == WM_NCDESTROY) {
+        ProxyLog("[IMGUIWNDPROC] WM_NCDESTROY received hwnd=0x%p", hWnd);
+        NotifyGameExitOnce(0, "WM_NCDESTROY");
+        PostQuitMessageOnce("HookedWndProc WM_NCDESTROY");
+    }
+
     if (msg == kMsgRelayStandaloneWinKey) {
         RelayStandaloneWinKeyToShell((UINT)wParam);
         return 0;
@@ -2803,17 +2882,25 @@ void ShutdownImGui() {
     
     ProxyLog("[IMGUI] Shutting down ImGui...");
     g_imguiDrawDataReady = false;
-    
-    if (g_imguiOriginalWndProc && g_gameWindow) {
-        SetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)g_imguiOriginalWndProc);
+
+    HWND restoreWindow = ResolvePrimaryGameWindow();
+    if (g_imguiOriginalWndProc && restoreWindow && IsWindow(restoreWindow)) {
+        ProxyLog("[IMGUI] Restoring WndProc on hwnd=0x%p", restoreWindow);
+        SetWindowLongPtrW(restoreWindow, GWLP_WNDPROC, (LONG_PTR)g_imguiOriginalWndProc);
+    } else if (g_imguiOriginalWndProc) {
+        ProxyLog("[IMGUI] Skipping WndProc restore because the target window is already gone");
     }
     g_imguiOriginalWndProc = nullptr;
-    
+
+    ProxyLog("[IMGUI] ImGui_ImplDX9_Shutdown...");
     ImGui_ImplDX9_Shutdown();
+    ProxyLog("[IMGUI] ImGui_ImplWin32_Shutdown...");
     ImGui_ImplWin32_Shutdown();
+    ProxyLog("[IMGUI] DestroyContext...");
     ImGui::DestroyContext();
     
     g_imguiInitialized = false;
+    ProxyLog("[IMGUI] Shutdown complete");
 }
 
 // ============================================================================
@@ -2995,7 +3082,7 @@ void RenderImGui() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit Game")) {
-                PostQuitMessage(0);
+                RequestGameShutdown("overlay Exit Game", g_gameWindow);
             }
             ImGui::EndMenu();
         }
@@ -3963,23 +4050,17 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
     
     if (uMsg == WM_CLOSE) {
         ProxyLog("[WNDPROC] WM_CLOSE received - game exiting normally");
-        if (g_pModOnGameExit && !g_gameExiting) {
-            g_gameExiting = true;
-            g_pModOnGameExit(0, "WM_CLOSE - Normal exit");
-        }
+        NotifyGameExitOnce(0, "WM_CLOSE - Normal exit");
     }
     if (uMsg == WM_DESTROY) {
         ProxyLog("[WNDPROC] WM_DESTROY received");
+        NotifyGameExitOnce(0, "WM_DESTROY");
+        PostQuitMessageOnce("ProxyWndProc WM_DESTROY");
     }
     if (uMsg == WM_NCDESTROY) {
         ProxyLog("[WNDPROC] WM_NCDESTROY received");
-    }
-    if (uMsg == WM_QUIT) {
-        ProxyLog("[WNDPROC] WM_QUIT received");
-        if (g_pModOnGameExit && !g_gameExiting) {
-            g_gameExiting = true;
-            g_pModOnGameExit(0, "WM_QUIT");
-        }
+        NotifyGameExitOnce(0, "WM_NCDESTROY");
+        PostQuitMessageOnce("ProxyWndProc WM_NCDESTROY");
     }
 
     // CallWindowProc can handle both function pointers and class atoms
@@ -4975,6 +5056,46 @@ static void UnloadConfiguredUserModDLLs() {
     g_loadedUserModDLLs.clear();
 }
 
+static void PerformProxyShutdown(bool fastProcessExit) {
+    if (g_proxyShutdownComplete) {
+        return;
+    }
+
+    g_proxyShutdownComplete = true;
+
+    ProxyLog("[SHUTDOWN] PerformProxyShutdown fast=%d", fastProcessExit ? 1 : 0);
+
+    if (!fastProcessExit) {
+        ShutdownImGui();
+        UninstallDeviceHooks();
+        UnloadConfiguredUserModDLLs();
+
+        if (g_pModShutdown) {
+            g_pModShutdown();
+        }
+
+        if (g_hModDLL) {
+            FreeLibrary(g_hModDLL);
+            g_hModDLL = nullptr;
+        }
+
+        if (g_hRealD3D9) {
+            FreeLibrary(g_hRealD3D9);
+            g_hRealD3D9 = nullptr;
+        }
+    } else {
+        ProxyLog("[SHUTDOWN] Skipping explicit teardown under fast process exit");
+    }
+
+    if (g_logFile) {
+        fflush(g_logFile);
+        fclose(g_logFile);
+        g_logFile = nullptr;
+    }
+
+    ShutdownConsole(false);
+}
+
 bool LoadCoreModDLL() {
     if (g_hModDLL) return true;
     
@@ -5100,33 +5221,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             break;
         }
             
-        case DLL_PROCESS_DETACH:
-            ProxyLog("[SHUTDOWN] DLL_PROCESS_DETACH");
-            
-            ShutdownImGui();
-            UninstallDeviceHooks();
-
-            UnloadConfiguredUserModDLLs();
-            
-            if (g_pModShutdown) {
-                g_pModShutdown();
-            }
-            
-            if (g_hModDLL) {
-                FreeLibrary(g_hModDLL);
-            }
-            
-            if (g_hRealD3D9) {
-                FreeLibrary(g_hRealD3D9);
-            }
-            
-            if (g_logFile) {
-                fclose(g_logFile);
-                g_logFile = nullptr;
-            }
-            
-            ShutdownConsole(false);
+        case DLL_PROCESS_DETACH: {
+            const bool processTerminating = (lpReserved != nullptr);
+            ProxyLog("[SHUTDOWN] DLL_PROCESS_DETACH process_terminating=%d fast_exit=%d",
+                     processTerminating ? 1 : 0,
+                     g_fastExitRequested ? 1 : 0);
+            PerformProxyShutdown(processTerminating || g_fastExitRequested);
             break;
+        }
     }
     return TRUE;
 }

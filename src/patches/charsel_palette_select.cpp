@@ -3,6 +3,7 @@
 #include "core/as2_constants.h"
 #include "core/game_state.h"
 #include "net/barrier_protocol.h"
+#include "net/session_manager.h"
 #include "net/netplay_palette_runtime.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
@@ -82,6 +83,7 @@ static AudioPlayWrapper_t s_audioPlay = reinterpret_cast<AudioPlayWrapper_t>(ADD
 
 static bool s_frontendActive = false;
 static bool s_frontendNetplay = false;
+static bool s_blockOfflineFrontend = false;
 static uint8_t s_localGameSlot = 0;
 static bool s_catalogReceived[2] = {};
 static uint16_t s_catalogMasks[2][256] = {};
@@ -137,6 +139,10 @@ static bool IsPaletteFrontendSubstate(uint32_t substate) {
            substate == CHARSEL_SUB_CONFIRM;
 }
 
+static bool IsModNetplayCharSelContext() {
+    return GetGameMode() == MODE_CHARSEL && Session_IsConnected();
+}
+
 static int GetControlSlot(const uint8_t* control) {
     const uintptr_t controlAddress = reinterpret_cast<uintptr_t>(control);
     if (controlAddress == ADDR_CHARSEL_P1_ENABLE) {
@@ -183,6 +189,11 @@ static void ResetFrontendSlotState(FrontendSlotState* state) {
 }
 
 static void DeactivateFrontend() {
+    if (s_frontendNetplay && GetGameMode() == MODE_CHARSEL) {
+        // Netplay tears down the palette frontend before the game fully leaves
+        // charsel. Hold off on offline re-entry until the mode tree changes.
+        s_blockOfflineFrontend = true;
+    }
     s_frontendActive = false;
     s_frontendNetplay = false;
     memset(s_catalogReceived, 0, sizeof(s_catalogReceived));
@@ -227,6 +238,7 @@ static void BeginFrontend(bool netplay, uint8_t localGameSlot) {
     uint16_t localMasks[256] = {};
     BuildLocalCatalog(localMasks);
 
+    s_blockOfflineFrontend = false;
     s_frontendActive = true;
     s_frontendNetplay = netplay;
     s_localGameSlot = localGameSlot;
@@ -272,17 +284,27 @@ static void EnsureFrontendState() {
     const uint32_t substate = GetSubstate();
 
     if (mode != MODE_CHARSEL) {
+        s_blockOfflineFrontend = false;
         if (s_frontendActive) {
             DeactivateFrontend();
         }
         return;
     }
 
-    if (gameType == GAMETYPE_NETPLAY) {
+    if (s_frontendNetplay) {
+        s_frontendActive = true;
+        return;
+    }
+
+    if (IsModNetplayCharSelContext()) {
         if (!s_frontendNetplay) {
             return;
         }
         s_frontendActive = true;
+        return;
+    }
+
+    if (s_blockOfflineFrontend) {
         return;
     }
 
@@ -824,8 +846,7 @@ void CharSelPaletteSelect_OnRemoteCatalog(const CharSelInputPayload* payload) {
     }
 
     const bool canApplyImmediately = s_frontendNetplay && s_frontendActive;
-    const bool shouldBufferPending = GetGameMode() == MODE_CHARSEL &&
-        GetGameType() == GAMETYPE_NETPLAY &&
+    const bool shouldBufferPending = IsModNetplayCharSelContext() &&
         IsPaletteFrontendSubstate(GetSubstate());
 
     if (!canApplyImmediately && !shouldBufferPending) {

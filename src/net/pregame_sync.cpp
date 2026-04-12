@@ -651,6 +651,14 @@ static void UpdateConfigExchange() {
         if (agreed) {
             memcpy(&s_lockedConfig, agreed, sizeof(LockedMatchConfig));
         }
+
+        // Palette transport starts before bootstrap agreement, but the local
+        // pre-agreement config can differ between peers because host-owned
+        // fields (such as seeds) are only finalized once config exchange
+        // completes. Re-arm the palette runtime on the shared agreed config so
+        // both sides use the same packet key and accept remote custom banks.
+        NetplayPaletteRuntime_OnLockedMatchConfig(&s_lockedConfig);
+
         s_configHash = LockedMatchConfig_Hash(&s_lockedConfig);
         s_configAgreed = true;
         SetStatusFmt("Config agreed (hash=0x%08X). Loading...", s_configHash);

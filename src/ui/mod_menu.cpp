@@ -61,6 +61,10 @@ static bool ProxyMenuVisible() {
     return s_isMenuVisible ? s_isMenuVisible() : true;
 }
 
+static bool IsMenuActuallyOpen() {
+    return g_menuOpen && ProxyMenuVisible();
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -380,11 +384,11 @@ void ModMenu_Toggle() {
 }
 
 bool ModMenu_IsOpen() {
-    return g_menuOpen;
+    return IsMenuActuallyOpen();
 }
 
 void ModMenu_Render() {
-    if (!ProxyMenuVisible() || !g_menuOpen) return;
+    if (!IsMenuActuallyOpen()) return;
 
     const float uiScale = ModUI_GetScale();
     const ImVec2 defaultPos(ModUI_Scale(10.0f), ModUI_Scale(10.0f));

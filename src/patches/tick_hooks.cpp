@@ -9,6 +9,7 @@ GetTick_t g_origGetTick = nullptr;
 static volatile float g_manualTickScale = 1.0f;
 static NetplayTickState g_netplayTickState{};
 static float g_lastLoggedEffectiveScale = 1.0f;
+static constexpr bool kEnableEffectiveTickScaleLogs = false;
 
 static float ClampTickScale(float scale) {
     if (scale < 0.1f) scale = 0.1f;
@@ -71,13 +72,15 @@ DWORD __cdecl Hook_GetTick() {
 
     const float effectiveScale = ComputeEffectiveScale();
     if (fabsf(g_lastLoggedEffectiveScale - effectiveScale) > 0.005f) {
-        LOG_INFO(
-            "[TickHooks] Effective tick scale changed: %.3fx (manual=%.3fx target=%.3fx current=%.3fx active=%d)",
-            effectiveScale,
-            g_manualTickScale,
-            g_netplayTickState.target_scale,
-            g_netplayTickState.current_scale,
-            g_netplayTickState.pacing_active ? 1 : 0);
+        if (kEnableEffectiveTickScaleLogs) {
+            LOG_INFO(
+                "[TickHooks] Effective tick scale changed: %.3fx (manual=%.3fx target=%.3fx current=%.3fx active=%d)",
+                effectiveScale,
+                g_manualTickScale,
+                g_netplayTickState.target_scale,
+                g_netplayTickState.current_scale,
+                g_netplayTickState.pacing_active ? 1 : 0);
+        }
         g_lastLoggedEffectiveScale = effectiveScale;
     }
 

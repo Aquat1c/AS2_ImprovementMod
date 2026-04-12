@@ -3,12 +3,14 @@
 #include "core/game_state.h"
 #include "net/netplay_palette_storage.h"
 #include "net/player_side_mapping.h"
+#include "net/gameplay_bridge.h"
 #include "patches/charsel_palette_select.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "patches/memory_utils.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
+#include "ui/mod_menu.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -76,8 +78,11 @@ struct PlayerRuntime {
 static bool          s_initialized = false;
 static bool          s_enabled = true;
 static bool          s_remotePreviewEnabled = false;
+static bool          s_remoteMatchCustomEnabled = true;
 static bool          s_matchActive = false;
 static bool          s_winscreenSuppressOverrides = false;
+static bool          s_gameplayReapplyIssued = false;
+static bool          s_tabWasDown = false;
 static uint32_t      s_localEpoch = 0;
 static uint32_t      s_stateRevision = 0;
 static uint32_t      s_configHash = 0;
@@ -140,8 +145,11 @@ static void AdvanceStateRevision() {
 }
 
 static void ResetMatchState(const char* reason) {
+    s_remoteMatchCustomEnabled = true;
     s_matchActive = false;
     s_winscreenSuppressOverrides = false;
+    s_gameplayReapplyIssued = false;
+    s_tabWasDown = false;
     s_localEpoch = 0;
     s_stateRevision = 0;
     s_configHash = 0;
@@ -164,11 +172,13 @@ static bool IsValidGameSlot(int gameSlot) {
     return gameSlot >= 0 && gameSlot < 2;
 }
 
+static bool IsModNetplayFrontendContext() {
+    return GetGameMode() == MODE_CHARSEL && Session_IsConnected();
+}
+
 static int GetFrontendPreviewLocalSlot() {
     if (s_matchActive ||
-        GetGameMode() != MODE_CHARSEL ||
-        GetGameType() != GAMETYPE_NETPLAY ||
-        !Session_IsConnected()) {
+        !IsModNetplayFrontendContext()) {
         return -1;
     }
 
@@ -210,7 +220,7 @@ static bool IsIgnoredOfflinePaletteGameType(uint32_t gameType) {
 }
 
 static bool IsSupportedFrontendPaletteContext(uint32_t gameMode, uint32_t gameType) {
-    if (gameMode == MODE_CHARSEL && gameType == GAMETYPE_NETPLAY) {
+    if (gameMode == MODE_CHARSEL && Session_IsConnected()) {
         return true;
     }
 
@@ -222,7 +232,7 @@ static bool ShouldRetainFrontendPaletteContext() {
     const uint32_t gameType = GetGameType();
     const uint32_t gameMode = GetGameMode();
 
-    if (gameType == GAMETYPE_NETPLAY) {
+    if (Session_IsConnected()) {
         return gameMode == MODE_CHARSEL;
     }
 
@@ -305,6 +315,8 @@ static bool HasCurrentSavedCustomBank(const PlayerRuntime& player) {
            player.saved_custom_bank.base_palette == player.base_palette;
 }
 
+static bool CopyBank(const NetplayPaletteBank& bank, NetplayPaletteBank* out);
+
 static bool ShouldUseSelectedCustomBank(int gameSlot) {
     return IsValidGameSlot(gameSlot) &&
            s_player[gameSlot].valid &&
@@ -312,6 +324,90 @@ static bool ShouldUseSelectedCustomBank(int gameSlot) {
                (uint8_t)gameSlot,
                s_player[gameSlot].character_id,
                s_player[gameSlot].base_palette);
+}
+
+static bool HasRemoteMatchNetplayBank(int gameSlot) {
+    return s_matchActive &&
+           IsValidGameSlot(gameSlot) &&
+           gameSlot != s_localGameSlot &&
+           s_player[gameSlot].valid &&
+           s_player[gameSlot].remote_custom_loaded &&
+           ShouldUseSelectedCustomBank(gameSlot);
+}
+
+static bool HasRemoteMatchVanillaBank(int gameSlot) {
+    return s_matchActive &&
+           IsValidGameSlot(gameSlot) &&
+           gameSlot != s_localGameSlot &&
+           s_player[gameSlot].valid &&
+           s_player[gameSlot].vanilla_bank.valid &&
+           ShouldUseSelectedCustomBank(gameSlot);
+}
+
+static bool HasRemoteMatchPaletteChoice(int gameSlot) {
+    return HasRemoteMatchNetplayBank(gameSlot) &&
+           HasRemoteMatchVanillaBank(gameSlot);
+}
+
+static const char* RemoteMatchPaletteViewName() {
+    return s_remoteMatchCustomEnabled ? "netplay" : "vanilla";
+}
+
+static bool HasRemoteMatchDisplayBank(int gameSlot) {
+    return s_remoteMatchCustomEnabled
+        ? HasRemoteMatchNetplayBank(gameSlot)
+        : HasRemoteMatchVanillaBank(gameSlot);
+}
+
+static bool CopyRemoteMatchDisplayBank(int gameSlot, NetplayPaletteBank* out) {
+    const bool netplayReady = HasRemoteMatchNetplayBank(gameSlot);
+    const bool vanillaReady = HasRemoteMatchVanillaBank(gameSlot);
+    const bool choiceReady = HasRemoteMatchPaletteChoice(gameSlot);
+    const bool displayReady = HasRemoteMatchDisplayBank(gameSlot);
+
+    if (!out || !displayReady) {
+        if (IsValidGameSlot(gameSlot)) {
+            const PlayerRuntime& player = s_player[gameSlot];
+            LOG_INFO("[Palette] Remote match palette read unavailable slot=P%d view=%s choice=%d vanilla_ready=%d netplay_ready=%d valid=%d char=%u base=%u vanilla_crc=0x%08X netplay_crc=0x%08X",
+                gameSlot + 1,
+                RemoteMatchPaletteViewName(),
+                choiceReady ? 1 : 0,
+                vanillaReady ? 1 : 0,
+                netplayReady ? 1 : 0,
+                player.valid ? 1 : 0,
+                player.character_id,
+                player.base_palette,
+                player.vanilla_bank.crc32,
+                player.remote_custom_bank.crc32);
+        }
+        return false;
+    }
+
+    const PlayerRuntime& player = s_player[gameSlot];
+    const NetplayPaletteBank& selected = s_remoteMatchCustomEnabled
+        ? player.remote_custom_bank
+        : player.vanilla_bank;
+    LOG_INFO("[Palette] Remote match palette read slot=P%d view=%s char=%u base=%u selected_crc=0x%08X vanilla_crc=0x%08X netplay_crc=0x%08X choice=%d",
+        gameSlot + 1,
+        RemoteMatchPaletteViewName(),
+        player.character_id,
+        player.base_palette,
+        selected.crc32,
+        player.vanilla_bank.crc32,
+        player.remote_custom_bank.crc32,
+        choiceReady ? 1 : 0);
+
+    return s_remoteMatchCustomEnabled
+        ? CopyBank(s_player[gameSlot].remote_custom_bank, out)
+        : CopyBank(s_player[gameSlot].vanilla_bank, out);
+}
+
+static bool AreRemotePaletteHotkeyModifiersDown() {
+    return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
 }
 
 static bool HasForcedLocalVisualCustomBank(int gameSlot) {
@@ -342,11 +438,9 @@ static bool ShouldUsePreviewCustomBank(int gameSlot) {
         return false;
     }
 
-    if (GetGameType() == GAMETYPE_NETPLAY) {
-        const int localPreviewSlot = GetFrontendPreviewLocalSlot();
-        if (!IsValidGameSlot(localPreviewSlot) || gameSlot != localPreviewSlot) {
-            return false;
-        }
+    const int localPreviewSlot = GetFrontendPreviewLocalSlot();
+    if (IsValidGameSlot(localPreviewSlot) && gameSlot != localPreviewSlot) {
+        return false;
     }
 
     return CharSelPaletteSelect_ShouldPreviewCustomBank(
@@ -400,7 +494,7 @@ static bool HasVisualOverrideForGameSlot(int gameSlot) {
         return player.local_custom_loaded;
     }
 
-    return s_remotePreviewEnabled && player.remote_custom_loaded;
+    return HasRemoteMatchDisplayBank(gameSlot);
 }
 
 static uint8_t BuildLocalFlags() {
@@ -449,6 +543,113 @@ static void RequestLiveReload(uint8_t gameSlot, const char* reason) {
         "Live reload requested: slot=P%d reason=%s",
         gameSlot + 1,
         reason ? reason : "unspecified");
+}
+
+static bool RequestGameplayPaletteReapply(const char* reason) {
+    if (!s_matchActive) {
+        return true;
+    }
+
+    int reloadCount = 0;
+    bool waitingForAssets = false;
+    for (int slot = 0; slot < 2; ++slot) {
+        if (!HasVisualOverrideForGameSlot(slot)) {
+            continue;
+        }
+
+        if (!s_player[slot].asset_loaded) {
+            waitingForAssets = true;
+            continue;
+        }
+
+        RequestLiveReload((uint8_t)slot, reason);
+        ++reloadCount;
+    }
+
+    if (reloadCount > 0) {
+        SetStatus("Reapplying palette overrides for gameplay entry");
+        Rollback::NetplayLog_Write("PALETTE", -1,
+            "Gameplay entry palette reapply: reload_count=%d local_slot=%d remote_palette=%s",
+            reloadCount,
+            s_localGameSlot,
+            s_remoteMatchCustomEnabled ? "netplay" : "vanilla");
+    }
+
+    return !waitingForAssets;
+}
+
+static void MaybeReapplyGameplayOverrides() {
+    if (!s_matchActive) {
+        s_gameplayReapplyIssued = false;
+        return;
+    }
+
+    const bool gameplayActive = GameplayBridge_IsSessionActive() && GetGameMode() == MODE_MATCH;
+    if (!gameplayActive) {
+        return;
+    }
+
+    if (s_gameplayReapplyIssued) {
+        return;
+    }
+
+    s_gameplayReapplyIssued = RequestGameplayPaletteReapply("gameplay entry reapply");
+}
+
+static void ProcessMatchPaletteHotkeys() {
+    const bool tabDown = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+    const bool modifiersDown = AreRemotePaletteHotkeyModifiersDown();
+
+    const bool allowHotkey = s_matchActive &&
+        GameplayBridge_IsSessionActive() &&
+        GetGameMode() == MODE_MATCH &&
+        !ModMenu_IsOpen();
+
+    if (tabDown && !s_tabWasDown) {
+        const int remoteSlot = IsValidGameSlot(s_localGameSlot)
+            ? (s_localGameSlot == 0 ? 1 : 0)
+            : -1;
+        const bool choiceAvailable = HasRemoteMatchPaletteChoice(remoteSlot);
+        const bool vanillaReady = HasRemoteMatchVanillaBank(remoteSlot);
+        const bool netplayReady = HasRemoteMatchNetplayBank(remoteSlot);
+
+        LOG_INFO("[Palette] Tab press detected allow=%d modifiers=%d remote_slot=%d current_view=%s choice=%d vanilla_ready=%d netplay_ready=%d menu_open=%d gameplay_active=%d mode=%u",
+            allowHotkey ? 1 : 0,
+            modifiersDown ? 1 : 0,
+            IsValidGameSlot(remoteSlot) ? (remoteSlot + 1) : 0,
+            RemoteMatchPaletteViewName(),
+            choiceAvailable ? 1 : 0,
+            vanillaReady ? 1 : 0,
+            netplayReady ? 1 : 0,
+            ModMenu_IsOpen() ? 1 : 0,
+            GameplayBridge_IsSessionActive() ? 1 : 0,
+            (unsigned)GetGameMode());
+
+        if (allowHotkey && !modifiersDown && choiceAvailable) {
+            s_remoteMatchCustomEnabled = !s_remoteMatchCustomEnabled;
+            RequestLiveReload((uint8_t)remoteSlot,
+                s_remoteMatchCustomEnabled
+                    ? "remote match switched to netplay palette"
+                    : "remote match switched to captured vanilla palette");
+
+            SetStatus("Remote match palette: %s",
+                s_remoteMatchCustomEnabled ? "netplay" : "vanilla");
+            LOG_INFO("[Palette] Remote match palette switched to %s via Tab hotkey",
+                s_remoteMatchCustomEnabled ? "NETPLAY" : "VANILLA");
+            Rollback::NetplayLog_Write("PALETTE", -1,
+                "Remote match palette switched: view=%s",
+                s_remoteMatchCustomEnabled ? "netplay" : "vanilla");
+        } else {
+            const char* reason = !allowHotkey
+                ? "hotkey not allowed"
+                : modifiersDown
+                    ? "modifier held"
+                    : "missing vanilla/netplay palette choice";
+            LOG_INFO("[Palette] Tab press ignored: %s", reason);
+        }
+    }
+
+    s_tabWasDown = tabDown;
 }
 
 static void RefreshLocalStoredBank() {
@@ -752,6 +953,8 @@ void NetplayPaletteRuntime_FrameUpdate() {
     }
 
     if (!s_matchActive) {
+        s_tabWasDown = false;
+        s_gameplayReapplyIssued = false;
         if (HasOfflineLocalContext() && !ShouldRetainFrontendPaletteContext()) {
             LOG_INFO("[Palette] Clearing offline context: mode=%u sub=%u type=%u has_p1=%d has_p2=%d",
                 (unsigned)GetGameMode(),
@@ -766,6 +969,9 @@ void NetplayPaletteRuntime_FrameUpdate() {
         }
         return;
     }
+
+    MaybeReapplyGameplayOverrides();
+    ProcessMatchPaletteHotkeys();
 
     if (s_localDirty) {
         SendLocalConfig();
@@ -839,6 +1045,8 @@ void NetplayPaletteRuntime_OnLockedMatchConfig(const LockedMatchConfig* config) 
     }
 
     RefreshLocalStoredBank();
+    s_remoteMatchCustomEnabled = true;
+    s_gameplayReapplyIssued = false;
     AdvanceLocalEpoch();
     AdvanceStateRevision();
     s_localDirty = true;
@@ -915,7 +1123,29 @@ void NetplayPaletteRuntime_OnMatchEnd(const char* reason) {
 }
 
 void NetplayPaletteRuntime_OnDisconnect(const char* reason) {
+    int remoteReloadSlot = -1;
+    if (s_matchActive && IsValidGameSlot(s_localGameSlot)) {
+        const int remoteSlot = s_localGameSlot == 0 ? 1 : 0;
+        if (IsValidGameSlot(remoteSlot) &&
+            s_player[remoteSlot].remote_custom_loaded &&
+            s_player[remoteSlot].asset_loaded &&
+            HasVisualOverrideForGameSlot(remoteSlot)) {
+            remoteReloadSlot = remoteSlot;
+        }
+    }
+
     ResetMatchState(reason ? reason : "disconnect");
+
+    if (IsValidGameSlot(remoteReloadSlot)) {
+        s_liveReloadRequested[remoteReloadSlot] = true;
+        LOG_INFO("[Palette] Queued remote palette cleanup slot=P%d reason=%s",
+            remoteReloadSlot + 1,
+            reason ? reason : "disconnect");
+        Rollback::NetplayLog_Write("PALETTE", -1,
+            "Queued remote palette cleanup: slot=P%d reason=%s",
+            remoteReloadSlot + 1,
+            reason ? reason : "disconnect");
+    }
 }
 
 void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
@@ -960,7 +1190,7 @@ void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
 
         if (hadCustomBank) {
             AdvanceStateRevision();
-            if (payload->game_slot != s_localGameSlot && s_remotePreviewEnabled) {
+            if (payload->game_slot != s_localGameSlot) {
                 RequestLiveReload(payload->game_slot, "remote palette cleared");
             }
         }
@@ -1023,6 +1253,13 @@ void NetplayPaletteRuntime_OnRemoteData(const PaletteDataPayload* payload) {
     memcpy(remote.remote_custom_bank.data, payload->payload, NETPLAY_PALETTE_BANK_SIZE);
     remote.remote_custom_loaded = true;
 
+    LOG_INFO("[Palette] Remote netplay palette bank captured slot=P%d char=%u base=%u crc=0x%08X local_slot=P%d",
+        payload->game_slot + 1,
+        payload->character_id,
+        payload->base_palette,
+        payload->payload_crc,
+        IsValidGameSlot(s_localGameSlot) ? (s_localGameSlot + 1) : 0);
+
     AdvanceStateRevision();
     SendAck(payload->game_slot,
         payload->epoch,
@@ -1031,7 +1268,7 @@ void NetplayPaletteRuntime_OnRemoteData(const PaletteDataPayload* payload) {
         1,
         payload->payload_crc);
 
-    if (payload->game_slot != s_localGameSlot && s_remotePreviewEnabled) {
+    if (payload->game_slot != s_localGameSlot) {
         RequestLiveReload(payload->game_slot, "remote palette updated");
     }
 
@@ -1314,15 +1551,11 @@ bool NetplayPaletteRuntime_CopyAssetOverrideBank(uint8_t gameSlot, NetplayPalett
         return CopyBank(s_player[gameSlot].local_custom_bank, out);
     }
 
-    if (!s_remotePreviewEnabled) {
+    if (!CopyRemoteMatchDisplayBank(gameSlot, out)) {
         return false;
     }
 
-    if (!ShouldUseSelectedCustomBank(gameSlot)) {
-        return false;
-    }
-
-    return CopyBank(s_player[gameSlot].remote_custom_bank, out);
+    return true;
 }
 
 bool NetplayPaletteRuntime_CopySpectatorBank(uint8_t gameSlot, NetplayPaletteBank* out) {
@@ -1403,6 +1636,12 @@ void NetplayPaletteRuntime_OnAssetBankCaptured(uint8_t gameSlot,
         patchPath,
         "Captured vanilla source palette",
         "Captured vanilla source bank");
+    LOG_INFO("[Palette] Vanilla palette bank captured slot=P%d char=%u base=%u crc=0x%08X assets=%u",
+        gameSlot + 1,
+        player.character_id,
+        basePalette,
+        player.vanilla_bank.crc32,
+        (unsigned)assetCount);
     LOG_INFO("[Palette] Captured source bank slot=P%d char=%u base=%u archive=%s patch=%s assets=%u",
         gameSlot + 1,
         player.character_id,
@@ -1475,11 +1714,9 @@ void NetplayPaletteRuntime_RequestFrontendReload(uint8_t gameSlot) {
         return;
     }
 
-    if (GetGameType() == GAMETYPE_NETPLAY) {
-        const int localPreviewSlot = GetFrontendPreviewLocalSlot();
-        if (!IsValidGameSlot(localPreviewSlot) || gameSlot != localPreviewSlot) {
-            return;
-        }
+    const int localPreviewSlot = GetFrontendPreviewLocalSlot();
+    if (IsValidGameSlot(localPreviewSlot) && gameSlot != localPreviewSlot) {
+        return;
     }
 
     if (!s_player[gameSlot].valid || !s_player[gameSlot].asset_loaded) {

@@ -277,8 +277,8 @@
 
 #define GAMETYPE_ARCADE    0   // Arcade/Story mode - single player ladder
 #define GAMETYPE_VS_CPU    1   // VS CPU - human picks both chars, P2 AI in match
-#define GAMETYPE_VS_HUMAN  2   // VS Human (2P local) - each player has own input
-#define GAMETYPE_NETPLAY   3   // Network play - online versus
+#define GAMETYPE_VS_HUMAN  2   // VS Human (2P local) - each player has own input, we use this for our netplay in mod!
+#define GAMETYPE_NETPLAY   3   // Network play - online versus - WE DON'T USE THIS, IT'S VANILLA NETPLAY HANDLER, NOT OUR MOD!!!!
 #define GAMETYPE_TRAINING  4   // Training mode (5th main-menu option)
 #define GAMETYPE_REPLAY    5   // Replay playback
 #define GAMETYPE_DEMO     10   // Demo/attract mode (shown on title screen)
@@ -705,7 +705,8 @@ static inline uint32_t GetGameType(void) {
 }
 
 /**
- * Check if currently in netplay mode
+ * Check if currently in vanilla netplay mode.
+ * Mod-owned online flow normally runs under VS_HUMAN instead.
  */
 static inline bool IsNetplay(void) {
     return GetGameType() == GAMETYPE_NETPLAY;
@@ -719,7 +720,7 @@ static inline bool IsInMatch(void) {
 }
 
 /**
- * Check if in MODE_MATCH with GAMETYPE_NETPLAY
+ * Check if in MODE_MATCH with the vanilla GAMETYPE_NETPLAY type.
  */
 static inline bool IsInNetplayMatch(void) {
     return IsInMatch() && IsNetplay();
@@ -733,7 +734,7 @@ static inline bool IsInCharSel(void) {
 }
 
 /**
- * Check if in netplay character select
+ * Check if in vanilla netplay character select.
  */
 static inline bool IsInNetplayCharSel(void) {
     return IsInCharSel() && IsNetplay();
@@ -811,7 +812,8 @@ static inline bool IsInPlayableMatchGameplay(void) {
 }
 
 /**
- * Check if in CharSel input sync substates (vanilla uses these for sync)
+ * Check if in the vanilla CharSel input-sync substates.
+ * Mod-owned online charsel does not rely on GAMETYPE_NETPLAY here.
  */
 static inline bool IsInCharSelInputSync(void) {
     uint32_t sub = GetSubstate();
