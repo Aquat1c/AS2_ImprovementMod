@@ -93,6 +93,10 @@ static void PushWorkerErrorEvent(uint32_t sessionToken, const char* msg) {
 static void PushNetworkEvent(const NetworkThreadEvent& ev) {
     std::lock_guard<std::mutex> eventLock(s_eventMutex);
     std::lock_guard<std::mutex> statsLock(s_statsMutex);
+    if (ev.type == NetworkThreadEventType::PacketReceived ||
+        ev.type == NetworkThreadEventType::Disconnected) {
+        s_stats.last_inbound_packet_tick_ms = ev.transport_tick_ms;
+    }
     if (s_events.size() >= MAX_PENDING_EVENTS) {
         s_stats.inbound_drop_count++;
         return;
@@ -183,6 +187,11 @@ static void WorkerThreadMain() {
                     activeSessionToken = cmd.session_token;
                     activePeer = nullptr;
                     Transport_DestroyHost();
+                    {
+                        std::lock_guard<std::mutex> statsLock(s_statsMutex);
+                        s_stats.last_inbound_packet_tick_ms = 0;
+                        s_stats.last_outbound_packet_tick_ms = 0;
+                    }
                     if (!Transport_CreateHost(cmd.listen_port)) {
                         PushWorkerErrorEvent(cmd.session_token, "Network thread failed to create host");
                     } else {
@@ -198,6 +207,11 @@ static void WorkerThreadMain() {
                     activeSessionToken = cmd.session_token;
                     activePeer = nullptr;
                     Transport_DestroyHost();
+                    {
+                        std::lock_guard<std::mutex> statsLock(s_statsMutex);
+                        s_stats.last_inbound_packet_tick_ms = 0;
+                        s_stats.last_outbound_packet_tick_ms = 0;
+                    }
                     bool hostReady = false;
                     if (cmd.listen_port > 0) {
                         hostReady = Transport_CreateHost(cmd.listen_port);
@@ -257,6 +271,10 @@ static void WorkerThreadMain() {
                                              cmd.reliable)) {
                         PushWorkerErrorEvent(cmd.session_token, "Network thread failed to send packet");
                     } else {
+                        {
+                            std::lock_guard<std::mutex> statsLock(s_statsMutex);
+                            s_stats.last_outbound_packet_tick_ms = GetTickCount();
+                        }
                         Rollback::NetplayLog_Verbose("NTHREAD", -1,
                             "Outbound packet sent on worker: token=%u ch=%u type=%s payload=%zu reliable=%d",
                             cmd.session_token,
@@ -294,6 +312,11 @@ static void WorkerThreadMain() {
                         "Worker host destroyed: token=%u",
                         activeSessionToken);
                     activeSessionToken = 0;
+                    {
+                        std::lock_guard<std::mutex> statsLock(s_statsMutex);
+                        s_stats.last_inbound_packet_tick_ms = 0;
+                        s_stats.last_outbound_packet_tick_ms = 0;
+                    }
                     break;
                 }
 

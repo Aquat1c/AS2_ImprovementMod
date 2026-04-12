@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "input_system.h"
+#include "rollback/netplay_log.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +33,8 @@ static uint16_t g_overrideInput[2] = {};
 
 // Background input mode
 static bool g_backgroundInputEnabled = false;
+static bool g_windowActiveStateKnown = false;
+static bool g_lastWindowActive = false;
 
 // Control swap
 static bool g_controlSwap = false;
@@ -143,6 +146,22 @@ static bool IsGameWindowActive() {
     DWORD foregroundPid = 0;
     GetWindowThreadProcessId(foreground, &foregroundPid);
     return (foregroundPid == GetCurrentProcessId());
+}
+
+static void LogGameWindowActiveState(bool active) {
+    HWND foreground = GetForegroundWindow();
+    DWORD foregroundPid = 0;
+    if (foreground) {
+        GetWindowThreadProcessId(foreground, &foregroundPid);
+    }
+
+    Rollback::NetplayLog_Write("INPUT", -1,
+        "Window active state changed: active=%d background=%d fg=0x%p fg_pid=%lu self_pid=%lu",
+        active ? 1 : 0,
+        g_backgroundInputEnabled ? 1 : 0,
+        static_cast<void*>(foreground),
+        static_cast<unsigned long>(foregroundPid),
+        static_cast<unsigned long>(GetCurrentProcessId()));
 }
 
 // ============================================================================
@@ -497,6 +516,13 @@ void InputSystem_Update(void) {
 
     // Process SDL events (gamepad hotplug + keyboard state pump)
     HandleGamepadEvents();
+
+    const bool windowActive = IsGameWindowActive();
+    if (!g_windowActiveStateKnown || g_lastWindowActive != windowActive) {
+        LogGameWindowActiveState(windowActive);
+        g_lastWindowActive = windowActive;
+        g_windowActiveStateKnown = true;
+    }
 
     for (int p = 0; p < 2; p++) {
         g_inputState[p].previous = g_inputState[p].current;

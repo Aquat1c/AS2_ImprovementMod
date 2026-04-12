@@ -80,9 +80,19 @@ static int AbortRollbackDispatcher(const char* fallbackReason) {
     // Route to the netplay menu disconnect error screen. HandleDisconnection
     // forces the game back to MODE_MENU, cancels the ENet session, and shows
     // the DisconnectError overlay with the reason string.
-    // The guard prevents double-firing if the lifecycle was already moved to
-    // DisconnectRecovery by another codepath before this abort fires.
-    if (Net::MatchLifecycle_GetPhase() != Net::MatchLifecyclePhase::DisconnectRecovery) {
+    // Background rollback polling can move the lifecycle into
+    // DisconnectRecovery before the dispatcher reaches this abort path, but
+    // that phase transition alone does not mean Session_Cancel() already ran.
+    // Keep routing through HandleDisconnection while the transport session is
+    // still alive so the peer is actively torn down instead of waiting for a
+    // later ENet timeout.
+    const Net::SessionState sessionState = Net::Session_GetState();
+    const bool sessionNeedsTeardown =
+        sessionState != Net::SessionState::Idle &&
+        sessionState != Net::SessionState::Failed &&
+        sessionState != Net::SessionState::Disconnecting;
+    if (sessionNeedsTeardown ||
+        Net::MatchLifecycle_GetPhase() != Net::MatchLifecyclePhase::DisconnectRecovery) {
         NetMenu::HandleDisconnection(reason);
     }
 

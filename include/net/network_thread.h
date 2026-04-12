@@ -52,6 +52,8 @@ struct NetworkThreadStats {
     uint32_t outbound_queue_depth;
     uint32_t inbound_drop_count;
     uint32_t outbound_drop_count;
+    DWORD    last_inbound_packet_tick_ms;
+    DWORD    last_outbound_packet_tick_ms;
     DWORD    last_service_tick_ms;
 };
 

@@ -45,6 +45,7 @@ static uint16_t       s_activeJoinPort = 0;
 static uint32_t       s_lastInboundDropCount  = 0;
 static uint32_t       s_lastOutboundDropCount = 0;
 static DWORD          s_lastQueueSpikeLogAt   = 0;
+static DWORD          s_lastInboundSilenceLogAt = 0;
 static DWORD          s_lastDrainLagLogAt     = 0;
 static DWORD          s_lastSessionUpdateTick = 0;
 static bool           s_localBuildHashCached  = false;
@@ -143,6 +144,7 @@ static void ResetState() {
     s_lastInboundDropCount = 0;
     s_lastOutboundDropCount = 0;
     s_lastQueueSpikeLogAt = 0;
+    s_lastInboundSilenceLogAt = 0;
     s_lastDrainLagLogAt = 0;
     s_lastSessionUpdateTick = 0;
     Nat_ClearRemoteHint();
@@ -1137,6 +1139,11 @@ static void UpdateStats() {
     s_stats.packets_lost = netStats.packets_lost;
 
     const DWORD now = GetTickCount();
+    const DWORD workerAgeMs =
+        (netStats.last_service_tick_ms > 0 && now >= netStats.last_service_tick_ms)
+            ? (now - netStats.last_service_tick_ms)
+            : 0;
+
     if ((netStats.inbound_queue_depth >= 128 || netStats.outbound_queue_depth >= 128) &&
         (now - s_lastQueueSpikeLogAt) >= 250) {
         s_lastQueueSpikeLogAt = now;
@@ -1167,6 +1174,37 @@ static void UpdateStats() {
             SessionStateName(s_state),
             s_activeSessionToken);
         s_lastOutboundDropCount = netStats.outbound_drop_count;
+    }
+
+    if (s_state == SessionState::Ready && netStats.peer_connected &&
+        netStats.last_inbound_packet_tick_ms > 0) {
+        const DWORD inboundSilenceMs =
+            (now >= netStats.last_inbound_packet_tick_ms)
+                ? (now - netStats.last_inbound_packet_tick_ms)
+                : 0;
+        const DWORD outboundAgeMs =
+            (netStats.last_outbound_packet_tick_ms > 0 &&
+             now >= netStats.last_outbound_packet_tick_ms)
+                ? (now - netStats.last_outbound_packet_tick_ms)
+                : 0xFFFFFFFFu;
+
+        if (inboundSilenceMs >= 500 && outboundAgeMs <= 500 &&
+            (s_lastInboundSilenceLogAt == 0 || (now - s_lastInboundSilenceLogAt) >= 250)) {
+            s_lastInboundSilenceLogAt = now;
+            Rollback::NetplayLog_Write("NTHREAD", -1,
+                "Inbound silence while outbound active: silence=%lums outbound_age=%lums worker_age=%lums "
+                "inbound_depth=%u outbound_depth=%u state=%s role=%s token=%u",
+                (unsigned long)inboundSilenceMs,
+                (unsigned long)outboundAgeMs,
+                (unsigned long)workerAgeMs,
+                netStats.inbound_queue_depth,
+                netStats.outbound_queue_depth,
+                SessionStateName(s_state),
+                SessionRoleName(s_role),
+                s_activeSessionToken);
+        }
+    } else {
+        s_lastInboundSilenceLogAt = 0;
     }
 }
 
