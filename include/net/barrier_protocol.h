@@ -69,6 +69,8 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         // Sync barriers — always reliable
         case PacketType::SyncAnnounce:
         case PacketType::SyncConfirm:
+        case PacketType::FrontendPhaseBarrier:
+        case PacketType::FrontendBoundaryDigest:
 
         // NAT coordination — reliable
         case PacketType::NatInfo:
@@ -78,6 +80,8 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         case PacketType::CharSelInput:
         case PacketType::CharSelLock:
         case PacketType::StageSync:
+        case PacketType::DelayChangeReq:
+        case PacketType::DelayChangeAck:
         case PacketType::ConfigExchange:
         case PacketType::ConfigAck:
         case PacketType::LoadBarrier:

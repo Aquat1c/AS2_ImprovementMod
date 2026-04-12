@@ -10,6 +10,7 @@
 
 #include "input/input_system.h"
 #include "net/charsel_sync.h"
+#include "net/frontend_input_sync.h"
 #include "net/match_lifecycle.h"
 #include "net/pause_handler.h"
 #include "net/pregame_sync.h"
@@ -113,6 +114,8 @@ void RematchCleanup_PrepareForNextMatch(const char* reason) {
             "CharSel lockstep still active without PregameSync owning it; aborting stale lockstep");
         Net::CharSelSync_Abort();
     }
+
+    Net::FrontendInputSync_AbortEpoch("rematch cleanup reset");
 
     if (InputSyncHooks_IsLoadBarrierFrozen()) {
         Rollback::NetplayLog_Write("REMATCH", -1,

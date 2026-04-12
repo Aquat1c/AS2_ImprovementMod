@@ -25,6 +25,7 @@
 #include "net/match_lifecycle.h"
 #include "net/set_tracker.h"
 #include "net/pregame_sync.h"
+#include "net/frontend_input_sync.h"
 #include "net/match_bootstrap.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
@@ -382,6 +383,50 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
             }
             Net::CharSelSync_OnRemoteFrameInput(
                 static_cast<const Net::CharSelFrameInputPayload*>(payload));
+            break;
+        }
+
+        case Net::PacketType::FrontendPhaseBarrier: {
+            if (payloadLen < sizeof(Net::FrontendPhaseBarrierPayload)) {
+                LogGameplayPacketAnomaly("Short FrontendPhaseBarrier", type, payloadLen,
+                                         sizeof(Net::FrontendPhaseBarrierPayload));
+                break;
+            }
+            Net::FrontendInputSync_OnRemotePhaseBarrier(
+                static_cast<const Net::FrontendPhaseBarrierPayload*>(payload));
+            break;
+        }
+
+        case Net::PacketType::FrontendBoundaryDigest: {
+            if (payloadLen < sizeof(Net::FrontendBoundaryDigestPayload)) {
+                LogGameplayPacketAnomaly("Short FrontendBoundaryDigest", type, payloadLen,
+                                         sizeof(Net::FrontendBoundaryDigestPayload));
+                break;
+            }
+            Net::FrontendInputSync_OnRemoteBoundaryDigest(
+                static_cast<const Net::FrontendBoundaryDigestPayload*>(payload));
+            break;
+        }
+
+        case Net::PacketType::DelayChangeReq: {
+            if (payloadLen < sizeof(Net::DelayChangeReqPayload)) {
+                LogGameplayPacketAnomaly("Short DelayChangeReq", type, payloadLen,
+                                         sizeof(Net::DelayChangeReqPayload));
+                break;
+            }
+            Net::FrontendInputSync_OnRemoteDelayChangeReq(
+                static_cast<const Net::DelayChangeReqPayload*>(payload));
+            break;
+        }
+
+        case Net::PacketType::DelayChangeAck: {
+            if (payloadLen < sizeof(Net::DelayChangeAckPayload)) {
+                LogGameplayPacketAnomaly("Short DelayChangeAck", type, payloadLen,
+                                         sizeof(Net::DelayChangeAckPayload));
+                break;
+            }
+            Net::FrontendInputSync_OnRemoteDelayChangeAck(
+                static_cast<const Net::DelayChangeAckPayload*>(payload));
             break;
         }
 
@@ -1278,6 +1323,8 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     s_rollbackBeginPending = false;
     s_frameOriginAbs = -1;
     Net::NetplayPacing_ResetSession("disconnect");
+    Net::WinScreenSync_Abort();
+    Net::FrontendInputSync_AbortEpoch(reason ? reason : "disconnect");
     Net::SpectatorRuntime_OnDisconnect(reason ? reason : "disconnect");
     Net::NetplayPaletteRuntime_OnDisconnect(reason ? reason : "disconnect");
 

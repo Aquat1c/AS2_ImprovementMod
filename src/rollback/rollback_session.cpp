@@ -1563,8 +1563,9 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->side_effects_suppressed = s_rollingBack;
     out->frames_ahead = framesAhead;
 
-    // Policy
-    out->active_delay = s_activeDelay;
+    // Diagnostics expose the visible delay only. The hidden gameplay delay
+    // floor remains internal to the live Gekko session.
+    out->active_delay = Net::DelayPolicy_GetActiveDelay();
     out->rollback_budget = s_rollbackBudget;
 
     // Checksums

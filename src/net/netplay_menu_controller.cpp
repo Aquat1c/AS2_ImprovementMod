@@ -13,6 +13,7 @@
 #include "net/nat_traversal.h"
 #include "net/netplay_menu_ui.h"
 #include "net/charsel_sync.h"
+#include "net/frontend_input_sync.h"
 #include "net/pregame_sync.h"
 #include "net/match_lifecycle.h"
 #include "net/sync_policy.h"
@@ -1384,9 +1385,11 @@ static void OpenDisconnectError(const char* why) {
     if (Net::MatchLifecycle_IsMatchOwned()) {
         Net::MatchLifecycle_OnDisconnect(why ? why : "Disconnected");
     }
+    Rollback::OnlineWiring_OnDisconnect(why ? why : "Disconnected");
 
     // Abort any in-progress pre-game sync
     Net::PregameSync_Abort(why ? why : "Disconnected");
+    Net::FrontendInputSync_AbortEpoch(why ? why : "Disconnected");
 
     // Clean vanilla netplay flags
     WriteU32(ADDR_GAME_TYPE, GAMETYPE_VS_HUMAN);

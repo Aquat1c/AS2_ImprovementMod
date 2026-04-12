@@ -847,7 +847,7 @@ void CharSelPaletteSelect_OnRemoteCatalog(const CharSelInputPayload* payload) {
 
     const bool canApplyImmediately = s_frontendNetplay && s_frontendActive;
     const bool shouldBufferPending = IsModNetplayCharSelContext() &&
-        IsPaletteFrontendSubstate(GetSubstate());
+        GetSubstate() < CHARSEL_SUB_STAGESEL_SLIDE;
 
     if (!canApplyImmediately && !shouldBufferPending) {
         return;

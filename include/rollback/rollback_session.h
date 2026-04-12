@@ -210,7 +210,7 @@ struct RollbackSessionSnapshot {
     float    frames_ahead;
 
     // Policy
-    int      active_delay;
+    int      active_delay;      // Visible user-facing delay; hidden floor stays internal.
     int      rollback_budget;
 
     // State integrity

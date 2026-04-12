@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 6;
+constexpr uint16_t PROTOCOL_VERSION = 7;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -49,6 +49,8 @@ enum class PacketType : uint16_t {
     // Initial session sync (reliable, channel 0)
     SyncAnnounce    = 6,    // Session metadata announce for pre-game agreement
     SyncConfirm     = 7,    // Session sync confirmation / side assignment
+    FrontendPhaseBarrier = 8,  // Frontend phase barrier / transition ack
+    FrontendBoundaryDigest = 9, // Frontend boundary digest / watchdog state
 
     // NAT traversal coordination (reliable, channel 0)
     NatInfo         = 10,   // Exchange NAT/UPnP status
@@ -56,7 +58,7 @@ enum class PacketType : uint16_t {
 
     // Pre-game sync (reliable, channel 0)
     CharSelInput    = 11,   // CharSel custom-palette availability catalog exchange
-    CharSelLock     = 12,   // Both confirmed — lock character selections
+    CharSelLock     = 12,   // Scoped character-selection lock notification
     StageSync       = 13,   // Stage selection exchange/lock
     ConfigExchange  = 14,   // LockedMatchConfig proposed by host
     ConfigAck       = 15,   // Join acknowledges config (includes config hash)
@@ -88,7 +90,7 @@ enum class PacketType : uint16_t {
     // release requires mutual ready+ack.
     GekkoReady      = 24,   // Startup barrier control (ready/ack)
 
-    // Obsolete delay-change packets (kept reserved; no live send sites)
+    // Frontend shared-delay coordination
     DelayChangeReq  = 21,
     DelayChangeAck  = 22,
 
@@ -155,14 +157,46 @@ struct FrameSyncStatusPayload {
 struct SyncAnnouncePayload {
     uint32_t session_id;         // Random session identifier for this match
     uint8_t  capability_flags;   // Bit 0: savestate baseline, Bit 1: desync diagnostics
-    uint8_t  _pad[3];
+    uint8_t  frontend_delay_proposal; // Local frontend delay recommendation for this epoch
+    uint16_t _pad;
 };
 
 struct SyncConfirmPayload {
     uint32_t session_id;         // Agreed session ID (host's ID is authoritative)
     uint8_t  confirmed;          // 1 = all checks passed
     uint8_t  assigned_side;      // Host decides: 0 = host is P1, 1 = host is P2
-    uint8_t  _pad[2];
+    uint8_t  frontend_delay_proposal; // Echo of sender's local recommendation
+    uint8_t  frontend_shared_delay;   // Shared frontend delay agreed for this epoch
+};
+
+struct FrontendPhaseBarrierPayload {
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase (current phase)
+    uint16_t next_phase;         // Net::FrontendSyncPhase (next phase)
+    uint32_t last_completed_frame; // Sender's final frame index for the completed phase
+    uint8_t  reason_code;        // Barrier reason / transition category
+    uint8_t  _pad[3];
+};
+
+struct FrontendBoundaryDigestPayload {
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase
+    uint8_t  digest_kind;        // Net::FrontendDigestKind
+    uint8_t  substate;           // Native substate for diagnostics
+    uint32_t frame;              // Local phase frame when digest was captured
+    uint32_t digest;             // CRC32 over the phase boundary state
+    uint8_t  p1_character;
+    uint8_t  p1_palette;
+    uint8_t  p2_character;
+    uint8_t  p2_palette;
+    uint8_t  stage_cursor;
+    uint8_t  stage_confirmed;
+    uint8_t  stage_counter;
+    uint8_t  stage_aux;
+    uint8_t  stage_cancel;
+    uint8_t  confirm_menu_cursor;
+    uint8_t  confirm_menu_action;
+    uint8_t  committed_stage_id;
 };
 
 struct NatInfoPayload {
@@ -191,14 +225,26 @@ struct CharSelInputPayload {
 };
 
 struct CharSelLockPayload {
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase (must be CharSel)
     uint8_t  character_id;       // Resolved character ID from grid table
     uint8_t  palette;            // Final palette
-    uint8_t  _pad[2];
 };
 
 struct StageSyncPayload {
-    uint8_t  stage_id;           // Selected stage ID
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase (must be StageSel)
+    uint16_t frame;              // Sender's current phase frame
+    uint8_t  stage_id;           // Sender's currently resolved stage ID
     uint8_t  confirmed;          // 0 = browsing, 1 = locked
+    uint8_t  stage_cursor;       // Shared cursor/grid index
+    uint8_t  stage_counter;      // Stage confirm/roulette counter byte
+    uint8_t  stage_aux;          // Adjacent stage state byte (watchdog only)
+    uint8_t  stage_cancel;       // Cancel flag
+    uint8_t  confirm_menu_cursor; // Confirm-menu cursor index
+    uint8_t  confirm_menu_action; // Confirm-menu action/armed flag
+    uint8_t  committed_stage_id; // Final committed stage ID if available
+    uint8_t  substate;           // Native charsel substate for diagnostics
     uint8_t  _pad[2];
 };
 
@@ -298,6 +344,9 @@ struct GekkoReadyPayload {
 };
 
 struct CharSelFrameInputPayload {
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase (CharSel or StageSel)
+    uint16_t _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
     uint16_t inputs[8];          // Redundant history: [frame, frame-1, ..., frame-7]
@@ -306,6 +355,9 @@ struct CharSelFrameInputPayload {
 };
 
 struct WinScreenFrameInputPayload {
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase (WinScreen)
+    uint16_t _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
     uint16_t inputs[8];          // Redundant history: [frame, frame-1, ..., frame-7]
@@ -349,13 +401,21 @@ struct PaletteAckPayload {
 };
 
 struct DelayChangeReqPayload {
-    uint8_t  new_delay;          // Obsolete reserved payload
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase
+    uint16_t new_delay;          // Requested shared frontend delay
+    uint32_t apply_from_frame;   // Apply point inside the phase timeline
+    uint8_t  reason_code;        // Net::FrontendDelayBumpReason
     uint8_t  _pad[3];
 };
 
 struct DelayChangeAckPayload {
-    uint8_t  acked_delay;        // Obsolete reserved payload
-    uint8_t  accepted;           // Obsolete reserved payload
+    uint32_t epoch_id;           // Frontend epoch/session scope
+    uint16_t phase;              // Net::FrontendSyncPhase
+    uint16_t acked_delay;        // Accepted shared frontend delay
+    uint32_t apply_from_frame;   // Apply point inside the phase timeline
+    uint8_t  accepted;           // 1 = accepted, 0 = rejected
+    uint8_t  reason_code;        // Net::FrontendDelayBumpReason
     uint8_t  _pad[2];
 };
 
@@ -400,6 +460,8 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::SessionMeta:    return "SessionMeta";
         case PacketType::SyncAnnounce:   return "SyncAnnounce";
         case PacketType::SyncConfirm:    return "SyncConfirm";
+        case PacketType::FrontendPhaseBarrier: return "FrontendPhaseBarrier";
+        case PacketType::FrontendBoundaryDigest: return "FrontendBoundaryDigest";
         case PacketType::NatInfo:        return "NatInfo";
         case PacketType::NatTraversalSignal: return "NatTraversalSignal";
         case PacketType::CharSelInput:   return "CharSelInput";

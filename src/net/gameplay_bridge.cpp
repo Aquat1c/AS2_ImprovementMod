@@ -7,6 +7,7 @@
  */
 
 #include "net/gameplay_bridge.h"
+#include "net/delay_policy.h"
 #include "net/player_side_mapping.h"
 #include "net/session_manager.h"
 #include "rollback/rollback_session.h"
@@ -77,7 +78,7 @@ void GameplayBridge_GetSnapshot(GameplayBridgeSnapshot* out) {
     out->session_active = s_sessionActive;
     out->local_game_slot = PlayerMapping_GetLocalGameSlot();
     out->remote_game_slot = PlayerMapping_GetRemoteGameSlot();
-    out->active_delay = Rollback::RollbackSession_GetActiveDelay();
+    out->active_delay = DelayPolicy_GetActiveDelay();
     out->rollback_budget = Rollback::RollbackSession_GetRollbackBudget();
     out->rb_frame_current = Rollback::RollbackSession_GetCurrentFrame();
     out->frames_ahead = Rollback::RollbackSession_FramesAhead();

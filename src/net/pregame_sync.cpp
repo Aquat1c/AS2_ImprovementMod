@@ -9,6 +9,7 @@
 
 #include "net/pregame_sync.h"
 #include "net/charsel_sync.h"
+#include "net/frontend_input_sync.h"
 #include "net/match_bootstrap.h"
 #include "net/match_lifecycle.h"
 #include "net/pause_handler.h"
@@ -62,7 +63,7 @@ static bool            s_remoteStageLocked   = false;
 static uint32_t        s_sessionId           = 0;
 static uint32_t        s_remoteSessionId     = 0;
 static uint8_t         s_assignedSide        = 0;   // 0 = host is P1
-static uint8_t         s_localCapabilities   = 0x01; // Bit 0: savestate baseline
+static uint8_t         s_localCapabilities   = 0x03; // Bit 0: savestate baseline, Bit 1: frontend digests
 static uint8_t         s_remoteCapabilities  = 0;
 static bool            s_syncAnnounceSent    = false;
 static bool            s_remoteSyncAnnounced = false;
@@ -167,9 +168,13 @@ static void HandleSyncAnnounce(const SyncAnnouncePayload* p) {
     s_remoteSessionId = p->session_id;
     s_remoteCapabilities = p->capability_flags;
     s_remoteSyncAnnounced = true;
+    FrontendInputSync_OnRemoteSyncAnnounce(p->frontend_delay_proposal, "pregame announce");
 
-    LOG_NETPLAY(LOG_INFO, "[PregameSync] Remote SyncAnnounce: session=0x%08X caps=0x%02X",
-        p->session_id, p->capability_flags);
+    LOG_NETPLAY(LOG_INFO,
+        "[PregameSync] Remote SyncAnnounce: session=0x%08X caps=0x%02X frontend_delay=%u",
+        p->session_id,
+        p->capability_flags,
+        p->frontend_delay_proposal);
 }
 
 static void HandleSyncConfirm(const SyncConfirmPayload* p) {
@@ -182,6 +187,10 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
     }
 
     s_remoteSyncConfirmed = true;
+    FrontendInputSync_OnRemoteSyncConfirm(
+        p->frontend_delay_proposal,
+        p->frontend_shared_delay,
+        "pregame confirm");
 
     // Receiving a SyncConfirm implies the remote already announced
     // (they went through Announce→Exchange→Confirm). If we missed their
@@ -197,10 +206,16 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
     if (role == SessionRole::Join) {
         s_sessionId = p->session_id;
         s_assignedSide = p->assigned_side;
+        FrontendInputSync_RebindEpoch(s_sessionId, "join adopted host session id");
     }
 
-    LOG_NETPLAY(LOG_INFO, "[PregameSync] Remote SyncConfirm: session=0x%08X side=%u confirmed=%u",
-        p->session_id, p->assigned_side, p->confirmed);
+    LOG_NETPLAY(LOG_INFO,
+        "[PregameSync] Remote SyncConfirm: session=0x%08X side=%u confirmed=%u frontend_delay=%u shared=%u",
+        p->session_id,
+        p->assigned_side,
+        p->confirmed,
+        p->frontend_delay_proposal,
+        p->frontend_shared_delay);
 }
 
 static void LogPregamePacketAnomaly(const char* reason,
@@ -253,6 +268,42 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
                 HandleSyncConfirm(static_cast<const SyncConfirmPayload*>(payload));
             } else {
                 LogPregamePacketAnomaly("Short SyncConfirm", type, payloadLen, sizeof(SyncConfirmPayload));
+            }
+            break;
+
+        case PacketType::FrontendPhaseBarrier:
+            if (payloadLen >= sizeof(FrontendPhaseBarrierPayload)) {
+                FrontendInputSync_OnRemotePhaseBarrier(
+                    static_cast<const FrontendPhaseBarrierPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short FrontendPhaseBarrier", type, payloadLen, sizeof(FrontendPhaseBarrierPayload));
+            }
+            break;
+
+        case PacketType::FrontendBoundaryDigest:
+            if (payloadLen >= sizeof(FrontendBoundaryDigestPayload)) {
+                FrontendInputSync_OnRemoteBoundaryDigest(
+                    static_cast<const FrontendBoundaryDigestPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short FrontendBoundaryDigest", type, payloadLen, sizeof(FrontendBoundaryDigestPayload));
+            }
+            break;
+
+        case PacketType::DelayChangeReq:
+            if (payloadLen >= sizeof(DelayChangeReqPayload)) {
+                FrontendInputSync_OnRemoteDelayChangeReq(
+                    static_cast<const DelayChangeReqPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short DelayChangeReq", type, payloadLen, sizeof(DelayChangeReqPayload));
+            }
+            break;
+
+        case PacketType::DelayChangeAck:
+            if (payloadLen >= sizeof(DelayChangeAckPayload)) {
+                FrontendInputSync_OnRemoteDelayChangeAck(
+                    static_cast<const DelayChangeAckPayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short DelayChangeAck", type, payloadLen, sizeof(DelayChangeAckPayload));
             }
             break;
 
@@ -432,12 +483,16 @@ static void SendSyncAnnounce() {
     SyncAnnouncePayload payload{};
     payload.session_id = s_sessionId;
     payload.capability_flags = s_localCapabilities;
+    payload.frontend_delay_proposal = (uint8_t)FrontendInputSync_GetLocalDelayProposal();
 
     BarrierProtocol_SendPacket(PacketType::SyncAnnounce,
                               &payload, sizeof(payload));
     s_syncAnnounceSent = true;
-    LOG_NETPLAY(LOG_INFO, "[PregameSync] Sent SyncAnnounce: session=0x%08X caps=0x%02X",
-        s_sessionId, s_localCapabilities);
+    LOG_NETPLAY(LOG_INFO,
+        "[PregameSync] Sent SyncAnnounce: session=0x%08X caps=0x%02X frontend_delay=%u",
+        s_sessionId,
+        s_localCapabilities,
+        payload.frontend_delay_proposal);
 }
 
 static void SendSyncConfirm() {
@@ -445,12 +500,18 @@ static void SendSyncConfirm() {
     payload.session_id = s_sessionId;
     payload.confirmed = 1;
     payload.assigned_side = s_assignedSide;
+    payload.frontend_delay_proposal = (uint8_t)FrontendInputSync_GetLocalDelayProposal();
+    payload.frontend_shared_delay = (uint8_t)FrontendInputSync_GetSharedDelay();
 
     BarrierProtocol_SendPacket(PacketType::SyncConfirm,
                               &payload, sizeof(payload));
     s_syncConfirmSent = true;
-    LOG_NETPLAY(LOG_INFO, "[PregameSync] Sent SyncConfirm: session=0x%08X side=%u",
-        s_sessionId, s_assignedSide);
+    LOG_NETPLAY(LOG_INFO,
+        "[PregameSync] Sent SyncConfirm: session=0x%08X side=%u local_frontend_delay=%u shared=%u",
+        s_sessionId,
+        s_assignedSide,
+        payload.frontend_delay_proposal,
+        payload.frontend_shared_delay);
 }
 
 static DWORD s_lastAnnounceSendTime = 0;
@@ -505,6 +566,7 @@ static void UpdateSyncExchange() {
         SessionRole role = Session_GetRole();
         if (role == SessionRole::Host) {
             s_assignedSide = 0;  // Host = P1 by default
+            FrontendInputSync_FinalizeDelayNegotiation("host sync exchange");
         }
 
         SendSyncConfirm();
@@ -523,6 +585,11 @@ static void UpdateSyncExchange() {
 
     // Wait for remote confirm
     if (s_remoteSyncConfirmed) {
+        if (!FrontendInputSync_FinalizeDelayNegotiation("sync confirm received")) {
+            SetErrorFmt("Frontend delay negotiation failed");
+            SetPhase(PregamePhase::Error, "frontend delay negotiation failed");
+            return;
+        }
         SetStatusFmt("Session sync confirmed.");
         SetPhase(PregamePhase::SyncConfirmed, "both confirmed");
     }
@@ -536,6 +603,11 @@ static void UpdateSyncExchange() {
 static void UpdateSyncConfirmed() {
     // Transition immediately to CharSel lockstep
     SessionRole role = Session_GetRole();
+    if (!FrontendInputSync_IsDelayNegotiated()) {
+        SetErrorFmt("Frontend delay was not negotiated");
+        SetPhase(PregamePhase::Error, "frontend delay missing");
+        return;
+    }
     LOG_NETPLAY(LOG_INFO, "[PregameSync] Session sync complete: session=0x%08X side=%u role=%s",
         s_sessionId, s_assignedSide,
         role == SessionRole::Host ? "Host" : "Join");
@@ -552,6 +624,12 @@ static void UpdateSyncConfirmed() {
 static uint32_t s_charselLogCounter = 0;
 
 static void UpdateFrontendCharSel() {
+    if (FrontendInputSync_HasRecoveryRequest()) {
+        SetErrorFmt("Frontend charsel recovery requested: %s", FrontendInputSync_GetRecoveryReason());
+        SetPhase(PregamePhase::Error, "frontend charsel recovery");
+        return;
+    }
+
     CharSelSync_FrameUpdate();
 
     CharSelSyncSnapshot csSnap{};
@@ -578,6 +656,12 @@ static void UpdateFrontendCharSel() {
 }
 
 static void UpdateFrontendStageSel() {
+    if (FrontendInputSync_HasRecoveryRequest()) {
+        SetErrorFmt("Frontend stagesel recovery requested: %s", FrontendInputSync_GetRecoveryReason());
+        SetPhase(PregamePhase::Error, "frontend stagesel recovery");
+        return;
+    }
+
     CharSelSync_FrameUpdate();
 
     CharSelSyncSnapshot csSnap{};
@@ -844,6 +928,7 @@ void PregameSync_Init() {
     s_remoteSyncConfirmed = false;
     s_phaseStartTime = 0;
 
+    FrontendInputSync_Init();
     CharSelSync_Init();
     MatchBootstrap_Init();
 
@@ -856,6 +941,7 @@ void PregameSync_Shutdown() {
 
     MatchBootstrap_Shutdown();
     CharSelSync_Shutdown();
+    FrontendInputSync_Shutdown();
 
     s_phase = PregamePhase::Idle;
     s_initialized = false;
@@ -909,6 +995,7 @@ bool PregameSync_Begin() {
             InputSyncHooks_SetLoadBarrierFreeze(false);
             CharSelSync_Abort();
             MatchBootstrap_Abort();
+            FrontendInputSync_AbortEpoch("pregame restart begin");
             SetPhase(PregamePhase::Idle, "restart begin");
         } else {
             LOG_NETPLAY(LOG_WARNING, "[PregameSync] Begin called but phase is %s",
@@ -950,6 +1037,11 @@ bool PregameSync_Begin() {
     s_lastAnnounceSendTime = 0;
     s_lastConfirmSendTime = 0;
     NetplayPaletteRuntime_OnDisconnect("pregame begin reset");
+    FrontendInputSync_BeginEpoch(
+        Session_GetRole(),
+        s_sessionId,
+        (uint16_t)FrontendInputSync_ComputeDelayProposal(),
+        "pregame begin");
 
     // Start with initial session sync (announce → exchange → confirmed → charsel)
     SetStatusFmt("Synchronizing session...");
@@ -970,6 +1062,7 @@ void PregameSync_Abort(const char* reason) {
 
     CharSelSync_Abort();
     MatchBootstrap_Abort();
+    FrontendInputSync_AbortEpoch(reason ? reason : "pregame abort");
 
     SetErrorFmt("%s", reason ? reason : "Pre-game sync aborted");
     SetPhase(PregamePhase::Idle, "aborted");

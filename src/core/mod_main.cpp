@@ -700,7 +700,7 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     if (rollbackActive) {
         Rollback::RollbackSessionSnapshot rbSnap{};
         Rollback::RollbackSession_GetSnapshot(&rbSnap);
-        out->delay_frames = rbSnap.active_delay;
+        out->delay_frames = Net::DelayPolicy_GetActiveDelay();
         out->rollback_frames = rbSnap.rollback_budget;
         out->local_frame = rbSnap.rb_frame_current;
         out->remote_frame = rbSnap.rb_frame_last_remote_received;
