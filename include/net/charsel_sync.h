@@ -92,7 +92,10 @@ void CharSelSync_CaptureLocalInput(uint16_t packedInput);
 bool CharSelSync_HasInputsForCurrentFrame();
 
 /// Consume the current frame's inputs and return P1/P2 in game-packed format.
-/// Advances the consume frame counter.  Host→P1, Join→P2.
+/// Advances the consume frame counter. Host→P1, Join→P2.
+/// During stage select this still returns the raw confirmed per-side inputs;
+/// the single canonical shared-cursor merge is applied later by
+/// Hook_InputProcess via StageSelSync_MergeConfirmed.
 bool CharSelSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2);
 
 /// Is the lockstep system actively running?

@@ -15,10 +15,13 @@
 
 namespace Net::Spectator {
 
-constexpr uint16_t PROTOCOL_VERSION = 2;
+constexpr uint16_t PROTOCOL_VERSION = 4;
 constexpr int MAX_PACKET_SIZE = 1200;
 constexpr int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;
 constexpr int MAX_FRAME_BATCH = 32;
+constexpr uint16_t LAN_DISCOVERY_PORT = 10702;
+constexpr uint32_t LAN_DISCOVERY_MAGIC = 0x44325341; // "AS2D"
+constexpr uint16_t LAN_DISCOVERY_VERSION = 1;
 
 constexpr uint8_t CHANNEL_CONTROL = 0;
 constexpr uint8_t CHANNEL_STREAM = 1;
@@ -66,6 +69,7 @@ struct HelloAckPayload {
     uint16_t protocol_version;
     uint16_t server_listen_port;
     uint32_t match_id;
+    uint32_t match_ordinal;
     uint8_t match_state;
     uint8_t _pad[3];
 };
@@ -76,11 +80,17 @@ struct RedirectPayload {
 
 struct MatchStatePayload {
     uint32_t match_id;
+    uint32_t match_ordinal;
+    uint32_t config_crc;
     uint8_t match_state;
     uint8_t _pad0[3];
     int32_t archive_start_rb_frame;
     int32_t confirmed_rb_frame;
     int32_t live_rb_frame;
+    uint16_t p1_wins;
+    uint16_t p2_wins;
+    uint16_t draws;
+    uint16_t completed_matches;
     LockedMatchConfig config;
     char p1_name[24];
     char p2_name[24];
@@ -97,6 +107,9 @@ struct FrameRecord {
 
 struct FrameBatchPayload {
     uint32_t match_id;
+    uint32_t match_ordinal;
+    uint32_t config_crc;
+    uint32_t session_seed;
     int32_t archive_start_rb_frame;
     int32_t confirmed_rb_frame;
     int32_t live_rb_frame;
@@ -117,12 +130,18 @@ struct PalettePlayerState {
 
 struct PaletteStatePayload {
     uint32_t match_id;
+    uint32_t match_ordinal;
+    uint32_t config_crc;
+    uint32_t session_seed;
     uint32_t palette_epoch;
     PalettePlayerState player[2];
 };
 
 struct PaletteDataPayload {
     uint32_t match_id;
+    uint32_t match_ordinal;
+    uint32_t config_crc;
+    uint32_t session_seed;
     uint32_t palette_epoch;
     uint8_t  game_slot;
     uint8_t  character_id;
@@ -136,6 +155,9 @@ struct PaletteDataPayload {
 
 struct HeartbeatPayload {
     uint32_t match_id;
+    uint32_t match_ordinal;
+    uint32_t config_crc;
+    uint32_t session_seed;
     int32_t confirmed_rb_frame;
     int32_t live_rb_frame;
     uint8_t match_state;
@@ -144,6 +166,7 @@ struct HeartbeatPayload {
 
 struct ClientStatusPayload {
     uint32_t match_id;
+    uint32_t match_ordinal;
     int32_t playback_rb_frame;
     int32_t buffered_frame_count;
     uint8_t flags;
@@ -153,6 +176,27 @@ struct ClientStatusPayload {
 struct DisconnectPayload {
     uint16_t reason_code;
     char message[64];
+};
+
+struct DiscoveryQueryPayload {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t _pad;
+    uint32_t nonce;
+};
+
+struct DiscoveryResponsePayload {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t spectator_port;
+    uint32_t nonce;
+    uint32_t match_id;
+    uint8_t match_state;
+    uint8_t connected_spectators;
+    uint8_t _pad[2];
+    char host_nickname[24];
+    char p1_name[24];
+    char p2_name[24];
 };
 
 #pragma pack(pop)

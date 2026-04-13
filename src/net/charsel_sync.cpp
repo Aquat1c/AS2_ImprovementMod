@@ -12,6 +12,7 @@
 #include "net/barrier_protocol.h"
 #include "net/frontend_input_sync.h"
 #include "net/session_manager.h"
+#include "net/stage_watchdog_tracker.h"
 #include "net/stagesel_sync.h"
 #include "core/as2_constants.h"
 #include "patches/charsel_palette_select.h"
@@ -75,6 +76,7 @@ static StageWatchdogState s_remoteStageState = {};
 static StageWatchdogState s_stageBoundaryState = {};
 static bool     s_stageBoundaryStateValid = false;
 static DWORD    s_lastStageWatchdogSendTime = 0;
+static StageWatchdogTrackerState s_remoteStageTracker = {};
 
 static bool IsStageSelCommittedSubstate(uint32_t substate) {
     return substate == CHARSEL_SUB_MATCHUP_COMMIT ||
@@ -139,6 +141,7 @@ static void ResetState() {
     memset(&s_stageBoundaryState, 0, sizeof(s_stageBoundaryState));
     s_stageBoundaryStateValid = false;
     s_lastStageWatchdogSendTime = 0;
+    StageWatchdogTracker_Reset(&s_remoteStageTracker);
 }
 
 static void SendCharSelLock() {
@@ -455,6 +458,7 @@ void CharSelSync_BeginStagePhase() {
     memset(&s_stageBoundaryState, 0, sizeof(s_stageBoundaryState));
     s_stageBoundaryStateValid = false;
     s_lastStageWatchdogSendTime = 0;
+    StageWatchdogTracker_Reset(&s_remoteStageTracker);
 
     CharSelPaletteSelect_EndFrontend();
     StageSelSync_Begin();
@@ -506,8 +510,7 @@ bool CharSelSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
 
     uint16_t localInput = 0;
     uint16_t remoteInput = 0;
-    FrontendFrameId frameId{};
-    if (!FrontendInputSync_ConsumeCurrentFrame(&localInput, &remoteInput, &frameId)) {
+    if (!FrontendInputSync_ConsumeCurrentFrame(&localInput, &remoteInput, nullptr)) {
         return false;
     }
 
@@ -521,13 +524,8 @@ bool CharSelSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         p2 = localInput;
     }
 
-    if (s_inStagePhase && StageSelSync_IsActive()) {
-        *outP1 = StageSelSync_MergeConfirmed(frameId.frame, p1, p2);
-        *outP2 = 0;
-    } else {
-        *outP1 = p1;
-        *outP2 = p2;
-    }
+    *outP1 = p1;
+    *outP2 = p2;
 
     return true;
 }
@@ -638,30 +636,48 @@ void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
         return;
     }
 
-    s_remoteStageState.stage_id = p->stage_id;
-    s_remoteStageState.stage_cursor = p->stage_cursor;
-    s_remoteStageState.stage_confirmed = p->confirmed;
-    s_remoteStageState.stage_counter = p->stage_counter;
-    s_remoteStageState.stage_aux = p->stage_aux;
-    s_remoteStageState.stage_cancel = p->stage_cancel;
-    s_remoteStageState.confirm_menu_cursor = p->confirm_menu_cursor;
-    s_remoteStageState.confirm_menu_action = p->confirm_menu_action;
-    s_remoteStageState.committed_stage_id = p->committed_stage_id;
-    s_remoteStageState.substate = p->substate;
-    s_remoteStage = p->stage_id;
-    if (p->confirmed) {
+    const StageWatchdogApplyResult applyResult = StageWatchdogTracker_Apply(&s_remoteStageTracker, p);
+    if (applyResult == StageWatchdogApplyResult::Duplicate ||
+        applyResult == StageWatchdogApplyResult::IgnoredOutOfOrder ||
+        applyResult == StageWatchdogApplyResult::IgnoredRegression) {
+        Rollback::NetplayLog_Verbose(
+            "STAGESEL", -1,
+            "Ignored StageSync watchdog: epoch=%u frame=%u stage=%u confirmed=%u result=%s",
+            p->epoch_id,
+            p->frame,
+            p->stage_id,
+            p->confirmed,
+            StageWatchdogApplyResultName(applyResult));
+        return;
+    }
+
+    const StageSyncPayload& accepted = s_remoteStageTracker.latest;
+
+    s_remoteStageState.stage_id = accepted.stage_id;
+    s_remoteStageState.stage_cursor = accepted.stage_cursor;
+    s_remoteStageState.stage_confirmed = accepted.confirmed;
+    s_remoteStageState.stage_counter = accepted.stage_counter;
+    s_remoteStageState.stage_aux = accepted.stage_aux;
+    s_remoteStageState.stage_cancel = accepted.stage_cancel;
+    s_remoteStageState.confirm_menu_cursor = accepted.confirm_menu_cursor;
+    s_remoteStageState.confirm_menu_action = accepted.confirm_menu_action;
+    s_remoteStageState.committed_stage_id = accepted.committed_stage_id;
+    s_remoteStageState.substate = accepted.substate;
+    s_remoteStage = accepted.stage_id;
+    if (accepted.confirmed) {
         s_remoteStageLocked = true;
     }
 
     Rollback::NetplayLog_Verbose(
         "STAGESEL", -1,
-        "Remote stage watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u sub=%u",
-        p->epoch_id,
-        p->frame,
-        p->stage_id,
-        p->confirmed,
-        p->stage_cursor,
-        p->substate);
+        "Remote stage watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u sub=%u result=%s",
+        accepted.epoch_id,
+        accepted.frame,
+        accepted.stage_id,
+        accepted.confirmed,
+        accepted.stage_cursor,
+        accepted.substate,
+        StageWatchdogApplyResultName(applyResult));
 }
 
 void CharSelSync_GetSnapshot(CharSelSyncSnapshot* out) {

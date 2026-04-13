@@ -151,13 +151,28 @@ struct MenuSnapshot {
     // Spectator client diagnostics
     bool          spectator_client_active;
     uint32_t      spectator_client_match_id;
+    uint32_t      spectator_client_match_ordinal;
+    char          spectator_p1_name[24];
+    char          spectator_p2_name[24];
+    int           spectator_p1_wins;
+    int           spectator_p2_wins;
     uint32_t      spectator_client_buffered_frames;
     int32_t       spectator_client_buffer_start;
     int32_t       spectator_client_buffer_end;
+    int32_t       spectator_client_confirmed_edge;
     int32_t       spectator_client_playback_frame;
     bool          spectator_client_should_fast_forward;
     bool          spectator_client_needs_hard_sync;
+    bool          spectator_client_relay_active;
+    uint16_t      spectator_client_relay_port;
+    uint32_t      spectator_client_relay_spectators;
     char          spectator_client_status[128];
+    bool          spectator_lan_discovery_active;
+    uint32_t      spectator_lan_result_count;
+    char          spectator_lan_discovery_status[128];
+    bool          spectator_playback_active;
+    int32_t       spectator_playback_frame;
+    char          spectator_playback_status[128];
 
     // Session display
     bool          is_host;

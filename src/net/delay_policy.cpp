@@ -121,8 +121,10 @@ static void LogRecommendationUpdate(int prevDelay,
     }
 
     LOG_INFO(
-        "[DelayPolicy] Recommendations: ping=%.1fms one_way=%.2ff K=%d delay=%d max_rb=%d",
+        "[DelayPolicy] Recommendations: ping=%.1fms variance=%.1fms jitter=%.2ff one_way=%.2ff K=%d delay=%d max_rb=%d",
         s_avgPingMs,
+        s_lastVarianceMs,
+        s_lastVarianceMs / FRAME_TIME_MS,
         s_oneWayFrames,
         s_rollbackToleranceK,
         s_recommendedDelay,
@@ -130,8 +132,10 @@ static void LogRecommendationUpdate(int prevDelay,
 
     Rollback::NetplayLog_Write(
         "DELAY", -1,
-        "Recommendations updated: ping=%.1fms one_way=%.2ff K=%d delay=%d max_rb=%d",
+        "Recommendations updated: ping=%.1fms variance=%.1fms jitter=%.2ff one_way=%.2ff K=%d delay=%d max_rb=%d",
         s_avgPingMs,
+        s_lastVarianceMs,
+        s_lastVarianceMs / FRAME_TIME_MS,
         s_oneWayFrames,
         s_rollbackToleranceK,
         s_recommendedDelay,
@@ -228,7 +232,9 @@ void DelayPolicy_GetMeasurement(NetworkMeasurement* out) {
 
     memset(out, 0, sizeof(*out));
     out->avg_ping_ms = s_avgPingMs;
+    out->rtt_variance_ms = s_lastVarianceMs;
     out->one_way_frames = s_oneWayFrames;
+    out->jitter_frames = s_lastVarianceMs / FRAME_TIME_MS;
     out->recommended_delay = s_recommendedDelay;
     out->recommended_max_rollback = s_recommendedMaxRollback;
     out->valid = s_measurementValid;
@@ -406,7 +412,9 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
     out->remote_announced_max_rollback = s_remoteAnnouncedMaxRb;
     out->stall_threshold = s_stallThreshold;
     out->measured_avg_ping_ms = s_avgPingMs;
+    out->measured_rtt_variance_ms = s_lastVarianceMs;
     out->measured_one_way_frames = s_oneWayFrames;
+    out->measured_jitter_frames = s_lastVarianceMs / FRAME_TIME_MS;
     out->measurement_valid = s_measurementValid;
     out->rollback_synced = s_rollbackSynced;
     out->rollback_current_delay = s_rollbackCurrentDelay;

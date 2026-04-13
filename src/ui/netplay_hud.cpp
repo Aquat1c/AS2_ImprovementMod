@@ -58,15 +58,25 @@ void NetplayHud_Render() {
         dl->AddText(ImVec2(p2x, topY), p2col, p2text);
     }
 
-    // --- BOTTOM: Connection stats bar ---
+    // --- BOTTOM: Connection stats or spectator status ---
     {
         char stats[80];
-        if (hud.ping_ms >= 0.0f) {
-            snprintf(stats, sizeof(stats), "PING:%dms  D:%d  RB:%d",
-                     (int)(hud.ping_ms + 0.5f), hud.delay_frames, hud.rollback_frames);
+        if (hud.show_connection_stats) {
+            if (hud.ping_ms >= 0.0f) {
+                snprintf(stats, sizeof(stats), "PING:%dms  D:%d  RB:%d",
+                         (int)(hud.ping_ms + 0.5f), hud.delay_frames, hud.rollback_frames);
+            } else {
+                snprintf(stats, sizeof(stats), "PING:--  D:%d  RB:%d",
+                         hud.delay_frames, hud.rollback_frames);
+            }
+        } else if (hud.status_text[0]) {
+            snprintf(stats, sizeof(stats), "%s", hud.status_text);
         } else {
-            snprintf(stats, sizeof(stats), "PING:--  D:%d  RB:%d",
-                     hud.delay_frames, hud.rollback_frames);
+            stats[0] = '\0';
+        }
+
+        if (!stats[0]) {
+            return;
         }
 
         ImVec2 sz = ImGui::CalcTextSize(stats);

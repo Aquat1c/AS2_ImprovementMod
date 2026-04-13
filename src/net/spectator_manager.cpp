@@ -37,12 +37,17 @@ static bool s_initialized = false;
 static bool s_enabled = false;
 static ENetHost* s_server = nullptr;
 static uint16_t s_listenPort = 10701;
+static uint16_t s_boundListenPort = 0;
 static uint32_t s_activeMatchId = 0;
+static uint32_t s_activeMatchOrdinal = 0;
 static char s_redirectEndpoint[96] = "";
 static char s_status[128] = "Spectator server disabled.";
 static std::unordered_map<ENetPeer*, PeerState> s_peers;
 
 constexpr int kMaxEventsPerFrame = 64;
+constexpr int kMaxHandshakenSpectators = 8;
+constexpr DWORD kRelayPeerFreshStatusMs = 2000;
+constexpr int kPortFallbackScanCount = 16;
 
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
@@ -70,6 +75,65 @@ static int CountHandshakenPeers() {
         }
     }
     return count;
+}
+
+static bool BuildPeerAdvertisedEndpoint(const PeerState& state, char* outEndpoint, size_t cap) {
+    if (!outEndpoint || cap == 0) {
+        return false;
+    }
+
+    outEndpoint[0] = '\0';
+    if (!state.peer || state.advertised_listen_port == 0) {
+        return false;
+    }
+
+    char host[96] = {};
+    if (enet_address_get_host_ip(&state.peer->address, host, sizeof(host)) != 0 || !host[0]) {
+        return false;
+    }
+
+    if (strchr(host, ':')) {
+        _snprintf_s(outEndpoint, cap, _TRUNCATE, "[%s]:%u", host, state.advertised_listen_port);
+    } else {
+        _snprintf_s(outEndpoint, cap, _TRUNCATE, "%s:%u", host, state.advertised_listen_port);
+    }
+    return outEndpoint[0] != '\0';
+}
+
+static bool FindRelayRedirectEndpoint(char* outEndpoint, size_t cap) {
+    if (!outEndpoint || cap == 0) {
+        return false;
+    }
+
+    outEndpoint[0] = '\0';
+    const DWORD now = GetTickCount();
+    const PeerState* best = nullptr;
+
+    for (const auto& entry : s_peers) {
+        const PeerState& state = entry.second;
+        if (!state.handshake_complete || !state.peer) {
+            continue;
+        }
+        if (state.advertised_listen_port == 0 || state.last_status_at_ms == 0) {
+            continue;
+        }
+        if ((now - state.last_status_at_ms) > kRelayPeerFreshStatusMs) {
+            continue;
+        }
+        if (state.last_playback_rb_frame < 0) {
+            continue;
+        }
+
+        if (!best || state.connected_at_ms < best->connected_at_ms) {
+            best = &state;
+        }
+    }
+
+    if (!best) {
+        return false;
+    }
+
+    return BuildPeerAdvertisedEndpoint(*best, outEndpoint, cap);
 }
 
 static PeerState* FindPeer(uintptr_t peer_id) {
@@ -112,8 +176,88 @@ static bool SendTyped(ENetPeer* peer,
     return true;
 }
 
+static uint16_t ResolveBoundPort(ENetHost* host, uint16_t fallbackPort) {
+    if (!host) {
+        return fallbackPort;
+    }
+
+    ENetAddress boundAddress{};
+    if (enet_socket_get_address(host->socket, &boundAddress) == 0 &&
+        boundAddress.port != 0) {
+        return boundAddress.port;
+    }
+
+    return fallbackPort;
+}
+
+static ENetHost* TryCreateServerHost(uint16_t port) {
+    ENetAddress address{};
+    address.host = ENET_HOST_ANY;
+    address.port = port;
+    return enet_host_create(&address, 8, Spectator::NUM_CHANNELS, 0, 0);
+}
+
+static ENetHost* CreateServerWithFallback(uint16_t requestedPort,
+                                          uint16_t* outBoundPort,
+                                          bool* outUsedFallback,
+                                          bool* outUsedEphemeral) {
+    if (outBoundPort) {
+        *outBoundPort = requestedPort;
+    }
+    if (outUsedFallback) {
+        *outUsedFallback = false;
+    }
+    if (outUsedEphemeral) {
+        *outUsedEphemeral = false;
+    }
+
+    ENetHost* host = TryCreateServerHost(requestedPort);
+    if (host) {
+        if (outBoundPort) {
+            *outBoundPort = ResolveBoundPort(host, requestedPort);
+        }
+        return host;
+    }
+
+    for (int delta = 1; delta <= kPortFallbackScanCount; delta++) {
+        const unsigned candidatePort = (unsigned)requestedPort + (unsigned)delta;
+        if (candidatePort > UINT16_MAX) {
+            break;
+        }
+
+        host = TryCreateServerHost((uint16_t)candidatePort);
+        if (!host) {
+            continue;
+        }
+
+        if (outBoundPort) {
+            *outBoundPort = ResolveBoundPort(host, (uint16_t)candidatePort);
+        }
+        if (outUsedFallback) {
+            *outUsedFallback = true;
+        }
+        return host;
+    }
+
+    host = TryCreateServerHost(0);
+    if (host) {
+        if (outBoundPort) {
+            *outBoundPort = ResolveBoundPort(host, 0);
+        }
+        if (outUsedFallback) {
+            *outUsedFallback = true;
+        }
+        if (outUsedEphemeral) {
+            *outUsedEphemeral = true;
+        }
+    }
+
+    return host;
+}
+
 static void DestroyServer(const char* reason) {
     if (!s_server) {
+        s_boundListenPort = 0;
         s_peers.clear();
         return;
     }
@@ -128,6 +272,7 @@ static void DestroyServer(const char* reason) {
 
     enet_host_destroy(s_server);
     s_server = nullptr;
+    s_boundListenPort = 0;
     s_peers.clear();
     SetStatus("Spectator server offline%s%s",
         reason ? ": " : "",
@@ -146,12 +291,15 @@ static bool EnsureServer() {
         return true;
     }
 
-    ENetAddress address{};
-    address.host = ENET_HOST_ANY;
-    address.port = s_listenPort;
-
-    s_server = enet_host_create(&address, 8, Spectator::NUM_CHANNELS, 0, 0);
+    bool usedFallback = false;
+    bool usedEphemeral = false;
+    s_server = CreateServerWithFallback(
+        s_listenPort,
+        &s_boundListenPort,
+        &usedFallback,
+        &usedEphemeral);
     if (!s_server) {
+        s_boundListenPort = 0;
         SetStatus("Failed to bind spectator port %u", s_listenPort);
         LOG_NETPLAY(LOG_WARNING,
             "[SpectatorMgr] Failed to create spectator host on port %u",
@@ -159,10 +307,19 @@ static bool EnsureServer() {
         return false;
     }
 
-    SetStatus("Spectator server listening on %u", s_listenPort);
+    if (usedFallback) {
+        SetStatus("Spectator server listening on %u (requested %u)",
+            s_boundListenPort,
+            s_listenPort);
+    } else {
+        SetStatus("Spectator server listening on %u", s_boundListenPort);
+    }
     LOG_NETPLAY(LOG_INFO,
-        "[SpectatorMgr] Spectator server listening on port %u",
-        s_listenPort);
+        "[SpectatorMgr] Spectator server listening: requested_port=%u bound_port=%u fallback=%d ephemeral=%d",
+        s_listenPort,
+        s_boundListenPort,
+        usedFallback ? 1 : 0,
+        usedEphemeral ? 1 : 0);
     return true;
 }
 
@@ -213,34 +370,48 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
         return;
     }
 
-    if (CountHandshakenPeers() >= 8) {
-        if (s_redirectEndpoint[0]) {
-            Spectator::RedirectPayload redirect{};
-            CopyText(redirect.endpoint, sizeof(redirect.endpoint), s_redirectEndpoint);
-            SendTyped(peer,
-                Spectator::CHANNEL_CONTROL,
-                Spectator::PacketType::Redirect,
-                &redirect,
-                sizeof(redirect),
-                true);
-            LOG_NETPLAY(LOG_INFO,
-                "[SpectatorMgr] Redirect peer=0x%p endpoint=%s",
-                peer,
-                s_redirectEndpoint);
-        } else {
-            Spectator::DisconnectPayload disconnect{};
-            disconnect.reason_code = 3;
-            CopyText(disconnect.message, sizeof(disconnect.message), "spectator capacity reached");
-            SendTyped(peer,
-                Spectator::CHANNEL_CONTROL,
-                Spectator::PacketType::Disconnect,
-                &disconnect,
-                sizeof(disconnect),
-                true);
-            LOG_NETPLAY(LOG_INFO,
-                "[SpectatorMgr] Reject peer=0x%p reason=capacity_reached",
-                peer);
-        }
+    const int handshakenPeers = CountHandshakenPeers();
+    char redirectEndpoint[96] = {};
+    bool shouldRedirect = false;
+    if (handshakenPeers >= kMaxHandshakenSpectators) {
+        shouldRedirect = FindRelayRedirectEndpoint(redirectEndpoint, sizeof(redirectEndpoint));
+    }
+    if (!shouldRedirect && s_redirectEndpoint[0]) {
+        CopyText(redirectEndpoint, sizeof(redirectEndpoint), s_redirectEndpoint);
+        shouldRedirect = handshakenPeers >= kMaxHandshakenSpectators;
+    }
+
+    if (shouldRedirect) {
+        Spectator::RedirectPayload redirect{};
+        CopyText(redirect.endpoint, sizeof(redirect.endpoint), redirectEndpoint);
+        SendTyped(peer,
+            Spectator::CHANNEL_CONTROL,
+            Spectator::PacketType::Redirect,
+            &redirect,
+            sizeof(redirect),
+            true);
+        LOG_NETPLAY(LOG_INFO,
+            "[SpectatorMgr] Redirect peer=0x%p endpoint=%s handshaken=%d",
+            peer,
+            redirectEndpoint,
+            handshakenPeers);
+        enet_peer_disconnect_later(peer, 0);
+        return;
+    }
+
+    if (handshakenPeers >= kMaxHandshakenSpectators) {
+        Spectator::DisconnectPayload disconnect{};
+        disconnect.reason_code = 3;
+        CopyText(disconnect.message, sizeof(disconnect.message), "spectator capacity reached");
+        SendTyped(peer,
+            Spectator::CHANNEL_CONTROL,
+            Spectator::PacketType::Disconnect,
+            &disconnect,
+            sizeof(disconnect),
+            true);
+        LOG_NETPLAY(LOG_INFO,
+            "[SpectatorMgr] Reject peer=0x%p reason=capacity_reached",
+            peer);
         enet_peer_disconnect_later(peer, 0);
         return;
     }
@@ -257,8 +428,9 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
 
     Spectator::HelloAckPayload ack{};
     ack.protocol_version = Spectator::PROTOCOL_VERSION;
-    ack.server_listen_port = s_listenPort;
+    ack.server_listen_port = s_boundListenPort != 0 ? s_boundListenPort : s_listenPort;
     ack.match_id = s_activeMatchId;
+    ack.match_ordinal = s_activeMatchOrdinal;
     ack.match_state = (s_activeMatchId != 0)
         ? Spectator::MATCH_STATE_ACTIVE
         : Spectator::MATCH_STATE_IDLE;
@@ -284,6 +456,11 @@ static void HandleClientStatus(ENetPeer* peer, const Spectator::ClientStatusPayl
         return;
     }
 
+    if (payload->match_id != 0 &&
+        (payload->match_id != s_activeMatchId || payload->match_ordinal != s_activeMatchOrdinal)) {
+        return;
+    }
+
     auto it = s_peers.find(peer);
     if (it == s_peers.end()) {
         return;
@@ -296,6 +473,29 @@ static void HandleClientStatus(ENetPeer* peer, const Spectator::ClientStatusPayl
     state.last_status_at_ms = GetTickCount();
 }
 
+static void HandleClientDisconnect(ENetPeer* peer, const Spectator::DisconnectPayload* payload) {
+    if (!peer) {
+        return;
+    }
+
+    auto it = s_peers.find(peer);
+    if (it == s_peers.end()) {
+        return;
+    }
+
+    const char* message = (payload && payload->message[0])
+        ? payload->message
+        : "client disconnect";
+    LOG_NETPLAY(LOG_INFO,
+        "[SpectatorMgr] Peer requested disconnect peer=0x%p nick='%s' reason_code=%u message=%s",
+        peer,
+        it->second.nickname[0] ? it->second.nickname : "?",
+        payload ? payload->reason_code : 0,
+        message);
+    s_peers.erase(it);
+    enet_peer_disconnect_now(peer, 0);
+}
+
 } // namespace
 
 namespace Net {
@@ -306,7 +506,9 @@ void SpectatorManager_Init() {
     }
     s_enabled = false;
     s_server = nullptr;
+    s_boundListenPort = 0;
     s_activeMatchId = 0;
+    s_activeMatchOrdinal = 0;
     s_status[0] = '\0';
     SetStatus("Spectator server disabled.");
     s_initialized = true;
@@ -346,20 +548,23 @@ void SpectatorManager_SetRedirectEndpoint(const char* endpoint) {
     CopyText(s_redirectEndpoint, sizeof(s_redirectEndpoint), endpoint);
 }
 
-void SpectatorManager_BeginMatch(uint32_t match_id) {
+void SpectatorManager_BeginMatch(uint32_t match_id, uint32_t match_ordinal) {
     s_activeMatchId = match_id;
+    s_activeMatchOrdinal = match_ordinal;
     for (auto& entry : s_peers) {
         entry.second.needs_full_sync = true;
         entry.second.next_rb_frame = 0;
     }
     LOG_NETPLAY(LOG_INFO,
-        "[SpectatorMgr] Active match begin: match_id=0x%08X peers=%d",
+        "[SpectatorMgr] Active match begin: match_id=0x%08X ordinal=%u peers=%d",
         match_id,
+        match_ordinal,
         CountHandshakenPeers());
 }
 
 void SpectatorManager_EndMatch(const char* reason) {
     s_activeMatchId = 0;
+    s_activeMatchOrdinal = 0;
     if (reason && reason[0]) {
         SetStatus("Spectator server idle: %s", reason);
     } else {
@@ -431,6 +636,14 @@ void SpectatorManager_FrameUpdate() {
                         }
                         break;
 
+                    case Spectator::PacketType::Disconnect:
+                        if (payloadLen >= sizeof(Spectator::DisconnectPayload)) {
+                            HandleClientDisconnect(event.peer, static_cast<const Spectator::DisconnectPayload*>(payload));
+                        } else {
+                            HandleClientDisconnect(event.peer, nullptr);
+                        }
+                        break;
+
                     default:
                         break;
                 }
@@ -493,12 +706,16 @@ int SpectatorManager_GetPeerSnapshots(SpectatorPeerSnapshot* out, int maxPeers) 
 }
 
 int32_t SpectatorManager_GetOldestRequestedFrame() {
-    int32_t oldest = INT_MAX;
+    int32_t oldest = -1;
     for (const auto& entry : s_peers) {
         if (!entry.second.handshake_complete) {
             continue;
         }
-        oldest = (std::min)(oldest, entry.second.next_rb_frame);
+        if (oldest < 0) {
+            oldest = entry.second.next_rb_frame;
+        } else {
+            oldest = (std::min)(oldest, entry.second.next_rb_frame);
+        }
     }
     return oldest;
 }
@@ -623,7 +840,9 @@ void SpectatorManager_GetSnapshot(SpectatorManagerSnapshot* out) {
     out->initialized = s_initialized;
     out->enabled = s_enabled;
     out->server_active = s_server != nullptr;
-    out->listen_port = s_listenPort;
+    out->listen_port = (s_server && s_boundListenPort != 0)
+        ? s_boundListenPort
+        : s_listenPort;
     out->active_match_id = s_activeMatchId;
     out->connected_spectators = CountHandshakenPeers();
     out->oldest_requested_rb_frame = SpectatorManager_GetOldestRequestedFrame();

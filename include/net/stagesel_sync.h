@@ -57,9 +57,11 @@ bool StageSelSync_ConsumeEdgeReset();
 
 /// Merge P1 and P2 lockstep-confirmed inputs into a single shared input.
 /// STATELESS: same (p1, p2) always produces the same result — no internal
-/// state, no cooldown, no history.  Records the confirmed frame in the
-/// audit ring.
+/// state, no cooldown, no history. Records the confirmed frame in the audit
+/// ring. The merge authority lives at raw input injection in Hook_InputProcess;
+/// callers should not pre-merge elsewhere.
 uint16_t StageSelSync_MergeConfirmed(uint32_t frame, uint16_t p1, uint16_t p2);
+
 
 // ============================================================================
 // Diagnostics

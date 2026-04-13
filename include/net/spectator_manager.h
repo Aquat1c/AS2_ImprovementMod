@@ -45,7 +45,7 @@ void SpectatorManager_SetEnabled(bool enabled);
 bool SpectatorManager_SetListenPort(uint16_t port);
 void SpectatorManager_SetRedirectEndpoint(const char* endpoint);
 
-void SpectatorManager_BeginMatch(uint32_t match_id);
+void SpectatorManager_BeginMatch(uint32_t match_id, uint32_t match_ordinal);
 void SpectatorManager_EndMatch(const char* reason);
 void SpectatorManager_FrameUpdate();
 

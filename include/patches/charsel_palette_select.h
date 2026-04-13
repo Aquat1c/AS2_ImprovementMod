@@ -26,6 +26,10 @@ void CharSelPaletteSelect_OnLocalCatalogChanged();
 
 bool CharSelPaletteSelect_IsCatalogReady();
 bool CharSelPaletteSelect_IsSelectionLocked(uint8_t game_slot);
+bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t game_slot,
+                                              uint8_t character_id,
+                                              uint8_t base_palette,
+                                              bool use_custom);
 bool CharSelPaletteSelect_ShouldPreviewCustomBank(uint8_t game_slot,
                                                  uint8_t character_id,
                                                  uint8_t base_palette);

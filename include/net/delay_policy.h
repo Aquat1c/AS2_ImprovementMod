@@ -44,7 +44,9 @@ constexpr int kHiddenGameplayDelayFloor = 1;
 
 struct NetworkMeasurement {
     float    avg_ping_ms;
+    float    rtt_variance_ms;
     float    one_way_frames;
+    float    jitter_frames;
     int      recommended_delay;
     int      recommended_max_rollback;
     bool     valid;
@@ -72,7 +74,9 @@ struct DelayPolicySnapshot {
     int      stall_threshold;
 
     float    measured_avg_ping_ms;
+    float    measured_rtt_variance_ms;
     float    measured_one_way_frames;
+    float    measured_jitter_frames;
     bool     measurement_valid;
 
     bool     rollback_synced;

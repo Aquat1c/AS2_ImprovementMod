@@ -9,6 +9,7 @@
  */
 
 #include "filesystem_patch.h"
+#include "core/as2_constants.h"
 #include "locale_patch.h"
 #include "ui/log_window.h"
 #include "MinHook.h"
@@ -64,6 +65,12 @@ static const char kDefaultModsConfigTemplate[] =
     "\r\n"
     "[Mods]\r\n"
     ";ExampleMod=1\r\n";
+
+static constexpr uintptr_t kAddrLegacyConfigPath = GAME_BASE + 0x3445E4; // byte_7445E4
+static constexpr uintptr_t kAddrLegacyKeymapPath = GAME_BASE + 0x3445D0; // byte_7445D0
+
+static const char kPatchedConfigPath[] = "as2_system.ini";
+static const char kPatchedKeymapPath[] = "as2_system.rec";
 
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
@@ -190,6 +197,21 @@ static bool WriteTextFileAnsi(const char* path, const char* content) {
     return written == length;
 }
 
+static bool CopyFileAnsi(const char* sourcePath, const char* destPath, bool failIfExists) {
+    if (!sourcePath || !sourcePath[0] || !destPath || !destPath[0]) {
+        return false;
+    }
+
+    WCHAR wideSource[MAX_PATH] = {};
+    WCHAR wideDest[MAX_PATH] = {};
+    if (!ConvertAnsiPathToWide(sourcePath, wideSource, MAX_PATH) ||
+        !ConvertAnsiPathToWide(destPath, wideDest, MAX_PATH)) {
+        return false;
+    }
+
+    return CopyFileW(wideSource, wideDest, failIfExists ? TRUE : FALSE) == TRUE;
+}
+
 static void NormalizeSlashes(char* path) {
     if (!path) {
         return;
@@ -269,6 +291,96 @@ static void JoinPath(char* outPath, size_t outCap, const char* left, const char*
     }
 
     snprintf(outPath, outCap, "%s\\%s", left, right);
+}
+
+static bool ReadStaticAnsiString(uintptr_t address, char* outText, size_t outCap) {
+    if (!address || !outText || outCap == 0) {
+        return false;
+    }
+
+    const char* source = reinterpret_cast<const char*>(address);
+    const size_t sourceLen = strnlen_s(source, MAX_PATH);
+    if (sourceLen == 0 || sourceLen >= MAX_PATH || sourceLen >= outCap) {
+        return false;
+    }
+
+    memcpy(outText, source, sourceLen);
+    outText[sourceLen] = '\0';
+    return true;
+}
+
+static bool PatchStaticAnsiString(uintptr_t address, const char* replacement) {
+    if (!address || !replacement || !replacement[0]) {
+        return false;
+    }
+
+    char* target = reinterpret_cast<char*>(address);
+    const size_t originalLen = strnlen_s(target, MAX_PATH);
+    const size_t replacementLen = strlen(replacement);
+    if (originalLen == 0 || originalLen >= MAX_PATH || replacementLen > originalLen) {
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(target, originalLen + 1, PAGE_READWRITE, &oldProtect)) {
+        return false;
+    }
+
+    memset(target, 0, originalLen + 1);
+    memcpy(target, replacement, replacementLen);
+
+    DWORD restoredProtect = 0;
+    VirtualProtect(target, originalLen + 1, oldProtect, &restoredProtect);
+    return true;
+}
+
+static void MaybeMigrateLegacySettingsFile(const char* legacyName,
+                                           const char* patchedName,
+                                           const char* label) {
+    if (!legacyName || !legacyName[0] || !patchedName || !patchedName[0] || !s_gameRoot[0]) {
+        return;
+    }
+
+    char legacyPath[MAX_PATH] = {};
+    char patchedPath[MAX_PATH] = {};
+    JoinPath(legacyPath, sizeof(legacyPath), s_gameRoot, legacyName);
+    JoinPath(patchedPath, sizeof(patchedPath), s_gameRoot, patchedName);
+
+    if (FileExistsAnsi(patchedPath) || !FileExistsAnsi(legacyPath)) {
+        return;
+    }
+
+    if (CopyFileAnsi(legacyPath, patchedPath, true)) {
+        LOG_INFO("[ModLoader] Migrated legacy %s file to %s", label, patchedPath);
+    } else {
+        LOG_WARN("[ModLoader] Failed to migrate legacy %s file to %s", label, patchedPath);
+    }
+}
+
+static void PatchLegacySettingsPaths() {
+    char legacyConfigName[MAX_PATH] = {};
+    char legacyKeymapName[MAX_PATH] = {};
+
+    if (!ReadStaticAnsiString(kAddrLegacyConfigPath, legacyConfigName, sizeof(legacyConfigName))) {
+        LOG_WARN("[ModLoader] Failed to read legacy config filename at 0x%08X", (unsigned int)kAddrLegacyConfigPath);
+        return;
+    }
+
+    if (!ReadStaticAnsiString(kAddrLegacyKeymapPath, legacyKeymapName, sizeof(legacyKeymapName))) {
+        LOG_WARN("[ModLoader] Failed to read legacy keymap filename at 0x%08X", (unsigned int)kAddrLegacyKeymapPath);
+        return;
+    }
+
+    MaybeMigrateLegacySettingsFile(legacyConfigName, kPatchedConfigPath, "config");
+    MaybeMigrateLegacySettingsFile(legacyKeymapName, kPatchedKeymapPath, "keymap");
+
+    if (!PatchStaticAnsiString(kAddrLegacyConfigPath, kPatchedConfigPath)) {
+        LOG_WARN("[ModLoader] Failed to patch legacy config filename at 0x%08X", (unsigned int)kAddrLegacyConfigPath);
+    }
+
+    if (!PatchStaticAnsiString(kAddrLegacyKeymapPath, kPatchedKeymapPath)) {
+        LOG_WARN("[ModLoader] Failed to patch legacy keymap filename at 0x%08X", (unsigned int)kAddrLegacyKeymapPath);
+    }
 }
 
 static bool IsValidModFolderName(const char* name) {
@@ -466,6 +578,64 @@ static DWORD GetFileAttributesViaWidePath(const char* path) {
     return GetFileAttributesW(widePath);
 }
 
+static HMODULE LoadLibraryViaWidePath(const char* path) {
+    WCHAR widePath[MAX_PATH] = {};
+    if (!ConvertAnsiPathToWide(path, widePath, MAX_PATH)) {
+        return nullptr;
+    }
+
+    return LoadLibraryW(widePath);
+}
+
+static bool ResolveGameRootPath(HMODULE gameModule, char* outRoot, size_t outRootCap) {
+    if (!outRoot || outRootCap == 0) {
+        return false;
+    }
+
+    outRoot[0] = '\0';
+
+    char modulePath[MAX_PATH] = {};
+    const DWORD modulePathLen = gameModule
+        ? GetModuleFileNameA(gameModule, modulePath, MAX_PATH)
+        : 0;
+    if (modulePathLen > 0 && modulePathLen < MAX_PATH) {
+        char moduleDir[MAX_PATH] = {};
+        CopyText(moduleDir, sizeof(moduleDir), modulePath);
+
+        char* lastSlash = strrchr(moduleDir, '\\');
+        if (!lastSlash) {
+            lastSlash = strrchr(moduleDir, '/');
+        }
+
+        if (lastSlash) {
+            *lastSlash = '\0';
+            NormalizeSlashes(moduleDir);
+            if (moduleDir[0] &&
+                strcmp(moduleDir, ".") != 0 &&
+                strcmp(moduleDir, "..") != 0 &&
+                DirectoryExistsAnsi(moduleDir)) {
+                CopyText(outRoot, outRootCap, moduleDir);
+                return true;
+            }
+        }
+
+        LOG_WARN("[ModLoader] Ignoring unusable module-derived game root '%s'; falling back to current directory", modulePath);
+    } else if (modulePathLen >= MAX_PATH) {
+        LOG_WARN("[ModLoader] Module path was truncated while resolving game root; falling back to current directory");
+    } else {
+        LOG_WARN("[ModLoader] GetModuleFileNameA failed while resolving game root; falling back to current directory");
+    }
+
+    char cwd[MAX_PATH] = {};
+    if (GetCurrentDirectoryA(MAX_PATH, cwd) == 0 || !cwd[0]) {
+        return false;
+    }
+
+    NormalizeSlashes(cwd);
+    CopyText(outRoot, outRootCap, cwd);
+    return true;
+}
+
 static bool ShouldRedirectReadOpen(DWORD desiredAccess, DWORD creationDisposition, DWORD flagsAndAttributes) {
     if (creationDisposition != OPEN_EXISTING) {
         return false;
@@ -615,24 +785,17 @@ void FilesystemPatch_Init(HMODULE gameModule) {
 
     s_gameModule = gameModule ? gameModule : GetModuleHandleA(nullptr);
 
-    char modulePath[MAX_PATH] = {};
-    if (GetModuleFileNameA(s_gameModule, modulePath, MAX_PATH) == 0) {
-        if (GetCurrentDirectoryA(MAX_PATH, modulePath) == 0) {
-            modulePath[0] = '\0';
-        }
+    if (!ResolveGameRootPath(s_gameModule, s_gameRoot, sizeof(s_gameRoot))) {
+        CopyText(s_gameRoot, sizeof(s_gameRoot), ".");
+        LOG_WARN("[ModLoader] Failed to resolve game root; using relative current directory fallback");
     }
 
-    char* lastSlash = strrchr(modulePath, '\\');
-    if (!lastSlash) {
-        lastSlash = strrchr(modulePath, '/');
-    }
-    if (lastSlash) {
-        *lastSlash = '\0';
-    }
-
-    CopyText(s_gameRoot, sizeof(s_gameRoot), modulePath);
     JoinPath(s_modsRoot, sizeof(s_modsRoot), s_gameRoot, "mods");
     JoinPath(s_configPath, sizeof(s_configPath), s_modsRoot, "mods.ini");
+
+    LOG_INFO("[ModLoader] Game root resolved to %s", s_gameRoot);
+
+    PatchLegacySettingsPaths();
 
     EnsureModsDirectoryAndConfig();
     ParseModsConfig();
@@ -704,7 +867,10 @@ void FilesystemPatch_LoadEnabledModDLLs() {
             continue;
         }
 
-        mod.module = LoadLibraryA(mod.dll_path);
+        mod.module = LoadLibraryViaWidePath(mod.dll_path);
+        if (!mod.module) {
+            mod.module = LoadLibraryA(mod.dll_path);
+        }
         if (!mod.module) {
             LOG_WARN("[ModLoader] Failed to load %s (err %lu)", mod.dll_path, GetLastError());
             continue;

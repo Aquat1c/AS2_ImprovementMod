@@ -45,6 +45,9 @@ struct MatchHudData {
     int      local_frame;
     int      remote_frame;
     bool     is_host;
+    bool     spectator_mode;
+    bool     show_connection_stats;
+    char     status_text[64];
 };
 __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out);
 

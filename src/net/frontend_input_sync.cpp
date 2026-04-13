@@ -10,6 +10,7 @@
 #endif
 #include <windows.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +26,12 @@ constexpr DWORD FRONTEND_TIMEOUT_MS = 10000;
 constexpr DWORD FRONTEND_RESEND_INTERVAL_MS = 100;
 constexpr DWORD FRONTEND_TARGETED_RESEND_INTERVAL_MS = 100;
 constexpr DWORD FRONTEND_DELAY_BUMP_INTERVAL_MS = 1500;
+constexpr DWORD FRONTEND_PRESSURE_SAMPLE_INTERVAL_MS = 250;
+constexpr DWORD FRONTEND_STARVATION_PRESSURE_MS = 900;
+constexpr uint8_t FRONTEND_JITTER_PRESSURE_SAMPLE_THRESHOLD = 3;
+constexpr uint8_t FRONTEND_STARVATION_PRESSURE_SAMPLE_THRESHOLD = 2;
+constexpr float FRONTEND_JITTER_IGNORE_MS = 4.0f;
+constexpr float FRONTEND_JITTER_BUMP_FRAME_MS = FRAME_TIME_MS * 0.75f;
 constexpr uint32_t FRONTEND_SEND_HEAD_BUFFER = FRONTEND_RING_SIZE / 2;
 
 static_assert((FRONTEND_RING_SIZE & (FRONTEND_RING_SIZE - 1)) == 0,
@@ -59,6 +66,10 @@ static DWORD             s_lastRemoteInputTime = 0;
 static DWORD             s_lastResendTime = 0;
 static DWORD             s_lastTargetedResendTime = 0;
 static DWORD             s_lastDelayBumpRequestTime = 0;
+static DWORD             s_waitingForCurrentFrameSince = 0;
+static DWORD             s_lastPressureSampleTime = 0;
+static uint8_t           s_jitterPressureSamples = 0;
+static uint8_t           s_starvationPressureSamples = 0;
 static bool              s_timedOut = false;
 
 static bool              s_pendingDelayBump = false;
@@ -90,6 +101,92 @@ static bool              s_remoteAdvanceObserved = false;
 
 static char              s_recoveryReason[128] = {};
 
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+static bool              s_testClockOverrideActive = false;
+static DWORD             s_testClockMs = 0;
+#endif
+
+struct FrontendDelayProposalDetails {
+    uint16_t configured_floor;
+    uint16_t base_delay;
+    uint16_t jitter_bump;
+    uint16_t recommended_delay;
+    float    avg_ping_ms;
+    float    rtt_variance_ms;
+    float    one_way_frames;
+    float    jitter_frames;
+    bool     measurement_valid;
+};
+
+static uint16_t ClampFrontendDelay(uint16_t delay);
+
+static DWORD NowMs() {
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+    if (s_testClockOverrideActive) {
+        return s_testClockMs;
+    }
+#endif
+    return GetTickCount();
+}
+
+static uint16_t ComputeJitterBumpFrames(float varianceMs) {
+    if (varianceMs <= FRONTEND_JITTER_IGNORE_MS) {
+        return 0;
+    }
+
+    const float effectiveVarianceMs = varianceMs - FRONTEND_JITTER_IGNORE_MS;
+    int bump = (int)ceilf(effectiveVarianceMs / FRONTEND_JITTER_BUMP_FRAME_MS);
+    if (bump < 0) {
+        bump = 0;
+    }
+    if (bump > (FRONTEND_DELAY_MAX - FRONTEND_DELAY_MIN)) {
+        bump = FRONTEND_DELAY_MAX - FRONTEND_DELAY_MIN;
+    }
+    return (uint16_t)bump;
+}
+
+static FrontendDelayProposalDetails ComputeDelayProposalDetails() {
+    FrontendDelayProposalDetails details{};
+    NetworkMeasurement measurement{};
+    DelayPolicy_GetMeasurement(&measurement);
+
+    details.measurement_valid = measurement.valid;
+    details.avg_ping_ms = measurement.avg_ping_ms;
+    details.rtt_variance_ms = measurement.rtt_variance_ms;
+    details.one_way_frames = measurement.one_way_frames;
+    details.jitter_frames = measurement.jitter_frames;
+    details.configured_floor = ClampFrontendDelay((uint16_t)(DelayPolicy_GetConfiguredDelay() + 2));
+    details.base_delay = ClampFrontendDelay((uint16_t)(DelayPolicy_ComputeRecommendedDelay() + 2));
+    if (details.base_delay < details.configured_floor) {
+        details.base_delay = details.configured_floor;
+    }
+    details.jitter_bump = measurement.valid
+        ? ComputeJitterBumpFrames(measurement.rtt_variance_ms)
+        : 0;
+    details.recommended_delay = ClampFrontendDelay((uint16_t)(details.base_delay + details.jitter_bump));
+    return details;
+}
+
+static FrontendDelayBumpReason SanitizeDelayReason(uint8_t reasonCode) {
+    switch ((FrontendDelayBumpReason)reasonCode) {
+        case FrontendDelayBumpReason::None:
+        case FrontendDelayBumpReason::Starvation:
+        case FrontendDelayBumpReason::RemoteRequest:
+        case FrontendDelayBumpReason::HostAdjust:
+        case FrontendDelayBumpReason::JitterPressure:
+            return (FrontendDelayBumpReason)reasonCode;
+        default:
+            return FrontendDelayBumpReason::None;
+    }
+}
+
+static void ResetDelayPressureTracking() {
+    s_waitingForCurrentFrameSince = 0;
+    s_lastPressureSampleTime = 0;
+    s_jitterPressureSamples = 0;
+    s_starvationPressureSamples = 0;
+}
+
 static uint16_t ClampFrontendDelay(uint16_t delay) {
     if (delay < FRONTEND_DELAY_MIN) return FRONTEND_DELAY_MIN;
     if (delay > FRONTEND_DELAY_MAX) return FRONTEND_DELAY_MAX;
@@ -111,7 +208,7 @@ static void ClearPhaseInputState() {
     s_consumeFrame = 0;
     s_localInputFrame = 0;
     s_remoteLatestFrame = 0;
-    s_lastRemoteInputTime = GetTickCount();
+    s_lastRemoteInputTime = NowMs();
     s_lastResendTime = 0;
     s_lastTargetedResendTime = 0;
     s_lastDelayBumpRequestTime = 0;
@@ -142,6 +239,7 @@ static void ClearPhaseInputState() {
     s_remoteDigest = 0;
     s_localAdvanceObserved = false;
     s_remoteAdvanceObserved = false;
+    ResetDelayPressureTracking();
 }
 
 static void ClearEpochState() {
@@ -273,22 +371,26 @@ static void MaybeApplyPendingDelay() {
     }
 
     const uint16_t oldDelay = s_sharedDelay;
+    const FrontendDelayBumpReason appliedReason = s_pendingDelayReason;
     s_sharedDelay = ClampFrontendDelay(s_pendingDelay);
     s_pendingDelayBump = false;
     s_pendingDelay = 0;
     s_pendingApplyFrom = 0;
+    s_pendingDelayReason = FrontendDelayBumpReason::None;
     s_waitingForDelayAck = false;
     s_requestedDelay = 0;
     s_requestedApplyFrom = 0;
     s_requestedDelayReason = FrontendDelayBumpReason::None;
+    ResetDelayPressureTracking();
 
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Applied shared frontend delay bump: old=%u new=%u phase=%s frame=%u",
+        "Applied shared frontend delay bump: old=%u new=%u phase=%s frame=%u reason=%s",
         oldDelay,
         s_sharedDelay,
         FrontendSyncPhaseName(s_phase),
-        s_consumeFrame);
+        s_consumeFrame,
+        FrontendDelayBumpReasonName(appliedReason));
 }
 
 static void SendDelayChangeAck(uint16_t ackedDelay,
@@ -332,7 +434,7 @@ static void RequestDelayIncrease(uint16_t requestedDelay,
     s_requestedDelay = requestedDelay;
     s_requestedApplyFrom = req.apply_from_frame;
     s_requestedDelayReason = reason;
-    s_lastDelayBumpRequestTime = GetTickCount();
+    s_lastDelayBumpRequestTime = NowMs();
 
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
@@ -343,6 +445,80 @@ static void RequestDelayIncrease(uint16_t requestedDelay,
         req.apply_from_frame,
         FrontendDelayBumpReasonName(reason),
         context ? context : "?");
+}
+
+static void MaybeRequestLiveDelayIncrease(DWORD now) {
+    if (!s_epochActive ||
+        !s_inputPhaseActive ||
+        s_waitingForDelayAck ||
+        s_pendingDelayBump ||
+        s_sharedDelay >= FRONTEND_DELAY_MAX) {
+        return;
+    }
+
+    if (s_lastDelayBumpRequestTime != 0 &&
+        (now - s_lastDelayBumpRequestTime) < FRONTEND_DELAY_BUMP_INTERVAL_MS) {
+        return;
+    }
+
+    if ((now - s_lastPressureSampleTime) < FRONTEND_PRESSURE_SAMPLE_INTERVAL_MS) {
+        return;
+    }
+
+    s_lastPressureSampleTime = now;
+
+    const FrontendDelayProposalDetails details = ComputeDelayProposalDetails();
+    const uint16_t delayFloor = GetEffectiveDelayFloor();
+    const DWORD remoteSilenceMs = s_lastRemoteInputTime != 0 && now >= s_lastRemoteInputTime
+        ? (now - s_lastRemoteInputTime)
+        : 0;
+    const DWORD waitMs = s_waitingForCurrentFrameSince != 0 && now >= s_waitingForCurrentFrameSince
+        ? (now - s_waitingForCurrentFrameSince)
+        : 0;
+    const bool jitterPressure = details.recommended_delay > delayFloor;
+    const bool starvationPressure = remoteSilenceMs >= FRONTEND_STARVATION_PRESSURE_MS ||
+        waitMs >= FRONTEND_STARVATION_PRESSURE_MS;
+
+    s_jitterPressureSamples = jitterPressure
+        ? (uint8_t)(s_jitterPressureSamples < 0xFF ? s_jitterPressureSamples + 1 : 0xFF)
+        : 0;
+    s_starvationPressureSamples = starvationPressure
+        ? (uint8_t)(s_starvationPressureSamples < 0xFF ? s_starvationPressureSamples + 1 : 0xFF)
+        : 0;
+
+    if (jitterPressure || starvationPressure) {
+        Rollback::NetplayLog_Verbose(
+            "FRONTEND", -1,
+            "Delay pressure sample: phase=%s shared=%u floor=%u rec=%u base=%u jitter_bump=%u avg_ping=%.1f variance=%.1f silence_ms=%lu wait_ms=%lu jitter_samples=%u starvation_samples=%u",
+            FrontendSyncPhaseName(s_phase),
+            s_sharedDelay,
+            delayFloor,
+            details.recommended_delay,
+            details.base_delay,
+            details.jitter_bump,
+            details.avg_ping_ms,
+            details.rtt_variance_ms,
+            (unsigned long)remoteSilenceMs,
+                (unsigned long)waitMs,
+            s_jitterPressureSamples,
+            s_starvationPressureSamples);
+    }
+
+    if (s_starvationPressureSamples >= FRONTEND_STARVATION_PRESSURE_SAMPLE_THRESHOLD) {
+        const uint16_t targetDelay = details.recommended_delay > delayFloor
+            ? details.recommended_delay
+            : ClampFrontendDelay((uint16_t)(delayFloor + 1));
+        RequestDelayIncrease(targetDelay,
+            FrontendDelayBumpReason::Starvation,
+            "sustained starvation pressure");
+        return;
+    }
+
+    if (s_jitterPressureSamples >= FRONTEND_JITTER_PRESSURE_SAMPLE_THRESHOLD) {
+        RequestDelayIncrease(details.recommended_delay,
+            FrontendDelayBumpReason::JitterPressure,
+            "sustained jitter pressure");
+    }
 }
 
 static void HandleRemoteFrameInput(uint32_t epochId,
@@ -370,7 +546,18 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         FrontendInputSync_RequestRecovery("frontend packet was outside ring window");
         return;
     }
+    if (frame < s_consumeFrame) {
+        Rollback::NetplayLog_Verbose(
+            "FRONTEND", -1,
+            "Ignored stale remote frame input older than consume point: type=%s frame=%u consume=%u ack=%u",
+            PacketTypeName(type),
+            frame,
+            s_consumeFrame,
+            ackFrame);
+        return;
+    }
 
+    const uint32_t previousRemoteLatest = s_remoteLatestFrame;
     bool acceptedAny = false;
     int newFramesApplied = 0;
     for (uint16_t i = 0; i < inputCount; i++) {
@@ -395,11 +582,13 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         s_remoteLatestFrame = frame;
     }
     if (acceptedAny) {
-        s_lastRemoteInputTime = GetTickCount();
+        s_lastRemoteInputTime = NowMs();
+        s_waitingForCurrentFrameSince = 0;
+        s_starvationPressureSamples = 0;
     }
 
     if (ackFrame < s_localInputFrame &&
-        (GetTickCount() - s_lastTargetedResendTime) >= FRONTEND_TARGETED_RESEND_INTERVAL_MS) {
+        (NowMs() - s_lastTargetedResendTime) >= FRONTEND_TARGETED_RESEND_INTERVAL_MS) {
         uint32_t resendFrame = ackFrame;
         if ((s_localInputFrame - ackFrame) > (uint32_t)FRONTEND_INPUT_REDUNDANCY) {
             resendFrame = ackFrame + (uint32_t)FRONTEND_INPUT_REDUNDANCY - 1;
@@ -409,8 +598,33 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         }
         if (s_hasLocalInput[resendFrame & FRONTEND_RING_MASK]) {
             SendInputPacket(resendFrame, "targeted resend");
-            s_lastTargetedResendTime = GetTickCount();
+            s_lastTargetedResendTime = NowMs();
         }
+    }
+
+    if (!acceptedAny && frame <= previousRemoteLatest) {
+        Rollback::NetplayLog_Verbose(
+            "FRONTEND", -1,
+            "Ignored duplicate/out-of-order remote frame input: type=%s epoch=%u phase=%s frame=%u ack=%u consume=%u remoteLatest=%u",
+            PacketTypeName(type),
+            epochId,
+            FrontendSyncPhaseName(s_phase),
+            frame,
+            ackFrame,
+            s_consumeFrame,
+            previousRemoteLatest);
+    } else if (acceptedAny && frame < previousRemoteLatest) {
+        Rollback::NetplayLog_Verbose(
+            "FRONTEND", -1,
+            "Accepted out-of-order remote frame history fill: type=%s epoch=%u phase=%s frame=%u ack=%u new=%d consume=%u remoteLatest=%u",
+            PacketTypeName(type),
+            epochId,
+            FrontendSyncPhaseName(s_phase),
+            frame,
+            ackFrame,
+            newFramesApplied,
+            s_consumeFrame,
+            previousRemoteLatest);
     }
 
     Rollback::NetplayLog_Verbose(
@@ -448,14 +662,22 @@ void FrontendInputSync_Shutdown() {
 }
 
 int FrontendInputSync_ComputeDelayProposal() {
-    int configured = DelayPolicy_GetConfiguredDelay() + 2;
-    int recommended = DelayPolicy_ComputeRecommendedDelay() + 2;
-    if (recommended > configured) {
-        configured = recommended;
-    }
-    if (configured < FRONTEND_DELAY_MIN) configured = FRONTEND_DELAY_MIN;
-    if (configured > FRONTEND_DELAY_MAX) configured = FRONTEND_DELAY_MAX;
-    return configured;
+    const FrontendDelayProposalDetails details = ComputeDelayProposalDetails();
+
+    Rollback::NetplayLog_Write(
+        "FRONTEND", -1,
+        "Local frontend delay proposal: configured_floor=%u base=%u jitter_bump=%u final=%u avg_ping=%.1f variance=%.1f one_way=%.2f jitter_frames=%.2f valid=%d",
+        details.configured_floor,
+        details.base_delay,
+        details.jitter_bump,
+        details.recommended_delay,
+        details.avg_ping_ms,
+        details.rtt_variance_ms,
+        details.one_way_frames,
+        details.jitter_frames,
+        details.measurement_valid ? 1 : 0);
+
+    return details.recommended_delay;
 }
 
 void FrontendInputSync_BeginEpoch(SessionRole role,
@@ -664,7 +886,7 @@ void FrontendInputSync_FrameUpdate() {
         return;
     }
 
-    const DWORD now = GetTickCount();
+    const DWORD now = NowMs();
     if (s_localInputFrame > 0 && (now - s_lastResendTime) >= FRONTEND_RESEND_INTERVAL_MS) {
         SendInputPacket(s_localInputFrame - 1, "periodic resend");
         s_lastResendTime = now;
@@ -701,19 +923,16 @@ bool FrontendInputSync_HasInputsForCurrentFrame() {
     const int idx = (int)(s_consumeFrame & FRONTEND_RING_MASK);
     const bool ready = s_hasLocalInput[idx] && s_hasRemoteInput[idx];
     if (ready) {
+        ResetDelayPressureTracking();
         return true;
     }
 
-    const DWORD now = GetTickCount();
-    if (!s_waitingForDelayAck &&
-        !s_pendingDelayBump &&
-        s_sharedDelay < FRONTEND_DELAY_MAX &&
-        s_lastRemoteInputTime != 0 &&
-        (now - s_lastRemoteInputTime) >= FRONTEND_DELAY_BUMP_INTERVAL_MS) {
-        RequestDelayIncrease((uint16_t)(s_sharedDelay + 1),
-                             FrontendDelayBumpReason::Starvation,
-                             "waiting for current frame");
+    const DWORD now = NowMs();
+    if (s_waitingForCurrentFrameSince == 0) {
+        s_waitingForCurrentFrameSince = now;
     }
+
+    MaybeRequestLiveDelayIncrease(now);
 
     if (!s_timedOut &&
         s_lastRemoteInputTime != 0 &&
@@ -974,34 +1193,54 @@ void FrontendInputSync_OnRemoteDelayChangeReq(const DelayChangeReqPayload* p) {
     }
 
     const uint16_t requested = ClampFrontendDelay(p->new_delay);
+    const FrontendDelayBumpReason requestedReason = SanitizeDelayReason(p->reason_code);
+    const uint32_t requestedApplyFrom = p->apply_from_frame > (s_consumeFrame + 1)
+        ? p->apply_from_frame
+        : (s_consumeFrame + 1);
     const uint16_t delayFloor = GetEffectiveDelayFloor();
     if (requested < delayFloor) {
         SendDelayChangeAck(delayFloor,
                            s_consumeFrame + 1,
                            false,
-                           FrontendDelayBumpReason::RemoteRequest);
+                           requestedReason);
+        return;
+    }
+
+    if (s_pendingDelayBump &&
+        s_pendingDelay == requested &&
+        s_pendingApplyFrom == requestedApplyFrom) {
+        SendDelayChangeAck(requested,
+                           requestedApplyFrom,
+                           true,
+                           requestedReason);
+        Rollback::NetplayLog_Verbose(
+            "FRONTEND", -1,
+            "Ignored duplicate remote delay bump request: phase=%s requested=%u apply_from=%u reason=%s",
+            FrontendSyncPhaseName(s_phase),
+            requested,
+            requestedApplyFrom,
+            FrontendDelayBumpReasonName(requestedReason));
         return;
     }
 
     s_pendingDelayBump = true;
     s_pendingDelay = requested;
-    s_pendingApplyFrom = p->apply_from_frame > (s_consumeFrame + 1)
-        ? p->apply_from_frame
-        : (s_consumeFrame + 1);
-    s_pendingDelayReason = FrontendDelayBumpReason::RemoteRequest;
+    s_pendingApplyFrom = requestedApplyFrom;
+    s_pendingDelayReason = requestedReason;
     SendDelayChangeAck(requested,
                        s_pendingApplyFrom,
                        true,
-                       FrontendDelayBumpReason::RemoteRequest);
+                       requestedReason);
 
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Accepted remote delay bump: phase=%s current=%u requested=%u apply_from=%u floor=%u",
+        "Accepted remote delay bump: phase=%s current=%u requested=%u apply_from=%u floor=%u reason=%s",
         FrontendSyncPhaseName(s_phase),
         s_sharedDelay,
         requested,
         s_pendingApplyFrom,
-        delayFloor);
+        delayFloor,
+        FrontendDelayBumpReasonName(requestedReason));
 }
 
 void FrontendInputSync_OnRemoteDelayChangeAck(const DelayChangeAckPayload* p) {
@@ -1015,6 +1254,17 @@ void FrontendInputSync_OnRemoteDelayChangeAck(const DelayChangeAckPayload* p) {
         return;
     }
     if (!s_waitingForDelayAck) {
+        if (s_pendingDelayBump &&
+            p->accepted &&
+            p->acked_delay == s_pendingDelay &&
+            p->apply_from_frame == s_pendingApplyFrom) {
+            Rollback::NetplayLog_Verbose(
+                "FRONTEND", -1,
+                "Ignored duplicate frontend delay bump ack: acked=%u apply_from=%u reason=%s",
+                p->acked_delay,
+                p->apply_from_frame,
+                FrontendDelayBumpReasonName(SanitizeDelayReason(p->reason_code)));
+        }
         return;
     }
 
@@ -1108,6 +1358,18 @@ const char* FrontendInputSync_GetRecoveryReason() {
 void FrontendInputSync_ClearRecoveryRequest() {
     s_recoveryReason[0] = '\0';
 }
+
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+void FrontendInputSync_Test_SetClockMs(uint32_t nowMs) {
+    s_testClockOverrideActive = true;
+    s_testClockMs = nowMs;
+}
+
+void FrontendInputSync_Test_ClearClockOverride() {
+    s_testClockOverrideActive = false;
+    s_testClockMs = 0;
+}
+#endif
 
 void FrontendInputSync_GetSnapshot(FrontendInputSyncSnapshot* out) {
     if (!out) {

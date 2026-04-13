@@ -278,15 +278,31 @@ static void RenderSpectateEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha
     int y = kRowStartY;
     RenderRow(y, "Connect", "Spectator stream", snap->selected_index == 0, true, alpha); y += kRowStep;
 
+    char discoveryVal[64];
+    if (snap->spectator_lan_discovery_active) {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE, "Scanning...");
+    } else if (snap->spectator_lan_result_count > 1) {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE,
+            "Found %u (cycle)", snap->spectator_lan_result_count);
+    } else if (snap->spectator_lan_result_count == 1) {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE, "Found 1");
+    } else {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE, "Broadcast query");
+    }
+    RenderRow(y, "Discover LAN", discoveryVal, snap->selected_index == 1, true, alpha); y += kRowStep;
+
     char endpointVal[128];
     if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::SpectatorEndpoint) {
         FormatEditBufferWithCursor(endpointVal, sizeof(endpointVal), snap->text_edit_buffer, snap->text_cursor_pos);
     } else {
         _snprintf_s(endpointVal, sizeof(endpointVal), _TRUNCATE, "%s", snap->spectator_endpoint);
     }
-    RenderRow(y, "Stream Endpoint", endpointVal, snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Back", nullptr, snap->selected_index == 2, true, alpha);
+    RenderRow(y, "Stream Endpoint", endpointVal, snap->selected_index == 2, true, alpha); y += kRowStep;
+    RenderRow(y, "Back", nullptr, snap->selected_index == 3, true, alpha);
     y += kRowStep + 8;
+
+    RenderInfoLine(y, "Discovery", snap->spectator_lan_discovery_status, alpha);
+    y += kInfoStep;
 
     char serverBuf[64];
     _snprintf_s(serverBuf, sizeof(serverBuf), _TRUNCATE, "%s @ %u (%d)",
@@ -374,9 +390,19 @@ static void RenderSpectatorConnecting(const NetMenu::MenuSnapshot* snap, uint8_t
     RenderInfoLine(y, "Endpoint", snap->spectator_endpoint, alpha);
     y += kInfoStep;
     if (snap->spectator_client_match_id != 0) {
-        char matchBuf[24];
-        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, "0x%08X", snap->spectator_client_match_id);
+        char matchBuf[40];
+        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, "G%u  0x%08X",
+            snap->spectator_client_match_ordinal != 0 ? snap->spectator_client_match_ordinal : 1,
+            snap->spectator_client_match_id);
         RenderInfoLine(y, "Match", matchBuf, alpha);
+        y += kInfoStep;
+    }
+    if (snap->spectator_p1_name[0] || snap->spectator_p2_name[0]) {
+        char playersBuf[64];
+        _snprintf_s(playersBuf, sizeof(playersBuf), _TRUNCATE, "%s vs %s",
+            snap->spectator_p1_name[0] ? snap->spectator_p1_name : "P1",
+            snap->spectator_p2_name[0] ? snap->spectator_p2_name : "P2");
+        RenderInfoLine(y, "Players", playersBuf, alpha);
         y += kInfoStep;
     }
     RenderInfoLine(y, "Status", snap->spectator_client_status, alpha);
@@ -391,38 +417,63 @@ static void RenderSpectatorConnected(const NetMenu::MenuSnapshot* snap, uint8_t 
     y += kInfoStep;
 
     if (snap->spectator_client_match_id != 0) {
-        char matchBuf[24];
-        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, "0x%08X", snap->spectator_client_match_id);
+        char matchBuf[40];
+        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, "G%u  0x%08X",
+            snap->spectator_client_match_ordinal != 0 ? snap->spectator_client_match_ordinal : 1,
+            snap->spectator_client_match_id);
         RenderInfoLine(y, "Match", matchBuf, alpha);
+        y += kInfoStep;
+    }
+
+    if (snap->spectator_p1_name[0] || snap->spectator_p2_name[0]) {
+        char playersBuf[64];
+        _snprintf_s(playersBuf, sizeof(playersBuf), _TRUNCATE, "%s vs %s",
+            snap->spectator_p1_name[0] ? snap->spectator_p1_name : "P1",
+            snap->spectator_p2_name[0] ? snap->spectator_p2_name : "P2");
+        RenderInfoLine(y, "Players", playersBuf, alpha);
+        y += kInfoStep;
+
+        char scoreBuf[32];
+        _snprintf_s(scoreBuf, sizeof(scoreBuf), _TRUNCATE, "%d - %d",
+            snap->spectator_p1_wins,
+            snap->spectator_p2_wins);
+        RenderInfoLine(y, "Score", scoreBuf, alpha);
         y += kInfoStep;
     }
 
     if (snap->spectator_client_buffered_frames > 0) {
         char bufferBuf[64];
-        _snprintf_s(bufferBuf, sizeof(bufferBuf), _TRUNCATE, "%u  [%d..%d]",
+        _snprintf_s(bufferBuf, sizeof(bufferBuf), _TRUNCATE, "%u  [%d..%d]  cf=%d",
             snap->spectator_client_buffered_frames,
             snap->spectator_client_buffer_start,
-            snap->spectator_client_buffer_end);
+            snap->spectator_client_buffer_end,
+            snap->spectator_client_confirmed_edge);
         RenderInfoLine(y, "Buffer", bufferBuf, alpha);
         y += kInfoStep;
     }
 
-    if (snap->spectator_client_playback_frame >= 0) {
+    if (snap->spectator_playback_frame >= 0) {
         char playbackBuf[48];
         _snprintf_s(playbackBuf, sizeof(playbackBuf), _TRUNCATE, "%d",
-            snap->spectator_client_playback_frame);
-        RenderInfoLine(y, "Playback", playbackBuf, alpha);
+            snap->spectator_playback_frame);
+        RenderInfoLine(y, "Watch Frame", playbackBuf, alpha);
         y += kInfoStep;
     }
 
-    const char* mode = "Live edge stable";
-    if (snap->spectator_client_needs_hard_sync) {
-        mode = "Hard sync requested";
-    } else if (snap->spectator_client_should_fast_forward) {
-        mode = "Fast forwarding";
+    if (snap->spectator_client_relay_active) {
+        char relayBuf[64];
+        _snprintf_s(relayBuf, sizeof(relayBuf), _TRUNCATE, "Port %u  Downstream %u",
+            snap->spectator_client_relay_port,
+            snap->spectator_client_relay_spectators);
+        RenderInfoLine(y, "Broadcast", relayBuf, alpha);
+        y += kInfoStep;
     }
-    RenderInfoLine(y, "Catch-up", mode, alpha);
-    y += kInfoStep;
+
+    if (snap->spectator_playback_active && snap->spectator_playback_status[0]) {
+        RenderInfoLine(y, "Watch", snap->spectator_playback_status, alpha);
+        y += kInfoStep;
+    }
+
     RenderInfoLine(y, "Status", snap->spectator_client_status, alpha);
 }
 

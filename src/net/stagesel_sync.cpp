@@ -86,8 +86,8 @@ void StageSelSync_Begin() {
     memset(s_auditRing, 0, sizeof(s_auditRing));
 
     Rollback::NetplayLog_Write("STAGESEL", -1,
-        "=== STAGE SELECT SYNC BEGIN (stateless merge) ===");
-    LOG_NETPLAY(LOG_INFO, "[StageSelSync] Begin — stateless merge, confirmed shared buffer");
+        "=== STAGE SELECT SYNC BEGIN (single merge authority at raw input injection) ===");
+    LOG_NETPLAY(LOG_INFO, "[StageSelSync] Begin — stateless merge, single authority at Hook_InputProcess");
 }
 
 void StageSelSync_Abort() {

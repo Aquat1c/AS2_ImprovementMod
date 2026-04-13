@@ -67,6 +67,7 @@ enum class FrontendDelayBumpReason : uint8_t {
     Starvation   = 1,
     RemoteRequest = 2,
     HostAdjust   = 3,
+    JitterPressure = 4,
 };
 
 inline const char* FrontendDelayBumpReasonName(FrontendDelayBumpReason reason) {
@@ -75,6 +76,7 @@ inline const char* FrontendDelayBumpReasonName(FrontendDelayBumpReason reason) {
         case FrontendDelayBumpReason::Starvation:    return "Starvation";
         case FrontendDelayBumpReason::RemoteRequest: return "RemoteRequest";
         case FrontendDelayBumpReason::HostAdjust:    return "HostAdjust";
+        case FrontendDelayBumpReason::JitterPressure:return "JitterPressure";
         default:                                     return "Unknown";
     }
 }
@@ -176,6 +178,11 @@ void FrontendInputSync_RequestRecovery(const char* reason);
 bool FrontendInputSync_HasRecoveryRequest();
 const char* FrontendInputSync_GetRecoveryReason();
 void FrontendInputSync_ClearRecoveryRequest();
+
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+void FrontendInputSync_Test_SetClockMs(uint32_t nowMs);
+void FrontendInputSync_Test_ClearClockOverride();
+#endif
 
 void FrontendInputSync_GetSnapshot(FrontendInputSyncSnapshot* out);
 

@@ -57,6 +57,9 @@ bool IsMenuActive();
 /// Does the menu currently consume all game input?
 bool ConsumesGameInput();
 
+/// Hide the menu immediately because an external launch path is taking over.
+void HideForLaunch(const char* reason);
+
 /// Get a read-only snapshot for UI rendering and diagnostics.
 void GetSnapshot(MenuSnapshot* out);
 

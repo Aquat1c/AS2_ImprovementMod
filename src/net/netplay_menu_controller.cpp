@@ -21,6 +21,7 @@
 #include "net/delay_policy.h"
 #include "net/spectator_runtime.h"
 #include "net/spectator_client.h"
+#include "net/spectator_playback.h"
 #include "net/netplay_palette_runtime.h"
 #include "rollback/online_wiring.h"
 #include "core/game_state.h"
@@ -94,6 +95,12 @@ static bool          s_remotePalettePreviewEnabled = false;
 static bool          s_joinSpectatorProbeActive = false;
 static char          s_joinSpectatorFailureReason[128] = "";
 static char          s_joinSpectatorProbeEndpoint[96] = "";
+static char          s_joinSpectatorFallbackEndpoint[96] = "";
+static bool          s_joinSpectatorFallbackAttempted = false;
+static uint32_t      s_selectedLanSpectatorIndex = 0;
+static uint32_t      s_lastLanSpectatorResultCount = 0;
+static bool          s_lastLanSpectatorDiscoveryActive = false;
+static char          s_lastLanSpectatorEndpoint[96] = "";
 
 // Config file path (relative to game directory)
 static const char*   kConfigFile          = "as2_netplay.cfg";
@@ -345,6 +352,7 @@ static void ApplyDelaySettingsToPolicy(const char* reason) {
 static void ApplySpectatorSettingsToRuntime(const char* reason) {
     Net::SpectatorRuntime_SetEnabled(s_spectatorsEnabled);
     Net::SpectatorRuntime_SetListenPort(s_spectatorListenPort);
+    Net::SpectatorClient_SetRelayConfig(s_spectatorsEnabled, s_spectatorListenPort);
 
     LOG_NETPLAY(LOG_INFO,
         "[NetMenu] Applied spectator settings (%s): enabled=%d port=%u",
@@ -521,7 +529,8 @@ static void CopyDisplayedSpectatorEndpoint(char* outEndpoint,
 static void ClearJoinSpectatorProbe(const char* reason) {
     if (s_joinSpectatorProbeActive ||
         s_joinSpectatorFailureReason[0] ||
-        s_joinSpectatorProbeEndpoint[0]) {
+        s_joinSpectatorProbeEndpoint[0] ||
+        s_joinSpectatorFallbackEndpoint[0]) {
         LOG_NETPLAY(LOG_INFO,
             "[MENU] clear_join_spectator_probe reason=%s endpoint=%s",
             reason && reason[0] ? reason : "unspecified",
@@ -530,6 +539,8 @@ static void ClearJoinSpectatorProbe(const char* reason) {
     s_joinSpectatorProbeActive = false;
     s_joinSpectatorFailureReason[0] = '\0';
     s_joinSpectatorProbeEndpoint[0] = '\0';
+    s_joinSpectatorFallbackEndpoint[0] = '\0';
+    s_joinSpectatorFallbackAttempted = false;
 }
 
 static bool ShouldAttemptJoinSpectatorProbe(const char* errorText) {
@@ -548,14 +559,16 @@ static bool ShouldAttemptJoinSpectatorProbe(const char* errorText) {
     return true;
 }
 
-static bool BuildDerivedSpectatorEndpoint(char* outEndpoint, size_t outCap) {
-    if (!outEndpoint || outCap == 0) {
+static bool BuildSpectatorEndpointFromBase(const char* baseEndpoint,
+                                           char* outEndpoint,
+                                           size_t outCap) {
+    if (!baseEndpoint || !baseEndpoint[0] || !outEndpoint || outCap == 0) {
         return false;
     }
 
     char host[96] = {};
     uint16_t port = 0;
-    if (!ParseEndpoint(s_remoteEndpoint, host, sizeof(host), &port, true)) {
+    if (!ParseEndpoint(baseEndpoint, host, sizeof(host), &port, true)) {
         return false;
     }
 
@@ -574,6 +587,85 @@ static bool BuildDerivedSpectatorEndpoint(char* outEndpoint, size_t outCap) {
     } else {
         _snprintf_s(outEndpoint, outCap, _TRUNCATE, "%s:%u", host, (uint16_t)spectatorPort);
     }
+    return true;
+}
+
+static bool BuildDerivedSpectatorEndpoint(char* outEndpoint, size_t outCap) {
+    if (!outEndpoint || outCap == 0) {
+        return false;
+    }
+
+    if (s_connectPreference == Net::ConnectPreference::RelayOnly &&
+        BuildSpectatorEndpointFromBase(s_relayEndpoint, outEndpoint, outCap)) {
+        return true;
+    }
+
+    if (BuildSpectatorEndpointFromBase(s_remoteEndpoint, outEndpoint, outCap)) {
+        return true;
+    }
+
+    if (BuildSpectatorEndpointFromBase(s_relayEndpoint, outEndpoint, outCap)) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool BuildAlternateDerivedSpectatorEndpoint(const char* primaryEndpoint,
+                                                   char* outEndpoint,
+                                                   size_t outCap) {
+    if (!outEndpoint || outCap == 0) {
+        return false;
+    }
+
+    outEndpoint[0] = '\0';
+
+    char derivedRemote[96] = {};
+    char derivedRelay[96] = {};
+    const bool haveRemote = BuildSpectatorEndpointFromBase(s_remoteEndpoint,
+        derivedRemote,
+        sizeof(derivedRemote));
+    const bool haveRelay = BuildSpectatorEndpointFromBase(s_relayEndpoint,
+        derivedRelay,
+        sizeof(derivedRelay));
+
+    if (haveRemote && haveRelay && _stricmp(derivedRemote, derivedRelay) != 0) {
+        if (primaryEndpoint && _stricmp(primaryEndpoint, derivedRemote) == 0) {
+            CopyText(outEndpoint, outCap, derivedRelay);
+            return true;
+        }
+        if (primaryEndpoint && _stricmp(primaryEndpoint, derivedRelay) == 0) {
+            CopyText(outEndpoint, outCap, derivedRemote);
+            return true;
+        }
+        CopyText(outEndpoint, outCap, derivedRelay);
+        return true;
+    }
+
+    return false;
+}
+
+static bool TryJoinSpectatorProbeFallback(const char* failureReason) {
+    if (!s_joinSpectatorProbeActive ||
+        s_joinSpectatorFallbackAttempted ||
+        !s_joinSpectatorFallbackEndpoint[0]) {
+        return false;
+    }
+
+    s_joinSpectatorFallbackAttempted = true;
+    Net::SpectatorClient_Disconnect("spectator probe fallback");
+    if (!Net::SpectatorClient_StartConnect(s_joinSpectatorFallbackEndpoint)) {
+        return false;
+    }
+
+    CopyText(s_joinSpectatorProbeEndpoint,
+        sizeof(s_joinSpectatorProbeEndpoint),
+        s_joinSpectatorFallbackEndpoint);
+    SetStatus("Primary spectator endpoint unavailable. Probing relay spectator stream...");
+    LOG_NETPLAY(LOG_WARNING,
+        "[SPROBE] fallback endpoint=%s reason=%s",
+        s_joinSpectatorFallbackEndpoint,
+        failureReason && failureReason[0] ? failureReason : "unspecified");
     return true;
 }
 
@@ -641,6 +733,11 @@ static bool BeginJoinSpectatorProbe(const char* sessionError) {
     CopyText(s_joinSpectatorProbeEndpoint,
         sizeof(s_joinSpectatorProbeEndpoint),
         derivedEndpoint);
+    BuildAlternateDerivedSpectatorEndpoint(
+        derivedEndpoint,
+        s_joinSpectatorFallbackEndpoint,
+        sizeof(s_joinSpectatorFallbackEndpoint));
+    s_joinSpectatorFallbackAttempted = false;
     CopyText(s_joinSpectatorFailureReason,
         sizeof(s_joinSpectatorFailureReason),
         sessionError && sessionError[0] ? sessionError : "Session error.");
@@ -1642,7 +1739,7 @@ static int ItemCount(MenuState st) {
         case MenuState::DirectConnectEntry:  return 3; // Host, Join, Back
         case MenuState::HostEntry:           return 3; // Host, Listen Port, Back
         case MenuState::JoinEntry:           return 3; // Join, Remote Endpoint, Back
-        case MenuState::SpectateEntry:       return 3; // Connect, Endpoint, Back
+        case MenuState::SpectateEntry:       return 4; // Connect, Discover LAN, Endpoint, Back
         case MenuState::SpectatorConnecting: return 1; // Cancel
         case MenuState::SpectatorConnected:  return 1; // Disconnect
         case MenuState::SettingsEntry:       return 16; // Expanded network/spectator/palette settings
@@ -2000,6 +2097,86 @@ static void ResetTextEditKeyState() {
 static void ActivateCurrentSelection();
 static void HandleBackNavigation();
 
+static void ApplyDiscoveredSpectatorEndpoint(const Net::SpectatorDiscoveryEntry& entry,
+                                             uint32_t index,
+                                             uint32_t count,
+                                             const char* reason) {
+    if (!entry.endpoint[0]) {
+        return;
+    }
+
+    CopyText(s_spectatorEndpoint, sizeof(s_spectatorEndpoint), entry.endpoint);
+    LOG_NETPLAY(LOG_INFO,
+        "[NetMenu] Spectator LAN endpoint selected (%s): index=%u/%u endpoint=%s host=%s match_active=%d",
+        reason ? reason : "unspecified",
+        (unsigned)(index + 1),
+        (unsigned)count,
+        entry.endpoint,
+        entry.host_nickname[0] ? entry.host_nickname : "?",
+        entry.match_active ? 1 : 0);
+
+    if (entry.match_active) {
+        SetStatus("LAN spectator %u/%u: %s (%s vs %s)",
+            (unsigned)(index + 1),
+            (unsigned)count,
+            entry.endpoint,
+            entry.p1_name[0] ? entry.p1_name : "P1",
+            entry.p2_name[0] ? entry.p2_name : "P2");
+    } else {
+        SetStatus("LAN spectator %u/%u: %s (no active match)",
+            (unsigned)(index + 1),
+            (unsigned)count,
+            entry.endpoint);
+    }
+}
+
+static void SyncSpectatorDiscoveryState() {
+    if (!MenuVisible()) {
+        return;
+    }
+
+    Net::SpectatorDiscoverySnapshot discovery{};
+    Net::SpectatorClient_GetDiscoverySnapshot(&discovery);
+
+    if (discovery.result_count > 0) {
+        if (s_selectedLanSpectatorIndex >= discovery.result_count) {
+            s_selectedLanSpectatorIndex = 0;
+        }
+
+        const Net::SpectatorDiscoveryEntry& selected =
+            discovery.results[s_selectedLanSpectatorIndex];
+        if (selected.endpoint[0] &&
+            (strcmp(selected.endpoint, s_lastLanSpectatorEndpoint) != 0 ||
+             discovery.result_count != s_lastLanSpectatorResultCount ||
+             discovery.active != s_lastLanSpectatorDiscoveryActive)) {
+            CopyText(s_lastLanSpectatorEndpoint,
+                sizeof(s_lastLanSpectatorEndpoint),
+                selected.endpoint);
+            if (s_state == MenuState::SpectateEntry && !IsTextEditing()) {
+                ApplyDiscoveredSpectatorEndpoint(
+                    selected,
+                    s_selectedLanSpectatorIndex,
+                    discovery.result_count,
+                    discovery.active ? "discovery update" : "discovery complete");
+            }
+        }
+    } else if (!discovery.active &&
+               s_lastLanSpectatorDiscoveryActive &&
+               s_state == MenuState::SpectateEntry &&
+               discovery.status[0]) {
+        s_lastLanSpectatorEndpoint[0] = '\0';
+        SetStatus("%s", discovery.status);
+    } else if (discovery.active &&
+               !s_lastLanSpectatorDiscoveryActive &&
+               s_state == MenuState::SpectateEntry &&
+               discovery.status[0]) {
+        SetStatus("%s", discovery.status);
+    }
+
+    s_lastLanSpectatorResultCount = discovery.result_count;
+    s_lastLanSpectatorDiscoveryActive = discovery.active;
+}
+
 static void SyncSpectatorClientState() {
     if (!MenuVisible()) {
         return;
@@ -2051,6 +2228,24 @@ static void SyncSpectatorClientState() {
             }
             break;
 
+        case Net::SpectatorClientState::ConnectedNoActiveMatch:
+            if (s_joinSpectatorProbeActive) {
+                LOG_NETPLAY(LOG_INFO,
+                    "[SPROBE] active_match_available=0 connected_waiting=1 endpoint=%s",
+                    activeEndpoint[0] ? activeEndpoint : "(unset)");
+                LOG_NETPLAY(LOG_INFO,
+                    "[MENU] transition_to_spectate_waiting_from_probe endpoint=%s",
+                    activeEndpoint[0] ? activeEndpoint : "(unset)");
+                ClearJoinSpectatorProbe("connected_waiting_for_match");
+                SetStatus("Connected to spectator host. Waiting for active match.");
+            }
+            if (s_state != MenuState::SpectatorConnected) {
+                s_activeBranch = RootBranch::Spectate;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SpectatorConnected, "spectator waiting for active match");
+            }
+            break;
+
         case Net::SpectatorClientState::Streaming:
             if (s_joinSpectatorProbeActive) {
                 LOG_NETPLAY(LOG_INFO,
@@ -2079,6 +2274,9 @@ static void SyncSpectatorClientState() {
                         activeEndpoint[0] ? activeEndpoint : "(unset)");
                     ClearJoinSpectatorProbe("no_active_match");
                 } else if (IsSpectatorEndpointTimeoutError(spectator.error)) {
+                    if (TryJoinSpectatorProbeFallback(spectator.error)) {
+                        return;
+                    }
                     LOG_NETPLAY(LOG_WARNING,
                         "[SPROBE] timeout endpoint=%s",
                         activeEndpoint[0] ? activeEndpoint : "(unset)");
@@ -2507,6 +2705,31 @@ static void ActivateCurrentSelection() {
                     SetStatus("Failed to start spectator connection.");
                 }
             } else if (s_selectedIndex == 1) {
+                Net::SpectatorDiscoverySnapshot discovery{};
+                Net::SpectatorClient_GetDiscoverySnapshot(&discovery);
+                if (discovery.active) {
+                    SetStatus("%s", discovery.status[0] ? discovery.status : "Scanning LAN for spectator hosts...");
+                } else if (discovery.result_count > 1) {
+                    s_selectedLanSpectatorIndex =
+                        (s_selectedLanSpectatorIndex + 1) % discovery.result_count;
+                    ApplyDiscoveredSpectatorEndpoint(
+                        discovery.results[s_selectedLanSpectatorIndex],
+                        s_selectedLanSpectatorIndex,
+                        discovery.result_count,
+                        "manual cycle");
+                } else {
+                    s_selectedLanSpectatorIndex = 0;
+                    s_lastLanSpectatorResultCount = 0;
+                    s_lastLanSpectatorEndpoint[0] = '\0';
+                    if (Net::SpectatorClient_BeginLanDiscovery()) {
+                        SetStatus("Scanning LAN for spectator hosts...");
+                    } else {
+                        Net::SpectatorDiscoverySnapshot retry{};
+                        Net::SpectatorClient_GetDiscoverySnapshot(&retry);
+                        SetStatus("%s", retry.status[0] ? retry.status : "Failed to start LAN discovery.");
+                    }
+                }
+            } else if (s_selectedIndex == 2) {
                 BeginTextEdit(TextEditField::SpectatorEndpoint, s_spectatorEndpoint, "Type spectator host:port or [ipv6]:port.");
             } else {
                 s_selectedIndex = 0;
@@ -2701,6 +2924,10 @@ void Init() {
     LoadAutoConnectConfig();
     s_autoRematchCleanupApplied = false;
     s_autoRematchLastAttemptAt = 0;
+    s_selectedLanSpectatorIndex = 0;
+    s_lastLanSpectatorResultCount = 0;
+    s_lastLanSpectatorDiscoveryActive = false;
+    s_lastLanSpectatorEndpoint[0] = '\0';
     s_initialized = true;
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Initialized");
 }
@@ -2713,6 +2940,10 @@ void Shutdown() {
     s_autoConnectCompletedMatches = 0;
     s_autoRematchCleanupApplied = false;
     s_autoRematchLastAttemptAt = 0;
+    s_selectedLanSpectatorIndex = 0;
+    s_lastLanSpectatorResultCount = 0;
+    s_lastLanSpectatorDiscoveryActive = false;
+    s_lastLanSpectatorEndpoint[0] = '\0';
     memset(&s_autoConnect, 0, sizeof(s_autoConnect));
     FinishClose();
     MenuUtils::Cleanup();
@@ -2732,6 +2963,7 @@ void FrameUpdate() {
 
     HandleAutoConnect();
     TryAutoRestartPregameFromPostMatchCharSel();
+    SyncSpectatorDiscoveryState();
     SyncSpectatorClientState();
 
     if (!MenuVisible()) return;
@@ -2818,6 +3050,10 @@ bool ConsumesGameInput() {
     return s_captureInput;
 }
 
+void HideForLaunch(const char* reason) {
+    HideMenuForLaunch(reason ? reason : "external launch");
+}
+
 void GetSnapshot(MenuSnapshot* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -2895,15 +3131,40 @@ void GetSnapshot(MenuSnapshot* out) {
         &spectatorClient);
     out->spectator_client_active = spectatorClient.active;
     out->spectator_client_match_id = spectatorClient.match_id;
+    out->spectator_client_match_ordinal = spectatorClient.match_ordinal;
+    CopyText(out->spectator_p1_name, sizeof(out->spectator_p1_name), spectatorClient.p1_name);
+    CopyText(out->spectator_p2_name, sizeof(out->spectator_p2_name), spectatorClient.p2_name);
+    out->spectator_p1_wins = spectatorClient.p1_wins;
+    out->spectator_p2_wins = spectatorClient.p2_wins;
     out->spectator_client_buffered_frames = spectatorClient.buffered_frame_count;
     out->spectator_client_buffer_start = spectatorClient.buffered_start_rb_frame;
     out->spectator_client_buffer_end = spectatorClient.buffered_end_rb_frame;
+    out->spectator_client_confirmed_edge = spectatorClient.confirmed_contiguous_rb_frame;
     out->spectator_client_playback_frame = spectatorClient.playback_rb_frame;
     out->spectator_client_should_fast_forward = spectatorClient.should_fast_forward;
     out->spectator_client_needs_hard_sync = spectatorClient.needs_hard_sync;
+    out->spectator_client_relay_active = spectatorClient.relay_server_active;
+    out->spectator_client_relay_port = spectatorClient.relay_listen_port;
+    out->spectator_client_relay_spectators = spectatorClient.relay_connected_spectators;
     CopyText(out->spectator_client_status,
         sizeof(out->spectator_client_status),
         spectatorClient.error[0] ? spectatorClient.error : spectatorClient.status);
+
+    Net::SpectatorPlaybackSnapshot spectatorPlayback{};
+    Net::SpectatorPlayback_GetSnapshot(&spectatorPlayback);
+    out->spectator_playback_active = spectatorPlayback.active;
+    out->spectator_playback_frame = spectatorPlayback.local_playback_rb_frame;
+    CopyText(out->spectator_playback_status,
+        sizeof(out->spectator_playback_status),
+        spectatorPlayback.status);
+
+    Net::SpectatorDiscoverySnapshot spectatorDiscovery{};
+    Net::SpectatorClient_GetDiscoverySnapshot(&spectatorDiscovery);
+    out->spectator_lan_discovery_active = spectatorDiscovery.active;
+    out->spectator_lan_result_count = spectatorDiscovery.result_count;
+    CopyText(out->spectator_lan_discovery_status,
+        sizeof(out->spectator_lan_discovery_status),
+        spectatorDiscovery.status);
 
     // Peer info from session
     Net::SessionSnapshot sessionSnap{};

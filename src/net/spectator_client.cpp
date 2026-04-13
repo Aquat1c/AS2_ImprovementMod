@@ -3,17 +3,21 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <ws2tcpip.h>
 
 #include "net/spectator_client.h"
 
+#include "net/enet_transport.h"
 #include "net/spectator_protocol.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
 #include <algorithm>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -36,12 +40,33 @@ struct BufferedPaletteState {
     uint8_t  data[NETPLAY_PALETTE_BANK_SIZE];
 };
 
+struct RelayPeerState {
+    ENetPeer* peer;
+    bool      handshake_complete;
+    bool      needs_full_sync;
+    int32_t   next_rb_frame;
+    int32_t   last_playback_rb_frame;
+    bool      fast_forward_requested;
+    bool      hard_sync_requested;
+    DWORD     connected_at_ms;
+    DWORD     last_status_at_ms;
+    char      nickname[24];
+};
+
 constexpr int kFastForwardGapFrames = 30;
 constexpr int kHardSyncGapFrames = 180;
 constexpr int kMaxEventsPerFrame = 64;
+constexpr int kMaxRelayEventsPerFrame = 64;
+constexpr int kMaxRelaySpectators = 8;
+constexpr int kMaxBufferedFramesRetained = 36000;
 constexpr DWORD kStatusIntervalMs = 250;
 constexpr DWORD kConnectTimeoutMs = 3000;
 constexpr DWORD kHandshakeTimeoutMs = 3000;
+constexpr DWORD kServerSilenceTimeoutMs = 5000;
+constexpr DWORD kRelayHeartbeatIntervalMs = 500;
+constexpr DWORD kLanDiscoveryTimeoutMs = 1500;
+constexpr int kMaxLanDiscoveryEventsPerFrame = 16;
+constexpr int kPortFallbackScanCount = 16;
 
 static bool s_initialized = false;
 static SpectatorClientState s_state = SpectatorClientState::Idle;
@@ -53,22 +78,57 @@ static char s_status[128] = "Spectator client idle.";
 static char s_error[128] = "";
 static bool s_matchActive = false;
 static uint32_t s_matchId = 0;
+static uint32_t s_matchOrdinal = 0;
 static int32_t s_bufferBaseRbFrame = -1;
 static int32_t s_bufferEndRbFrame = -1;
 static std::vector<BufferedFrame> s_buffer;
 static int32_t s_serverConfirmedRbFrame = -1;
+static int32_t s_confirmedContiguousRbFrame = -1;
 static int32_t s_serverLiveRbFrame = -1;
 static int32_t s_playbackRbFrame = -1;
+static LockedMatchConfig s_matchConfig{};
+static uint32_t s_streamConfigCrc = 0;
+static uint32_t s_streamSessionSeed = 0;
+static char s_p1Name[24] = "P1";
+static char s_p2Name[24] = "P2";
+static bool s_haveMatchState = false;
+static uint16_t s_p1Wins = 0;
+static uint16_t s_p2Wins = 0;
+static uint16_t s_draws = 0;
+static uint16_t s_completedMatches = 0;
 static bool s_fastForwardEnabled = true;
 static bool s_hardSyncEnabled = false;
 static bool s_shouldFastForward = false;
 static bool s_needsHardSync = false;
+static uint32_t s_bufferedValidFrameCount = 0;
+static bool s_archiveHasGap = false;
 static DWORD s_lastStatusSentAt = 0;
+static DWORD s_lastServerPacketAt = 0;
 static DWORD s_stateEnteredAt = 0;
 static bool s_deferredDestroyHost = false;
 static char s_deferredDestroyReason[64] = "";
 static uint32_t s_paletteEpoch = 0;
 static BufferedPaletteState s_palette[2] = {};
+static bool s_relayEnabled = false;
+static uint16_t s_relayListenPort = 10701;
+static uint16_t s_relayBoundListenPort = 0;
+static ENetHost* s_relayServer = nullptr;
+static std::unordered_map<ENetPeer*, RelayPeerState> s_relayPeers;
+static DWORD s_lastRelayHeartbeatAt = 0;
+static uint32_t s_lastRelayPaletteEpochSent = 0;
+static SOCKET s_discoverySocket = INVALID_SOCKET;
+static bool s_discoveryActive = false;
+static DWORD s_discoveryStartedAt = 0;
+static uint32_t s_discoveryNonce = 0;
+static char s_discoveryStatus[128] = "LAN discovery idle.";
+static SpectatorDiscoveryEntry s_discoveryResults[SPECTATOR_DISCOVERY_MAX_RESULTS] = {};
+static uint32_t s_discoveryResultCount = 0;
+
+static void DestroyRelayServer(const char* reason);
+
+static uint32_t ComputeConfigCrc(const LockedMatchConfig& config) {
+    return LockedMatchConfig_Hash(&config);
+}
 
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
@@ -95,6 +155,200 @@ static void SetError(const char* fmt, ...) {
     va_end(ap);
 }
 
+static void SetDiscoveryStatus(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(s_discoveryStatus, sizeof(s_discoveryStatus), _TRUNCATE, fmt, ap);
+    va_end(ap);
+}
+
+static void ResetDiscoveryResults() {
+    memset(s_discoveryResults, 0, sizeof(s_discoveryResults));
+    s_discoveryResultCount = 0;
+}
+
+static void CloseDiscoverySocket(const char* reason) {
+    if (s_discoverySocket == INVALID_SOCKET) {
+        return;
+    }
+    closesocket(s_discoverySocket);
+    s_discoverySocket = INVALID_SOCKET;
+    if (reason && reason[0]) {
+        LOG_NETPLAY(LOG_INFO,
+            "[SCLIENT] lan_discovery_socket_closed reason=%s",
+            reason);
+    }
+}
+
+static bool EnsureDiscoverySocket() {
+    if (s_discoverySocket != INVALID_SOCKET) {
+        return true;
+    }
+
+    if (!Transport_GlobalInit()) {
+        SetDiscoveryStatus("Failed to initialize network transport.");
+        return false;
+    }
+
+    SOCKET socketHandle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (socketHandle == INVALID_SOCKET) {
+        SetDiscoveryStatus("Failed to open LAN discovery socket.");
+        LOG_NETPLAY(LOG_WARNING,
+            "[SCLIENT] lan_discovery_create_failed err=%d",
+            (int)WSAGetLastError());
+        return false;
+    }
+
+    BOOL reuseAddr = TRUE;
+    setsockopt(socketHandle, SOL_SOCKET, SO_REUSEADDR,
+        reinterpret_cast<const char*>(&reuseAddr), sizeof(reuseAddr));
+
+    BOOL allowBroadcast = TRUE;
+    if (setsockopt(socketHandle, SOL_SOCKET, SO_BROADCAST,
+            reinterpret_cast<const char*>(&allowBroadcast), sizeof(allowBroadcast)) != 0) {
+        SetDiscoveryStatus("Failed to enable LAN discovery broadcast.");
+        closesocket(socketHandle);
+        return false;
+    }
+
+    u_long nonBlocking = 1;
+    if (ioctlsocket(socketHandle, FIONBIO, &nonBlocking) != 0) {
+        SetDiscoveryStatus("Failed to prepare LAN discovery socket.");
+        closesocket(socketHandle);
+        return false;
+    }
+
+    sockaddr_in bindAddr{};
+    bindAddr.sin_family = AF_INET;
+    bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bindAddr.sin_port = htons(0);
+    if (bind(socketHandle, reinterpret_cast<const sockaddr*>(&bindAddr), sizeof(bindAddr)) == SOCKET_ERROR) {
+        SetDiscoveryStatus("Failed to bind LAN discovery socket.");
+        closesocket(socketHandle);
+        return false;
+    }
+
+    s_discoverySocket = socketHandle;
+    return true;
+}
+
+static void UpsertDiscoveryResult(const char* endpoint,
+                                  const Spectator::DiscoveryResponsePayload* response) {
+    if (!endpoint || !endpoint[0] || !response) {
+        return;
+    }
+
+    uint32_t slotIndex = s_discoveryResultCount;
+    for (uint32_t index = 0; index < s_discoveryResultCount; index++) {
+        if (_stricmp(s_discoveryResults[index].endpoint, endpoint) == 0) {
+            slotIndex = index;
+            break;
+        }
+    }
+
+    if (slotIndex >= SPECTATOR_DISCOVERY_MAX_RESULTS) {
+        return;
+    }
+
+    if (slotIndex == s_discoveryResultCount) {
+        s_discoveryResultCount++;
+    }
+
+    SpectatorDiscoveryEntry& entry = s_discoveryResults[slotIndex];
+    CopyText(entry.endpoint, sizeof(entry.endpoint), endpoint);
+    CopyText(entry.host_nickname, sizeof(entry.host_nickname), response->host_nickname);
+    CopyText(entry.p1_name, sizeof(entry.p1_name), response->p1_name);
+    CopyText(entry.p2_name, sizeof(entry.p2_name), response->p2_name);
+    entry.match_id = response->match_id;
+    entry.match_active = response->match_state == Spectator::MATCH_STATE_ACTIVE;
+    entry.connected_spectators = response->connected_spectators;
+}
+
+static void PollLanDiscoverySocket() {
+    if (!s_discoveryActive || s_discoverySocket == INVALID_SOCKET) {
+        return;
+    }
+
+    for (int attempt = 0; attempt < kMaxLanDiscoveryEventsPerFrame; attempt++) {
+        Spectator::DiscoveryResponsePayload response{};
+        sockaddr_in fromAddr{};
+        int fromAddrLen = sizeof(fromAddr);
+        const int recvResult = recvfrom(
+            s_discoverySocket,
+            reinterpret_cast<char*>(&response),
+            sizeof(response),
+            0,
+            reinterpret_cast<sockaddr*>(&fromAddr),
+            &fromAddrLen);
+        if (recvResult == SOCKET_ERROR) {
+            const int error = WSAGetLastError();
+            if (error != WSAEWOULDBLOCK) {
+                SetDiscoveryStatus("LAN discovery failed while receiving results.");
+                LOG_NETPLAY(LOG_WARNING,
+                    "[SCLIENT] lan_discovery_recv_failed err=%d",
+                    error);
+                s_discoveryActive = false;
+                CloseDiscoverySocket("recv_failed");
+            }
+            break;
+        }
+
+        if (recvResult < (int)sizeof(response) ||
+            response.magic != Spectator::LAN_DISCOVERY_MAGIC ||
+            response.version != Spectator::LAN_DISCOVERY_VERSION ||
+            response.nonce != s_discoveryNonce) {
+            continue;
+        }
+
+        char hostAddress[64] = {};
+        if (!InetNtopA(AF_INET, &fromAddr.sin_addr, hostAddress, sizeof(hostAddress))) {
+            const char* legacyAddress = inet_ntoa(fromAddr.sin_addr);
+            if (!legacyAddress || !legacyAddress[0]) {
+                continue;
+            }
+            strncpy_s(hostAddress, sizeof(hostAddress), legacyAddress, _TRUNCATE);
+        }
+
+        char endpoint[96] = {};
+        _snprintf_s(endpoint, sizeof(endpoint), _TRUNCATE,
+            "%s:%u",
+            hostAddress,
+            response.spectator_port);
+
+        UpsertDiscoveryResult(endpoint, &response);
+        SetDiscoveryStatus("Found %u LAN spectator host%s.",
+            s_discoveryResultCount,
+            s_discoveryResultCount == 1 ? "" : "s");
+        LOG_NETPLAY(LOG_INFO,
+            "[SCLIENT] lan_discovery_result endpoint=%s host=%s match_state=%u spectators=%u",
+            endpoint,
+            response.host_nickname[0] ? response.host_nickname : "?",
+            response.match_state,
+            response.connected_spectators);
+    }
+}
+
+static void UpdateLanDiscoveryLifetime() {
+    if (!s_discoveryActive) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if ((now - s_discoveryStartedAt) < kLanDiscoveryTimeoutMs) {
+        return;
+    }
+
+    s_discoveryActive = false;
+    CloseDiscoverySocket("timeout");
+    if (s_discoveryResultCount <= 0) {
+        SetDiscoveryStatus("No LAN spectator hosts found.");
+    } else {
+        SetDiscoveryStatus("LAN discovery complete: found %u host%s.",
+            s_discoveryResultCount,
+            s_discoveryResultCount == 1 ? "" : "s");
+    }
+}
+
 static void FailConnection(const char* message) {
     if (message && message[0]) {
         SetError("%s", message);
@@ -104,10 +358,33 @@ static void FailConnection(const char* message) {
             message,
             s_endpoint[0] ? s_endpoint : "(unset)");
     }
+    if (s_relayServer) {
+        DestroyRelayServer(message && message[0] ? message : "upstream failure");
+    }
     s_matchActive = false;
     s_matchId = 0;
+    s_matchOrdinal = 0;
     s_state = SpectatorClientState::Failed;
     s_stateEnteredAt = 0;
+}
+
+static void EnterConnectedNoActiveMatch(const char* source, const char* message) {
+    const bool stateChanged = s_state != SpectatorClientState::ConnectedNoActiveMatch;
+    s_matchActive = false;
+    s_state = SpectatorClientState::ConnectedNoActiveMatch;
+    s_stateEnteredAt = GetTickCount();
+    s_error[0] = '\0';
+    SetStatus("%s",
+        (message && message[0])
+            ? message
+            : "Connected to spectator host; waiting for active match.");
+
+    if (stateChanged) {
+        LOG_NETPLAY(LOG_INFO,
+            "[SCLIENT] connected_waiting_no_match source=%s endpoint=%s",
+            source && source[0] ? source : "unknown",
+            s_endpoint[0] ? s_endpoint : "(unset)");
+    }
 }
 
 static void ResetBuffer() {
@@ -115,11 +392,31 @@ static void ResetBuffer() {
     s_bufferBaseRbFrame = -1;
     s_bufferEndRbFrame = -1;
     s_serverConfirmedRbFrame = -1;
+    s_confirmedContiguousRbFrame = -1;
     s_serverLiveRbFrame = -1;
     s_playbackRbFrame = -1;
+    s_matchId = 0;
+    s_matchOrdinal = 0;
+    s_matchActive = false;
+    LockedMatchConfig_Clear(&s_matchConfig);
+    s_streamConfigCrc = 0;
+    s_streamSessionSeed = 0;
+    CopyText(s_p1Name, sizeof(s_p1Name), "P1");
+    CopyText(s_p2Name, sizeof(s_p2Name), "P2");
+    s_haveMatchState = false;
+    s_p1Wins = 0;
+    s_p2Wins = 0;
+    s_draws = 0;
+    s_completedMatches = 0;
     s_shouldFastForward = false;
     s_needsHardSync = false;
+    s_bufferedValidFrameCount = 0;
+    s_archiveHasGap = false;
+    s_lastStatusSentAt = 0;
+    s_lastServerPacketAt = 0;
     s_paletteEpoch = 0;
+    s_lastRelayHeartbeatAt = 0;
+    s_lastRelayPaletteEpochSent = 0;
     memset(s_palette, 0, sizeof(s_palette));
 }
 
@@ -158,6 +455,141 @@ static void RequestDeferredDestroy(const char* reason) {
             s_endpoint[0] ? s_endpoint : "(unset)");
     }
     s_deferredDestroyHost = true;
+}
+
+static uint16_t ResolveBoundPort(ENetHost* host, uint16_t fallbackPort) {
+    if (!host) {
+        return fallbackPort;
+    }
+
+    ENetAddress boundAddress{};
+    if (enet_socket_get_address(host->socket, &boundAddress) == 0 &&
+        boundAddress.port != 0) {
+        return boundAddress.port;
+    }
+
+    return fallbackPort;
+}
+
+static ENetHost* TryCreateRelayServerHost(uint16_t port) {
+    ENetAddress address{};
+    address.host = ENET_HOST_ANY;
+    address.port = port;
+    return enet_host_create(&address, kMaxRelaySpectators, Spectator::NUM_CHANNELS, 0, 0);
+}
+
+static ENetHost* CreateRelayServerWithFallback(uint16_t requestedPort,
+                                               uint16_t* outBoundPort,
+                                               bool* outUsedFallback,
+                                               bool* outUsedEphemeral) {
+    if (outBoundPort) {
+        *outBoundPort = requestedPort;
+    }
+    if (outUsedFallback) {
+        *outUsedFallback = false;
+    }
+    if (outUsedEphemeral) {
+        *outUsedEphemeral = false;
+    }
+
+    ENetHost* host = TryCreateRelayServerHost(requestedPort);
+    if (host) {
+        if (outBoundPort) {
+            *outBoundPort = ResolveBoundPort(host, requestedPort);
+        }
+        return host;
+    }
+
+    for (int delta = 1; delta <= kPortFallbackScanCount; delta++) {
+        const unsigned candidatePort = (unsigned)requestedPort + (unsigned)delta;
+        if (candidatePort > UINT16_MAX) {
+            break;
+        }
+
+        host = TryCreateRelayServerHost((uint16_t)candidatePort);
+        if (!host) {
+            continue;
+        }
+
+        if (outBoundPort) {
+            *outBoundPort = ResolveBoundPort(host, (uint16_t)candidatePort);
+        }
+        if (outUsedFallback) {
+            *outUsedFallback = true;
+        }
+        return host;
+    }
+
+    host = TryCreateRelayServerHost(0);
+    if (host) {
+        if (outBoundPort) {
+            *outBoundPort = ResolveBoundPort(host, 0);
+        }
+        if (outUsedFallback) {
+            *outUsedFallback = true;
+        }
+        if (outUsedEphemeral) {
+            *outUsedEphemeral = true;
+        }
+    }
+
+    return host;
+}
+
+static bool HasBufferedStreamIdentity() {
+    return s_matchId != 0 ||
+           s_matchOrdinal != 0 ||
+           s_streamConfigCrc != 0 ||
+           s_streamSessionSeed != 0 ||
+           s_haveMatchState ||
+           s_bufferBaseRbFrame >= 0 ||
+           s_bufferEndRbFrame >= 0 ||
+           s_paletteEpoch != 0;
+}
+
+static void AdoptIncomingStreamIdentity(uint32_t matchId,
+                                        uint32_t matchOrdinal,
+                                        const char* source) {
+    if (HasBufferedStreamIdentity() &&
+        (s_matchId != matchId || s_matchOrdinal != matchOrdinal)) {
+        LOG_NETPLAY(LOG_INFO,
+            "[SCLIENT] stream_identity_change source=%s old_match=0x%08X/%u new_match=0x%08X/%u reset=1",
+            source && source[0] ? source : "unknown",
+            s_matchId,
+            s_matchOrdinal,
+            matchId,
+            matchOrdinal);
+        ResetBuffer();
+    }
+
+    s_matchId = matchId;
+    s_matchOrdinal = matchOrdinal;
+}
+
+static bool AdoptIncomingConfigIdentity(uint32_t configCrc,
+                                        uint32_t sessionSeed,
+                                        const char* source) {
+    if (configCrc == 0 && sessionSeed == 0) {
+        return true;
+    }
+
+    if ((s_streamConfigCrc != 0 || s_streamSessionSeed != 0) &&
+        (s_streamConfigCrc != configCrc || s_streamSessionSeed != sessionSeed)) {
+        LOG_NETPLAY(LOG_WARNING,
+            "[SCLIENT] stream_identity_mismatch source=%s match=0x%08X/%u old_crc=0x%08X old_seed=0x%08X new_crc=0x%08X new_seed=0x%08X",
+            source && source[0] ? source : "unknown",
+            s_matchId,
+            s_matchOrdinal,
+            s_streamConfigCrc,
+            s_streamSessionSeed,
+            configCrc,
+            sessionSeed);
+        return false;
+    }
+
+    s_streamConfigCrc = configCrc;
+    s_streamSessionSeed = sessionSeed;
+    return true;
 }
 
 static bool ParseEndpointText(const char* text, char* outHost, size_t outHostSize, uint16_t* outPort) {
@@ -236,6 +668,141 @@ static bool SendTyped(uint8_t channel,
     return true;
 }
 
+static int CountRelayHandshakenPeers() {
+    int count = 0;
+    for (const auto& entry : s_relayPeers) {
+        if (entry.second.handshake_complete) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static RelayPeerState* FindRelayPeer(ENetPeer* peer) {
+    auto it = s_relayPeers.find(peer);
+    return (it != s_relayPeers.end()) ? &it->second : nullptr;
+}
+
+static bool RelaySendTyped(ENetPeer* peer,
+                           uint8_t channel,
+                           Spectator::PacketType type,
+                           const void* payload,
+                           size_t payloadLen,
+                           bool reliable) {
+    if (!peer) {
+        return false;
+    }
+    if (sizeof(Spectator::PacketType) + payloadLen > (size_t)Spectator::MAX_PACKET_SIZE) {
+        return false;
+    }
+
+    uint8_t buffer[Spectator::MAX_PACKET_SIZE] = {};
+    memcpy(buffer, &type, sizeof(type));
+    if (payload && payloadLen > 0) {
+        memcpy(buffer + sizeof(type), payload, payloadLen);
+    }
+
+    ENetPacket* packet = enet_packet_create(buffer,
+        sizeof(type) + payloadLen,
+        reliable ? ENET_PACKET_FLAG_RELIABLE : 0);
+    if (!packet) {
+        return false;
+    }
+    if (enet_peer_send(peer, channel, packet) < 0) {
+        enet_packet_destroy(packet);
+        return false;
+    }
+    return true;
+}
+
+static bool ShouldRunRelayServer() {
+    return s_relayEnabled &&
+           s_relayListenPort != 0 &&
+           (s_state == SpectatorClientState::Connecting ||
+            s_state == SpectatorClientState::Handshaking ||
+            s_state == SpectatorClientState::ConnectedNoActiveMatch ||
+            s_state == SpectatorClientState::Streaming);
+}
+
+static void DestroyRelayServer(const char* reason) {
+    if (!s_relayServer) {
+        s_relayPeers.clear();
+        s_relayBoundListenPort = 0;
+        s_lastRelayHeartbeatAt = 0;
+        s_lastRelayPaletteEpochSent = 0;
+        return;
+    }
+
+    Spectator::DisconnectPayload disconnect{};
+    disconnect.reason_code = 0;
+    CopyText(disconnect.message, sizeof(disconnect.message),
+        reason && reason[0] ? reason : "relay offline");
+
+    for (size_t index = 0; index < s_relayServer->peerCount; index++) {
+        ENetPeer* peer = &s_relayServer->peers[index];
+        if (peer->state == ENET_PEER_STATE_CONNECTED ||
+            peer->state == ENET_PEER_STATE_CONNECTING) {
+            RelaySendTyped(peer,
+                Spectator::CHANNEL_CONTROL,
+                Spectator::PacketType::Disconnect,
+                &disconnect,
+                sizeof(disconnect),
+                true);
+            enet_peer_disconnect_now(peer, 0);
+        }
+    }
+
+    enet_host_flush(s_relayServer);
+
+    enet_host_destroy(s_relayServer);
+    s_relayServer = nullptr;
+    s_relayPeers.clear();
+    s_relayBoundListenPort = 0;
+    s_lastRelayHeartbeatAt = 0;
+    s_lastRelayPaletteEpochSent = 0;
+
+    LOG_NETPLAY(LOG_INFO,
+        "[SCLIENT] relay_server_destroyed reason=%s",
+        reason && reason[0] ? reason : "unspecified");
+}
+
+static bool EnsureRelayServer() {
+    if (s_relayServer) {
+        if (ShouldRunRelayServer()) {
+            return true;
+        }
+        DestroyRelayServer("relay_disabled");
+        return false;
+    }
+
+    if (!ShouldRunRelayServer()) {
+        return false;
+    }
+
+    bool usedFallback = false;
+    bool usedEphemeral = false;
+    s_relayServer = CreateRelayServerWithFallback(
+        s_relayListenPort,
+        &s_relayBoundListenPort,
+        &usedFallback,
+        &usedEphemeral);
+    if (!s_relayServer) {
+        s_relayBoundListenPort = 0;
+        LOG_NETPLAY(LOG_WARNING,
+            "[SCLIENT] relay_server_bind_failed port=%u",
+            s_relayListenPort);
+        return false;
+    }
+
+    LOG_NETPLAY(LOG_INFO,
+        "[SCLIENT] relay_server_listening requested_port=%u bound_port=%u fallback=%d ephemeral=%d",
+        s_relayListenPort,
+        s_relayBoundListenPort,
+        usedFallback ? 1 : 0,
+        usedEphemeral ? 1 : 0);
+    return true;
+}
+
 static BufferedFrame* EnsureBufferSlot(int32_t rb_frame) {
     if (rb_frame < 0) {
         return nullptr;
@@ -257,32 +824,202 @@ static BufferedFrame* EnsureBufferSlot(int32_t rb_frame) {
     return &s_buffer[index];
 }
 
-static void AdvanceSyntheticPlayback() {
-    if (!s_matchActive || s_bufferEndRbFrame < 0) {
-        s_shouldFastForward = false;
-        s_needsHardSync = false;
+static bool IsConfirmedBufferedFrame(const BufferedFrame& frame) {
+    return frame.valid &&
+        (((frame.record.flags & Spectator::FRAME_FLAG_CONFIRMED) != 0) ||
+         (s_serverConfirmedRbFrame >= 0 && frame.record.rb_frame <= s_serverConfirmedRbFrame));
+}
+
+static void RecomputeBufferedArchiveStats() {
+    s_bufferedValidFrameCount = 0;
+    s_archiveHasGap = false;
+    s_bufferEndRbFrame = -1;
+    s_confirmedContiguousRbFrame = -1;
+
+    if (s_buffer.empty() || s_bufferBaseRbFrame < 0) {
         return;
     }
 
-    if (s_playbackRbFrame < s_bufferBaseRbFrame) {
+    for (size_t index = 0; index < s_buffer.size(); index++) {
+        if (!s_buffer[index].valid) {
+            continue;
+        }
+
+        s_bufferedValidFrameCount++;
+        s_bufferEndRbFrame = s_bufferBaseRbFrame + (int32_t)index;
+    }
+
+    size_t contiguousCount = 0;
+    while (contiguousCount < s_buffer.size() &&
+           IsConfirmedBufferedFrame(s_buffer[contiguousCount])) {
+        contiguousCount++;
+    }
+
+    if (contiguousCount > 0) {
+        s_confirmedContiguousRbFrame = s_bufferBaseRbFrame + (int32_t)contiguousCount - 1;
+    }
+
+    s_archiveHasGap = s_bufferedValidFrameCount > contiguousCount;
+}
+
+static const BufferedFrame* GetBufferSlot(int32_t rb_frame) {
+    if (rb_frame < s_bufferBaseRbFrame) {
+        return nullptr;
+    }
+    const size_t index = (size_t)(rb_frame - s_bufferBaseRbFrame);
+    if (index >= s_buffer.size()) {
+        return nullptr;
+    }
+    return &s_buffer[index];
+}
+
+static void PruneBufferedFrames() {
+    if (s_buffer.empty()) {
+        return;
+    }
+
+    int32_t keepFromRbFrame = s_bufferBaseRbFrame;
+    if (CountRelayHandshakenPeers() > 0) {
+        int32_t oldestRequestedRbFrame = -1;
+        for (const auto& entry : s_relayPeers) {
+            if (!entry.second.handshake_complete) {
+                continue;
+            }
+            if (oldestRequestedRbFrame < 0) {
+                oldestRequestedRbFrame = entry.second.next_rb_frame;
+            } else {
+                oldestRequestedRbFrame = (std::min)(oldestRequestedRbFrame, entry.second.next_rb_frame);
+            }
+        }
+        if (oldestRequestedRbFrame >= 0) {
+            keepFromRbFrame = (std::max)(keepFromRbFrame, oldestRequestedRbFrame);
+        }
+    } else if ((int)s_buffer.size() > kMaxBufferedFramesRetained) {
+        const int32_t bufferEndRbFrame = s_bufferBaseRbFrame + (int32_t)s_buffer.size() - 1;
+        keepFromRbFrame = bufferEndRbFrame - kMaxBufferedFramesRetained + 1;
+    }
+
+    const int32_t bufferEndRbFrame = s_bufferBaseRbFrame + (int32_t)s_buffer.size() - 1;
+    keepFromRbFrame = (std::min)(keepFromRbFrame, bufferEndRbFrame);
+    if (keepFromRbFrame <= s_bufferBaseRbFrame) {
+        return;
+    }
+
+    const size_t trimCount = (size_t)(keepFromRbFrame - s_bufferBaseRbFrame);
+    s_buffer.erase(s_buffer.begin(), s_buffer.begin() + trimCount);
+    s_bufferBaseRbFrame = keepFromRbFrame;
+
+    if (s_playbackRbFrame >= 0 && s_playbackRbFrame < s_bufferBaseRbFrame) {
         s_playbackRbFrame = s_bufferBaseRbFrame;
     }
-
-    const int32_t gap = s_bufferEndRbFrame - s_playbackRbFrame;
-    s_shouldFastForward = false;
-    s_needsHardSync = false;
-
-    if (s_hardSyncEnabled && gap >= kHardSyncGapFrames) {
-        s_playbackRbFrame = s_bufferEndRbFrame - 2;
-        s_needsHardSync = true;
-    } else {
-        int step = 1;
-        if (s_fastForwardEnabled && gap >= kFastForwardGapFrames) {
-            step = 4;
-            s_shouldFastForward = true;
+    for (auto& entry : s_relayPeers) {
+        if (entry.second.next_rb_frame < s_bufferBaseRbFrame) {
+            entry.second.next_rb_frame = s_bufferBaseRbFrame;
         }
-        s_playbackRbFrame = (std::min)(s_bufferEndRbFrame, s_playbackRbFrame + step);
     }
+
+    RecomputeBufferedArchiveStats();
+}
+
+static void BuildBufferedMatchStatePayload(Spectator::MatchStatePayload* out) {
+    if (!out) {
+        return;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->match_id = s_matchId;
+    out->match_ordinal = s_matchOrdinal;
+    out->config_crc = s_streamConfigCrc != 0
+        ? s_streamConfigCrc
+        : (s_haveMatchState ? ComputeConfigCrc(s_matchConfig) : 0);
+    out->match_state = s_matchActive
+        ? Spectator::MATCH_STATE_ACTIVE
+        : (s_matchId != 0 ? Spectator::MATCH_STATE_ENDED : Spectator::MATCH_STATE_IDLE);
+    out->archive_start_rb_frame = s_bufferBaseRbFrame;
+    out->confirmed_rb_frame = s_serverConfirmedRbFrame;
+    out->live_rb_frame = s_serverLiveRbFrame;
+    out->p1_wins = s_p1Wins;
+    out->p2_wins = s_p2Wins;
+    out->draws = s_draws;
+    out->completed_matches = s_completedMatches;
+    out->config = s_matchConfig;
+    CopyText(out->p1_name, sizeof(out->p1_name), s_p1Name);
+    CopyText(out->p2_name, sizeof(out->p2_name), s_p2Name);
+}
+
+static void BuildBufferedPaletteStatePayload(Spectator::PaletteStatePayload* out) {
+    if (!out) {
+        return;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->match_id = s_matchId;
+    out->match_ordinal = s_matchOrdinal;
+    out->config_crc = s_streamConfigCrc != 0
+        ? s_streamConfigCrc
+        : (s_haveMatchState ? ComputeConfigCrc(s_matchConfig) : 0);
+    out->session_seed = s_streamSessionSeed != 0
+        ? s_streamSessionSeed
+        : (s_haveMatchState ? s_matchConfig.session_seed : 0);
+    out->palette_epoch = s_paletteEpoch;
+
+    for (int index = 0; index < 2; index++) {
+        if (!s_palette[index].metadata_valid) {
+            continue;
+        }
+        out->player[index].character_id = s_palette[index].character_id;
+        out->player[index].base_palette = s_palette[index].base_palette;
+        out->player[index].flags = s_palette[index].flags;
+        out->player[index].has_custom_data = s_palette[index].bank_valid ? 1 : 0;
+        out->player[index].payload_size = s_palette[index].payload_size;
+        out->player[index].payload_crc = s_palette[index].payload_crc;
+    }
+}
+
+static bool SendBufferedPaletteSyncForPeer(ENetPeer* peer) {
+    if (!peer) {
+        return false;
+    }
+
+    Spectator::PaletteStatePayload state{};
+    BuildBufferedPaletteStatePayload(&state);
+    if (!RelaySendTyped(peer,
+            Spectator::CHANNEL_CONTROL,
+            Spectator::PacketType::PaletteState,
+            &state,
+            sizeof(state),
+            true)) {
+        return false;
+    }
+
+    for (int index = 0; index < 2; index++) {
+        if (!s_palette[index].bank_valid ||
+            s_palette[index].payload_size != NETPLAY_PALETTE_BANK_SIZE) {
+            continue;
+        }
+
+        Spectator::PaletteDataPayload data{};
+        data.match_id = s_matchId;
+        data.match_ordinal = s_matchOrdinal;
+        data.config_crc = state.config_crc;
+        data.session_seed = state.session_seed;
+        data.palette_epoch = s_paletteEpoch;
+        data.game_slot = (uint8_t)index;
+        data.character_id = s_palette[index].character_id;
+        data.base_palette = s_palette[index].base_palette;
+        data.payload_crc = s_palette[index].payload_crc;
+        data.payload_size = s_palette[index].payload_size;
+        memcpy(data.payload, s_palette[index].data, NETPLAY_PALETTE_BANK_SIZE);
+
+        RelaySendTyped(peer,
+            Spectator::CHANNEL_CONTROL,
+            Spectator::PacketType::PaletteData,
+            &data,
+            sizeof(data),
+            true);
+    }
+
+    return true;
 }
 
 static void SendClientStatusIfNeeded() {
@@ -297,6 +1034,7 @@ static void SendClientStatusIfNeeded() {
 
     Spectator::ClientStatusPayload payload{};
     payload.match_id = s_matchId;
+    payload.match_ordinal = s_matchOrdinal;
     payload.playback_rb_frame = s_playbackRbFrame;
     payload.buffered_frame_count = (s_playbackRbFrame >= 0 && s_bufferEndRbFrame >= s_playbackRbFrame)
         ? (s_bufferEndRbFrame - s_playbackRbFrame)
@@ -317,6 +1055,307 @@ static void SendClientStatusIfNeeded() {
     }
 }
 
+static void HandleRelayHello(ENetPeer* peer, const Spectator::HelloPayload* payload) {
+    if (!peer || !payload) {
+        return;
+    }
+
+    auto it = s_relayPeers.find(peer);
+    if (it == s_relayPeers.end()) {
+        return;
+    }
+
+    if (payload->protocol_version != Spectator::PROTOCOL_VERSION) {
+        Spectator::DisconnectPayload disconnect{};
+        disconnect.reason_code = 1;
+        CopyText(disconnect.message, sizeof(disconnect.message), "spectator protocol mismatch");
+        RelaySendTyped(peer,
+            Spectator::CHANNEL_CONTROL,
+            Spectator::PacketType::Disconnect,
+            &disconnect,
+            sizeof(disconnect),
+            true);
+        enet_peer_disconnect_later(peer, 0);
+        return;
+    }
+
+    if (payload->requested_match_id != 0 && payload->requested_match_id != s_matchId) {
+        Spectator::DisconnectPayload disconnect{};
+        disconnect.reason_code = 2;
+        CopyText(disconnect.message, sizeof(disconnect.message), "requested match not active");
+        RelaySendTyped(peer,
+            Spectator::CHANNEL_CONTROL,
+            Spectator::PacketType::Disconnect,
+            &disconnect,
+            sizeof(disconnect),
+            true);
+        enet_peer_disconnect_later(peer, 0);
+        return;
+    }
+
+    if (CountRelayHandshakenPeers() >= kMaxRelaySpectators) {
+        Spectator::DisconnectPayload disconnect{};
+        disconnect.reason_code = 3;
+        CopyText(disconnect.message, sizeof(disconnect.message), "spectator capacity reached");
+        RelaySendTyped(peer,
+            Spectator::CHANNEL_CONTROL,
+            Spectator::PacketType::Disconnect,
+            &disconnect,
+            sizeof(disconnect),
+            true);
+        enet_peer_disconnect_later(peer, 0);
+        return;
+    }
+
+    RelayPeerState& state = it->second;
+    state.handshake_complete = true;
+    state.needs_full_sync = true;
+    state.next_rb_frame = (s_bufferBaseRbFrame >= 0) ? s_bufferBaseRbFrame : 0;
+    state.last_playback_rb_frame = -1;
+    state.fast_forward_requested = false;
+    state.hard_sync_requested = false;
+    CopyText(state.nickname, sizeof(state.nickname), payload->nickname);
+
+    Spectator::HelloAckPayload ack{};
+    ack.protocol_version = Spectator::PROTOCOL_VERSION;
+    ack.server_listen_port = s_relayBoundListenPort != 0
+        ? s_relayBoundListenPort
+        : s_relayListenPort;
+    ack.match_id = s_matchId;
+    ack.match_ordinal = s_matchOrdinal;
+    ack.match_state = s_matchActive
+        ? Spectator::MATCH_STATE_ACTIVE
+        : Spectator::MATCH_STATE_IDLE;
+    RelaySendTyped(peer,
+        Spectator::CHANNEL_CONTROL,
+        Spectator::PacketType::HelloAck,
+        &ack,
+        sizeof(ack),
+        true);
+}
+
+static void HandleRelayClientStatus(ENetPeer* peer, const Spectator::ClientStatusPayload* payload) {
+    RelayPeerState* state = FindRelayPeer(peer);
+    if (!state || !payload) {
+        return;
+    }
+
+    if (payload->match_id != 0 &&
+        (payload->match_id != s_matchId || payload->match_ordinal != s_matchOrdinal)) {
+        return;
+    }
+
+    state->last_playback_rb_frame = payload->playback_rb_frame;
+    state->fast_forward_requested = (payload->flags & Spectator::CLIENT_STATUS_FLAG_FAST_FORWARD) != 0;
+    state->hard_sync_requested = (payload->flags & Spectator::CLIENT_STATUS_FLAG_HARD_SYNC) != 0;
+    state->last_status_at_ms = GetTickCount();
+}
+
+static void HandleRelayDisconnect(ENetPeer* peer) {
+    if (!peer) {
+        return;
+    }
+    s_relayPeers.erase(peer);
+    enet_peer_disconnect_now(peer, 0);
+}
+
+static void ServiceRelayServer() {
+    if (!ShouldRunRelayServer()) {
+        if (s_relayServer) {
+            DestroyRelayServer("relay_inactive");
+        }
+        return;
+    }
+
+    if (!EnsureRelayServer()) {
+        return;
+    }
+
+    ENetEvent event{};
+    int processedEvents = 0;
+    while (processedEvents < kMaxRelayEventsPerFrame &&
+           enet_host_service(s_relayServer, &event, 0) > 0) {
+        processedEvents++;
+        switch (event.type) {
+            case ENET_EVENT_TYPE_CONNECT: {
+                RelayPeerState state{};
+                state.peer = event.peer;
+                state.handshake_complete = false;
+                state.needs_full_sync = false;
+                state.next_rb_frame = 0;
+                state.last_playback_rb_frame = -1;
+                state.fast_forward_requested = false;
+                state.hard_sync_requested = false;
+                state.connected_at_ms = GetTickCount();
+                state.last_status_at_ms = 0;
+                state.nickname[0] = '\0';
+                s_relayPeers[event.peer] = state;
+                break;
+            }
+
+            case ENET_EVENT_TYPE_RECEIVE: {
+                if (!event.packet) {
+                    break;
+                }
+
+                if (!Spectator::ValidatePacketSize(event.packet->data, event.packet->dataLength)) {
+                    enet_packet_destroy(event.packet);
+                    break;
+                }
+
+                const Spectator::PacketType type = Spectator::ReadPacketType(event.packet->data);
+                const void* payload = Spectator::GetPayloadPtr(event.packet->data);
+                const size_t payloadLen = Spectator::GetPayloadSize(event.packet->dataLength);
+
+                switch (type) {
+                    case Spectator::PacketType::Hello:
+                        if (payloadLen >= sizeof(Spectator::HelloPayload)) {
+                            HandleRelayHello(event.peer, static_cast<const Spectator::HelloPayload*>(payload));
+                        }
+                        break;
+
+                    case Spectator::PacketType::ClientStatus:
+                        if (payloadLen >= sizeof(Spectator::ClientStatusPayload)) {
+                            HandleRelayClientStatus(event.peer, static_cast<const Spectator::ClientStatusPayload*>(payload));
+                        }
+                        break;
+
+                    case Spectator::PacketType::Disconnect:
+                        HandleRelayDisconnect(event.peer);
+                        break;
+
+                    default:
+                        break;
+                }
+
+                enet_packet_destroy(event.packet);
+                break;
+            }
+
+            case ENET_EVENT_TYPE_DISCONNECT:
+                s_relayPeers.erase(event.peer);
+                break;
+
+            case ENET_EVENT_TYPE_NONE:
+                break;
+        }
+    }
+
+    if (!s_matchActive || !s_haveMatchState) {
+        enet_host_flush(s_relayServer);
+        return;
+    }
+
+    Spectator::MatchStatePayload matchPayload{};
+    BuildBufferedMatchStatePayload(&matchPayload);
+
+    for (auto& entry : s_relayPeers) {
+        RelayPeerState& peer = entry.second;
+        if (!peer.handshake_complete) {
+            continue;
+        }
+
+        if (peer.needs_full_sync) {
+            RelaySendTyped(peer.peer,
+                Spectator::CHANNEL_CONTROL,
+                Spectator::PacketType::MatchState,
+                &matchPayload,
+                sizeof(matchPayload),
+                true);
+            SendBufferedPaletteSyncForPeer(peer.peer);
+            peer.next_rb_frame = (s_bufferBaseRbFrame >= 0) ? s_bufferBaseRbFrame : 0;
+            peer.needs_full_sync = false;
+        }
+
+        const int32_t safeLiveFrame = s_serverConfirmedRbFrame - 2;
+        if (safeLiveFrame < peer.next_rb_frame) {
+            continue;
+        }
+
+        Spectator::FrameBatchPayload batch{};
+        batch.match_id = s_matchId;
+        batch.match_ordinal = s_matchOrdinal;
+        batch.config_crc = s_streamConfigCrc != 0
+            ? s_streamConfigCrc
+            : ComputeConfigCrc(s_matchConfig);
+        batch.session_seed = s_streamSessionSeed != 0
+            ? s_streamSessionSeed
+            : s_matchConfig.session_seed;
+        batch.archive_start_rb_frame = s_bufferBaseRbFrame;
+        batch.confirmed_rb_frame = s_serverConfirmedRbFrame;
+        batch.live_rb_frame = s_serverLiveRbFrame;
+
+        int32_t nextFrame = peer.next_rb_frame;
+        for (; batch.record_count < Spectator::MAX_FRAME_BATCH && nextFrame <= safeLiveFrame; nextFrame++) {
+            const BufferedFrame* slot = GetBufferSlot(nextFrame);
+            if (!slot || !slot->valid) {
+                break;
+            }
+            batch.records[batch.record_count++] = slot->record;
+        }
+
+        if (batch.record_count > 0) {
+            size_t payloadSize = sizeof(batch);
+            if (batch.record_count < Spectator::MAX_FRAME_BATCH) {
+                payloadSize -= sizeof(batch.records) -
+                    (sizeof(batch.records[0]) * batch.record_count);
+            }
+
+            if (RelaySendTyped(peer.peer,
+                    Spectator::CHANNEL_STREAM,
+                    Spectator::PacketType::FrameBatch,
+                    &batch,
+                    payloadSize,
+                    true)) {
+                peer.next_rb_frame = batch.records[batch.record_count - 1].rb_frame + 1;
+            }
+        }
+    }
+
+    if (s_paletteEpoch != s_lastRelayPaletteEpochSent) {
+        s_lastRelayPaletteEpochSent = s_paletteEpoch;
+        for (auto& entry : s_relayPeers) {
+            if (!entry.second.handshake_complete) {
+                continue;
+            }
+            SendBufferedPaletteSyncForPeer(entry.second.peer);
+        }
+    }
+
+    const DWORD now = GetTickCount();
+    if ((now - s_lastRelayHeartbeatAt) >= kRelayHeartbeatIntervalMs) {
+        Spectator::HeartbeatPayload heartbeat{};
+        heartbeat.match_id = s_matchId;
+        heartbeat.match_ordinal = s_matchOrdinal;
+        heartbeat.config_crc = s_streamConfigCrc != 0
+            ? s_streamConfigCrc
+            : ComputeConfigCrc(s_matchConfig);
+        heartbeat.session_seed = s_streamSessionSeed != 0
+            ? s_streamSessionSeed
+            : s_matchConfig.session_seed;
+        heartbeat.confirmed_rb_frame = s_serverConfirmedRbFrame;
+        heartbeat.live_rb_frame = s_serverLiveRbFrame;
+        heartbeat.match_state = s_matchActive
+            ? Spectator::MATCH_STATE_ACTIVE
+            : Spectator::MATCH_STATE_ENDED;
+        for (auto& entry : s_relayPeers) {
+            if (!entry.second.handshake_complete) {
+                continue;
+            }
+            RelaySendTyped(entry.second.peer,
+                Spectator::CHANNEL_CONTROL,
+                Spectator::PacketType::Heartbeat,
+                &heartbeat,
+                sizeof(heartbeat),
+                true);
+        }
+        s_lastRelayHeartbeatAt = now;
+    }
+
+    PruneBufferedFrames();
+    enet_host_flush(s_relayServer);
+}
+
 } // namespace
 
 namespace Net {
@@ -334,9 +1373,18 @@ void SpectatorClient_Init() {
     s_matchId = 0;
     ResetBuffer();
     SetStatus("Spectator client idle.");
+    SetDiscoveryStatus("LAN discovery idle.");
+    ResetDiscoveryResults();
     s_stateEnteredAt = 0;
+    s_lastServerPacketAt = 0;
     s_deferredDestroyHost = false;
     s_deferredDestroyReason[0] = '\0';
+    s_relayEnabled = false;
+    s_relayListenPort = 10701;
+    s_relayBoundListenPort = 0;
+    LockedMatchConfig_Clear(&s_matchConfig);
+    CopyText(s_p1Name, sizeof(s_p1Name), "P1");
+    CopyText(s_p2Name, sizeof(s_p2Name), "P2");
     s_initialized = true;
 }
 
@@ -345,13 +1393,101 @@ void SpectatorClient_Shutdown() {
         return;
     }
     SpectatorClient_Disconnect("shutdown");
+    DestroyRelayServer("shutdown");
+    s_discoveryActive = false;
+    CloseDiscoverySocket("shutdown");
+    ResetDiscoveryResults();
     s_initialized = false;
+}
+
+void SpectatorClient_SetRelayConfig(bool enabled, uint16_t listenPort) {
+    const uint16_t previousPort = s_relayListenPort;
+    s_relayEnabled = enabled;
+    if (listenPort != 0) {
+        s_relayListenPort = listenPort;
+    }
+
+    if (!s_initialized) {
+        return;
+    }
+
+    if (s_relayServer && (!enabled || s_relayListenPort != previousPort)) {
+        DestroyRelayServer(enabled ? "relay_rebind" : "relay_disabled");
+    }
+    if (enabled) {
+        EnsureRelayServer();
+    }
+}
+
+bool SpectatorClient_BeginLanDiscovery() {
+    if (!s_initialized) {
+        return false;
+    }
+
+    if (s_state == SpectatorClientState::Connecting ||
+        s_state == SpectatorClientState::Handshaking ||
+        s_state == SpectatorClientState::ConnectedNoActiveMatch ||
+        s_state == SpectatorClientState::Streaming ||
+        s_state == SpectatorClientState::Redirected) {
+        SetDiscoveryStatus("Disconnect the active spectator session before scanning LAN.");
+        return false;
+    }
+
+    s_discoveryActive = false;
+    CloseDiscoverySocket("restart");
+    ResetDiscoveryResults();
+
+    if (!EnsureDiscoverySocket()) {
+        return false;
+    }
+
+    Spectator::DiscoveryQueryPayload query{};
+    query.magic = Spectator::LAN_DISCOVERY_MAGIC;
+    query.version = Spectator::LAN_DISCOVERY_VERSION;
+    query.nonce = (GetTickCount() ^ 0x51A2D04Fu);
+    if (query.nonce == 0) {
+        query.nonce = 1;
+    }
+
+    sockaddr_in targetAddr{};
+    targetAddr.sin_family = AF_INET;
+    targetAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    targetAddr.sin_port = htons(Spectator::LAN_DISCOVERY_PORT);
+
+    const int sendResult = sendto(
+        s_discoverySocket,
+        reinterpret_cast<const char*>(&query),
+        sizeof(query),
+        0,
+        reinterpret_cast<const sockaddr*>(&targetAddr),
+        sizeof(targetAddr));
+    if (sendResult != (int)sizeof(query)) {
+        SetDiscoveryStatus("Failed to broadcast LAN discovery.");
+        LOG_NETPLAY(LOG_WARNING,
+            "[SCLIENT] lan_discovery_send_failed err=%d",
+            (int)WSAGetLastError());
+        CloseDiscoverySocket("send_failed");
+        return false;
+    }
+
+    s_discoveryNonce = query.nonce;
+    s_discoveryStartedAt = GetTickCount();
+    s_discoveryActive = true;
+    SetDiscoveryStatus("Scanning LAN for spectator hosts...");
+    LOG_NETPLAY(LOG_INFO,
+        "[SCLIENT] lan_discovery_start nonce=0x%08X port=%u",
+        s_discoveryNonce,
+        Spectator::LAN_DISCOVERY_PORT);
+    return true;
 }
 
 bool SpectatorClient_StartConnect(const char* endpoint) {
     if (!s_initialized || !endpoint || !endpoint[0]) {
         return false;
     }
+
+    s_discoveryActive = false;
+    CloseDiscoverySocket("spectator_connect");
 
     char host[96] = {};
     uint16_t port = 0;
@@ -365,10 +1501,9 @@ bool SpectatorClient_StartConnect(const char* endpoint) {
         return false;
     }
 
+    DestroyRelayServer("start_connect_reset");
     DestroyClientHostNow("start_connect_reset");
     ResetBuffer();
-    s_matchActive = false;
-    s_matchId = 0;
     s_error[0] = '\0';
     s_redirectEndpoint[0] = '\0';
     s_deferredDestroyHost = false;
@@ -414,6 +1549,8 @@ bool SpectatorClient_StartConnect(const char* endpoint) {
     SetStatus("Connecting to spectator endpoint %s", endpoint);
     s_state = SpectatorClientState::Connecting;
     s_stateEnteredAt = GetTickCount();
+    s_lastServerPacketAt = 0;
+    EnsureRelayServer();
     LOG_NETPLAY(LOG_INFO,
         "[SCLIENT] start_connect endpoint=%s",
         endpoint);
@@ -430,19 +1567,33 @@ void SpectatorClient_Disconnect(const char* reason) {
             &payload,
             sizeof(payload),
             true);
+        if (s_clientHost) {
+            enet_host_flush(s_clientHost);
+        }
     }
 
+    DestroyRelayServer(reason ? reason : "disconnect");
     DestroyClientHostNow(reason ? reason : "disconnect");
     ResetBuffer();
     s_matchActive = false;
     s_matchId = 0;
+    s_error[0] = '\0';
+    s_redirectEndpoint[0] = '\0';
     s_state = SpectatorClientState::Idle;
     SetStatus("Spectator client idle.");
     s_stateEnteredAt = 0;
 }
 
 void SpectatorClient_FrameUpdate() {
-    if (!s_initialized || !s_clientHost) {
+    if (!s_initialized) {
+        return;
+    }
+
+    PollLanDiscoverySocket();
+    UpdateLanDiscoveryLifetime();
+    ServiceRelayServer();
+
+    if (!s_clientHost) {
         return;
     }
 
@@ -456,6 +1607,7 @@ void SpectatorClient_FrameUpdate() {
             case ENET_EVENT_TYPE_CONNECT: {
                 Spectator::HelloPayload hello{};
                 hello.protocol_version = Spectator::PROTOCOL_VERSION;
+                hello.client_listen_port = s_relayServer ? s_relayBoundListenPort : 0;
                 hello.flags = Spectator::HELLO_FLAG_ACCEPT_REDIRECT;
                 CopyText(hello.nickname, sizeof(hello.nickname), "Spectator");
                 SendTyped(Spectator::CHANNEL_CONTROL,
@@ -485,26 +1637,31 @@ void SpectatorClient_FrameUpdate() {
                 const Spectator::PacketType type = Spectator::ReadPacketType(event.packet->data);
                 const void* payload = Spectator::GetPayloadPtr(event.packet->data);
                 const size_t payloadLen = Spectator::GetPayloadSize(event.packet->dataLength);
+                s_lastServerPacketAt = GetTickCount();
 
                 switch (type) {
                     case Spectator::PacketType::HelloAck:
                         if (payloadLen >= sizeof(Spectator::HelloAckPayload)) {
                             const auto* ack = static_cast<const Spectator::HelloAckPayload*>(payload);
-                            s_matchId = ack->match_id;
+                            AdoptIncomingStreamIdentity(ack->match_id, ack->match_ordinal, "hello_ack");
                             s_matchActive = ack->match_state == Spectator::MATCH_STATE_ACTIVE;
                             if (!s_matchActive) {
-                                LOG_NETPLAY(LOG_WARNING,
-                                    "[SCLIENT] fail reason=no_active_match endpoint=%s",
-                                    s_endpoint[0] ? s_endpoint : "(unset)");
-                                FailConnection("No active match to spectate.");
-                                RequestDeferredDestroy("fail_during_receive");
-                                stopProcessing = true;
-                            } else {
-                                SetStatus("Connected to spectator server.");
                                 LOG_NETPLAY(LOG_INFO,
-                                    "[SCLIENT] hello_ack endpoint=%s match_id=0x%08X active_match=1",
+                                    "[SCLIENT] hello_ack endpoint=%s match_id=0x%08X ordinal=%u active_match=0",
                                     s_endpoint[0] ? s_endpoint : "(unset)",
-                                    s_matchId);
+                                    s_matchId,
+                                    s_matchOrdinal);
+                                EnterConnectedNoActiveMatch(
+                                    "hello_ack",
+                                    "Connected to spectator host; waiting for active match.");
+                            } else {
+                                SetStatus("Connected to spectator server for G%u.",
+                                    s_matchOrdinal != 0 ? s_matchOrdinal : 1);
+                                LOG_NETPLAY(LOG_INFO,
+                                    "[SCLIENT] hello_ack endpoint=%s match_id=0x%08X ordinal=%u active_match=1",
+                                    s_endpoint[0] ? s_endpoint : "(unset)",
+                                    s_matchId,
+                                    s_matchOrdinal);
                             }
                         }
                         break;
@@ -528,22 +1685,62 @@ void SpectatorClient_FrameUpdate() {
                     case Spectator::PacketType::MatchState:
                         if (payloadLen >= sizeof(Spectator::MatchStatePayload)) {
                             const auto* match = static_cast<const Spectator::MatchStatePayload*>(payload);
-                            s_matchId = match->match_id;
+                            const SpectatorClientState previousState = s_state;
+                            AdoptIncomingStreamIdentity(match->match_id, match->match_ordinal, "match_state");
+                            if (!AdoptIncomingConfigIdentity(
+                                    match->config_crc != 0
+                                        ? match->config_crc
+                                        : ComputeConfigCrc(match->config),
+                                    match->config.session_seed,
+                                    "match_state")) {
+                                FailConnection("Spectator stream identity mismatch.");
+                                RequestDeferredDestroy("identity_mismatch");
+                                stopProcessing = true;
+                                break;
+                            }
                             s_matchActive = match->match_state == Spectator::MATCH_STATE_ACTIVE;
+                            s_matchConfig = match->config;
+                            s_p1Wins = match->p1_wins;
+                            s_p2Wins = match->p2_wins;
+                            s_draws = match->draws;
+                            s_completedMatches = match->completed_matches;
+                            CopyText(s_p1Name, sizeof(s_p1Name), match->p1_name);
+                            CopyText(s_p2Name, sizeof(s_p2Name), match->p2_name);
+                            s_haveMatchState = true;
                             s_serverConfirmedRbFrame = match->confirmed_rb_frame;
                             s_serverLiveRbFrame = match->live_rb_frame;
+                            RecomputeBufferedArchiveStats();
                             if (s_matchActive) {
                                 s_state = SpectatorClientState::Streaming;
                                 s_stateEnteredAt = 0;
-                                SetStatus("Spectator stream active: live=%d confirmed=%d",
+                                SetStatus("Spectator stream active: G%u %u-%u live=%d confirmed=%d",
+                                    s_matchOrdinal != 0 ? s_matchOrdinal : 1,
+                                    s_p1Wins,
+                                    s_p2Wins,
                                     s_serverLiveRbFrame,
                                     s_serverConfirmedRbFrame);
                                 LOG_NETPLAY(LOG_INFO,
-                                    "[SCLIENT] stream_active endpoint=%s match_id=0x%08X live=%d confirmed=%d",
+                                    "[SCLIENT] stream_active endpoint=%s match_id=0x%08X ordinal=%u live=%d confirmed=%d score=%u-%u draws=%u completed=%u",
                                     s_endpoint[0] ? s_endpoint : "(unset)",
                                     s_matchId,
+                                    s_matchOrdinal,
                                     s_serverLiveRbFrame,
-                                    s_serverConfirmedRbFrame);
+                                    s_serverConfirmedRbFrame,
+                                    s_p1Wins,
+                                    s_p2Wins,
+                                    s_draws,
+                                    s_completedMatches);
+                                if (previousState == SpectatorClientState::ConnectedNoActiveMatch) {
+                                    LOG_NETPLAY(LOG_INFO,
+                                        "[SCLIENT] active_match_detected endpoint=%s match_id=0x%08X ordinal=%u",
+                                        s_endpoint[0] ? s_endpoint : "(unset)",
+                                        s_matchId,
+                                        s_matchOrdinal);
+                                }
+                            } else {
+                                s_state = SpectatorClientState::Streaming;
+                                s_stateEnteredAt = 0;
+                                SetStatus("Connected to spectator stream; waiting for next match.");
                             }
                         }
                         break;
@@ -553,7 +1750,16 @@ void SpectatorClient_FrameUpdate() {
                             const auto* batch = static_cast<const Spectator::FrameBatchPayload*>(payload);
                             const uint16_t recordCount = (std::min)(batch->record_count,
                                 (uint16_t)Spectator::MAX_FRAME_BATCH);
-                            s_matchId = batch->match_id;
+                            const SpectatorClientState previousState = s_state;
+                            AdoptIncomingStreamIdentity(batch->match_id, batch->match_ordinal, "frame_batch");
+                            if (!AdoptIncomingConfigIdentity(batch->config_crc,
+                                    batch->session_seed,
+                                    "frame_batch")) {
+                                FailConnection("Spectator stream identity mismatch.");
+                                RequestDeferredDestroy("identity_mismatch");
+                                stopProcessing = true;
+                                break;
+                            }
                             s_serverConfirmedRbFrame = batch->confirmed_rb_frame;
                             s_serverLiveRbFrame = batch->live_rb_frame;
                             for (uint16_t index = 0; index < recordCount; index++) {
@@ -564,19 +1770,33 @@ void SpectatorClient_FrameUpdate() {
                                 slot->record = batch->records[index];
                                 slot->valid = true;
                             }
-                            if (s_playbackRbFrame < 0) {
-                                s_playbackRbFrame = s_bufferBaseRbFrame;
-                            }
+                            RecomputeBufferedArchiveStats();
                             s_state = SpectatorClientState::Streaming;
                             s_stateEnteredAt = 0;
                             s_matchActive = true;
+                            if (previousState == SpectatorClientState::ConnectedNoActiveMatch) {
+                                LOG_NETPLAY(LOG_INFO,
+                                    "[SCLIENT] active_archive_detected endpoint=%s match_id=0x%08X ordinal=%u confirmed=%d",
+                                    s_endpoint[0] ? s_endpoint : "(unset)",
+                                    s_matchId,
+                                    s_matchOrdinal,
+                                    s_serverConfirmedRbFrame);
+                            }
                         }
                         break;
 
                     case Spectator::PacketType::PaletteState:
                         if (payloadLen >= sizeof(Spectator::PaletteStatePayload)) {
                             const auto* palette = static_cast<const Spectator::PaletteStatePayload*>(payload);
-                            s_matchId = palette->match_id;
+                            AdoptIncomingStreamIdentity(palette->match_id, palette->match_ordinal, "palette_state");
+                            if (!AdoptIncomingConfigIdentity(palette->config_crc,
+                                    palette->session_seed,
+                                    "palette_state")) {
+                                FailConnection("Spectator stream identity mismatch.");
+                                RequestDeferredDestroy("identity_mismatch");
+                                stopProcessing = true;
+                                break;
+                            }
                             s_paletteEpoch = palette->palette_epoch;
                             for (int index = 0; index < 2; index++) {
                                 s_palette[index].metadata_valid = true;
@@ -598,7 +1818,15 @@ void SpectatorClient_FrameUpdate() {
                             const auto* palette = static_cast<const Spectator::PaletteDataPayload*>(payload);
                             if (palette->game_slot < 2 &&
                                 palette->payload_size == NETPLAY_PALETTE_BANK_SIZE) {
-                                s_matchId = palette->match_id;
+                                AdoptIncomingStreamIdentity(palette->match_id, palette->match_ordinal, "palette_data");
+                                if (!AdoptIncomingConfigIdentity(palette->config_crc,
+                                        palette->session_seed,
+                                        "palette_data")) {
+                                    FailConnection("Spectator stream identity mismatch.");
+                                    RequestDeferredDestroy("identity_mismatch");
+                                    stopProcessing = true;
+                                    break;
+                                }
                                 s_paletteEpoch = palette->palette_epoch;
                                 BufferedPaletteState& slot = s_palette[palette->game_slot];
                                 slot.metadata_valid = true;
@@ -615,10 +1843,31 @@ void SpectatorClient_FrameUpdate() {
                     case Spectator::PacketType::Heartbeat:
                         if (payloadLen >= sizeof(Spectator::HeartbeatPayload)) {
                             const auto* heartbeat = static_cast<const Spectator::HeartbeatPayload*>(payload);
-                            s_matchId = heartbeat->match_id;
+                            const bool wasWaitingNoMatch = s_state == SpectatorClientState::ConnectedNoActiveMatch;
+                            AdoptIncomingStreamIdentity(heartbeat->match_id, heartbeat->match_ordinal, "heartbeat");
+                            if (!AdoptIncomingConfigIdentity(heartbeat->config_crc,
+                                    heartbeat->session_seed,
+                                    "heartbeat")) {
+                                FailConnection("Spectator stream identity mismatch.");
+                                RequestDeferredDestroy("identity_mismatch");
+                                stopProcessing = true;
+                                break;
+                            }
                             s_serverConfirmedRbFrame = heartbeat->confirmed_rb_frame;
                             s_serverLiveRbFrame = heartbeat->live_rb_frame;
                             s_matchActive = heartbeat->match_state == Spectator::MATCH_STATE_ACTIVE;
+                            RecomputeBufferedArchiveStats();
+                            if (s_matchActive && wasWaitingNoMatch) {
+                                SetStatus("Active match detected; waiting for stream metadata.");
+                                LOG_NETPLAY(LOG_INFO,
+                                    "[SCLIENT] active_match_heartbeat endpoint=%s match_id=0x%08X ordinal=%u",
+                                    s_endpoint[0] ? s_endpoint : "(unset)",
+                                    s_matchId,
+                                    s_matchOrdinal);
+                            }
+                            if (!s_matchActive && s_state == SpectatorClientState::Streaming) {
+                                SetStatus("Connected to spectator stream; waiting for next match.");
+                            }
                         }
                         break;
 
@@ -697,7 +1946,18 @@ void SpectatorClient_FrameUpdate() {
         return;
     }
 
-    AdvanceSyntheticPlayback();
+    if (s_state == SpectatorClientState::Streaming &&
+        s_lastServerPacketAt != 0 &&
+        (now - s_lastServerPacketAt) >= kServerSilenceTimeoutMs) {
+        LOG_NETPLAY(LOG_WARNING,
+            "[SCLIENT] stream_timeout endpoint=%s last_packet_ms=%lu",
+            s_endpoint[0] ? s_endpoint : "(unset)",
+            (unsigned long)(now - s_lastServerPacketAt));
+        FailConnection("Spectator stream timed out.");
+        DestroyClientHostNow("stream_timeout");
+        return;
+    }
+
     SendClientStatusIfNeeded();
     enet_host_flush(s_clientHost);
 }
@@ -725,20 +1985,72 @@ void SpectatorClient_GetSnapshot(SpectatorClientSnapshot* out) {
     CopyText(out->endpoint, sizeof(out->endpoint), s_endpoint);
     CopyText(out->redirect_endpoint, sizeof(out->redirect_endpoint), s_redirectEndpoint);
     out->match_id = s_matchId;
+    out->match_ordinal = s_matchOrdinal;
+    out->have_match_state = s_haveMatchState;
     out->match_active = s_matchActive;
+    out->config_crc = s_streamConfigCrc != 0
+        ? s_streamConfigCrc
+        : (s_haveMatchState ? ComputeConfigCrc(s_matchConfig) : 0);
+    out->session_seed = s_streamSessionSeed != 0
+        ? s_streamSessionSeed
+        : (s_haveMatchState ? s_matchConfig.session_seed : 0);
+    out->config = s_matchConfig;
+    CopyText(out->p1_name, sizeof(out->p1_name), s_p1Name);
+    CopyText(out->p2_name, sizeof(out->p2_name), s_p2Name);
+    out->p1_wins = s_p1Wins;
+    out->p2_wins = s_p2Wins;
+    out->draws = s_draws;
+    out->completed_matches = s_completedMatches;
     out->buffered_start_rb_frame = s_bufferBaseRbFrame;
     out->buffered_end_rb_frame = s_bufferEndRbFrame;
     out->server_confirmed_rb_frame = s_serverConfirmedRbFrame;
+    out->confirmed_contiguous_rb_frame = s_confirmedContiguousRbFrame;
     out->server_live_rb_frame = s_serverLiveRbFrame;
     out->playback_rb_frame = s_playbackRbFrame;
-    out->buffered_frame_count =
-        (s_bufferBaseRbFrame >= 0 && s_bufferEndRbFrame >= s_bufferBaseRbFrame)
-            ? (uint32_t)(s_bufferEndRbFrame - s_bufferBaseRbFrame + 1)
-            : 0;
+    out->buffered_frame_count = s_bufferedValidFrameCount;
+    out->archive_has_gap = s_archiveHasGap;
     out->should_fast_forward = s_shouldFastForward;
     out->needs_hard_sync = s_needsHardSync;
+    out->relay_server_active = s_relayServer != nullptr;
+    out->relay_listen_port = s_relayBoundListenPort != 0
+        ? s_relayBoundListenPort
+        : s_relayListenPort;
+    out->relay_connected_spectators = (uint32_t)CountRelayHandshakenPeers();
     CopyText(out->status, sizeof(out->status), s_status);
     CopyText(out->error, sizeof(out->error), s_error);
+}
+
+void SpectatorClient_GetDiscoverySnapshot(SpectatorDiscoverySnapshot* out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->active = s_discoveryActive;
+    out->result_count = s_discoveryResultCount;
+    CopyText(out->status, sizeof(out->status), s_discoveryStatus);
+    for (uint32_t index = 0; index < s_discoveryResultCount && index < SPECTATOR_DISCOVERY_MAX_RESULTS; index++) {
+        out->results[index] = s_discoveryResults[index];
+    }
+}
+
+bool SpectatorClient_GetFrameInputs(int32_t rb_frame, uint16_t* outP1, uint16_t* outP2) {
+    if (rb_frame < s_bufferBaseRbFrame ||
+        (s_confirmedContiguousRbFrame >= 0 && rb_frame > s_confirmedContiguousRbFrame)) {
+        return false;
+    }
+
+    const BufferedFrame* slot = GetBufferSlot(rb_frame);
+    if (!slot || !slot->valid) {
+        return false;
+    }
+
+    if (outP1) {
+        *outP1 = slot->record.p1_input;
+    }
+    if (outP2) {
+        *outP2 = slot->record.p2_input;
+    }
+    return true;
 }
 
 } // namespace Net

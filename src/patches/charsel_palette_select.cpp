@@ -180,6 +180,21 @@ static bool IsSelectableCharacter(uint8_t characterId) {
     return ReadU8(ADDR_CHARSEL_UNLOCK_TABLE + characterId, 0) == 1;
 }
 
+static bool TryFindGridIndex(uint8_t characterId, uint8_t* outGridIndex) {
+    if (!outGridIndex) {
+        return false;
+    }
+
+    for (uint8_t gridIndex = 0; gridIndex <= 20; ++gridIndex) {
+        if (LookupCharId(gridIndex) == characterId) {
+            *outGridIndex = gridIndex;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void ResetFrontendSlotState(FrontendSlotState* state) {
     if (!state) {
         return;
@@ -901,6 +916,58 @@ bool CharSelPaletteSelect_IsCatalogReady() {
 
 bool CharSelPaletteSelect_IsSelectionLocked(uint8_t gameSlot) {
     return gameSlot < 2 && s_slotState[gameSlot].phase == SlotPhase::LockedFinal;
+}
+
+bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t gameSlot,
+                                               uint8_t characterId,
+                                               uint8_t basePalette,
+                                               bool useCustom) {
+    if (gameSlot > 1 || !s_frontendActive || !IsSelectableCharacter(characterId)) {
+        return false;
+    }
+
+    PaletteOption options[kOptionCapacity] = {};
+    const int optionCount = BuildOptions(gameSlot,
+        characterId,
+        options,
+        (int)kOptionCapacity);
+    if (optionCount <= 0) {
+        return false;
+    }
+
+    uint8_t optionIndex = 0;
+    if (!TryFindOptionIndex(options, optionCount, basePalette, useCustom, &optionIndex) &&
+        !TryFindOptionIndex(options, optionCount, basePalette, false, &optionIndex)) {
+        optionIndex = 0;
+    }
+
+    uint8_t gridIndex = 0;
+    if (!TryFindGridIndex(characterId, &gridIndex)) {
+        return false;
+    }
+
+    const int localSelection = (int)((gameSlot == 0 ? ADDR_CHARSEL_P1_CHAR_ID : ADDR_CHARSEL_P2_CHAR_ID) - 176);
+    uint8_t* const control = reinterpret_cast<uint8_t*>(gameSlot == 0 ? ADDR_CHARSEL_P1_ENABLE : ADDR_CHARSEL_P2_ENABLE);
+    const PaletteOption& option = options[optionIndex];
+
+    control[0] = 0;
+    control[1] = gridIndex;
+
+    s_slotState[gameSlot].phase = SlotPhase::LockedFinal;
+    s_slotState[gameSlot].character_id = characterId;
+    s_slotState[gameSlot].display_index = optionIndex;
+
+    WriteSelectionValues(localSelection,
+        control,
+        characterId,
+        option,
+        false);
+
+    s_matchSelection[gameSlot].valid = true;
+    s_matchSelection[gameSlot].character_id = characterId;
+    s_matchSelection[gameSlot].base_palette = option.base_palette;
+    s_matchSelection[gameSlot].use_custom = option.use_custom;
+    return true;
 }
 
 bool CharSelPaletteSelect_ShouldPreviewCustomBank(uint8_t gameSlot,

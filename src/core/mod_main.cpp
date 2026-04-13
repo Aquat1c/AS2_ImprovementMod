@@ -29,6 +29,7 @@
 #include "rollback/online_wiring.h"
 #include "net/spectator_runtime.h"
 #include "net/spectator_client.h"
+#include "net/spectator_playback.h"
 #include "net/netplay_palette_runtime.h"
 #include "net/enet_transport.h"
 #include "net/session_manager.h"
@@ -333,6 +334,7 @@ static void DeferredInit() {
     Net::NetplayPaletteRuntime_Init();
     Net::SpectatorRuntime_Init();
     Net::SpectatorClient_Init();
+    Net::SpectatorPlayback_Init();
 
     // Initialize netplay menu controller and mode ownership hooks
     NetMenu::Init();
@@ -449,6 +451,7 @@ __declspec(dllexport) void ModShutdown() {
         Net::PregameSync_Shutdown();
         NetMenu::Shutdown();
         ModeOwnership::Remove();
+        Net::SpectatorPlayback_Shutdown();
         Net::SpectatorClient_Shutdown();
         Net::SpectatorRuntime_Shutdown();
         PaletteAssetHook_Shutdown();
@@ -530,13 +533,15 @@ __declspec(dllexport) void ModOnFrame() {
     // Run scripted input runner (injects overrides before SDL update)
     SIR_OnFrame();
 
-    // Poll SDL just before rollback collects local input.
+    Net::SpectatorRuntime_FrameUpdate();
+    Net::SpectatorClient_FrameUpdate();
+    Net::SpectatorPlayback_FrameUpdate();
+
+    // Poll SDL after local override producers have staged their desired input.
     InputSystem_Update();
 
     // Update online wiring (manages rollback session lifecycle)
     Rollback::OnlineWiring_FrameUpdate();
-    Net::SpectatorRuntime_FrameUpdate();
-    Net::SpectatorClient_FrameUpdate();
 
     // Drive gameplay bridge per-frame (rollback session + delay policy consumption)
     // The bridge is the single entry point for per-frame gameplay runtime.
@@ -652,6 +657,62 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     memset(out, 0, sizeof(*out));
     if (!g_initialized) return false;
 
+    Net::SpectatorPlaybackSnapshot spectatorPlayback{};
+    Net::SpectatorPlayback_GetSnapshot(&spectatorPlayback);
+    Net::SpectatorClientSnapshot spectatorClient{};
+    Net::SpectatorClient_GetSnapshot(&spectatorClient);
+    if (spectatorPlayback.gameplay_owned &&
+        spectatorClient.active &&
+        spectatorClient.match_id != 0 &&
+        GetGameMode() != MODE_MENU) {
+        out->active = true;
+        out->is_host = false;
+        out->spectator_mode = true;
+        out->show_connection_stats = false;
+        strncpy_s(out->p1_name, sizeof(out->p1_name),
+            spectatorClient.p1_name[0] ? spectatorClient.p1_name : "P1",
+            _TRUNCATE);
+        strncpy_s(out->p2_name, sizeof(out->p2_name),
+            spectatorClient.p2_name[0] ? spectatorClient.p2_name : "P2",
+            _TRUNCATE);
+        out->p1_wins = spectatorClient.p1_wins;
+        out->p2_wins = spectatorClient.p2_wins;
+        out->ping_ms = -1.0f;
+        out->delay_frames = 0;
+        out->rollback_frames = 0;
+        out->local_frame = spectatorPlayback.local_playback_rb_frame;
+        out->remote_frame = spectatorPlayback.confirmed_edge_rb_frame;
+
+        const char* statusText = "SPECTATING";
+        switch (spectatorPlayback.state) {
+            case Net::SpectatorPlaybackState::Buffering:
+                statusText = "SPECTATING / BUFFERING";
+                break;
+            case Net::SpectatorPlaybackState::CatchingUp:
+                statusText = "SPECTATING / CATCHING UP";
+                break;
+            case Net::SpectatorPlaybackState::Live:
+                statusText = "SPECTATING / LIVE";
+                break;
+            case Net::SpectatorPlaybackState::ReadyToBootstrap:
+            case Net::SpectatorPlaybackState::BootstrappingFrontend:
+            case Net::SpectatorPlaybackState::WaitingInteractiveStart:
+                statusText = "SPECTATING / STARTING";
+                break;
+            case Net::SpectatorPlaybackState::EndOfMatch:
+            case Net::SpectatorPlaybackState::WaitingNextMatch:
+                statusText = "SPECTATING / WAITING";
+                break;
+            case Net::SpectatorPlaybackState::PlaybackError:
+                statusText = "SPECTATING / ERROR";
+                break;
+            default:
+                break;
+        }
+        strncpy_s(out->status_text, sizeof(out->status_text), statusText, _TRUNCATE);
+        return true;
+    }
+
     // Only show HUD when a session is active
     Net::SessionSnapshot sessionSnap{};
     Net::Session_GetSnapshot(&sessionSnap);
@@ -670,6 +731,9 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
 
     out->active = true;
     out->is_host = (Net::Session_GetRole() == Net::SessionRole::Host);
+    out->spectator_mode = false;
+    out->show_connection_stats = true;
+    out->status_text[0] = '\0';
 
     // --- Names: P1 = game P1, P2 = game P2 ---
     // Get local and remote nicknames

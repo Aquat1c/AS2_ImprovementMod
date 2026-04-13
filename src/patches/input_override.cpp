@@ -10,6 +10,7 @@
 #include "net/session_manager.h"
 #include "net/charsel_sync.h"
 #include "net/delay_policy.h"
+#include "net/frontend_input_sync.h"
 #include "net/match_lifecycle.h"
 #include "net/pregame_sync.h"
 #include "net/stagesel_sync.h"
@@ -2310,8 +2311,18 @@ int __cdecl Hook_InputProcess(int gameState) {
                 return result;
             }
 
+            const uint32_t mergedFrontendFrame = Net::FrontendInputSync_GetConsumeFrame() > 0
+                ? (Net::FrontendInputSync_GetConsumeFrame() - 1)
+                : 0;
+            if (edgeReset) {
+                Rollback::NetplayLog_Write(
+                    "STAGESEL", -1,
+                    "Stage merge authority=Hook_InputProcess shared_frame=%u policy=or_strip_select_cancel_axes",
+                    mergedFrontendFrame);
+            }
+
             const uint16_t merged = Net::StageSelSync_MergeConfirmed(
-                (uint32_t)ReadMemory<int>(ADDR_INPUT_WRITE_IDX), p1, p2);
+                mergedFrontendFrame, p1, p2);
             const uint16_t adjPrevHeld = edgeReset ? (uint16_t)0 : prevHeldP1;
             const uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~adjPrevHeld);
 
