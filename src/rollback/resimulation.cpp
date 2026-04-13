@@ -8,6 +8,7 @@
 
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
+#include "rollback/game_snapshot.h"
 #include "rollback/netplay_log.h"
 #include "input/input_system.h"
 #include "as2_constants.h"
@@ -30,43 +31,7 @@ namespace Rollback {
 typedef unsigned short (__cdecl *MatchHandler_t)(uint32_t* a1);
 static MatchHandler_t g_matchHandler = (MatchHandler_t)ADDR_MATCH_MODE;
 
-// ============================================================================
-// State History Slot
-// ============================================================================
-
-// Reuse the same state regions as the manual savestate system.
-// These must stay in sync with savestate.cpp definitions.
-#define SH_MAIN_START     ADDR_MATCH_BASE
-#define SH_MAIN_SIZE      ((ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE)
-#define SH_PRE_MATCH_START ADDR_PRE_MATCH_GAP
-#define SH_PRE_MATCH_SIZE  PRE_MATCH_GAP_SIZE
-#define SH_INPUT_P1_START  ADDR_P1_INPUT_BUFFER
-#define SH_INPUT_P2_START  ADDR_P2_INPUT_BUFFER
-#define SH_INPUT_SIZE      INPUT_BUFFER_SIZE
-
-struct StateSlot {
-    bool     valid;
-    int32_t  frame;
-    uint32_t checksum;
-    uint32_t rng_seed;
-
-    // Scattered globals
-    uint32_t sim_frame;
-    uint32_t display_frame;
-    uint32_t game_mode;
-    uint32_t substate;
-    uint32_t substate_timer;
-    uint32_t game_type;
-    uint32_t match_phase_timer;
-    uint32_t input_read_idx;
-    uint32_t input_write_idx;
-
-    // Blobs
-    uint8_t main_state[SH_MAIN_SIZE];
-    uint8_t pre_match_gap[SH_PRE_MATCH_SIZE];
-    uint8_t input_p1[SH_INPUT_SIZE];
-    uint8_t input_p2[SH_INPUT_SIZE];
-};
+using StateSlot = GameSnapshot;
 
 // ============================================================================
 // State History Ring Buffer
@@ -95,101 +60,6 @@ static int32_t s_lastRollbackLength    = 0;
 // ============================================================================
 // State Capture / Restore (replicates savestate.cpp logic)
 // ============================================================================
-
-static bool CaptureToSlot(StateSlot* slot, int32_t frame) {
-    slot->frame = frame;
-
-    // Scattered globals
-    slot->sim_frame       = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-    slot->display_frame   = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
-    slot->game_mode       = ReadMemory<uint32_t>(ADDR_GAME_MODE);
-    slot->substate        = ReadMemory<uint32_t>(ADDR_SUB_STATE);
-    slot->substate_timer  = ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER);
-    slot->game_type       = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
-    slot->match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
-    slot->rng_seed        = DetVer_GetRngSeed();
-
-    // Main region
-    __try {
-        memcpy(slot->main_state, (const void*)SH_MAIN_START, SH_MAIN_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("[StateHistory] Capture AV at main region 0x%08X", SH_MAIN_START);
-        return false;
-    }
-
-    // Pre-match gap
-    __try {
-        memcpy(slot->pre_match_gap, (const void*)SH_PRE_MATCH_START, SH_PRE_MATCH_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        memset(slot->pre_match_gap, 0, SH_PRE_MATCH_SIZE);
-    }
-
-    // Input buffers
-    __try {
-        memcpy(slot->input_p1, (const void*)SH_INPUT_P1_START, SH_INPUT_SIZE);
-        memcpy(slot->input_p2, (const void*)SH_INPUT_P2_START, SH_INPUT_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Non-critical
-    }
-
-    slot->input_read_idx  = ReadMemory<uint32_t>(ADDR_INPUT_READ_IDX);
-    slot->input_write_idx = ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX);
-
-    // Checksum for diagnostics
-    slot->checksum = CalcCRC32(slot->main_state, SH_MAIN_SIZE);
-    slot->valid = true;
-
-    return true;
-}
-
-static bool RestoreFromSlot(const StateSlot* slot) {
-    // Main region
-    __try {
-        memcpy((void*)SH_MAIN_START, slot->main_state, SH_MAIN_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("[StateHistory] Restore AV at main region 0x%08X", SH_MAIN_START);
-        return false;
-    }
-
-    // Pre-match gap
-    __try {
-        memcpy((void*)SH_PRE_MATCH_START, slot->pre_match_gap, SH_PRE_MATCH_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Non-critical
-    }
-
-    // RNG
-    DetVer_SetRngSeed(slot->rng_seed);
-
-    // Scattered globals
-    WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, slot->sim_frame);
-    WriteMemory<uint32_t>(ADDR_FRAME_COUNTER, slot->display_frame);
-    WriteMemory<uint32_t>(ADDR_GAME_MODE, slot->game_mode);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE, slot->substate);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, slot->substate_timer);
-    WriteMemory<uint32_t>(ADDR_GAME_TYPE, slot->game_type);
-    WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, slot->match_phase_timer);
-
-    // Input buffers
-    __try {
-        memcpy((void*)SH_INPUT_P1_START, slot->input_p1, SH_INPUT_SIZE);
-        memcpy((void*)SH_INPUT_P2_START, slot->input_p2, SH_INPUT_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Non-critical
-    }
-
-    WriteMemory<uint32_t>(ADDR_INPUT_READ_IDX, slot->input_read_idx);
-    WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, slot->input_write_idx);
-
-    // Clear per-frame temp scratch to prevent stale collision data
-    __try {
-        memset((void*)ADDR_MATCH_PER_FRAME_TEMP, 0, MATCH_PER_FRAME_TEMP_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Non-critical
-    }
-
-    return true;
-}
 
 /// Write input pair (local + remote) into game buffers for the next frame advance.
 /// local_player: 0 = P1 is local, 1 = P2 is local.
@@ -244,7 +114,7 @@ void StateHistory_Shutdown() {
 void StateHistory_Reset() {
     if (!s_historyInit || !s_slots) return;
     for (int i = 0; i < STATE_HISTORY_CAPACITY; i++) {
-        s_slots[i].valid = false;
+        GameSnapshot_Clear(&s_slots[i]);
     }
     s_writeIdx = 0;
     s_count = 0;
@@ -256,7 +126,7 @@ bool StateHistory_CaptureFrame(int32_t frame) {
     if (!s_historyInit || !s_slots) return false;
 
     StateSlot* slot = &s_slots[s_writeIdx];
-    if (!CaptureToSlot(slot, frame)) {
+    if (!GameSnapshot_Capture(slot, frame)) {
         return false;
     }
 
@@ -284,7 +154,7 @@ bool StateHistory_LoadFrame(int32_t frame) {
                 "Loading state: checksum=0x%08X slot=%d",
                 s_slots[idx].checksum,
                 idx);
-            return RestoreFromSlot(&s_slots[idx]);
+            return GameSnapshot_Restore(&s_slots[idx]);
         }
     }
 
@@ -302,6 +172,28 @@ bool StateHistory_HasFrame(int32_t frame) {
         }
     }
     return false;
+}
+
+void StateHistory_DiscardFramesAfter(int32_t frame) {
+    if (!s_historyInit || !s_slots) return;
+
+    while (s_count > 0) {
+        const int newestIdx = (s_writeIdx - 1 + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
+        if (!s_slots[newestIdx].valid || s_slots[newestIdx].frame <= frame) {
+            break;
+        }
+
+        GameSnapshot_Clear(&s_slots[newestIdx]);
+        s_writeIdx = newestIdx;
+        --s_count;
+    }
+
+    NetplayLog_Write("STATE", frame,
+        "Discarded future states after frame %d: count=%d oldest=%d newest=%d",
+        frame,
+        s_count,
+        StateHistory_GetOldestFrame(),
+        StateHistory_GetNewestFrame());
 }
 
 int32_t StateHistory_GetOldestFrame() {

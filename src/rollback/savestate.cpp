@@ -25,6 +25,7 @@
 
 #include "rollback/savestate.h"
 #include "rollback/determinism_verify.h"
+#include "rollback/game_snapshot.h"
 #include "training/practice_tools.h"
 #include "as2_constants.h"
 #include "patches/memory_utils.h"
@@ -38,28 +39,6 @@
 #include <xmmintrin.h>
 
 // ============================================================================
-// State Region Definitions
-// ============================================================================
-
-// Main contiguous state: match base through end of P2 entity
-#define SS_MAIN_START       ADDR_MATCH_BASE
-#define SS_MAIN_SIZE        ((ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE)
-
-// Pre-match gap (effect index, audio channel index, render blend)
-// 12 bytes at 0x76C5EC immediately before match base
-#define SS_PRE_MATCH_START  ADDR_PRE_MATCH_GAP
-#define SS_PRE_MATCH_SIZE   PRE_MATCH_GAP_SIZE
-
-// Per-frame temp scratch (collision/hit temp data at match+0x700)
-// Already inside the main region, but we explicitly clear it on load
-// to prevent stale one-frame transient data from bleeding.
-
-// Input buffers (P1 and P2, 208 bytes each)
-#define SS_INPUT_P1_START   ADDR_P1_INPUT_BUFFER
-#define SS_INPUT_P2_START   ADDR_P2_INPUT_BUFFER
-#define SS_INPUT_SIZE       INPUT_BUFFER_SIZE
-
-// ============================================================================
 // Savestate Storage
 // ============================================================================
 
@@ -67,27 +46,7 @@ struct SavestateSlot {
     // Metadata
     SavestateInfo info;
 
-    // Main contiguous state blob
-    uint8_t main_state[SS_MAIN_SIZE];
-
-    // Scattered globals
-    uint8_t pre_match_gap[SS_PRE_MATCH_SIZE];
-    uint32_t rng_seed;
-    uint32_t sim_frame;
-    uint32_t display_frame;
-    uint32_t game_mode;
-    uint32_t substate;
-    uint32_t substate_timer;
-    uint32_t game_type;
-    uint32_t match_phase_timer;
-
-    // Input buffers
-    uint8_t input_p1[SS_INPUT_SIZE];
-    uint8_t input_p2[SS_INPUT_SIZE];
-
-    // Input read/write indices
-    uint32_t input_read_idx;
-    uint32_t input_write_idx;
+    Rollback::GameSnapshot snapshot;
 
     // FPU state — captured for diagnostics but NOT restored by default.
     // Uncomment the restore lines in Savestate_Load if desync evidence
@@ -129,7 +88,9 @@ static void EnsureLogFile() {
         fprintf(g_logFile, "# Alice Senki 2 - Savestate Log\n");
         fprintf(g_logFile, "# Build: %s %s\n", __DATE__, __TIME__);
         fprintf(g_logFile, "# Main region: 0x%08X size=%u (%u KB)\n",
-                SS_MAIN_START, (unsigned)SS_MAIN_SIZE, (unsigned)(SS_MAIN_SIZE / 1024));
+                ADDR_MATCH_BASE,
+                (unsigned)Rollback::GAME_SNAPSHOT_MAIN_SIZE,
+                (unsigned)(Rollback::GAME_SNAPSHOT_MAIN_SIZE / 1024));
         fprintf(g_logFile, "#\n");
         fflush(g_logFile);
     }
@@ -165,7 +126,7 @@ static inline uint32_t CaptureMXCSR() {
 
 static uint32_t ComputeMainChecksum() {
     __try {
-        return CalcCRC32((const void*)SS_MAIN_START, SS_MAIN_SIZE);
+        return CalcCRC32((const void*)ADDR_MATCH_BASE, Rollback::GAME_SNAPSHOT_MAIN_SIZE);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0xDEADDEAD;
     }
@@ -178,8 +139,11 @@ static uint32_t ComputeMainChecksum() {
 void Savestate_Init() {
     memset(&g_slot, 0, sizeof(g_slot));
     g_slot.info.valid = false;
+    Rollback::GameSnapshot_Clear(&g_slot.snapshot);
     LOG_INFO("[Savestate] Initialized (main region: 0x%08X, %u bytes / %u KB)",
-             SS_MAIN_START, (unsigned)SS_MAIN_SIZE, (unsigned)(SS_MAIN_SIZE / 1024));
+             ADDR_MATCH_BASE,
+             (unsigned)Rollback::GAME_SNAPSHOT_MAIN_SIZE,
+             (unsigned)(Rollback::GAME_SNAPSHOT_MAIN_SIZE / 1024));
 }
 
 void Savestate_Shutdown() {
@@ -217,60 +181,24 @@ bool Savestate_Save() {
         return false;
     }
 
-    // Capture metadata
-    g_slot.sim_frame       = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-    g_slot.display_frame   = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
-    g_slot.game_mode       = ReadMemory<uint32_t>(ADDR_GAME_MODE);
-    g_slot.substate        = ReadMemory<uint32_t>(ADDR_SUB_STATE);
-    g_slot.substate_timer  = ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER);
-    g_slot.game_type       = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
-    g_slot.match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
-
-    // Capture RNG seed via TLS
-    g_slot.rng_seed = DetVer_GetRngSeed();
+    if (!Rollback::GameSnapshot_Capture(
+            &g_slot.snapshot,
+            (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER))) {
+        LOG_ERROR("[Savestate] FAILED — snapshot capture rejected");
+        return false;
+    }
 
     // Capture FPU state (diagnostic only — NOT restored on load)
     g_slot.fpu_cw    = CaptureX87CW();
     g_slot.fpu_mxcsr = CaptureMXCSR();
 
-    // Capture main contiguous region
-    __try {
-        memcpy(g_slot.main_state, (const void*)SS_MAIN_START, SS_MAIN_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("[Savestate] FAILED — access violation reading main region at 0x%08X", SS_MAIN_START);
-        return false;
-    }
-
-    // Capture pre-match gap
-    __try {
-        memcpy(g_slot.pre_match_gap, (const void*)SS_PRE_MATCH_START, SS_PRE_MATCH_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("[Savestate] Failed to capture pre-match gap (non-critical)");
-        memset(g_slot.pre_match_gap, 0, SS_PRE_MATCH_SIZE);
-    }
-
-    // Capture input buffers
-    __try {
-        memcpy(g_slot.input_p1, (const void*)SS_INPUT_P1_START, SS_INPUT_SIZE);
-        memcpy(g_slot.input_p2, (const void*)SS_INPUT_P2_START, SS_INPUT_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("[Savestate] Failed to capture input buffers (non-critical)");
-    }
-
-    // Capture input indices
-    g_slot.input_read_idx  = ReadMemory<uint32_t>(ADDR_INPUT_READ_IDX);
-    g_slot.input_write_idx = ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX);
-
-    // Compute checksum for verification
-    uint32_t checksum = CalcCRC32(g_slot.main_state, SS_MAIN_SIZE);
-
     // Fill info
     g_slot.info.valid     = true;
-    g_slot.info.frame     = g_slot.sim_frame;
-    g_slot.info.checksum  = checksum;
-    g_slot.info.rng_seed  = g_slot.rng_seed;
-    g_slot.info.game_mode = g_slot.game_mode;
-    g_slot.info.substate  = g_slot.substate;
+    g_slot.info.frame     = g_slot.snapshot.sim_frame;
+    g_slot.info.checksum  = g_slot.snapshot.checksum;
+    g_slot.info.rng_seed  = g_slot.snapshot.rng_seed;
+    g_slot.info.game_mode = g_slot.snapshot.game_mode;
+    g_slot.info.substate  = g_slot.snapshot.substate;
 
     LOG_INFO("[Savestate] SAVED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d",
              g_slot.info.frame, g_slot.info.checksum, g_slot.info.rng_seed,
@@ -279,7 +207,7 @@ bool Savestate_Save() {
     // Log to file for determinism analysis
     LogToFile("SAVE frame=%d checksum=0x%08X rng=0x%08X mode=%d sub=%d timer=%d fpu_cw=0x%04X mxcsr=0x%08X\n",
               g_slot.info.frame, g_slot.info.checksum, g_slot.info.rng_seed,
-              g_slot.info.game_mode, g_slot.info.substate, g_slot.match_phase_timer,
+              g_slot.info.game_mode, g_slot.info.substate, g_slot.snapshot.match_phase_timer,
               g_slot.fpu_cw, g_slot.fpu_mxcsr);
 
     return true;
@@ -309,54 +237,9 @@ bool Savestate_Load() {
     LOG_INFO("[Savestate] LOADING — restoring frame %d (current frame %d)",
              g_slot.info.frame, preFrame);
 
-    // Restore main contiguous region
-    __try {
-        memcpy((void*)SS_MAIN_START, g_slot.main_state, SS_MAIN_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("[Savestate] FAILED — access violation writing main region at 0x%08X", SS_MAIN_START);
+    if (!Rollback::GameSnapshot_Restore(&g_slot.snapshot)) {
+        LOG_ERROR("[Savestate] FAILED — snapshot restore rejected");
         return false;
-    }
-
-    // Restore pre-match gap
-    __try {
-        memcpy((void*)SS_PRE_MATCH_START, g_slot.pre_match_gap, SS_PRE_MATCH_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("[Savestate] Failed to restore pre-match gap (non-critical)");
-    }
-
-    // Restore RNG seed
-    DetVer_SetRngSeed(g_slot.rng_seed);
-
-    // Restore frame counters
-    WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, g_slot.sim_frame);
-    WriteMemory<uint32_t>(ADDR_FRAME_COUNTER, g_slot.display_frame);
-
-    // Restore mode/substate (should be same, but be explicit)
-    WriteMemory<uint32_t>(ADDR_GAME_MODE, g_slot.game_mode);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE, g_slot.substate);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, g_slot.substate_timer);
-    WriteMemory<uint32_t>(ADDR_GAME_TYPE, g_slot.game_type);
-    WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, g_slot.match_phase_timer);
-
-    // Restore input buffers
-    __try {
-        memcpy((void*)SS_INPUT_P1_START, g_slot.input_p1, SS_INPUT_SIZE);
-        memcpy((void*)SS_INPUT_P2_START, g_slot.input_p2, SS_INPUT_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("[Savestate] Failed to restore input buffers (non-critical)");
-    }
-
-    // Restore input indices
-    WriteMemory<uint32_t>(ADDR_INPUT_READ_IDX, g_slot.input_read_idx);
-    WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, g_slot.input_write_idx);
-
-    // Post-load cleanup:
-    // Clear per-frame temp scratch to prevent stale collision/hit data
-    // from bleeding into the first frame after load.
-    __try {
-        memset((void*)ADDR_MATCH_PER_FRAME_TEMP, 0, MATCH_PER_FRAME_TEMP_SIZE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("[Savestate] Failed to clear per-frame temp scratch");
     }
 
     // FPU state: NOT restored by default. If desync investigation reveals
@@ -498,6 +381,8 @@ void Savestate_RenderImGui() {
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("State region: 0x%08X (%u KB)", SS_MAIN_START, (unsigned)(SS_MAIN_SIZE / 1024));
+    ImGui::TextDisabled("State region: 0x%08X (%u KB)",
+        ADDR_MATCH_BASE,
+        (unsigned)(Rollback::GAME_SNAPSHOT_MAIN_SIZE / 1024));
     ImGui::TextDisabled("FPU: diagnostic only (not restored)");
 }

@@ -42,6 +42,7 @@
 #include "net/gameplay_bridge.h"
 #include "net/set_tracker.h"
 #include "net/player_side_mapping.h"
+#include "replay/replay_runtime.h"
 #include "testing/scripted_input_runner.h"
 #include "training/practice_tools.h"
 #include "imgui.h"
@@ -370,6 +371,7 @@ static void DeferredInit() {
 
     // Initialize practice mode tools
     PracticeTools_Init();
+    Replay::ReplayRuntime_Init();
 
     LOG_INFO("Frame Counter: 0x%08X = %d", ADDR_SIM_FRAME_COUNTER, AS2_GetFrameNumber());
     LOG_INFO("Game Mode: 0x%08X = %d", ADDR_GAME_MODE, GetGameMode());
@@ -438,6 +440,7 @@ __declspec(dllexport) void ModShutdown() {
     LOG_INFO("Mod shutdown...");
 
     if (g_initialized) {
+        Replay::ReplayRuntime_Shutdown();
         PracticeTools_Shutdown();
         SIR_Shutdown();
         Rollback::OnlineWiring_Shutdown();
@@ -539,6 +542,7 @@ __declspec(dllexport) void ModOnFrame() {
 
     // Poll SDL after local override producers have staged their desired input.
     InputSystem_Update();
+    Replay::ReplayRuntime_FrameUpdate();
 
     // Update online wiring (manages rollback session lifecycle)
     Rollback::OnlineWiring_FrameUpdate();
@@ -636,6 +640,7 @@ __declspec(dllexport) void ModOnPresent(void* pDevice) {
     HitboxViewer_Render();
     NetplayHud_Render();
     PracticeTools_RenderHUD();
+    Replay::ReplayRuntime_RenderHUD();
     ModMenu_Render();
 }
 

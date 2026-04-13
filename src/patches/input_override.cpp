@@ -18,6 +18,7 @@
 #include "net/player_side_mapping.h"
 #include "patches/charsel_palette_select.h"
 #include "core/game_state.h"
+#include "replay/replay_runtime.h"
 #include "rollback/rollback_session.h"
 #include "rollback/online_wiring.h"
 #include "rollback/netplay_log.h"
@@ -915,15 +916,18 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     // SessionManager updates, packet exchange, and ImGui rendering.
     if (InputSyncHooks_IsGameplayFreezeActive()) {
         const bool practiceFreeze = PracticeTools_ShouldFreezeFrame();
+        const bool replayFreeze = Replay::ReplayRuntime_ShouldFreezeFrame();
         const bool charselLockstep = Net::CharSelSync_IsLockstepActive();
         const bool loadBarrierFreeze = InputSyncHooks_IsLoadBarrierFrozen();
         const bool timesyncFreeze = InputSyncHooks_IsTimesyncFrozen();
         const bool rollbackOwnsGameplay = Rollback::RollbackSession_IsActive();
+        const bool replayOwnsGameplay = Replay::ReplayRuntime_IsReplayMatchActive();
         const bool startupBarrierOwnsGameplay =
             Rollback::OnlineWiring_IsGameplayEntryAdvanceBlocked();
         const bool pregameOwnsLoadBarrier = Net::PregameSync_IsActive();
         const bool legitimateFreeze =
             practiceFreeze ||
+            (replayFreeze && replayOwnsGameplay) ||
             charselLockstep ||
             (loadBarrierFreeze && pregameOwnsLoadBarrier) ||
             (timesyncFreeze && (rollbackOwnsGameplay || startupBarrierOwnsGameplay));
@@ -932,7 +936,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             Rollback::NetplayLog_Write("SYNC", -1,
                 "Clearing stale gameplay freeze in non-owned path: mode=%u sub=%u "
                 "practice=%d charsel=%d load=%d timesync=%d pregame=%d "
-                "session_connected=%d rollback_active=%d startup_blocked=%d",
+                "replay=%d session_connected=%d rollback_active=%d startup_blocked=%d",
                 gameMode,
                 subState,
                 practiceFreeze ? 1 : 0,
@@ -940,6 +944,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 loadBarrierFreeze ? 1 : 0,
                 timesyncFreeze ? 1 : 0,
                 pregameOwnsLoadBarrier ? 1 : 0,
+                replayFreeze ? 1 : 0,
                 Net::Session_IsConnected() ? 1 : 0,
                 rollbackOwnsGameplay ? 1 : 0,
                 startupBarrierOwnsGameplay ? 1 : 0);
@@ -2201,7 +2206,11 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     s_startupGateLogCount = 0;
     Net::NetplayPacing_NotifyLocalMode();
     InputSyncHooks_SetTimesyncFreeze(false);
-    return g_origInputDispatcher(outputInputs);
+    const int result = g_origInputDispatcher(outputInputs);
+    if (result == 0 && Replay::ReplayRuntime_IsReplayMatchActive()) {
+        Replay::ReplayRuntime_OnDispatcherAdvance(reinterpret_cast<int16_t*>(outputInputs));
+    }
+    return result;
 }
 
 // ============================================================================
@@ -2234,7 +2243,10 @@ static uint16_t ReadHeldMaskFromAltBuffer(uintptr_t altBufferAddr) {
 }
 
 int __cdecl Hook_InputProcess(int gameState) {
-    const bool consumeForCustomMenu = InputSystem_IsBindingActive() || NetMenu::ConsumesGameInput();
+    const bool consumeForCustomMenu =
+        InputSystem_IsBindingActive() ||
+        NetMenu::ConsumesGameInput() ||
+        Replay::ReplayRuntime_ShouldConsumeMenuInput();
     const uint32_t gameMode = GetGameMode();
     const uint32_t subState = GetSubstate();
 
@@ -2351,8 +2363,12 @@ int __cdecl Hook_InputProcess(int gameState) {
         uint16_t currentP2 = InputSystem_IsNetplayInputActive(1)
                                  ? InputSystem_GetNetplayInput(1) : 0;
 
-        const uint16_t pressedP1 = (uint16_t)(currentP1 & (uint16_t)~prevHeldP1);
-        const uint16_t pressedP2 = (uint16_t)(currentP2 & (uint16_t)~prevHeldP2);
+        uint16_t pressedP1 = (uint16_t)(currentP1 & (uint16_t)~prevHeldP1);
+        uint16_t pressedP2 = (uint16_t)(currentP2 & (uint16_t)~prevHeldP2);
+        if (InputSystem_IsPauseBlocked()) {
+            pressedP1 = (uint16_t)(pressedP1 & (uint16_t)~INPUT_START);
+            pressedP2 = (uint16_t)(pressedP2 & (uint16_t)~INPUT_START);
+        }
 
         for (int i = 0; i < 10; i++) {
             const uint16_t mask = g_buttonMasks[i];
@@ -2397,8 +2413,12 @@ int __cdecl Hook_InputProcess(int gameState) {
             currentP2 = tmp;
         }
 
-        const uint16_t pressedP1 = (uint16_t)(currentP1 & (uint16_t)~prevHeldP1);
-        const uint16_t pressedP2 = (uint16_t)(currentP2 & (uint16_t)~prevHeldP2);
+        uint16_t pressedP1 = (uint16_t)(currentP1 & (uint16_t)~prevHeldP1);
+        uint16_t pressedP2 = (uint16_t)(currentP2 & (uint16_t)~prevHeldP2);
+        if (InputSystem_IsPauseBlocked()) {
+            pressedP1 = (uint16_t)(pressedP1 & (uint16_t)~INPUT_START);
+            pressedP2 = (uint16_t)(pressedP2 & (uint16_t)~INPUT_START);
+        }
 
         for (int i = 0; i < 10; i++) {
             const uint16_t mask = g_buttonMasks[i];

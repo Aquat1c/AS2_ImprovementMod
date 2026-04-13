@@ -61,6 +61,10 @@ bool StateHistory_LoadFrame(int32_t frame);
 /// Check if a specific frame is available in history.
 bool StateHistory_HasFrame(int32_t frame);
 
+/// Discard any saved states newer than the given frame.
+/// Preserves older snapshots so reverse stepping can continue across restores.
+void StateHistory_DiscardFramesAfter(int32_t frame);
+
 /// Get the oldest frame available in history.
 int32_t StateHistory_GetOldestFrame();
 

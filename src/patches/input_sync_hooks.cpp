@@ -18,6 +18,7 @@
 #include "rollback/netplay_log.h"
 #include "net/session_manager.h"
 #include "net/charsel_sync.h"
+#include "replay/replay_runtime.h"
 #include "core/game_state.h"
 #include "training/practice_tools.h"
 #include "MinHook.h"
@@ -70,7 +71,10 @@ static inline void ResetVanillaTimeouts() {
 }
 
 static inline bool IsGameplayFreezeActiveInternal() {
-    return s_load_barrier_freeze || s_timesync_freeze || PracticeTools_ShouldFreezeFrame();
+    return s_load_barrier_freeze ||
+           s_timesync_freeze ||
+           PracticeTools_ShouldFreezeFrame() ||
+           Replay::ReplayRuntime_ShouldFreezeFrame();
 }
 
 static inline bool ShouldSuppressAdvanceFrame() {
@@ -132,6 +136,7 @@ static int __cdecl Hook_AdvanceFrame() {
     const bool loadBarrierFreeze = s_load_barrier_freeze;
     const bool timesyncFreeze = s_timesync_freeze;
     const bool practiceFreeze = PracticeTools_ShouldFreezeFrame();
+    const bool replayFreeze = Replay::ReplayRuntime_ShouldFreezeFrame();
     const bool charselLockstep = Net::CharSelSync_IsLockstepActive();
     bool suppress = ShouldSuppressAdvanceFrame();
     if (suppress) {
@@ -142,7 +147,7 @@ static int __cdecl Hook_AdvanceFrame() {
                 "AdvanceFrame SUPPRESSED (#%u): lockstep=%d freeze=%d frameSim=%d frameDisp=%d",
                 s_advSuppressCount,
                 (int)charselLockstep,
-                (int)(loadBarrierFreeze || timesyncFreeze || practiceFreeze),
+                (int)(loadBarrierFreeze || timesyncFreeze || practiceFreeze || replayFreeze),
                 *(volatile int32_t*)ADDR_FRAME_SIMULATION,
                 *(volatile int32_t*)ADDR_FRAME_DISPLAY);
             Rollback::NetplayLog_Flush();

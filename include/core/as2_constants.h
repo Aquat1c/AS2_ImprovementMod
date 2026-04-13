@@ -241,6 +241,14 @@
 #define INPUT_HISTORY_P1_SIZE   170978
 #define INPUT_HISTORY_P2_SIZE   157672
 
+#define ADDR_REPLAY_SELECT_INDEX   0x7AC540
+#define ADDR_REPLAY_SELECT_COUNT   0x7AC544
+#define ADDR_REPLAY_SELECT_RESULT  0x7AC548
+#define ADDR_REPLAY_SELECT_DISPLAY 0x7AC54C
+#define ADDR_REPLAY_HEADER_BASE    0x7AC63C
+#define ADDR_REPLAY_ELEMENT_COUNT  0x7AC680
+#define ADDR_REPLAY_INPUT_BASE     0x7AC684
+
 #define INPUT_HISTORY_WINDOW    20
 
 #define ADDR_DINPUT_KEYBOARD    0x9D09CC
@@ -564,8 +572,12 @@
 // P2 sel struct at CHARSEL_BASE + 867288, character at +176, palette at +180
 #define ADDR_CHARSEL_P1_CHAR_ID 0x8E9F10  // DWORD - P1 selected character ID
 #define ADDR_CHARSEL_P1_PALETTE 0x8E9F14  // BYTE  - P1 palette (0-7, -1=unset)
+#define ADDR_CHARSEL_P1_VARIANT 0x8E9F2A  // WORD  - P1 variant/color value
+#define ADDR_CHARSEL_P1_VARIANT_EXTRA 0x8E9F2C  // BYTE  - P1 variant extra byte
 #define ADDR_CHARSEL_P2_CHAR_ID 0x8E9FE0  // DWORD - P2 selected character ID
 #define ADDR_CHARSEL_P2_PALETTE 0x8E9FE4  // BYTE  - P2 palette (0-7, -1=unset)
+#define ADDR_CHARSEL_P2_VARIANT 0x8E9FFA  // WORD  - P2 variant/color value
+#define ADDR_CHARSEL_P2_VARIANT_EXTRA 0x8E9FFC  // BYTE  - P2 variant extra byte
 
 // Grid-to-character lookup table (21 entries)
 #define ADDR_CHARSEL_GRID_TABLE 0x74C200  // dword_74C200[21] - maps grid index → char ID
@@ -574,6 +586,7 @@
 #define ADDR_CHARSEL_CANCEL     0x816029  // 1 = cancel (return to menu)
 #define ADDR_CHARSEL_DISCONNECT 0x81602C  // 1 = disconnect triggered
 #define ADDR_CHARSEL_MATCH_CHAR 0x816024  // LOBYTE = character for match config
+#define ADDR_MATCH_CONFIG_FLAGS  0x816470  // DWORD - round/stage/training match config block
 #define ADDR_STAGE_CURSOR       0x816024  // During sub=7 (Preview): LOBYTE=cursor pos, BYTE1=confirmed, BYTE2=roulette counter
 #define ADDR_CHARSEL_STAGE_ID   0x816471  // BYTE1(dword_816470) = stage ID
 #define ADDR_CHARSEL_TEAM_COLOR 0x815FFE  // Team color selection
