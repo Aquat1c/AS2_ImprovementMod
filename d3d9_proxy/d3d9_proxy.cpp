@@ -799,6 +799,7 @@ static FILE* g_logFile = nullptr;
 static unsigned int g_logLinesSinceFlush = 0;
 static HANDLE g_hConsole = INVALID_HANDLE_VALUE;
 static bool g_consoleAllocated = false;
+static bool g_consoleVisible = false;
 
 // DLL path (for full path logging)
 static char g_dllPath[MAX_PATH] = {0};
@@ -1422,6 +1423,7 @@ void InitConsole() {
     
     if (AllocConsole()) {
         g_consoleAllocated = true;
+        g_consoleVisible = false;
         SetConsoleTitleA("Alice Senki 2 - Improvement Mod Debug Console");
         g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
         
@@ -1445,6 +1447,12 @@ void InitConsole() {
         printf("  Debug Console\n");
         printf("========================================\n");
         printf("\033[0m\n");
+
+        // Hide console by default — logging continues in background
+        HWND consoleWnd = GetConsoleWindow();
+        if (consoleWnd) {
+            ShowWindow(consoleWnd, SW_HIDE);
+        }
     }
 }
 
@@ -1470,15 +1478,20 @@ void ShutdownConsole(bool logMessage) {
 }
 
 void ToggleConsole() {
-    if (g_consoleAllocated) {
-        ShutdownConsole();
-        return;
+    if (!g_consoleAllocated) {
+        InitConsole();
     }
+    if (!g_consoleAllocated) return;
 
-    InitConsole();
-    if (g_consoleAllocated) {
-        ProxyLog("[CONSOLE] Debug console opened");
+    HWND consoleWnd = GetConsoleWindow();
+    if (!consoleWnd) return;
+
+    g_consoleVisible = !g_consoleVisible;
+    ShowWindow(consoleWnd, g_consoleVisible ? SW_SHOW : SW_HIDE);
+    if (g_consoleVisible) {
+        SetForegroundWindow(consoleWnd);
     }
+    ProxyLog("[CONSOLE] Debug console %s", g_consoleVisible ? "shown" : "hidden");
 }
 
 // ============================================================================
@@ -3137,7 +3150,7 @@ void RenderImGui() {
         ImGui::Text("Alice Senki 2 - Improvement Mod v0.4");
         ImGui::Separator();
         if (ImGui::BeginMenu("Options")) {
-            if (ImGui::MenuItem("AS2 Mod", nullptr, false, g_pModToggleMenu != nullptr)) {
+            if (ImGui::MenuItem("Settings", nullptr, false, g_pModToggleMenu != nullptr)) {
                 g_pModToggleMenu();
             }
             ImGui::Separator();
@@ -3149,7 +3162,7 @@ void RenderImGui() {
                 }
             }
             ImGui::MenuItem("Keep Aspect Ratio", nullptr, &g_keepAspectRatio);
-            if (ImGui::MenuItem(g_consoleAllocated ? "Close Debug Console" : "Open Debug Console")) {
+            if (ImGui::MenuItem(g_consoleVisible ? "Hide Debug Console" : "Show Debug Console")) {
                 ToggleConsole();
             }
             ImGui::Separator();
@@ -5181,6 +5194,12 @@ bool LoadCoreModDLL() {
     if (!hSDL) {
         ProxyLog("[MOD] WARNING: SDL3.dll not found at: %s (Error: %d)", sdlPath, GetLastError());
         ProxyLog("[MOD] Make sure SDL3.dll is in the game folder!");
+        MessageBoxA(NULL,
+            "SDL3.dll was not found in the game folder.\n\n"
+            "The mod requires SDL3.dll to function.\n"
+            "Please place SDL3.dll next to the game executable.",
+            "Alice Senki 2 - Improvement Mod", MB_OK | MB_ICONERROR);
+        return false;
     } else {
         ProxyLog("[MOD] SDL3.dll loaded from: %s", sdlPath);
     }
@@ -5200,6 +5219,14 @@ bool LoadCoreModDLL() {
             ProxyLog("[MOD]   1. as2_rollback.dll exists at: %s", modPath);
             ProxyLog("[MOD]   2. SDL3.dll exists at: %s", sdlPath);
         }
+        char errMsg[512];
+        snprintf(errMsg, sizeof(errMsg),
+            "as2_rollback.dll failed to load (Error: %lu).\n\n"
+            "Expected location:\n%s\n\n"
+            "Make sure as2_rollback.dll and SDL3.dll are both\n"
+            "in the game folder.",
+            err, modPath);
+        MessageBoxA(NULL, errMsg, "Alice Senki 2 - Improvement Mod", MB_OK | MB_ICONERROR);
         return false;
     }
     ProxyLog("[MOD] as2_rollback.dll loaded: 0x%p", g_hModDLL);
@@ -5301,7 +5328,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             ProxyLog("[SHUTDOWN] DLL_PROCESS_DETACH process_terminating=%d fast_exit=%d",
                      processTerminating ? 1 : 0,
                      g_fastExitRequested ? 1 : 0);
-            PerformProxyShutdown(processTerminating || g_fastExitRequested);
+            // Always use fast path: complex teardown (thread joins, hook removal,
+            // 25+ subsystem shutdowns) must not run under DllMain/loader lock.
+            // The process is exiting — Windows will reclaim all resources.
+            PerformProxyShutdown(true);
             break;
         }
     }

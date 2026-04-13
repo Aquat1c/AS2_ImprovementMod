@@ -16,6 +16,7 @@
 #include "rollback/savestate.h"
 #include "testing/scripted_input_runner.h"
 #include "training/practice_tools.h"
+#include "rollback/rollback_session.h"
 #include "imgui.h"
 #include <stdio.h>
 #include <string.h>
@@ -399,7 +400,9 @@ void ModMenu_Render() {
     
     ImGuiWindowFlags flags = ImGuiWindowFlags_MenuBar;
     
-    if (!ImGui::Begin("AS2 Mod", &g_menuOpen, flags)) {
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    
+    if (!ImGui::Begin("Settings", &g_menuOpen, flags)) {
         ImGui::End();
         return;
     }
@@ -466,9 +469,11 @@ void ModMenu_Render() {
                 ImGui::EndTabItem();
             }
         }
-        if (ImGui::BeginTabItem("Hitbox")) {
-            HitboxViewer_RenderControls();
-            ImGui::EndTabItem();
+        if (!Rollback::RollbackSession_IsActive()) {
+            if (ImGui::BeginTabItem("Hitbox")) {
+                HitboxViewer_RenderControls();
+                ImGui::EndTabItem();
+            }
         }
         if (ImGui::BeginTabItem("Practice")) {
             PracticeTools_RenderImGui();

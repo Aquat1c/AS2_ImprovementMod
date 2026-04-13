@@ -637,7 +637,9 @@ __declspec(dllexport) void ModOnFrame() {
 __declspec(dllexport) void ModOnPresent(void* pDevice) {
     if (!g_initialized) return;
     ApplySharedImGuiScale();
-    HitboxViewer_Render();
+    if (!Rollback::RollbackSession_IsActive()) {
+        HitboxViewer_Render();
+    }
     NetplayHud_Render();
     PracticeTools_RenderHUD();
     Replay::ReplayRuntime_RenderHUD();

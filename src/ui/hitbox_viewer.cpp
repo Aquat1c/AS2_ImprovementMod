@@ -672,7 +672,7 @@ void HitboxViewer_Render() {
     if (!g_enabled) return;
     if (!AS2_IsInMatch()) return;
 
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
     if (!dl) return;
 
     ScreenTransform t = GetTransform();

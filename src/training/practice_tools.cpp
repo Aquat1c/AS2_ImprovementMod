@@ -20,6 +20,7 @@
 #include "input_system.h"
 #include "as2_constants.h"
 #include "log_window.h"
+#include "rollback/rollback_session.h"
 #include "imgui.h"
 
 #include <windows.h>
@@ -208,8 +209,8 @@ void PracticeTools_FrameUpdate() {
     bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     bool f9Down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
 
-    // F4: Toggle hitbox viewer
-    if (f4Down && !s_f4WasDown) {
+    // F4: Toggle hitbox viewer (disabled during netplay)
+    if (f4Down && !s_f4WasDown && !Rollback::RollbackSession_IsActive()) {
         HitboxViewer_ToggleEnabled();
         PushToast(HitboxViewer_IsEnabled() ? "Hitboxes ON" : "Hitboxes OFF",
                   HitboxViewer_IsEnabled() ? IM_COL32(100, 255, 100, 255) : IM_COL32(255, 100, 100, 255));

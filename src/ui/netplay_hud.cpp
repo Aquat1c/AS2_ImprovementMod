@@ -1,8 +1,15 @@
 /**
  * Netplay HUD — ImGui-based overlay for online match stats.
  *
- * Renders player nicknames with win counts (top) and connection stats
- * (ping, delay, rollback) at the bottom using ImGui foreground draw list.
+ * Renders player nicknames in compact pills below the HP bar area (top)
+ * and connection stats (ping, delay, rollback) at the bottom using
+ * ImGui foreground draw list.
+ *
+ * Game HUD layout reference (640x480):
+ *   y ≈ 0-65   : Character portraits + HP bars + guard gauge + win dots
+ *   y ≈ 65-78  : Character name labels (game-rendered, e.g. "SHIZUKA")
+ *   y ≈ 78+    : Free space — nickname pills go here
+ *   y ≈ 430-480: Super meter gauge area
  */
 
 #include "ui/netplay_hud.h"
@@ -14,6 +21,32 @@
 #include <cstring>
 
 namespace {
+
+// ── Layout constants ───────────────────────────────────────────────────
+constexpr float kScreenW = 640.0f;
+constexpr float kScreenH = 480.0f;
+
+// Nickname pills sit just below the game's character name labels.
+constexpr float kNickY          = 78.0f;
+constexpr float kNickPadH       = 3.0f;   // vertical padding inside pill
+constexpr float kNickPadW       = 6.0f;   // horizontal padding inside pill
+constexpr float kNickMarginX    = 4.0f;   // distance from screen edge
+constexpr float kNickRounding   = 3.0f;   // pill corner radius
+
+// Bottom stats bar
+constexpr float kStatsPadH      = 3.0f;
+constexpr float kStatsPadW      = 6.0f;
+constexpr float kStatsRounding  = 3.0f;
+
+// ── Colours ─────────────────────────────────────────────────────────────
+constexpr ImU32 kP1Bg           = IM_COL32( 20,  60, 120, 180);
+constexpr ImU32 kP2Bg           = IM_COL32(120,  20,  30, 180);
+constexpr ImU32 kNickText       = IM_COL32(255, 255, 255, 240);
+constexpr ImU32 kShadowCol      = IM_COL32(  0,   0,   0, 160);
+constexpr ImU32 kStatsBg        = IM_COL32(  0,   0,   0, 160);
+constexpr ImU32 kStatsText      = IM_COL32(255, 255, 255, 230);
+
+// ── UTF-8 helpers ───────────────────────────────────────────────────────
 
 static bool IsUtf8ContinuationByte(unsigned char value) {
     return (value & 0xC0) == 0x80;
@@ -43,28 +76,43 @@ static size_t Utf8CountCodepoints(const char* text) {
 }
 
 static void ClipUtf8Text(char* out, size_t outCap, const char* text, size_t maxChars) {
-    if (!out || outCap == 0) {
-        return;
-    }
-
+    if (!out || outCap == 0) return;
     out[0] = '\0';
-    if (!text || !text[0]) {
-        return;
-    }
+    if (!text || !text[0]) return;
 
     if (Utf8CountCodepoints(text) <= maxChars || maxChars < 4) {
         strncpy_s(out, outCap, text, _TRUNCATE);
         return;
     }
-
     const size_t prefixBytes = Utf8PrefixBytes(text, maxChars - 3);
     _snprintf_s(out, outCap, _TRUNCATE, "%.*s...", (int)prefixBytes, text);
 }
 
-static void BuildPlayerLabel(char* out, size_t outCap, const char* name, int wins) {
-    char clippedName[96] = {};
-    ClipUtf8Text(clippedName, sizeof(clippedName), name && name[0] ? name : "Player", 18);
-    _snprintf_s(out, outCap, _TRUNCATE, "%s (%d)", clippedName, wins);
+// ── Draw helper: shadowed text ──────────────────────────────────────────
+
+static void DrawShadowedText(ImDrawList* dl, const ImVec2& pos, ImU32 col, const char* text) {
+    dl->AddText(ImVec2(pos.x + 1.0f, pos.y + 1.0f), kShadowCol, text);
+    dl->AddText(pos, col, text);
+}
+
+// ── Draw helper: nickname pill ──────────────────────────────────────────
+
+static void DrawNickPill(ImDrawList* dl, const char* name, ImU32 bgCol,
+                         float anchorX, float y, bool alignRight) {
+    char clipped[96] = {};
+    ClipUtf8Text(clipped, sizeof(clipped), name && name[0] ? name : "Player", 16);
+
+    ImVec2 tsz = ImGui::CalcTextSize(clipped);
+    float pillW = tsz.x + kNickPadW * 2.0f;
+    float pillH = tsz.y + kNickPadH * 2.0f;
+
+    float x = alignRight ? (anchorX - pillW) : anchorX;
+
+    // Pill background
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + pillW, y + pillH), bgCol, kNickRounding);
+
+    // Nickname text (shadowed)
+    DrawShadowedText(dl, ImVec2(x + kNickPadW, y + kNickPadH), kNickText, clipped);
 }
 
 } // namespace
@@ -81,35 +129,11 @@ void NetplayHud_Render() {
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     if (!dl) return;
 
-    const float W = 640.0f;
-    const float H = 480.0f;
-
-    // --- TOP: Player names with win counts above HP bars ---
-    {
-        const float topY = 2.0f;
-
-        char p1text[128];
-        char p2text[128];
-        BuildPlayerLabel(p1text, sizeof(p1text), hud.p1_name, hud.p1_wins);
-        BuildPlayerLabel(p2text, sizeof(p2text), hud.p2_name, hud.p2_wins);
-
-        ImVec2 p1sz = ImGui::CalcTextSize(p1text);
-        ImVec2 p2sz = ImGui::CalcTextSize(p2text);
-
-        const float pad = 4.0f;
-        const ImU32 shadowCol = IM_COL32(0, 0, 0, 180);
-
-        // P1 (left, blue)
-        const ImU32 p1col = IM_COL32(100, 200, 255, 255);
-        dl->AddText(ImVec2(pad + 1.0f, topY + 1.0f), shadowCol, p1text);
-        dl->AddText(ImVec2(pad, topY), p1col, p1text);
-
-        // P2 (right, red)
-        const ImU32 p2col = IM_COL32(255, 130, 130, 255);
-        float p2x = W - pad - p2sz.x;
-        dl->AddText(ImVec2(p2x + 1.0f, topY + 1.0f), shadowCol, p2text);
-        dl->AddText(ImVec2(p2x, topY), p2col, p2text);
-    }
+    // --- TOP: Nickname pills below HP bar area ---
+    DrawNickPill(dl, hud.p1_name, kP1Bg,
+                 kNickMarginX, kNickY, false);               // left-aligned
+    DrawNickPill(dl, hud.p2_name, kP2Bg,
+                 kScreenW - kNickMarginX, kNickY, true);     // right-aligned
 
     // --- BOTTOM: Connection stats or spectator status ---
     {
@@ -128,27 +152,21 @@ void NetplayHud_Render() {
             stats[0] = '\0';
         }
 
-        if (!stats[0]) {
-            return;
-        }
+        if (!stats[0]) return;
 
         ImVec2 sz = ImGui::CalcTextSize(stats);
-        const float pad = 4.0f;
-        float barW = sz.x + pad * 2.0f;
-        float barH = sz.y + pad * 2.0f;
-        float barX = (W - barW) * 0.5f;
-        float barY = H - barH;
+        float barW = sz.x + kStatsPadW * 2.0f;
+        float barH = sz.y + kStatsPadH * 2.0f;
+        float barX = (kScreenW - barW) * 0.5f;
+        float barY = kScreenH - barH;
 
-        // Background
         dl->AddRectFilled(
             ImVec2(barX, barY),
             ImVec2(barX + barW, barY + barH),
-            IM_COL32(0, 0, 0, 160));
+            kStatsBg, kStatsRounding);
 
-        // Text
         dl->AddText(
-            ImVec2(barX + pad, barY + pad),
-            IM_COL32(255, 255, 255, 230),
-            stats);
+            ImVec2(barX + kStatsPadW, barY + kStatsPadH),
+            kStatsText, stats);
     }
 }

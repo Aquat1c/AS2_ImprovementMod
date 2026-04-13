@@ -1950,7 +1950,7 @@ static void RenderReplayMatchHud() {
         }
     }
 
-    snprintf(lines[3], sizeof(lines[3]), "\\ Pause  ] Fwd  [ Back  Shift+[ Rewind");
+    snprintf(lines[3], sizeof(lines[3]), "Bksl Pause  ] Fwd  [ Back  Shift+[ Rewind");
     snprintf(lines[4], sizeof(lines[4]), "+/- Speed  1 P1  2 P2  0 Exit  Ins HUD");
     snprintf(lines[5], sizeof(lines[5]), "Press takeover key again to restart.");
     lines[6][0] = '\0';
@@ -2417,7 +2417,7 @@ void ReplayRuntime_Init() {
     ResetMatchHotkeyEdges();
     ResetMenuHotkeyEdges();
     s_initialized = true;
-    LOG_INFO("[Replay] Runtime initialized (\\ pause, ] step, [ back, Shift+[ rewind, Insert HUD, 1/2 takeover)");
+    LOG_INFO("[Replay] Runtime initialized (Bksl pause, ] step, [ back, Shift+[ rewind, Insert HUD, 1/2 takeover)");
 }
 
 void ReplayRuntime_Shutdown() {
