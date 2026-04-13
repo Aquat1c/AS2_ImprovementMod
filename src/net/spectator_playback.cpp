@@ -833,6 +833,14 @@ static void DriveBootstrap(const SpectatorClientSnapshot& client) {
     ClearPlaybackOverrides();
 
     if (mode == MODE_PREMATCH_INTRO || (mode == MODE_MATCH && !AS2_IsInPlayableGameplay())) {
+        if (s_localFrameOriginAbs >= 0 && mode == MODE_MATCH) {
+            // Gameplay was already started (round transition, not initial
+            // bootstrap).  Keep dispatching so the game engine can advance
+            // its intro/phase timer — otherwise the timer stalls and the
+            // spectator deadlocks waiting for the intro to end.
+            UpdateLivePlayback(client);
+            return;
+        }
         TransitionState(SpectatorPlaybackState::WaitingInteractiveStart,
             "Waiting for the round to start.");
         return;
@@ -1108,7 +1116,7 @@ SpectatorDispatchAction SpectatorPlayback_GetDispatcherFrame(uint16_t* outP1,
         (s_state == SpectatorPlaybackState::Buffering ||
          s_state == SpectatorPlaybackState::CatchingUp ||
          s_state == SpectatorPlaybackState::Live);
-    if (!gameplayOwned || GetGameMode() != MODE_MATCH || !AS2_IsInPlayableGameplay()) {
+    if (!gameplayOwned || GetGameMode() != MODE_MATCH) {
         s_dispatchFramesProducedThisLoop = 0;
         return SpectatorDispatchAction::Unhandled;
     }

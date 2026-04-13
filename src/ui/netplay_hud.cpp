@@ -22,15 +22,17 @@
 
 namespace {
 
-// ── Layout constants ───────────────────────────────────────────────────
-constexpr float kScreenW = 640.0f;
-constexpr float kScreenH = 480.0f;
+// ── Layout constants (ratios relative to native 640x480) ───────────────
+constexpr float kNativeW = 640.0f;
+constexpr float kNativeH = 480.0f;
 
 // Nickname pills sit just below the game's character name labels.
-constexpr float kNickY          = 78.0f;
+// Expressed as fractions of the native resolution so they scale with any
+// display size (borderless fullscreen, resolution scaling, etc.).
+constexpr float kNickYRatio     = 78.0f  / kNativeH;
 constexpr float kNickPadH       = 3.0f;   // vertical padding inside pill
 constexpr float kNickPadW       = 6.0f;   // horizontal padding inside pill
-constexpr float kNickMarginX    = 4.0f;   // distance from screen edge
+constexpr float kNickMarginXRatio = 2.0f / kNativeW;  // distance from screen edge
 constexpr float kNickRounding   = 3.0f;   // pill corner radius
 
 // Bottom stats bar
@@ -129,11 +131,17 @@ void NetplayHud_Render() {
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     if (!dl) return;
 
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float W = display.x > 0.0f ? display.x : kNativeW;
+    const float H = display.y > 0.0f ? display.y : kNativeH;
+    const float nickY      = H * kNickYRatio;
+    const float nickMargin = W * kNickMarginXRatio;
+
     // --- TOP: Nickname pills below HP bar area ---
     DrawNickPill(dl, hud.p1_name, kP1Bg,
-                 kNickMarginX, kNickY, false);               // left-aligned
+                 nickMargin, nickY, false);               // left-aligned
     DrawNickPill(dl, hud.p2_name, kP2Bg,
-                 kScreenW - kNickMarginX, kNickY, true);     // right-aligned
+                 W - nickMargin, nickY, true);             // right-aligned
 
     // --- BOTTOM: Connection stats or spectator status ---
     {
@@ -157,8 +165,8 @@ void NetplayHud_Render() {
         ImVec2 sz = ImGui::CalcTextSize(stats);
         float barW = sz.x + kStatsPadW * 2.0f;
         float barH = sz.y + kStatsPadH * 2.0f;
-        float barX = (kScreenW - barW) * 0.5f;
-        float barY = kScreenH - barH;
+        float barX = (W - barW) * 0.5f;
+        float barY = H - barH;
 
         dl->AddRectFilled(
             ImVec2(barX, barY),
