@@ -6,7 +6,8 @@ out/
 # VSCode
 .vscode/
 .github
-docs/
+docs/*
+!docs/MASTER_DOCUMENT.md
 lib/
 
 # Logs / temp
