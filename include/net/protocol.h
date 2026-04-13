@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 7;
+constexpr uint16_t PROTOCOL_VERSION = 8;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -110,14 +110,14 @@ enum class PacketType : uint16_t {
 struct HelloPayload {
     uint16_t protocol_version;   // Must match PROTOCOL_VERSION
     uint32_t build_hash;         // Exact local mod build fingerprint
-    char     nickname[24];       // Null-terminated UTF-8 nickname
+    char     nickname[64];       // Null-terminated UTF-8 nickname
     uint16_t listen_port;        // Port this peer is listening on
 };
 
 struct HelloAckPayload {
     uint16_t protocol_version;
     uint32_t build_hash;         // Exact local mod build fingerprint
-    char     nickname[24];
+    char     nickname[64];
     uint16_t listen_port;
 };
 

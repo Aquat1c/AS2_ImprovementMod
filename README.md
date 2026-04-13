@@ -217,7 +217,7 @@ Defined in `protocol.h` (457 lines). Protocol version 6 with 40+ packet types.
 - **Debug:** Ping, Pong, StateDigest, FrameSyncStatus
 
 **Key payloads:**
-- `HelloPayload`: Protocol version, exact local mod build fingerprint (uint32), nickname[24], listen port
+- `HelloPayload`: Protocol version, exact local mod build fingerprint (uint32), nickname[64], listen port
 - `ConfigExchangePayload`: Character IDs, palettes, stage, round count, time limit, RNG seed, session seed, delay/rollback configuration
 - `BaselineDigestPayload`: CRC32 of baseline savestate for agreement verification
 - `BaselineBreakdownPayload`: Per-region CRCs (main, header, context, effects, summons, entities, input buffers) for mismatch diagnosis

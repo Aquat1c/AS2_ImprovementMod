@@ -15,13 +15,13 @@
 
 namespace Net::Spectator {
 
-constexpr uint16_t PROTOCOL_VERSION = 4;
+constexpr uint16_t PROTOCOL_VERSION = 6;
 constexpr int MAX_PACKET_SIZE = 1200;
 constexpr int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;
 constexpr int MAX_FRAME_BATCH = 32;
 constexpr uint16_t LAN_DISCOVERY_PORT = 10702;
 constexpr uint32_t LAN_DISCOVERY_MAGIC = 0x44325341; // "AS2D"
-constexpr uint16_t LAN_DISCOVERY_VERSION = 1;
+constexpr uint16_t LAN_DISCOVERY_VERSION = 3;
 
 constexpr uint8_t CHANNEL_CONTROL = 0;
 constexpr uint8_t CHANNEL_STREAM = 1;
@@ -62,12 +62,14 @@ struct HelloPayload {
     uint32_t requested_match_id;
     uint8_t flags;
     uint8_t _pad[3];
-    char nickname[24];
+    char nickname[64];
 };
 
 struct HelloAckPayload {
     uint16_t protocol_version;
     uint16_t server_listen_port;
+    uint16_t session_listen_port;
+    uint16_t _pad0;
     uint32_t match_id;
     uint32_t match_ordinal;
     uint8_t match_state;
@@ -91,9 +93,11 @@ struct MatchStatePayload {
     uint16_t p2_wins;
     uint16_t draws;
     uint16_t completed_matches;
+    uint16_t session_listen_port;
+    uint16_t _pad1;
     LockedMatchConfig config;
-    char p1_name[24];
-    char p2_name[24];
+    char p1_name[64];
+    char p2_name[64];
 };
 
 struct FrameRecord {
@@ -160,8 +164,9 @@ struct HeartbeatPayload {
     uint32_t session_seed;
     int32_t confirmed_rb_frame;
     int32_t live_rb_frame;
+    uint16_t session_listen_port;
     uint8_t match_state;
-    uint8_t _pad[3];
+    uint8_t _pad;
 };
 
 struct ClientStatusPayload {
@@ -189,14 +194,15 @@ struct DiscoveryResponsePayload {
     uint32_t magic;
     uint16_t version;
     uint16_t spectator_port;
+    uint16_t session_listen_port;
     uint32_t nonce;
     uint32_t match_id;
     uint8_t match_state;
     uint8_t connected_spectators;
     uint8_t _pad[2];
-    char host_nickname[24];
-    char p1_name[24];
-    char p2_name[24];
+    char host_nickname[64];
+    char p1_name[64];
+    char p2_name[64];
 };
 
 #pragma pack(pop)

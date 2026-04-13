@@ -63,6 +63,8 @@
 // Timing
 // sub_635F80 - wrapper around timeGetTime() used by the main loop frame limiter
 #define ADDR_GET_TICK           (GAME_BASE + 0x235F80)  // sub_635F80
+#define ADDR_REPLAY_SAVE        (GAME_BASE + 0x19B830)  // sub_59B830
+#define ADDR_REPLAY_SELECT_DRAW (GAME_BASE + 0x19BF90)  // sub_59BF90
 
 // Static CRT functions (game has statically linked CRT - NOT importing from msvcrt.dll)
 // RNG uses TLS-based _tiddata struct: seed at [_getptd()+0x14]

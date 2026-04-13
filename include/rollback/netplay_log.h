@@ -47,8 +47,16 @@ bool NetplayLog_IsVerbose();
 /// frame = game frame or -1 if not applicable.
 void NetplayLog_Write(const char* tag, int32_t frame, const char* fmt, ...);
 
+/// Spectator log function. Writes to the main full-path netplay log and the
+/// dedicated spectator log file.
+void NetplayLog_WriteSpectator(const char* tag, int32_t frame, const char* fmt, ...);
+
 /// Verbose-only log (only written in verbose mode).
 void NetplayLog_Verbose(const char* tag, int32_t frame, const char* fmt, ...);
+
+/// Verbose-only spectator log. Writes to the main full-path netplay log and
+/// the dedicated spectator log file when verbose mode is enabled.
+void NetplayLog_VerboseSpectator(const char* tag, int32_t frame, const char* fmt, ...);
 
 /// Log a before/after state change with reason.
 void NetplayLog_StateChange(const char* tag, int32_t frame,

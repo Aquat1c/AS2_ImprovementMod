@@ -6,6 +6,7 @@
 #include "patches/filesystem_patch.h"
 #include "patches/palette_asset_hook.h"
 #include "patches/charsel_palette_select.h"
+#include "replay/replay_runtime.h"
 #include "training/practice_tools.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -231,6 +232,10 @@ bool InstallHooks() {
 
     if (!Net::CharSelPaletteSelect_Install()) {
         LOG_WARN("Failed to install char-select palette flow hooks (continuing anyway)");
+    }
+
+    if (!Replay::ReplayRuntime_InstallHooks()) {
+        LOG_WARN("Failed to install replay save hook (continuing anyway)");
     }
     
     // --- Enable all hooks ---

@@ -13,6 +13,7 @@
 #include "net/frontend_input_sync.h"
 #include "net/match_lifecycle.h"
 #include "net/pregame_sync.h"
+#include "net/spectator_playback.h"
 #include "net/stagesel_sync.h"
 #include "net/winscreen_sync.h"
 #include "net/player_side_mapping.h"
@@ -903,6 +904,10 @@ static uint16_t s_winscreenPrevP2 = 0;
 static uint32_t s_winscreenDispatchCount = 0;
 static uint32_t s_winscreenWaitCount = 0;
 static bool s_winscreenFirstLog = false;
+static bool s_spectatorDispatchActive = false;
+static uint16_t s_spectatorPrevP1 = 0;
+static uint16_t s_spectatorPrevP2 = 0;
+static uint32_t s_spectatorDispatchCount = 0;
 
 int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     if (!outputInputs) return -1;
@@ -1302,6 +1307,77 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         s_winscreen_produced_this_loop = false;
         s_winscreenPrevP1 = 0;
         s_winscreenPrevP2 = 0;
+    }
+
+    {
+        uint16_t p1 = 0;
+        uint16_t p2 = 0;
+        int32_t rbFrame = -1;
+        const Net::SpectatorDispatchAction spectatorAction =
+            Net::SpectatorPlayback_GetDispatcherFrame(&p1, &p2, &rbFrame);
+        if (spectatorAction == Net::SpectatorDispatchAction::ProduceFrame) {
+            s_spectatorDispatchActive = true;
+            s_spectatorDispatchCount++;
+
+            outputInputs[0] = (__int16)p1;
+            outputInputs[1] = (__int16)p2;
+
+            volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
+            const uint32_t writeIdx = (uint32_t)*pFrameWrite;
+            if (writeIdx < INPUT_HISTORY_MAX) {
+                *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p1;
+                *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p2;
+            }
+            *pFrameWrite = (int32_t)(writeIdx + 1);
+
+            const uint16_t justP1 = p1 & (uint16_t)~s_spectatorPrevP1;
+            const uint16_t justP2 = p2 & (uint16_t)~s_spectatorPrevP2;
+            s_spectatorPrevP1 = p1;
+            s_spectatorPrevP2 = p2;
+
+            __try {
+                for (int i = 0; i < 10; i++) {
+                    const uint16_t mask = (uint16_t)(1 << i);
+                    WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (i * 2),
+                        (uint16_t)((p1 & mask) ? 1 : 0));
+                    WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
+                        (uint16_t)((justP1 & mask) ? 1 : 0));
+                    WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (i * 2),
+                        (uint16_t)((p2 & mask) ? 1 : 0));
+                    WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
+                        (uint16_t)((justP2 & mask) ? 1 : 0));
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                LOG_NETPLAY(LOG_ERROR,
+                    "[InputDispatch] EXCEPTION writing spectator raw input buffers rb=%d P1=0x%04X P2=0x%04X",
+                    rbFrame,
+                    p1,
+                    p2);
+                return -1;
+            }
+
+            if (s_spectatorDispatchCount <= 5 || (s_spectatorDispatchCount % 120) == 0) {
+                Rollback::NetplayLog_Write("SPLAY", rbFrame,
+                    "Dispatcher advance rb=%d P1=0x%04X P2=0x%04X writeIdx=%u->%u",
+                    rbFrame,
+                    p1,
+                    p2,
+                    writeIdx,
+                    writeIdx + 1);
+            }
+            return 0;
+        }
+
+        if (spectatorAction == Net::SpectatorDispatchAction::BreakLoop) {
+            return -1;
+        }
+
+        if (s_spectatorDispatchActive) {
+            s_spectatorDispatchActive = false;
+            s_spectatorPrevP1 = 0;
+            s_spectatorPrevP2 = 0;
+            s_spectatorDispatchCount = 0;
+        }
     }
 
     // Pre-live interactive boundary gate:
@@ -2226,7 +2302,6 @@ static const uint16_t g_buttonMasks[10] = {
     0x0001, 0x0002, 0x0004, 0x0008, 0x0010,
     0x0020, 0x0040, 0x0080, 0x0100, 0x0200
 };
-
 static uint16_t ReadHeldMaskFromAltBuffer(uintptr_t altBufferAddr) {
     uint16_t heldMask = 0;
     __try {
@@ -2279,6 +2354,9 @@ int __cdecl Hook_InputProcess(int gameState) {
     };
 
     if (consumeForCustomMenu) {
+        if (Replay::ReplayRuntime_ShouldConsumeMenuInput()) {
+            Replay::ReplayRuntime_OnFrontendInputsProcessed();
+        }
         clearLiveInputBuffers();
         return result;
     }

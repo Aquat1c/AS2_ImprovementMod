@@ -412,7 +412,7 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
     timeBeginPeriod(1);
 
     LOG_INFO("========================================");
-    LOG_INFO("Alice Senki 2 - Mod v0.3");
+    LOG_INFO("Alice Senki 2 - Mod v0.4");
     LOG_INFO("Build: %s %s", __DATE__, __TIME__);
     LOG_INFO("========================================");
     LOG_INFO("Game module: 0x%p", gameModule);
@@ -714,7 +714,25 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
             default:
                 break;
         }
-        strncpy_s(out->status_text, sizeof(out->status_text), statusText, _TRUNCATE);
+
+        if (spectatorPlayback.state == Net::SpectatorPlaybackState::CatchingUp &&
+            spectatorPlayback.tick_scale_target > 1.0f) {
+            _snprintf_s(out->status_text,
+                sizeof(out->status_text),
+                _TRUNCATE,
+                "%s %.2fx",
+                statusText,
+                spectatorPlayback.tick_scale_target);
+        } else if (spectatorPlayback.manual_catchup_scale > 0.0f) {
+            _snprintf_s(out->status_text,
+                sizeof(out->status_text),
+                _TRUNCATE,
+                "%s max %.2fx",
+                statusText,
+                spectatorPlayback.manual_catchup_scale);
+        } else {
+            strncpy_s(out->status_text, sizeof(out->status_text), statusText, _TRUNCATE);
+        }
         return true;
     }
 

@@ -23,6 +23,11 @@ void CharSelPaletteSelect_OnCharSelBegin(bool netplay, uint8_t local_game_slot);
 void CharSelPaletteSelect_EndFrontend();
 void CharSelPaletteSelect_OnRemoteCatalog(const CharSelInputPayload* payload);
 void CharSelPaletteSelect_OnLocalCatalogChanged();
+void CharSelPaletteSelect_ClearExternalCustomHints();
+void CharSelPaletteSelect_SetExternalCustomHint(uint8_t game_slot,
+                                                uint8_t character_id,
+                                                uint8_t base_palette,
+                                                bool available);
 
 bool CharSelPaletteSelect_IsCatalogReady();
 bool CharSelPaletteSelect_IsSelectionLocked(uint8_t game_slot);

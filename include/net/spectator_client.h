@@ -13,6 +13,8 @@
 
 namespace Net {
 
+struct NetplayPaletteBank;
+
 constexpr int SPECTATOR_DISCOVERY_MAX_RESULTS = 8;
 
 enum class SpectatorClientState : uint8_t {
@@ -31,6 +33,7 @@ struct SpectatorClientSnapshot {
     SpectatorClientState state;
     char     endpoint[96];
     char     redirect_endpoint[96];
+    uint16_t session_listen_port;
     uint32_t match_id;
     uint32_t match_ordinal;
     bool     have_match_state;
@@ -38,8 +41,8 @@ struct SpectatorClientSnapshot {
     uint32_t config_crc;
     uint32_t session_seed;
     LockedMatchConfig config;
-    char     p1_name[24];
-    char     p2_name[24];
+    char     p1_name[64];
+    char     p2_name[64];
     uint16_t p1_wins;
     uint16_t p2_wins;
     uint16_t draws;
@@ -63,9 +66,9 @@ struct SpectatorClientSnapshot {
 
 struct SpectatorDiscoveryEntry {
     char     endpoint[96];
-    char     host_nickname[24];
-    char     p1_name[24];
-    char     p2_name[24];
+    char     host_nickname[64];
+    char     p1_name[64];
+    char     p2_name[64];
     uint32_t match_id;
     bool     match_active;
     uint8_t  connected_spectators;
@@ -76,6 +79,17 @@ struct SpectatorDiscoverySnapshot {
     uint32_t result_count;
     char     status[128];
     SpectatorDiscoveryEntry results[SPECTATOR_DISCOVERY_MAX_RESULTS];
+};
+
+struct SpectatorBufferedPaletteSlot {
+    bool     metadata_valid;
+    bool     has_custom_data;
+    bool     bank_valid;
+    uint8_t  character_id;
+    uint8_t  base_palette;
+    uint8_t  flags;
+    uint32_t payload_crc;
+    uint16_t payload_size;
 };
 
 void SpectatorClient_Init();
@@ -89,10 +103,13 @@ void SpectatorClient_SetRelayConfig(bool enabled, uint16_t listenPort);
 
 void SpectatorClient_SetFastForwardEnabled(bool enabled);
 void SpectatorClient_SetHardSyncEnabled(bool enabled);
+void SpectatorClient_SetPlaybackFrame(int32_t rb_frame);
 
 SpectatorClientState SpectatorClient_GetState();
 void SpectatorClient_GetSnapshot(SpectatorClientSnapshot* out);
 void SpectatorClient_GetDiscoverySnapshot(SpectatorDiscoverySnapshot* out);
 bool SpectatorClient_GetFrameInputs(int32_t rb_frame, uint16_t* outP1, uint16_t* outP2);
+bool SpectatorClient_GetBufferedPaletteSlot(uint8_t game_slot, SpectatorBufferedPaletteSlot* out);
+bool SpectatorClient_CopyBufferedPaletteBank(uint8_t game_slot, NetplayPaletteBank* out);
 
 } // namespace Net

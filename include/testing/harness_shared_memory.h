@@ -21,7 +21,7 @@
 // ============================================================================
 
 #define HARNESS_SHM_MAGIC       0x48524E53  // "HRNS"
-#define HARNESS_SHM_VERSION     2
+#define HARNESS_SHM_VERSION     3
 #define HARNESS_SHM_NAME_HOST   "Local\\AS2_Harness_Host"
 #define HARNESS_SHM_NAME_CLIENT "Local\\AS2_Harness_Client"
 
@@ -42,7 +42,7 @@ struct HarnessSharedData {
     uint8_t  active;
     uint8_t  is_host;
     uint8_t  _pad0[2];
-    char     nickname[24];
+    char     nickname[64];
 
     // ---- Phase / State Machine ----
     uint32_t phase;          // Phase enum ordinal
@@ -55,7 +55,7 @@ struct HarnessSharedData {
     uint32_t packets_sent;
     uint32_t packets_received;
     uint32_t desync_count;
-    char     peer_nickname[24];
+    char     peer_nickname[64];
     char     status_text[128];
     char     error_text[128];
 

@@ -4,6 +4,7 @@
 #include "net/netplay_palette_storage.h"
 #include "net/player_side_mapping.h"
 #include "net/gameplay_bridge.h"
+#include "net/match_lifecycle.h"
 #include "patches/charsel_palette_select.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
@@ -94,7 +95,7 @@ static int           s_localGameSlot = -1;
 static int           s_offlineEditorGameSlot = -1;
 static PlayerRuntime s_player[2] = {};
 static bool          s_liveReloadRequested[2] = {};
-static char          s_status[128] = "Palette runtime idle.";
+static char          s_status[128] = "Palette sync idle.";
 
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
@@ -162,7 +163,7 @@ static void ResetMatchState(const char* reason) {
     memset(s_liveReloadRequested, 0, sizeof(s_liveReloadRequested));
     ClearPlayerRuntime(&s_player[0], 0);
     ClearPlayerRuntime(&s_player[1], 1);
-    SetStatus("Palette runtime idle%s%s",
+    SetStatus("Palette sync idle%s%s",
         reason ? ": " : "",
         reason ? reason : "");
     LOG_INFO("[Palette] Runtime reset: reason=%s", reason ? reason : "none");
@@ -567,9 +568,9 @@ static bool RequestGameplayPaletteReapply(const char* reason) {
     }
 
     if (reloadCount > 0) {
-        SetStatus("Reapplying palette overrides for gameplay entry");
+        SetStatus("Refreshing match palettes before the round starts");
         Rollback::NetplayLog_Write("PALETTE", -1,
-            "Gameplay entry palette reapply: reload_count=%d local_slot=%d remote_palette=%s",
+            "Intro palette reapply: reload_count=%d local_slot=%d remote_palette=%s",
             reloadCount,
             s_localGameSlot,
             s_remoteMatchCustomEnabled ? "netplay" : "vanilla");
@@ -584,8 +585,11 @@ static void MaybeReapplyGameplayOverrides() {
         return;
     }
 
-    const bool gameplayActive = GameplayBridge_IsSessionActive() && GetGameMode() == MODE_MATCH;
-    if (!gameplayActive) {
+    const bool introWindowActive =
+        !GameplayBridge_IsSessionActive() &&
+        GetGameMode() == MODE_MATCH &&
+        MatchLifecycle_GetPhase() == MatchLifecyclePhase::IntroActive;
+    if (!introWindowActive) {
         return;
     }
 
@@ -593,7 +597,7 @@ static void MaybeReapplyGameplayOverrides() {
         return;
     }
 
-    s_gameplayReapplyIssued = RequestGameplayPaletteReapply("gameplay entry reapply");
+    s_gameplayReapplyIssued = RequestGameplayPaletteReapply("intro entry reapply");
 }
 
 static void ProcessMatchPaletteHotkeys() {
@@ -632,8 +636,8 @@ static void ProcessMatchPaletteHotkeys() {
                     ? "remote match switched to netplay palette"
                     : "remote match switched to captured vanilla palette");
 
-            SetStatus("Remote match palette: %s",
-                s_remoteMatchCustomEnabled ? "netplay" : "vanilla");
+            SetStatus("Opponent palette view: %s",
+                s_remoteMatchCustomEnabled ? "Synced" : "Original");
             LOG_INFO("[Palette] Remote match palette switched to %s via Tab hotkey",
                 s_remoteMatchCustomEnabled ? "NETPLAY" : "VANILLA");
             Rollback::NetplayLog_Write("PALETTE", -1,
@@ -844,7 +848,7 @@ static bool SendLocalConfig() {
         s_localSent = true;
         s_localDirty = false;
         s_lastSendAt = GetTickCount();
-        SetStatus("Palette epoch %u sent for P%d", s_localEpoch, s_localGameSlot + 1);
+            SetStatus("Sent a palette update for P%d", s_localGameSlot + 1);
         Rollback::NetplayLog_Write("PALETTE", -1,
             "Local palette send: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X data_sent=%d",
             s_localEpoch,
@@ -1051,10 +1055,7 @@ void NetplayPaletteRuntime_OnLockedMatchConfig(const LockedMatchConfig* config) 
     AdvanceStateRevision();
     s_localDirty = true;
 
-    SetStatus("Palette runtime armed: epoch=%u config=0x%08X local=P%d",
-        s_localEpoch,
-        s_configHash,
-        s_localGameSlot + 1);
+    SetStatus("Palette sync ready for P%d", s_localGameSlot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
         "Palette runtime armed: epoch=%u config=0x%08X local=P%d remote=P%d local_custom=%d",
         s_localEpoch,
@@ -1082,8 +1083,8 @@ void NetplayPaletteRuntime_OnRoundRestart() {
     }
 
     SetStatus(reloadCount > 0
-            ? "Reapplying palette overrides for round restart"
-            : "Round restart: no palette overrides to reapply");
+        ? "Refreshing match palettes for the new round"
+        : "No palette refresh was needed for the new round");
     Rollback::NetplayLog_Write("PALETTE", -1,
         "Round restart palette refresh: reload_count=%d local_slot=%d suppress=%d",
         reloadCount,
@@ -1109,8 +1110,8 @@ void NetplayPaletteRuntime_OnWinScreenEnter() {
     }
 
     SetStatus(reloadCount > 0
-            ? "Clearing palette overrides for win screen"
-            : "Win screen entered: palette overrides disabled");
+        ? "Clearing match palette previews for the win screen"
+        : "Palette previews are disabled on the win screen");
     Rollback::NetplayLog_Write("PALETTE", -1,
         "Win screen palette clear: reload_count=%d local_slot=%d remote_preview=%d",
         reloadCount,
@@ -1197,8 +1198,8 @@ void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
     }
 
     SetStatus(expectsData
-            ? "Remote palette data pending for P%d"
-            : "Remote palette config received for P%d",
+            ? "Waiting for palette data from P%d"
+            : "Received palette settings for P%d",
         payload->game_slot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
         "Remote palette config: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X expects_data=%d",
@@ -1272,7 +1273,7 @@ void NetplayPaletteRuntime_OnRemoteData(const PaletteDataPayload* payload) {
         RequestLiveReload(payload->game_slot, "remote palette updated");
     }
 
-    SetStatus("Remote custom palette ready for P%d", payload->game_slot + 1);
+    SetStatus("Custom palette ready for P%d", payload->game_slot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
         "Remote palette data accepted: epoch=%u config=0x%08X slot=P%d crc=0x%08X",
         payload->epoch,
@@ -1301,7 +1302,7 @@ void NetplayPaletteRuntime_OnRemoteAck(const PaletteAckPayload* payload) {
         ((!expectedData && payload->received_data == 0 && payload->payload_crc == 0) ||
          (expectedData && payload->received_data != 0 && payload->payload_crc == expectedCrc))) {
         s_remoteAcknowledged = true;
-        SetStatus("Palette epoch %u acknowledged by remote", s_localEpoch);
+        SetStatus("The other player confirmed the palette update");
         Rollback::NetplayLog_Write("PALETTE", -1,
             "Remote palette ack accepted: epoch=%u slot=P%d crc=0x%08X",
             payload->epoch,
@@ -1635,7 +1636,7 @@ void NetplayPaletteRuntime_OnAssetBankCaptured(uint8_t gameSlot,
         archivePath,
         patchPath,
         "Captured vanilla source palette",
-        "Captured vanilla source bank");
+        "Captured the original palette");
     LOG_INFO("[Palette] Vanilla palette bank captured slot=P%d char=%u base=%u crc=0x%08X assets=%u",
         gameSlot + 1,
         player.character_id,
@@ -1695,7 +1696,7 @@ void NetplayPaletteRuntime_OnLiveBankObserved(uint8_t gameSlot,
         archivePath,
         patchPath,
         "Observed live decoded palette",
-        "Observed live memory bank");
+        "Read the live palette");
     LOG_INFO("[Palette] Observed live bank slot=P%d char=%u base=%u archive=%s patch=%s assets=%u",
         gameSlot + 1,
         player.character_id,
@@ -1752,8 +1753,8 @@ void NetplayPaletteRuntime_OnLiveReloadComplete(uint8_t gameSlot, bool success, 
         gameSlot + 1,
         reason ? reason : "unspecified");
     SetStatus(success
-            ? "Live palette reload complete for P%d"
-            : "Live palette reload failed for P%d",
+            ? "Updated the match palette for P%d"
+            : "Couldn't update the match palette for P%d",
         gameSlot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
         "Live reload %s: slot=P%d reason=%s",

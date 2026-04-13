@@ -2,7 +2,9 @@
 
 #include "core/as2_constants.h"
 #include "net/netplay_palette_runtime.h"
+#include "net/spectator_playback.h"
 #include "patches/memory_utils.h"
+#include "replay/replay_runtime.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 #include "MinHook.h"
@@ -1064,7 +1066,20 @@ static bool ApplyOverridePatch(uint8_t gameSlot,
         patchPath);
 
     NetplayPaletteBank overrideBank{};
-    if (!NetplayPaletteRuntime_CopyAssetOverrideBank(gameSlot, &overrideBank) ||
+    const bool hasReplayOverride = Replay::ReplayRuntime_CopyPaletteOverrideBank(gameSlot, &overrideBank);
+    bool hasSpectatorOverride = false;
+    if (!hasReplayOverride) {
+        const int characterId = ResolveCharacterArchiveId(archivePath);
+        if (characterId >= 0) {
+            hasSpectatorOverride = SpectatorPlayback_CopyPaletteOverrideBank(gameSlot,
+                (uint8_t)characterId,
+                patchIndex,
+                &overrideBank);
+        }
+    }
+
+    if ((!hasReplayOverride && !hasSpectatorOverride &&
+         !NetplayPaletteRuntime_CopyAssetOverrideBank(gameSlot, &overrideBank)) ||
         !overrideBank.valid ||
         overrideBank.base_palette != patchIndex) {
         return true;

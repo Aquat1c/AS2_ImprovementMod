@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "net/spectator_manager.h"
+#include "net/session_manager.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
@@ -19,6 +20,15 @@ namespace {
 
 using namespace Net;
 
+#define SMGR_LOG(level, frame, fmt, ...) \
+    do { \
+        LOG_NETPLAY(level, fmt, ##__VA_ARGS__); \
+        Rollback::NetplayLog_WriteSpectator("SMGR", frame, fmt, ##__VA_ARGS__); \
+    } while (0)
+
+#define SMGR_TRACE(frame, fmt, ...) \
+    Rollback::NetplayLog_WriteSpectator("SMGR", frame, fmt, ##__VA_ARGS__)
+
 struct PeerState {
     ENetPeer* peer;
     bool handshake_complete;
@@ -30,7 +40,7 @@ struct PeerState {
     uint16_t advertised_listen_port;
     DWORD connected_at_ms;
     DWORD last_status_at_ms;
-    char nickname[24];
+    char nickname[64];
 };
 
 static bool s_initialized = false;
@@ -277,7 +287,7 @@ static void DestroyServer(const char* reason) {
     SetStatus("Spectator server offline%s%s",
         reason ? ": " : "",
         reason ? reason : "");
-    LOG_NETPLAY(LOG_INFO,
+    SMGR_LOG(LOG_INFO, -1,
         "[SpectatorMgr] Server destroyed reason=%s",
         reason && reason[0] ? reason : "unspecified");
 }
@@ -301,7 +311,7 @@ static bool EnsureServer() {
     if (!s_server) {
         s_boundListenPort = 0;
         SetStatus("Failed to bind spectator port %u", s_listenPort);
-        LOG_NETPLAY(LOG_WARNING,
+        SMGR_LOG(LOG_WARNING, -1,
             "[SpectatorMgr] Failed to create spectator host on port %u",
             s_listenPort);
         return false;
@@ -314,7 +324,7 @@ static bool EnsureServer() {
     } else {
         SetStatus("Spectator server listening on %u", s_boundListenPort);
     }
-    LOG_NETPLAY(LOG_INFO,
+    SMGR_LOG(LOG_INFO, -1,
         "[SpectatorMgr] Spectator server listening: requested_port=%u bound_port=%u fallback=%d ephemeral=%d",
         s_listenPort,
         s_boundListenPort,
@@ -344,7 +354,7 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
             sizeof(disconnect),
             true);
         enet_peer_disconnect_later(peer, 0);
-        LOG_NETPLAY(LOG_WARNING,
+        SMGR_LOG(LOG_WARNING, -1,
             "[SpectatorMgr] Reject peer=0x%p reason=protocol_mismatch",
             peer);
         return;
@@ -362,7 +372,7 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
             sizeof(disconnect),
             true);
         enet_peer_disconnect_later(peer, 0);
-        LOG_NETPLAY(LOG_INFO,
+        SMGR_LOG(LOG_INFO, -1,
             "[SpectatorMgr] Reject peer=0x%p reason=requested_match_not_active requested=0x%08X active=0x%08X",
             peer,
             payload->requested_match_id,
@@ -390,7 +400,7 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
             &redirect,
             sizeof(redirect),
             true);
-        LOG_NETPLAY(LOG_INFO,
+        SMGR_LOG(LOG_INFO, -1,
             "[SpectatorMgr] Redirect peer=0x%p endpoint=%s handshaken=%d",
             peer,
             redirectEndpoint,
@@ -409,7 +419,7 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
             &disconnect,
             sizeof(disconnect),
             true);
-        LOG_NETPLAY(LOG_INFO,
+        SMGR_LOG(LOG_INFO, -1,
             "[SpectatorMgr] Reject peer=0x%p reason=capacity_reached",
             peer);
         enet_peer_disconnect_later(peer, 0);
@@ -427,8 +437,11 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
     CopyText(state.nickname, sizeof(state.nickname), payload->nickname);
 
     Spectator::HelloAckPayload ack{};
+    SessionSnapshot session{};
+    Session_GetSnapshot(&session);
     ack.protocol_version = Spectator::PROTOCOL_VERSION;
     ack.server_listen_port = s_boundListenPort != 0 ? s_boundListenPort : s_listenPort;
+    ack.session_listen_port = session.local_listen_port;
     ack.match_id = s_activeMatchId;
     ack.match_ordinal = s_activeMatchOrdinal;
     ack.match_state = (s_activeMatchId != 0)
@@ -442,10 +455,10 @@ static void HandleHello(ENetPeer* peer, const Spectator::HelloPayload* payload) 
         sizeof(ack),
         true);
 
-    LOG_NETPLAY(LOG_INFO,
+    SMGR_LOG(LOG_INFO, -1,
         "[SpectatorMgr] Spectator admitted: peer=0x%p nick='%s' listen_port=%u match_id=0x%08X match_state=%u",
         peer,
-        state.nickname,
+        state.nickname[0] ? state.nickname : "?",
         state.advertised_listen_port,
         ack.match_id,
         ack.match_state);
@@ -467,10 +480,27 @@ static void HandleClientStatus(ENetPeer* peer, const Spectator::ClientStatusPayl
     }
 
     PeerState& state = it->second;
+    const int32_t previousPlayback = state.last_playback_rb_frame;
+    const bool previousFastForward = state.fast_forward_requested;
+    const bool previousHardSync = state.hard_sync_requested;
     state.last_playback_rb_frame = payload->playback_rb_frame;
     state.fast_forward_requested = (payload->flags & Spectator::CLIENT_STATUS_FLAG_FAST_FORWARD) != 0;
     state.hard_sync_requested = (payload->flags & Spectator::CLIENT_STATUS_FLAG_HARD_SYNC) != 0;
     state.last_status_at_ms = GetTickCount();
+
+    if (previousPlayback != state.last_playback_rb_frame ||
+        previousFastForward != state.fast_forward_requested ||
+        previousHardSync != state.hard_sync_requested) {
+        SMGR_TRACE(
+            state.last_playback_rb_frame,
+            "[SpectatorMgr] ClientStatus peer=0x%p nick='%s' playback=%d buffered=%u fast_forward=%d hard_sync=%d",
+            peer,
+            state.nickname[0] ? state.nickname : "?",
+            state.last_playback_rb_frame,
+            payload->buffered_frame_count,
+            state.fast_forward_requested ? 1 : 0,
+            state.hard_sync_requested ? 1 : 0);
+    }
 }
 
 static void HandleClientDisconnect(ENetPeer* peer, const Spectator::DisconnectPayload* payload) {
@@ -486,7 +516,7 @@ static void HandleClientDisconnect(ENetPeer* peer, const Spectator::DisconnectPa
     const char* message = (payload && payload->message[0])
         ? payload->message
         : "client disconnect";
-    LOG_NETPLAY(LOG_INFO,
+    SMGR_LOG(LOG_INFO, -1,
         "[SpectatorMgr] Peer requested disconnect peer=0x%p nick='%s' reason_code=%u message=%s",
         peer,
         it->second.nickname[0] ? it->second.nickname : "?",
@@ -512,17 +542,28 @@ void SpectatorManager_Init() {
     s_status[0] = '\0';
     SetStatus("Spectator server disabled.");
     s_initialized = true;
+    SMGR_TRACE(-1,
+        "[SpectatorMgr] Init listen_port=%u enabled=%d",
+        s_listenPort,
+        s_enabled ? 1 : 0);
 }
 
 void SpectatorManager_Shutdown() {
     if (!s_initialized) {
         return;
     }
+    SMGR_TRACE(-1, "[SpectatorMgr] Shutdown");
     DestroyServer("shutdown");
     s_initialized = false;
 }
 
 void SpectatorManager_SetEnabled(bool enabled) {
+    if (s_enabled != enabled) {
+        SMGR_TRACE(-1,
+            "[SpectatorMgr] Enabled %d -> %d",
+            s_enabled ? 1 : 0,
+            enabled ? 1 : 0);
+    }
     s_enabled = enabled;
     if (!enabled) {
         DestroyServer("disabled");
@@ -537,6 +578,10 @@ bool SpectatorManager_SetListenPort(uint16_t port) {
         return true;
     }
 
+    SMGR_TRACE(-1,
+        "[SpectatorMgr] Listen port %u -> %u",
+        s_listenPort,
+        port);
     s_listenPort = port;
     if (s_server) {
         DestroyServer("rebind");
@@ -546,6 +591,9 @@ bool SpectatorManager_SetListenPort(uint16_t port) {
 
 void SpectatorManager_SetRedirectEndpoint(const char* endpoint) {
     CopyText(s_redirectEndpoint, sizeof(s_redirectEndpoint), endpoint);
+    SMGR_TRACE(-1,
+        "[SpectatorMgr] Redirect endpoint set to %s",
+        s_redirectEndpoint[0] ? s_redirectEndpoint : "(unset)");
 }
 
 void SpectatorManager_BeginMatch(uint32_t match_id, uint32_t match_ordinal) {
@@ -555,7 +603,7 @@ void SpectatorManager_BeginMatch(uint32_t match_id, uint32_t match_ordinal) {
         entry.second.needs_full_sync = true;
         entry.second.next_rb_frame = 0;
     }
-    LOG_NETPLAY(LOG_INFO,
+    SMGR_LOG(LOG_INFO, -1,
         "[SpectatorMgr] Active match begin: match_id=0x%08X ordinal=%u peers=%d",
         match_id,
         match_ordinal,
@@ -570,7 +618,7 @@ void SpectatorManager_EndMatch(const char* reason) {
     } else {
         SetStatus("Spectator server idle.");
     }
-    LOG_NETPLAY(LOG_INFO,
+    SMGR_LOG(LOG_INFO, -1,
         "[SpectatorMgr] Active match end reason=%s",
         reason && reason[0] ? reason : "unspecified");
 }
@@ -602,7 +650,7 @@ void SpectatorManager_FrameUpdate() {
                 state.last_status_at_ms = 0;
                 state.nickname[0] = '\0';
                 s_peers[event.peer] = state;
-                LOG_NETPLAY(LOG_INFO,
+                SMGR_LOG(LOG_INFO, -1,
                     "[SpectatorMgr] Peer connected peer=0x%p raw_count=%zu",
                     event.peer,
                     s_peers.size());
@@ -615,6 +663,10 @@ void SpectatorManager_FrameUpdate() {
                 }
 
                 if (!Spectator::ValidatePacketSize(event.packet->data, event.packet->dataLength)) {
+                    SMGR_LOG(LOG_WARNING, -1,
+                        "[SpectatorMgr] Dropped invalid packet peer=0x%p bytes=%zu",
+                        event.peer,
+                        (size_t)event.packet->dataLength);
                     enet_packet_destroy(event.packet);
                     break;
                 }
@@ -633,6 +685,11 @@ void SpectatorManager_FrameUpdate() {
                     case Spectator::PacketType::ClientStatus:
                         if (payloadLen >= sizeof(Spectator::ClientStatusPayload)) {
                             HandleClientStatus(event.peer, static_cast<const Spectator::ClientStatusPayload*>(payload));
+                        } else {
+                            SMGR_LOG(LOG_WARNING, -1,
+                                "[SpectatorMgr] Short ClientStatus packet peer=0x%p bytes=%zu",
+                                event.peer,
+                                payloadLen);
                         }
                         break;
 
@@ -645,6 +702,11 @@ void SpectatorManager_FrameUpdate() {
                         break;
 
                     default:
+                        SMGR_TRACE(-1,
+                            "[SpectatorMgr] Ignored packet peer=0x%p type=%u bytes=%zu",
+                            event.peer,
+                            (unsigned)type,
+                            payloadLen);
                         break;
                 }
 
@@ -653,7 +715,7 @@ void SpectatorManager_FrameUpdate() {
             }
 
             case ENET_EVENT_TYPE_DISCONNECT:
-                LOG_NETPLAY(LOG_INFO,
+                SMGR_LOG(LOG_INFO, -1,
                     "[SpectatorMgr] Peer disconnected peer=0x%p",
                     event.peer);
                 s_peers.erase(event.peer);
@@ -726,6 +788,10 @@ bool SpectatorManager_ClearPeerFullSync(uintptr_t peer_id) {
         return false;
     }
     peer->needs_full_sync = false;
+    SMGR_TRACE(-1,
+        "[SpectatorMgr] Full sync cleared peer=0x%p next_rb_frame=%d",
+        reinterpret_cast<void*>(peer_id),
+        peer->next_rb_frame);
     return true;
 }
 
@@ -743,12 +809,20 @@ bool SpectatorManager_SendMatchState(uintptr_t peer_id, const Spectator::MatchSt
     if (!peer || !payload) {
         return false;
     }
-    return SendTyped(peer->peer,
+    const bool sent = SendTyped(peer->peer,
         Spectator::CHANNEL_CONTROL,
         Spectator::PacketType::MatchState,
         payload,
         sizeof(*payload),
         true);
+    if (!sent) {
+        SMGR_LOG(LOG_WARNING, -1,
+            "[SpectatorMgr] SendMatchState failed peer=0x%p match_id=0x%08X ordinal=%u",
+            reinterpret_cast<void*>(peer_id),
+            payload->match_id,
+            payload->match_ordinal);
+    }
+    return sent;
 }
 
 bool SpectatorManager_SendPaletteState(uintptr_t peer_id, const Spectator::PaletteStatePayload* payload) {
@@ -756,12 +830,21 @@ bool SpectatorManager_SendPaletteState(uintptr_t peer_id, const Spectator::Palet
     if (!peer || !payload) {
         return false;
     }
-    return SendTyped(peer->peer,
+    const bool sent = SendTyped(peer->peer,
         Spectator::CHANNEL_CONTROL,
         Spectator::PacketType::PaletteState,
         payload,
         sizeof(*payload),
         true);
+    if (!sent) {
+        SMGR_LOG(LOG_WARNING, -1,
+            "[SpectatorMgr] SendPaletteState failed peer=0x%p match_id=0x%08X ordinal=%u epoch=%u",
+            reinterpret_cast<void*>(peer_id),
+            payload->match_id,
+            payload->match_ordinal,
+            payload->palette_epoch);
+    }
+    return sent;
 }
 
 bool SpectatorManager_SendPaletteData(uintptr_t peer_id, const Spectator::PaletteDataPayload* payload) {
@@ -769,12 +852,22 @@ bool SpectatorManager_SendPaletteData(uintptr_t peer_id, const Spectator::Palett
     if (!peer || !payload) {
         return false;
     }
-    return SendTyped(peer->peer,
+    const bool sent = SendTyped(peer->peer,
         Spectator::CHANNEL_CONTROL,
         Spectator::PacketType::PaletteData,
         payload,
         sizeof(*payload),
         true);
+    if (!sent) {
+        SMGR_LOG(LOG_WARNING, -1,
+            "[SpectatorMgr] SendPaletteData failed peer=0x%p match_id=0x%08X ordinal=%u slot=%u epoch=%u",
+            reinterpret_cast<void*>(peer_id),
+            payload->match_id,
+            payload->match_ordinal,
+            payload->game_slot,
+            payload->palette_epoch);
+    }
+    return sent;
 }
 
 bool SpectatorManager_SendFrameBatch(uintptr_t peer_id, const Spectator::FrameBatchPayload* payload) {
@@ -789,47 +882,103 @@ bool SpectatorManager_SendFrameBatch(uintptr_t peer_id, const Spectator::FrameBa
             (sizeof(payload->records[0]) * payload->record_count);
     }
 
-    return SendTyped(peer->peer,
+    const bool sent = SendTyped(peer->peer,
         Spectator::CHANNEL_STREAM,
         Spectator::PacketType::FrameBatch,
         payload,
         payloadSize,
         true);
+    if (!sent) {
+        SMGR_LOG(LOG_WARNING, -1,
+            "[SpectatorMgr] SendFrameBatch failed peer=0x%p match_id=0x%08X ordinal=%u records=%u start=%d confirmed=%d live=%d",
+            reinterpret_cast<void*>(peer_id),
+            payload->match_id,
+            payload->match_ordinal,
+            payload->record_count,
+            payload->archive_start_rb_frame,
+            payload->confirmed_rb_frame,
+            payload->live_rb_frame);
+    }
+    return sent;
+}
+
+bool SpectatorManager_SendHeartbeat(uintptr_t peer_id, const Spectator::HeartbeatPayload* payload) {
+    PeerState* peer = FindPeer(peer_id);
+    if (!peer || !payload) {
+        return false;
+    }
+
+    const bool sent = SendTyped(peer->peer,
+        Spectator::CHANNEL_CONTROL,
+        Spectator::PacketType::Heartbeat,
+        payload,
+        sizeof(*payload),
+        true);
+    if (!sent) {
+        SMGR_LOG(LOG_WARNING, -1,
+            "[SpectatorMgr] SendHeartbeat failed peer=0x%p match_id=0x%08X ordinal=%u confirmed=%d live=%d state=%u",
+            reinterpret_cast<void*>(peer_id),
+            payload->match_id,
+            payload->match_ordinal,
+            payload->confirmed_rb_frame,
+            payload->live_rb_frame,
+            payload->match_state);
+    }
+    return sent;
 }
 
 void SpectatorManager_BroadcastHeartbeat(const Spectator::HeartbeatPayload* payload) {
     if (!payload) {
         return;
     }
+    int sentCount = 0;
     for (const auto& entry : s_peers) {
         if (!entry.second.handshake_complete) {
             continue;
         }
-        SendTyped(entry.first,
+        if (SendTyped(entry.first,
             Spectator::CHANNEL_CONTROL,
             Spectator::PacketType::Heartbeat,
             payload,
             sizeof(*payload),
-            true);
+            true)) {
+            sentCount++;
+        }
     }
+    SMGR_TRACE(payload->live_rb_frame,
+        "[SpectatorMgr] BroadcastHeartbeat peers=%d match_id=0x%08X ordinal=%u confirmed=%d live=%d state=%u",
+        sentCount,
+        payload->match_id,
+        payload->match_ordinal,
+        payload->confirmed_rb_frame,
+        payload->live_rb_frame,
+        payload->match_state);
 }
 
 void SpectatorManager_BroadcastDisconnect(const Spectator::DisconnectPayload* payload) {
     if (!payload) {
         return;
     }
+    int sentCount = 0;
     for (const auto& entry : s_peers) {
         if (!entry.second.handshake_complete) {
             continue;
         }
-        SendTyped(entry.first,
+        if (SendTyped(entry.first,
             Spectator::CHANNEL_CONTROL,
             Spectator::PacketType::Disconnect,
             payload,
             sizeof(*payload),
-            true);
+            true)) {
+            sentCount++;
+        }
         enet_peer_disconnect_later(entry.first, 0);
     }
+    SMGR_TRACE(-1,
+        "[SpectatorMgr] BroadcastDisconnect peers=%d reason_code=%u message=%s",
+        sentCount,
+        payload->reason_code,
+        payload->message[0] ? payload->message : "?");
 }
 
 void SpectatorManager_GetSnapshot(SpectatorManagerSnapshot* out) {

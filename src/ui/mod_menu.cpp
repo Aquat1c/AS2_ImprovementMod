@@ -24,7 +24,7 @@
 // Menu State
 // ============================================================================
 
-static bool g_menuOpen = true;
+static bool g_menuOpen = false;
 static int g_currentTab = 0;
 static bool g_showAdvanced = false;
 static float g_lastMenuWindowScale = -1.0f;
@@ -374,7 +374,7 @@ static void TabLog() {
 // ============================================================================
 
 void ModMenu_Init() {
-    g_menuOpen = true;
+    g_menuOpen = false;
     g_currentTab = 0;
     PaletteEditor_Init();
 }

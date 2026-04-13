@@ -75,6 +75,12 @@ struct MatchSelection {
     bool    use_custom;
 };
 
+struct ExternalCustomHint {
+    bool    valid;
+    uint8_t character_id;
+    uint8_t base_palette;
+};
+
 static CharSelSelectPlayer_t s_originalSelectPlayer = nullptr;
 static CharSelRenderHelper_t s_originalRenderHelper = nullptr;
 static RenderCreateColor_t s_createColor = reinterpret_cast<RenderCreateColor_t>(ADDR_RENDER_CREATE_COLOR);
@@ -91,6 +97,9 @@ static bool s_pendingCatalogReceived[2] = {};
 static uint16_t s_pendingCatalogMasks[2][256] = {};
 static FrontendSlotState s_slotState[2] = {};
 static MatchSelection s_matchSelection[2] = {};
+static ExternalCustomHint s_externalCustomHint[2] = {};
+
+static void RefreshSlotAfterCatalogChange(uint8_t gameSlot);
 
 static uint8_t ReadU8(uintptr_t address, uint8_t fallback = 0) {
     __try {
@@ -217,6 +226,7 @@ static void DeactivateFrontend() {
     memset(s_pendingCatalogMasks, 0, sizeof(s_pendingCatalogMasks));
     ResetFrontendSlotState(&s_slotState[0]);
     ResetFrontendSlotState(&s_slotState[1]);
+    memset(s_externalCustomHint, 0, sizeof(s_externalCustomHint));
 }
 
 static void BuildLocalCatalog(uint16_t* outMasks) {
@@ -359,7 +369,13 @@ static int BuildOptions(uint8_t gameSlot,
         ++count;
     }
 
-    const uint16_t customMask = s_catalogMasks[gameSlot][characterId];
+    uint16_t customMask = s_catalogMasks[gameSlot][characterId];
+    const ExternalCustomHint& externalHint = s_externalCustomHint[gameSlot];
+    if (externalHint.valid &&
+        externalHint.character_id == characterId &&
+        externalHint.base_palette < kVisibleVanillaPaletteCount) {
+        customMask |= (uint16_t)(1u << externalHint.base_palette);
+    }
     for (uint8_t basePalette = 0; basePalette < kVisibleVanillaPaletteCount && count < capacity; ++basePalette) {
         if ((customMask & (uint16_t)(1u << basePalette)) == 0) {
             continue;
@@ -907,6 +923,53 @@ void CharSelPaletteSelect_OnLocalCatalogChanged() {
     RefreshSlotAfterCatalogChange(1);
 }
 
+void CharSelPaletteSelect_ClearExternalCustomHints() {
+    bool changed = false;
+    for (uint8_t gameSlot = 0; gameSlot < 2; ++gameSlot) {
+        if (!s_externalCustomHint[gameSlot].valid) {
+            continue;
+        }
+
+        memset(&s_externalCustomHint[gameSlot], 0, sizeof(s_externalCustomHint[gameSlot]));
+        changed = true;
+        if (s_frontendActive) {
+            RefreshSlotAfterCatalogChange(gameSlot);
+        }
+    }
+
+    if (changed) {
+        Rollback::NetplayLog_Write("CHARPAL", -1, "Cleared external custom palette hints");
+    }
+}
+
+void CharSelPaletteSelect_SetExternalCustomHint(uint8_t gameSlot,
+                                                uint8_t characterId,
+                                                uint8_t basePalette,
+                                                bool available) {
+    if (gameSlot > 1) {
+        return;
+    }
+
+    ExternalCustomHint next{};
+    if (available && basePalette < kVisibleVanillaPaletteCount) {
+        next.valid = true;
+        next.character_id = characterId;
+        next.base_palette = basePalette;
+    }
+
+    ExternalCustomHint& current = s_externalCustomHint[gameSlot];
+    if (current.valid == next.valid &&
+        current.character_id == next.character_id &&
+        current.base_palette == next.base_palette) {
+        return;
+    }
+
+    current = next;
+    if (s_frontendActive) {
+        RefreshSlotAfterCatalogChange(gameSlot);
+    }
+}
+
 bool CharSelPaletteSelect_IsCatalogReady() {
     if (!s_frontendNetplay) {
         return true;
@@ -924,6 +987,17 @@ bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t gameSlot,
                                                bool useCustom) {
     if (gameSlot > 1 || !s_frontendActive || !IsSelectableCharacter(characterId)) {
         return false;
+    }
+
+    PaletteOption previousOption{};
+    bool hadPreviousOption = TryGetDisplayedOption(gameSlot, s_slotState[gameSlot], &previousOption);
+    if (!hadPreviousOption) {
+        const MatchSelection& previousSelection = s_matchSelection[gameSlot];
+        if (previousSelection.valid) {
+            previousOption.base_palette = previousSelection.base_palette;
+            previousOption.use_custom = previousSelection.use_custom;
+            hadPreviousOption = true;
+        }
     }
 
     PaletteOption options[kOptionCapacity] = {};
@@ -967,6 +1041,11 @@ bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t gameSlot,
     s_matchSelection[gameSlot].character_id = characterId;
     s_matchSelection[gameSlot].base_palette = option.base_palette;
     s_matchSelection[gameSlot].use_custom = option.use_custom;
+    MaybeRequestPreviewReload(gameSlot,
+        hadPreviousOption,
+        hadPreviousOption ? &previousOption : nullptr,
+        true,
+        &option);
     return true;
 }
 

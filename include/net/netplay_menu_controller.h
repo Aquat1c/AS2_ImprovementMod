@@ -60,6 +60,9 @@ bool ConsumesGameInput();
 /// Hide the menu immediately because an external launch path is taking over.
 void HideForLaunch(const char* reason);
 
+/// Reopen the custom menu after an external launch path unwinds.
+void ShowMenuAfterExternalLaunch(const char* reason);
+
 /// Get a read-only snapshot for UI rendering and diagnostics.
 void GetSnapshot(MenuSnapshot* out);
 

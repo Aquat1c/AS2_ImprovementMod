@@ -108,7 +108,7 @@ struct ConnectionStats {
 
 struct PeerInfo {
     bool     valid;
-    char     nickname[24];
+    char     nickname[64];
     uint32_t build_hash;
     uint16_t protocol_version;
     uint16_t listen_port;
@@ -168,7 +168,7 @@ inline void NatTraversalConfig_SetDefaults(NatTraversalConfig* cfg) {
 // ============================================================================
 
 struct SessionConfig {
-    char     nickname[24];
+    char     nickname[64];
     uint16_t listen_port;
     char     target_host[96];     // Join target host/IP
     uint16_t target_port;

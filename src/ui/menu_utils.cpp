@@ -15,10 +15,61 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 
 #pragma comment(lib, "winhttp.lib")
 
 namespace MenuUtils {
+
+static std::wstring Utf8ToWide(const char* text) {
+    if (!text || !text[0]) {
+        return {};
+    }
+
+    int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nullptr, 0);
+    UINT codePage = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    if (size <= 1) {
+        codePage = CP_ACP;
+        flags = 0;
+        size = MultiByteToWideChar(codePage, flags, text, -1, nullptr, 0);
+    }
+    if (size <= 1) {
+        return {};
+    }
+
+    std::wstring result(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(codePage, flags, text, -1, result.data(), size);
+    result.resize(static_cast<size_t>(size - 1));
+    return result;
+}
+
+static std::string WideToUtf8(const wchar_t* text) {
+    if (!text || !text[0]) {
+        return {};
+    }
+
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) {
+        return {};
+    }
+
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr);
+    result.resize(static_cast<size_t>(size - 1));
+    return result;
+}
+
+static void TrimClipboardText(char* text) {
+    if (!text) {
+        return;
+    }
+
+    size_t len = strlen(text);
+    while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r' || text[len - 1] == ' ')) {
+        text[--len] = '\0';
+    }
+}
 
 // ============================================================================
 // Internal state
@@ -212,12 +263,25 @@ bool CopyToClipboard(const char* text) {
     if (!text || !text[0]) return false;
     if (!OpenClipboard(NULL)) return false;
     EmptyClipboard();
-    size_t len = strlen(text) + 1;
+
+    const std::wstring wideText = Utf8ToWide(text);
+    if (wideText.empty()) {
+        CloseClipboard();
+        return false;
+    }
+
+    const size_t len = (wideText.size() + 1) * sizeof(wchar_t);
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
     if (hMem) {
-        char* p = (char*)GlobalLock(hMem);
-        if (p) { memcpy(p, text, len); GlobalUnlock(hMem); }
-        SetClipboardData(CF_TEXT, hMem);
+        wchar_t* p = static_cast<wchar_t*>(GlobalLock(hMem));
+        if (p) {
+            memcpy(p, wideText.c_str(), len);
+            GlobalUnlock(hMem);
+        }
+        if (!SetClipboardData(CF_UNICODETEXT, hMem)) {
+            GlobalFree(hMem);
+            hMem = NULL;
+        }
     }
     CloseClipboard();
     return hMem != NULL;
@@ -226,21 +290,41 @@ bool CopyToClipboard(const char* text) {
 bool PasteFromClipboard(char* dst, size_t cap) {
     if (!dst || cap == 0) return false;
     if (!OpenClipboard(NULL)) return false;
-    HANDLE hData = GetClipboardData(CF_TEXT);
     bool ok = false;
+
+    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
     if (hData) {
-        const char* p = (const char*)GlobalLock(hData);
+        const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(hData));
         if (p) {
-            strncpy_s(dst, cap, p, _TRUNCATE);
-            // Strip trailing whitespace
-            size_t len = strlen(dst);
-            while (len > 0 && (dst[len - 1] == '\n' || dst[len - 1] == '\r' ||
-                   dst[len - 1] == ' '))
-                dst[--len] = '\0';
-            ok = true;
+            const std::string utf8 = WideToUtf8(p);
+            if (!utf8.empty()) {
+                strncpy_s(dst, cap, utf8.c_str(), _TRUNCATE);
+                TrimClipboardText(dst);
+                ok = true;
+            }
             GlobalUnlock(hData);
         }
     }
+
+    if (!ok) {
+        hData = GetClipboardData(CF_TEXT);
+        if (hData) {
+            const char* p = static_cast<const char*>(GlobalLock(hData));
+            if (p) {
+                const std::wstring wideText = Utf8ToWide(p);
+                if (!wideText.empty()) {
+                    const std::string utf8 = WideToUtf8(wideText.c_str());
+                    if (!utf8.empty()) {
+                        strncpy_s(dst, cap, utf8.c_str(), _TRUNCATE);
+                        TrimClipboardText(dst);
+                        ok = true;
+                    }
+                }
+                GlobalUnlock(hData);
+            }
+        }
+    }
+
     CloseClipboard();
     return ok;
 }

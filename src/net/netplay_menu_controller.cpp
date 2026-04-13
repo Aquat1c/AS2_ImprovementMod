@@ -23,6 +23,7 @@
 #include "net/spectator_client.h"
 #include "net/spectator_playback.h"
 #include "net/netplay_palette_runtime.h"
+#include "rollback/netplay_log.h"
 #include "rollback/online_wiring.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
@@ -49,6 +50,12 @@ namespace {
 
 using namespace NetMenu;
 
+#define SPECTATE_MENU_LOG(level, tag, fmt, ...) \
+    do { \
+        LOG_NETPLAY(level, fmt, ##__VA_ARGS__); \
+        Rollback::NetplayLog_WriteSpectator(tag, -1, fmt, ##__VA_ARGS__); \
+    } while (0)
+
 constexpr int kFadeFrames = 25;
 
 static bool          s_initialized       = false;
@@ -61,11 +68,11 @@ static uint32_t      s_selectedIndex     = 0;
 static int           s_fadeFrames        = 0;
 static bool          s_captureInput      = false;
 static bool          s_waitForNeutral    = false;
-static char          s_status[128]       = "Waiting for network menu selection.";
+static char          s_status[128]       = "Choose an online option.";
 static char          s_lastError[128]    = "";
 static char          s_textEditBuffer[96] = "";
 static int           s_textCursorPos      = 0;   // Cursor position within text edit buffer
-static char          s_localNickname[24]  = "Player";
+static char          s_localNickname[64]  = "Player";
 static uint16_t      s_listenPort         = 10700;
 static char          s_remoteEndpoint[96] = "127.0.0.1:10700";
 static char          s_spectatorEndpoint[96] = "127.0.0.1:10701";
@@ -102,6 +109,21 @@ static uint32_t      s_lastLanSpectatorResultCount = 0;
 static bool          s_lastLanSpectatorDiscoveryActive = false;
 static char          s_lastLanSpectatorEndpoint[96] = "";
 
+enum class ActionPromptKind : uint8_t {
+    None = 0,
+    JoinAsSpectator,
+    JoinInsteadOfWaiting,
+};
+
+static ActionPromptKind s_actionPromptKind = ActionPromptKind::None;
+static uint32_t      s_actionPromptSelectedIndex = 0;
+static uint32_t      s_actionPromptOptionCount = 0;
+static char          s_actionPromptTitle[96] = "";
+static char          s_actionPromptBody[160] = "";
+static char          s_actionPromptOptions[3][32] = {};
+static char          s_actionPromptJoinEndpoint[96] = "";
+static bool          s_idleSpectatorPromptDeferred = false;
+
 // Config file path (relative to game directory)
 static const char*   kConfigFile          = "as2_netplay.cfg";
 static const char*   kAutoConnectFile     = "as2_autoconnect.cfg";
@@ -112,6 +134,21 @@ static char  s_cachedAutoConnectContent[4096] = {};
 static bool  s_cachedAutoConnectValid = false;
 
 static void TransitionTo(MenuState next, const char* why);
+static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg);
+static void ApplyNatSettingsToService(const char* reason);
+
+static const char* FriendlyConnectPreferenceLabel(Net::ConnectPreference pref) {
+    switch (pref) {
+        case Net::ConnectPreference::AutoDirectThenRelay: return "Automatic";
+        case Net::ConnectPreference::DirectOnly:          return "Direct Only";
+        case Net::ConnectPreference::RelayOnly:           return "Relay Only";
+        default:                                          return "Unknown";
+    }
+}
+
+static const char* EnabledStateLabel(bool enabled) {
+    return enabled ? "Enabled" : "Disabled";
+}
 
 enum class AutoConnectState : uint8_t {
     Disabled = 0,
@@ -130,7 +167,7 @@ struct AutoConnectConfig {
     bool     enabled;
     bool     valid;
     bool     isHost;
-    char     nickname[24];
+    char     nickname[64];
     uint16_t listenPort;
     char     targetIp[96];
     uint16_t targetPort;
@@ -354,7 +391,7 @@ static void ApplySpectatorSettingsToRuntime(const char* reason) {
     Net::SpectatorRuntime_SetListenPort(s_spectatorListenPort);
     Net::SpectatorClient_SetRelayConfig(s_spectatorsEnabled, s_spectatorListenPort);
 
-    LOG_NETPLAY(LOG_INFO,
+    SPECTATE_MENU_LOG(LOG_INFO, "SMENU",
         "[NetMenu] Applied spectator settings (%s): enabled=%d port=%u",
         reason ? reason : "unspecified",
         s_spectatorsEnabled ? 1 : 0,
@@ -407,6 +444,251 @@ static void TrimWhitespace(char* s) {
     if (start > 0) {
         memmove(s, s + start, len - start + 1);
     }
+}
+
+static bool IsUtf8ContinuationByte(unsigned char byte) {
+    return (byte & 0xC0) == 0x80;
+}
+
+static void AlignCursorToUtf8Boundary(const char* text, int* cursorPos) {
+    if (!text || !cursorPos) {
+        return;
+    }
+
+    const int len = (int)strlen(text);
+    if (*cursorPos < 0) {
+        *cursorPos = 0;
+    }
+    if (*cursorPos > len) {
+        *cursorPos = len;
+    }
+
+    while (*cursorPos > 0 && *cursorPos < len &&
+           IsUtf8ContinuationByte((unsigned char)text[*cursorPos])) {
+        --(*cursorPos);
+    }
+}
+
+static int PreviousUtf8Boundary(const char* text, int cursorPos) {
+    AlignCursorToUtf8Boundary(text, &cursorPos);
+    if (!text || cursorPos <= 0) {
+        return 0;
+    }
+
+    --cursorPos;
+    while (cursorPos > 0 && IsUtf8ContinuationByte((unsigned char)text[cursorPos])) {
+        --cursorPos;
+    }
+    return cursorPos;
+}
+
+static int NextUtf8Boundary(const char* text, int cursorPos) {
+    AlignCursorToUtf8Boundary(text, &cursorPos);
+    if (!text) {
+        return 0;
+    }
+
+    const int len = (int)strlen(text);
+    if (cursorPos >= len) {
+        return len;
+    }
+
+    ++cursorPos;
+    while (cursorPos < len && IsUtf8ContinuationByte((unsigned char)text[cursorPos])) {
+        ++cursorPos;
+    }
+    return cursorPos;
+}
+
+static bool IsEndpointField(TextEditField field) {
+    return field == TextEditField::RemoteEndpoint ||
+           field == TextEditField::SpectatorEndpoint ||
+           field == TextEditField::RelayEndpoint ||
+           field == TextEditField::StunEndpoint;
+}
+
+static bool IsWordSeparatorByte(unsigned char ch) {
+    return ch == ' ' || ch == '.' || ch == ':' || ch == '/' || ch == '\\' ||
+           ch == '[' || ch == ']' || ch == '-';
+}
+
+static int PreviousWordBoundary(const char* text, int cursorPos) {
+    AlignCursorToUtf8Boundary(text, &cursorPos);
+    while (cursorPos > 0) {
+        const int prev = PreviousUtf8Boundary(text, cursorPos);
+        const unsigned char ch = (unsigned char)text[prev];
+        cursorPos = prev;
+        if (!IsWordSeparatorByte(ch)) {
+            break;
+        }
+    }
+
+    while (cursorPos > 0) {
+        const int prev = PreviousUtf8Boundary(text, cursorPos);
+        const unsigned char ch = (unsigned char)text[prev];
+        if (IsWordSeparatorByte(ch)) {
+            break;
+        }
+        cursorPos = prev;
+    }
+    return cursorPos;
+}
+
+static int NextWordBoundary(const char* text, int cursorPos) {
+    AlignCursorToUtf8Boundary(text, &cursorPos);
+    const int len = (int)strlen(text);
+
+    while (cursorPos < len) {
+        const unsigned char ch = (unsigned char)text[cursorPos];
+        if (!IsWordSeparatorByte(ch)) {
+            break;
+        }
+        cursorPos = NextUtf8Boundary(text, cursorPos);
+    }
+
+    while (cursorPos < len) {
+        const unsigned char ch = (unsigned char)text[cursorPos];
+        if (IsWordSeparatorByte(ch)) {
+            break;
+        }
+        cursorPos = NextUtf8Boundary(text, cursorPos);
+    }
+
+    while (cursorPos < len) {
+        const unsigned char ch = (unsigned char)text[cursorPos];
+        if (!IsWordSeparatorByte(ch)) {
+            break;
+        }
+        cursorPos = NextUtf8Boundary(text, cursorPos);
+    }
+
+    return cursorPos;
+}
+
+static bool IsAllowedEndpointWideChar(wchar_t ch) {
+    return (ch >= L'0' && ch <= L'9') ||
+           (ch >= L'a' && ch <= L'z') ||
+           (ch >= L'A' && ch <= L'Z') ||
+           ch == L'.' || ch == L':' || ch == L'-' || ch == L'_' ||
+           ch == L'[' || ch == L']' || ch == L'/';
+}
+
+static bool NormalizeWideCharForField(TextEditField field, wchar_t* ch) {
+    if (!ch) {
+        return false;
+    }
+
+    if (*ch >= 0xD800 && *ch <= 0xDFFF) {
+        return false;
+    }
+
+    if (field == TextEditField::ListenPort || field == TextEditField::SpectatorPort) {
+        return *ch >= L'0' && *ch <= L'9';
+    }
+
+    if (IsEndpointField(field)) {
+        return IsAllowedEndpointWideChar(*ch);
+    }
+
+    if (*ch == L'\r' || *ch == L'\n' || *ch == L'\t') {
+        *ch = L' ';
+    }
+
+    return *ch >= 0x20 && *ch != 0x7F;
+}
+
+static int TranslateVirtualKeyToUnicode(int vk, wchar_t* outChars, int outCharCount) {
+    BYTE keyState[256] = {};
+    if (!outChars || outCharCount <= 0 || !GetKeyboardState(keyState)) {
+        return 0;
+    }
+
+    const UINT scanCode = MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
+    int translatedCount = ToUnicode(vk, scanCode, keyState, outChars, outCharCount, 0);
+    if (translatedCount < 0) {
+        wchar_t deadKeyBuffer[8] = {};
+        ToUnicode(vk, scanCode, keyState, deadKeyBuffer, (int)_countof(deadKeyBuffer), 0);
+        return 0;
+    }
+
+    return translatedCount;
+}
+
+static bool InsertUtf8AtCursor(char* buffer,
+                               size_t bufferCap,
+                               size_t maxEditLen,
+                               int* cursorPos,
+                               const char* utf8Text,
+                               size_t utf8Bytes) {
+    if (!buffer || bufferCap == 0 || !cursorPos || !utf8Text || utf8Bytes == 0) {
+        return false;
+    }
+
+    AlignCursorToUtf8Boundary(buffer, cursorPos);
+    const size_t len = strlen(buffer);
+    if (len + utf8Bytes > maxEditLen || len + utf8Bytes + 1 > bufferCap) {
+        return false;
+    }
+
+    memmove(buffer + *cursorPos + utf8Bytes,
+            buffer + *cursorPos,
+            len - (size_t)(*cursorPos) + 1);
+    memcpy(buffer + *cursorPos, utf8Text, utf8Bytes);
+    *cursorPos += (int)utf8Bytes;
+    return true;
+}
+
+static bool InsertWideTextAtCursor(TextEditField field,
+                                   size_t maxEditLen,
+                                   const wchar_t* wideText,
+                                   int wideCharCount) {
+    if (!wideText || wideCharCount <= 0) {
+        return false;
+    }
+
+    bool insertedAny = false;
+    for (int i = 0; i < wideCharCount; ++i) {
+        wchar_t ch = wideText[i];
+        if (!NormalizeWideCharForField(field, &ch)) {
+            continue;
+        }
+
+        char utf8[8] = {};
+        const int utf8Bytes = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, utf8, (int)sizeof(utf8), nullptr, nullptr);
+        if (utf8Bytes <= 0) {
+            continue;
+        }
+
+        if (!InsertUtf8AtCursor(s_textEditBuffer,
+                                sizeof(s_textEditBuffer),
+                                maxEditLen,
+                                &s_textCursorPos,
+                                utf8,
+                                (size_t)utf8Bytes)) {
+            break;
+        }
+
+        insertedAny = true;
+    }
+
+    return insertedAny;
+}
+
+static bool InsertClipboardTextAtCursor(TextEditField field, size_t maxEditLen, const char* utf8Text) {
+    if (!utf8Text || !utf8Text[0]) {
+        return false;
+    }
+
+    wchar_t wideBuffer[256] = {};
+    int wideCount = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Text, -1, wideBuffer, (int)_countof(wideBuffer));
+    if (wideCount <= 1) {
+        wideCount = MultiByteToWideChar(CP_ACP, 0, utf8Text, -1, wideBuffer, (int)_countof(wideBuffer));
+    }
+    if (wideCount <= 1) {
+        return false;
+    }
+
+    return InsertWideTextAtCursor(field, maxEditLen, wideBuffer, wideCount - 1);
 }
 
 template <typename... Args>
@@ -480,6 +762,22 @@ static bool ParseEndpoint(const char* str, char* outHost, size_t hostCap,
     return true;
 }
 
+static bool FormatEndpointText(const char* host,
+                               uint16_t port,
+                               char* outEndpoint,
+                               size_t outCap) {
+    if (!host || !host[0] || port == 0 || !outEndpoint || outCap == 0) {
+        return false;
+    }
+
+    if (strchr(host, ':')) {
+        _snprintf_s(outEndpoint, outCap, _TRUNCATE, "[%s]:%u", host, port);
+    } else {
+        _snprintf_s(outEndpoint, outCap, _TRUNCATE, "%s:%u", host, port);
+    }
+    return outEndpoint[0] != '\0';
+}
+
 static bool ContainsInsensitive(const char* haystack, const char* needle) {
     if (!haystack || !needle || !haystack[0] || !needle[0]) {
         return false;
@@ -531,7 +829,7 @@ static void ClearJoinSpectatorProbe(const char* reason) {
         s_joinSpectatorFailureReason[0] ||
         s_joinSpectatorProbeEndpoint[0] ||
         s_joinSpectatorFallbackEndpoint[0]) {
-        LOG_NETPLAY(LOG_INFO,
+        SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
             "[MENU] clear_join_spectator_probe reason=%s endpoint=%s",
             reason && reason[0] ? reason : "unspecified",
             s_joinSpectatorProbeEndpoint[0] ? s_joinSpectatorProbeEndpoint : "(unset)");
@@ -582,12 +880,7 @@ static bool BuildSpectatorEndpointFromBase(const char* baseEndpoint,
         return false;
     }
 
-    if (strchr(host, ':')) {
-        _snprintf_s(outEndpoint, outCap, _TRUNCATE, "[%s]:%u", host, (uint16_t)spectatorPort);
-    } else {
-        _snprintf_s(outEndpoint, outCap, _TRUNCATE, "%s:%u", host, (uint16_t)spectatorPort);
-    }
-    return true;
+    return FormatEndpointText(host, (uint16_t)spectatorPort, outEndpoint, outCap);
 }
 
 static bool BuildDerivedSpectatorEndpoint(char* outEndpoint, size_t outCap) {
@@ -645,6 +938,173 @@ static bool BuildAlternateDerivedSpectatorEndpoint(const char* primaryEndpoint,
     return false;
 }
 
+static bool BuildSessionEndpointFromSpectator(const Net::SpectatorClientSnapshot& spectator,
+                                             char* outEndpoint,
+                                             size_t outCap) {
+    if (!outEndpoint || outCap == 0 || spectator.session_listen_port == 0) {
+        return false;
+    }
+
+    char sourceEndpoint[96] = {};
+    CopyDisplayedSpectatorEndpoint(sourceEndpoint, sizeof(sourceEndpoint), &spectator);
+    if (!sourceEndpoint[0]) {
+        return false;
+    }
+
+    char host[96] = {};
+    uint16_t ignoredPort = 0;
+    if (!ParseEndpoint(sourceEndpoint, host, sizeof(host), &ignoredPort, true)) {
+        return false;
+    }
+
+    return FormatEndpointText(host,
+        spectator.session_listen_port,
+        outEndpoint,
+        outCap);
+}
+
+static bool IsActionPromptOpen() {
+    return s_actionPromptKind != ActionPromptKind::None;
+}
+
+static void ClearActionPrompt(const char* reason) {
+    if (!IsActionPromptOpen()) {
+        return;
+    }
+
+    SPECTATE_MENU_LOG(LOG_INFO, "SMENU",
+        "[MENU] clear_action_prompt kind=%u reason=%s",
+        (unsigned)s_actionPromptKind,
+        reason && reason[0] ? reason : "unspecified");
+    s_actionPromptKind = ActionPromptKind::None;
+    s_actionPromptSelectedIndex = 0;
+    s_actionPromptOptionCount = 0;
+    s_actionPromptTitle[0] = '\0';
+    s_actionPromptBody[0] = '\0';
+    memset(s_actionPromptOptions, 0, sizeof(s_actionPromptOptions));
+    s_actionPromptJoinEndpoint[0] = '\0';
+}
+
+static void OpenActionPrompt(ActionPromptKind kind,
+                             const char* title,
+                             const char* body,
+                             const char* option0,
+                             const char* option1,
+                             const char* option2,
+                             uint32_t optionCount,
+                             const char* joinEndpoint,
+                             const char* statusText) {
+    s_actionPromptKind = kind;
+    s_actionPromptSelectedIndex = 0;
+    s_actionPromptOptionCount = (std::min)(optionCount, 3u);
+    CopyText(s_actionPromptTitle, sizeof(s_actionPromptTitle), title);
+    CopyText(s_actionPromptBody, sizeof(s_actionPromptBody), body);
+    memset(s_actionPromptOptions, 0, sizeof(s_actionPromptOptions));
+    CopyText(s_actionPromptOptions[0], sizeof(s_actionPromptOptions[0]), option0 ? option0 : "");
+    CopyText(s_actionPromptOptions[1], sizeof(s_actionPromptOptions[1]), option1 ? option1 : "");
+    CopyText(s_actionPromptOptions[2], sizeof(s_actionPromptOptions[2]), option2 ? option2 : "");
+    CopyText(s_actionPromptJoinEndpoint, sizeof(s_actionPromptJoinEndpoint), joinEndpoint ? joinEndpoint : "");
+    if (statusText && statusText[0]) {
+        SetStatus("%s", statusText);
+    }
+    s_waitForNeutral = true;
+    InputSystem_ResetRepeatState(0);
+
+    SPECTATE_MENU_LOG(LOG_INFO, "SMENU",
+        "[MENU] open_action_prompt kind=%u title=%s options=%u join_endpoint=%s",
+        (unsigned)kind,
+        s_actionPromptTitle[0] ? s_actionPromptTitle : "(untitled)",
+        (unsigned)s_actionPromptOptionCount,
+        s_actionPromptJoinEndpoint[0] ? s_actionPromptJoinEndpoint : "(none)");
+}
+
+static void OpenJoinAsSpectatorPrompt(const Net::SpectatorClientSnapshot& spectator,
+                                      const char* activeEndpoint) {
+    char body[160] = {};
+    if (spectator.p1_name[0] || spectator.p2_name[0]) {
+        _snprintf_s(body, sizeof(body), _TRUNCATE,
+            "%s vs %s is already underway. Watch this match instead?",
+            spectator.p1_name[0] ? spectator.p1_name : "P1",
+            spectator.p2_name[0] ? spectator.p2_name : "P2");
+    } else if (activeEndpoint && activeEndpoint[0]) {
+        _snprintf_s(body, sizeof(body), _TRUNCATE,
+            "A match is already underway on %s. Watch it instead?",
+            activeEndpoint);
+    } else {
+        _snprintf_s(body, sizeof(body), _TRUNCATE,
+            "A match is already underway. Watch it instead?");
+    }
+
+    OpenActionPrompt(
+        ActionPromptKind::JoinAsSpectator,
+        "A match is already in progress.",
+        body,
+        "Watch Match",
+        "Back",
+        nullptr,
+        2,
+        nullptr,
+        "The host is already playing. Choose whether to watch or go back.");
+}
+
+static void OpenIdleSpectatorPrompt(const Net::SpectatorClientSnapshot& spectator,
+                                    const char* activeEndpoint) {
+    char joinEndpoint[96] = {};
+    BuildSessionEndpointFromSpectator(spectator, joinEndpoint, sizeof(joinEndpoint));
+
+    char body[160] = {};
+    if (joinEndpoint[0]) {
+        _snprintf_s(body, sizeof(body), _TRUNCATE,
+            "You can join the room now at %s, keep waiting here for a match to start, or cancel.",
+            joinEndpoint);
+    } else if (activeEndpoint && activeEndpoint[0]) {
+        _snprintf_s(body, sizeof(body), _TRUNCATE,
+            "%s is idle right now. You can join now, keep waiting here, or cancel.",
+            activeEndpoint);
+    } else {
+        _snprintf_s(body, sizeof(body), _TRUNCATE,
+            "You can join now, keep waiting here, or cancel.");
+    }
+
+    OpenActionPrompt(
+        ActionPromptKind::JoinInsteadOfWaiting,
+        "The host is not in a match yet.",
+        body,
+        "Join Match",
+        "Keep Waiting",
+        "Cancel",
+        3,
+        joinEndpoint,
+        "The watch server is idle. Choose whether to join, keep waiting, or cancel.");
+}
+
+static void MoveActionPromptSelection(int delta) {
+    if (!IsActionPromptOpen() || s_actionPromptOptionCount == 0) {
+        s_actionPromptSelectedIndex = 0;
+        return;
+    }
+
+    int next = (int)s_actionPromptSelectedIndex + delta;
+    while (next < 0) {
+        next += (int)s_actionPromptOptionCount;
+    }
+    while (next >= (int)s_actionPromptOptionCount) {
+        next -= (int)s_actionPromptOptionCount;
+    }
+    s_actionPromptSelectedIndex = (uint32_t)next;
+}
+
+static uint32_t GetActionPromptCancelIndex() {
+    switch (s_actionPromptKind) {
+        case ActionPromptKind::JoinAsSpectator:
+            return 1;
+        case ActionPromptKind::JoinInsteadOfWaiting:
+            return 2;
+        default:
+            return 0;
+    }
+}
+
 static bool TryJoinSpectatorProbeFallback(const char* failureReason) {
     if (!s_joinSpectatorProbeActive ||
         s_joinSpectatorFallbackAttempted ||
@@ -661,8 +1121,8 @@ static bool TryJoinSpectatorProbeFallback(const char* failureReason) {
     CopyText(s_joinSpectatorProbeEndpoint,
         sizeof(s_joinSpectatorProbeEndpoint),
         s_joinSpectatorFallbackEndpoint);
-    SetStatus("Primary spectator endpoint unavailable. Probing relay spectator stream...");
-    LOG_NETPLAY(LOG_WARNING,
+    SetStatus("The main watch address did not respond. Trying the relay watch address...");
+    SPECTATE_MENU_LOG(LOG_WARNING, "SPROBE",
         "[SPROBE] fallback endpoint=%s reason=%s",
         s_joinSpectatorFallbackEndpoint,
         failureReason && failureReason[0] ? failureReason : "unspecified");
@@ -694,13 +1154,85 @@ static void ResolveJoinSpectatorProbeFailureMessage(const Net::SpectatorClientSn
         return;
     }
 
-    strncpy_s(outMessage, outCap, "No active spectator stream found.", _TRUNCATE);
+    strncpy_s(outMessage, outCap, "No watch feed was available for that room.", _TRUNCATE);
+}
+
+static bool StartJoinSessionToEndpoint(const char* endpoint,
+                                       const char* statusText,
+                                       const char* transitionWhy) {
+    char targetHost[96] = {};
+    uint16_t targetPort = 0;
+    if (!ParseEndpoint(endpoint, targetHost, sizeof(targetHost), &targetPort, s_allowIPv6Endpoint)) {
+        SetStatus("Enter the host address as host:port or [ipv6]:port.");
+        return false;
+    }
+
+    Net::SessionConfig cfg{};
+    Net::SessionConfig_SetDefaults(&cfg);
+    cfg.listen_port = s_listenPort;
+    strncpy_s(cfg.target_host, sizeof(cfg.target_host), targetHost, _TRUNCATE);
+    cfg.target_port = targetPort;
+    cfg.connect_preference = s_connectPreference;
+    strncpy_s(cfg.nickname, sizeof(cfg.nickname), s_localNickname, _TRUNCATE);
+
+    Net::NatRuntimeConfig natCfg{};
+    if (!BuildNatRuntimeConfig(&natCfg)) {
+        SetStatus("Connection settings are invalid.");
+        return false;
+    }
+
+    cfg.nat.enable_upnp = natCfg.enable_upnp;
+    cfg.nat.enable_stun = natCfg.enable_stun;
+    cfg.nat.enable_hole_punch = natCfg.enable_hole_punch;
+    cfg.nat.enable_turn = natCfg.enable_turn;
+    cfg.nat.enable_pcp_fallback = natCfg.enable_pcp_fallback;
+    cfg.nat.allow_ipv6_endpoint = natCfg.allow_ipv6_endpoint;
+    cfg.nat.prefer_portforwarded_direct = natCfg.prefer_portforwarded_direct;
+    strncpy_s(cfg.nat.stun_host, sizeof(cfg.nat.stun_host), natCfg.stun_host, _TRUNCATE);
+    cfg.nat.stun_port = natCfg.stun_port;
+    strncpy_s(cfg.nat.turn_host, sizeof(cfg.nat.turn_host), natCfg.turn_host, _TRUNCATE);
+    cfg.nat.turn_port = natCfg.turn_port;
+    strncpy_s(cfg.nat.turn_username, sizeof(cfg.nat.turn_username), natCfg.turn_username, _TRUNCATE);
+    strncpy_s(cfg.nat.turn_password, sizeof(cfg.nat.turn_password), natCfg.turn_password, _TRUNCATE);
+    cfg.nat.gather_timeout_ms = natCfg.gather_timeout_ms;
+    cfg.nat.connect_timeout_ms = natCfg.connect_timeout_ms;
+    cfg.nat.mapping_timeout_ms = natCfg.mapping_timeout_ms;
+    cfg.nat.traversal_log_verbosity = natCfg.traversal_log_verbosity;
+
+    if (s_relayEndpoint[0]) {
+        char relayHost[96] = {};
+        uint16_t relayPort = 0;
+        if (!ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
+            SetStatus("The relay server address is invalid.");
+            return false;
+        }
+        strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
+        cfg.nat.relay_port = relayPort;
+    }
+
+    ApplyDelaySettingsToPolicy("join start");
+    ApplyNatSettingsToService("join start");
+    CopyText(s_remoteEndpoint, sizeof(s_remoteEndpoint), endpoint);
+
+    if (!Net::Session_StartJoin(&cfg)) {
+        SetStatus("Couldn't start joining the room.");
+        return false;
+    }
+
+    s_activeBranch = RootBranch::DirectPlay;
+    s_selectedIndex = 0;
+    ClearError();
+    SetStatus("%s", statusText && statusText[0] ? statusText : "Connecting to host...");
+    TransitionTo(MenuState::Connecting, transitionWhy ? transitionWhy : "join started");
+    return true;
 }
 
 static void CancelSpectatorConnectionAndReturn(const char* disconnectReason,
                                                const char* statusText,
                                                const char* transitionWhy) {
+    ClearActionPrompt("cancel_spectator_connection");
     ClearJoinSpectatorProbe("user_cancel");
+    s_idleSpectatorPromptDeferred = false;
     Net::SpectatorClient_Disconnect(disconnectReason ? disconnectReason : "spectator canceled");
     s_selectedIndex = 0;
     if (statusText && statusText[0]) {
@@ -715,11 +1247,11 @@ static bool BeginJoinSpectatorProbe(const char* sessionError) {
         return false;
     }
 
-    LOG_NETPLAY(LOG_WARNING,
+    SPECTATE_MENU_LOG(LOG_WARNING, "SPROBE",
         "[JOIN] gameplay_join_failed_pre_session target=%s reason=%s",
         s_remoteEndpoint,
         sessionError && sessionError[0] ? sessionError : "busy_or_pre_session_fail");
-    LOG_NETPLAY(LOG_INFO,
+    SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
         "[JOIN] probing_spectator_endpoint derived=%s",
         derivedEndpoint);
 
@@ -751,8 +1283,8 @@ static bool BeginJoinSpectatorProbe(const char* sessionError) {
     s_activeBranch = RootBranch::Spectate;
     s_selectedIndex = 0;
     ClearError();
-    SetStatus("Join target may already be in-match. Probing spectator stream...");
-    LOG_NETPLAY(LOG_INFO,
+    SetStatus("The host may already be playing. Checking whether a live watch feed is available...");
+    SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
         "[MENU] begin_join_spectator_probe endpoint=%s",
         s_joinSpectatorProbeEndpoint);
     TransitionTo(MenuState::SpectatorConnecting, "join spectator probe");
@@ -780,7 +1312,7 @@ static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg) {
         char stunHost[96] = {};
         uint16_t stunPort = 0;
         if (!ParseEndpoint(s_stunEndpoint, stunHost, sizeof(stunHost), &stunPort, true)) {
-            SetStatus("Invalid STUN server endpoint.");
+            SetStatus("The STUN server address is invalid.");
             return false;
         }
         strncpy_s(cfg.stun_host, sizeof(cfg.stun_host), stunHost, _TRUNCATE);
@@ -794,7 +1326,7 @@ static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg) {
         char turnHost[96] = {};
         uint16_t turnPort = 0;
         if (!ParseEndpoint(s_turnEndpoint, turnHost, sizeof(turnHost), &turnPort, true)) {
-            SetStatus("Invalid TURN server endpoint.");
+            SetStatus("The TURN server address is invalid.");
             return false;
         }
         strncpy_s(cfg.turn_host, sizeof(cfg.turn_host), turnHost, _TRUNCATE);
@@ -1429,7 +1961,9 @@ static void ResetMenuInputState() {
 
 static void OpenMenu() {
     ModeOwnership::EnterCustomMenuContext();
+    ClearActionPrompt("open_menu");
     ClearJoinSpectatorProbe("open_menu");
+    s_idleSpectatorPromptDeferred = false;
     s_activeBranch = RootBranch::DirectPlay;
     s_settingsCategory = SettingsCategory::Identity;
     s_phase = MenuPhase::Opening;
@@ -1437,7 +1971,7 @@ static void OpenMenu() {
     s_captureInput = true;
     ResetMenuInputState();
     ClearError();
-    SetStatus("Opening custom netplay menu.");
+    SetStatus("Opening the online menu.");
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Opening custom netplay menu");
     TransitionTo(MenuState::MenuRoot, "Network selected");
 }
@@ -1446,14 +1980,16 @@ static void FinishClose() {
     if (s_joinSpectatorProbeActive) {
         Net::SpectatorClient_Disconnect("menu close cleared join spectator probe");
     }
+    ClearActionPrompt("finish_close");
     ClearJoinSpectatorProbe("finish_close");
+    s_idleSpectatorPromptDeferred = false;
     s_phase = MenuPhase::Hidden;
     s_fadeFrames = 0;
     s_captureInput = false;
     ClearTextEditState();
     s_waitForNeutral = true;
     s_selectedIndex = 0;
-    SetStatus("Waiting for network menu selection.");
+    SetStatus("Choose an online option.");
     TransitionTo(MenuState::Inactive, "menu closed");
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Custom netplay menu closed");
     InputSystem_ResetRepeatState(0);
@@ -1462,7 +1998,7 @@ static void FinishClose() {
 static void BeginClose(const char* why) {
     if (!MenuVisible() || s_phase == MenuPhase::Closing) return;
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Closing custom menu (%s)", why ? why : "?");
-    SetStatus("Closing custom netplay menu.");
+    SetStatus("Closing the online menu.");
     s_phase = MenuPhase::Closing;
     s_waitForNeutral = true;
     ClearTextEditState();
@@ -1476,7 +2012,9 @@ static void OpenDisconnectError(const char* why) {
     uint32_t currentMode = GetGameMode();
     LOG_NETPLAY(LOG_WARNING, "[NetMenu] OpenDisconnectError: reason='%s' mode=%u", why ? why : "?", currentMode);
     Net::SpectatorClient_Disconnect("disconnect error");
+    ClearActionPrompt("disconnect_error");
     ClearJoinSpectatorProbe("disconnect_error");
+    s_idleSpectatorPromptDeferred = false;
 
     // Notify match lifecycle layer of disconnect
     if (Net::MatchLifecycle_IsMatchOwned()) {
@@ -1567,6 +2105,23 @@ static void SyncSessionState() {
             break;
         case Net::SessionState::Failed:
             if (s_state != MenuState::DisconnectError) {
+                // If we're sitting at an idle menu screen (not actively in a
+                // connection flow), silently clear the stale failed session
+                // instead of showing a disconnect error the user never asked for.
+                const bool inConnectionFlow =
+                    s_state == MenuState::Connecting ||
+                    s_state == MenuState::Handshake ||
+                    s_state == MenuState::ConnectedSession ||
+                    s_state == MenuState::CharSelTransition ||
+                    s_state == MenuState::PostMatch ||
+                    s_state == MenuState::SpectatorConnecting ||
+                    s_state == MenuState::SpectatorConnected;
+                if (!inConnectionFlow) {
+                    LOG_NETPLAY(LOG_INFO, "[NetMenu] Silently clearing stale failed session (menu state=%d, reason='%s')",
+                        (int)s_state, snap.error_text[0] ? snap.error_text : "?");
+                    Net::Session_Cancel();
+                    break;
+                }
                 const bool isJoinConnectFailure =
                     snap.role == Net::SessionRole::Join &&
                     (s_state == MenuState::Connecting || s_state == MenuState::Handshake) &&
@@ -1590,6 +2145,7 @@ static void SyncSessionState() {
 
 static void HideMenuForLaunch(const char* why) {
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Hiding menu for launch (%s)", why ? why : "?");
+    ClearActionPrompt("hide_for_launch");
     s_phase = MenuPhase::Hidden;
     s_fadeFrames = 0;
     s_captureInput = false;
@@ -1742,7 +2298,15 @@ static int ItemCount(MenuState st) {
         case MenuState::SpectateEntry:       return 4; // Connect, Discover LAN, Endpoint, Back
         case MenuState::SpectatorConnecting: return 1; // Cancel
         case MenuState::SpectatorConnected:  return 1; // Disconnect
-        case MenuState::SettingsEntry:       return 16; // Expanded network/spectator/palette settings
+        case MenuState::SettingsCategoryMenu: return 4; // Player, Network, Watch, Back
+        case MenuState::SettingsEntry: {
+            switch (s_settingsCategory) {
+                case SettingsCategory::Identity:     return 5; // Name, Delay, Rollback, Bias, Back
+                case SettingsCategory::Endpoint:     return 8; // Route, UPnP, STUN, Hole, IPv6, Relay, STUN srv, Back
+                case SettingsCategory::SessionMatch: return 5; // Watchers, Port, PalSync, PalPreview, Back
+                default: return 5;
+            }
+        }
         case MenuState::Connecting:          return 1; // Cancel
         case MenuState::Handshake:           return 1; // Cancel
         case MenuState::ConnectedSession:    return 4; // Rollback Frames, Input Delay, Launch CharSel, Disconnect
@@ -1750,6 +2314,42 @@ static int ItemCount(MenuState st) {
         case MenuState::PostMatch:           return 3; // Rematch, Return, Disconnect
         case MenuState::DisconnectError:     return 2; // OK, Close Menu
         default: return 0;
+    }
+}
+
+// Map (category, local index) -> original flat setting index (0-15)
+// Returns -1 for "Back" items or invalid
+static int SettingGlobalId() {
+    if (s_state != MenuState::SettingsEntry) return -1;
+    switch (s_settingsCategory) {
+        case SettingsCategory::Identity:
+            switch (s_selectedIndex) {
+                case 0: return 0;   // Display Name
+                case 1: return 1;   // Input Delay
+                case 2: return 2;   // Max Rollback
+                case 3: return 3;   // Stability Bias
+                default: return -1; // Back
+            }
+        case SettingsCategory::Endpoint:
+            switch (s_selectedIndex) {
+                case 0: return 4;   // Route
+                case 1: return 5;   // UPnP
+                case 2: return 6;   // STUN
+                case 3: return 7;   // UDP Hole Punch
+                case 4: return 8;   // Allow IPv6
+                case 5: return 9;   // Relay Server
+                case 6: return 10;  // STUN Server
+                default: return -1; // Back
+            }
+        case SettingsCategory::SessionMatch:
+            switch (s_selectedIndex) {
+                case 0: return 11;  // Watchers
+                case 1: return 12;  // Watch Port
+                case 2: return 13;  // Sync Palettes
+                case 3: return 14;  // Preview Remote
+                default: return -1; // Back
+            }
+        default: return -1;
     }
 }
 
@@ -1793,19 +2393,21 @@ static void FinishTextEdit(bool commit) {
         return;
     }
 
+    TrimWhitespace(s_textEditBuffer);
+
     // Apply committed edits
     if (field == TextEditField::Nickname && s_textEditBuffer[0]) {
         CopyText(s_localNickname, sizeof(s_localNickname), s_textEditBuffer);
         LOG_NETPLAY(LOG_INFO, "[NetMenu] Nickname set to: %s", s_localNickname);
-        SetStatus("Nickname: %s", s_localNickname);
+        SetStatus("Display name: %s", s_localNickname);
     } else if (field == TextEditField::ListenPort && s_textEditBuffer[0]) {
         int port = atoi(s_textEditBuffer);
         if (port > 0 && port <= 65535) {
             s_listenPort = (uint16_t)port;
             LOG_NETPLAY(LOG_INFO, "[NetMenu] Listen port set to: %u", s_listenPort);
-            SetStatus("Listen port: %u", s_listenPort);
+            SetStatus("Room port: %u", s_listenPort);
         } else {
-            SetStatus("Invalid port (1-65535).");
+            SetStatus("Enter a valid room port from 1 to 65535.");
         }
     } else if (field == TextEditField::RemoteEndpoint && s_textEditBuffer[0]) {
         char testHost[96] = {};
@@ -1813,58 +2415,58 @@ static void FinishTextEdit(bool commit) {
         if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, s_allowIPv6Endpoint)) {
             CopyText(s_remoteEndpoint, sizeof(s_remoteEndpoint), s_textEditBuffer);
             LOG_NETPLAY(LOG_INFO, "[NetMenu] Remote endpoint set to: %s", s_remoteEndpoint);
-            SetStatus("Remote: %s", s_remoteEndpoint);
+            SetStatus("Host address: %s", s_remoteEndpoint);
         } else {
-            SetStatus("Invalid endpoint (host:port or [ipv6]:port).");
+            SetStatus("Enter an address as host:port or [ipv6]:port.");
         }
     } else if (field == TextEditField::SpectatorEndpoint && s_textEditBuffer[0]) {
         char testHost[96] = {};
         uint16_t testPort = 0;
         if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
             CopyText(s_spectatorEndpoint, sizeof(s_spectatorEndpoint), s_textEditBuffer);
-            LOG_NETPLAY(LOG_INFO, "[NetMenu] Spectator endpoint set to: %s", s_spectatorEndpoint);
-            SetStatus("Spectator endpoint: %s", s_spectatorEndpoint);
+            SPECTATE_MENU_LOG(LOG_INFO, "SMENU", "[NetMenu] Spectator endpoint set to: %s", s_spectatorEndpoint);
+            SetStatus("Watch address: %s", s_spectatorEndpoint);
         } else {
-            SetStatus("Invalid spectator endpoint.");
+            SetStatus("Enter a valid watch address.");
         }
     } else if (field == TextEditField::SpectatorPort && s_textEditBuffer[0]) {
         int port = atoi(s_textEditBuffer);
         if (port > 0 && port <= 65535) {
             s_spectatorListenPort = (uint16_t)port;
             ApplySpectatorSettingsToRuntime("text edit commit");
-            LOG_NETPLAY(LOG_INFO, "[NetMenu] Spectator listen port set to: %u", s_spectatorListenPort);
-            SetStatus("Spectator port: %u", s_spectatorListenPort);
+            SPECTATE_MENU_LOG(LOG_INFO, "SMENU", "[NetMenu] Spectator listen port set to: %u", s_spectatorListenPort);
+            SetStatus("Watch port: %u", s_spectatorListenPort);
         } else {
-            SetStatus("Invalid spectator port (1-65535).");
+            SetStatus("Enter a valid watch port from 1 to 65535.");
         }
     } else if (field == TextEditField::RelayEndpoint) {
         if (!s_textEditBuffer[0]) {
             s_relayEndpoint[0] = '\0';
-            SetStatus("Relay endpoint cleared.");
+            SetStatus("Relay server cleared.");
         } else {
             char testHost[96] = {};
             uint16_t testPort = 0;
             if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
                 CopyText(s_relayEndpoint, sizeof(s_relayEndpoint), s_textEditBuffer);
                 LOG_NETPLAY(LOG_INFO, "[NetMenu] Relay endpoint set to: %s", s_relayEndpoint);
-                SetStatus("Relay: %s", s_relayEndpoint);
+                SetStatus("Relay server: %s", s_relayEndpoint);
             } else {
-                SetStatus("Invalid relay endpoint.");
+                SetStatus("Enter a valid relay server address.");
             }
         }
     } else if (field == TextEditField::StunEndpoint) {
         if (!s_textEditBuffer[0]) {
             CopyText(s_stunEndpoint, sizeof(s_stunEndpoint), "stun.l.google.com:19302");
-            SetStatus("STUN endpoint reset to default.");
+            SetStatus("STUN server reset to the default address.");
         } else {
             char testHost[96] = {};
             uint16_t testPort = 0;
             if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
                 CopyText(s_stunEndpoint, sizeof(s_stunEndpoint), s_textEditBuffer);
                 LOG_NETPLAY(LOG_INFO, "[NetMenu] STUN endpoint set to: %s", s_stunEndpoint);
-                SetStatus("STUN: %s", s_stunEndpoint);
+                SetStatus("STUN server: %s", s_stunEndpoint);
             } else {
-                SetStatus("Invalid STUN endpoint.");
+                SetStatus("Enter a valid STUN server address.");
             }
         }
     }
@@ -1881,13 +2483,10 @@ static void FinishTextEdit(bool commit) {
 }
 
 static void HandleTextEditing() {
-    bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     static bool prevDown[256] = {};
     static bool s_prevDownInitialized = false;
 
-    // On the first frame of text editing, snapshot current key states
-    // to avoid ghost presses from keys already held when editing began.
     if (!s_prevDownInitialized) {
         for (int vk = 0; vk < 256; ++vk) {
             prevDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
@@ -1896,58 +2495,31 @@ static void HandleTextEditing() {
         return;
     }
 
-    // Determine max editable length from the field type
     size_t maxEditLen = sizeof(s_textEditBuffer) - 1;
     if (s_textEditField == TextEditField::Nickname) {
-        maxEditLen = sizeof(s_localNickname) - 1; // 23 chars
+        maxEditLen = sizeof(s_localNickname) - 1;
     } else if (s_textEditField == TextEditField::ListenPort ||
                s_textEditField == TextEditField::SpectatorPort) {
-        maxEditLen = 5; // max "65535"
-    } else if (s_textEditField == TextEditField::RemoteEndpoint ||
-               s_textEditField == TextEditField::SpectatorEndpoint ||
-               s_textEditField == TextEditField::RelayEndpoint ||
-               s_textEditField == TextEditField::StunEndpoint) {
+        maxEditLen = 5;
+    } else if (IsEndpointField(s_textEditField)) {
         maxEditLen = sizeof(s_remoteEndpoint) - 1;
     }
 
-    // Clamp cursor to valid range
     int len = (int)strlen(s_textEditBuffer);
-    if (s_textCursorPos > len) s_textCursorPos = len;
-    if (s_textCursorPos < 0)  s_textCursorPos = 0;
+    AlignCursorToUtf8Boundary(s_textEditBuffer, &s_textCursorPos);
 
-    // Helper: insert a character at cursor position
-    auto insertCharAtCursor = [&](char ch) {
-        int curLen = (int)strlen(s_textEditBuffer);
-        if (curLen >= (int)maxEditLen) return;
-        // Shift everything from cursor position right by 1
-        for (int i = curLen; i >= s_textCursorPos; i--) {
-            s_textEditBuffer[i + 1] = s_textEditBuffer[i];
-        }
-        s_textEditBuffer[s_textCursorPos] = ch;
-        s_textCursorPos++;
-    };
-
-    // Helper: can we insert one more char?
-    auto canInsert = [&]() -> bool {
-        return (int)strlen(s_textEditBuffer) < (int)maxEditLen;
-    };
-
-    // Ctrl+V paste at cursor
     {
         bool vDown = (GetAsyncKeyState('V') & 0x8000) != 0;
         if (ctrlDown && vDown && !prevDown['V']) {
             char pasteBuffer[128] = {};
             if (MenuUtils::PasteFromClipboard(pasteBuffer, sizeof(pasteBuffer))) {
-                for (int i = 0; pasteBuffer[i] && canInsert(); i++) {
-                    insertCharAtCursor(pasteBuffer[i]);
-                }
+                InsertClipboardTextAtCursor(s_textEditField, maxEditLen, pasteBuffer);
             }
             prevDown['V'] = true;
             return;
         }
     }
 
-    // Ctrl+A select all (clear buffer)
     {
         bool aDown = (GetAsyncKeyState('A') & 0x8000) != 0;
         if (ctrlDown && aDown && !prevDown['A']) {
@@ -1963,7 +2535,6 @@ static void HandleTextEditing() {
         if (down && !prevDown[vk]) {
             len = (int)strlen(s_textEditBuffer);
 
-            // Confirm / Cancel
             if (vk == VK_RETURN) {
                 s_prevDownInitialized = false;
                 FinishTextEdit(true);
@@ -1974,33 +2545,17 @@ static void HandleTextEditing() {
                 return;
             }
 
-            // Cursor movement: Left/Right
             else if (vk == VK_LEFT) {
-                if (ctrlDown) {
-                    // Ctrl+Left: jump to previous word boundary
-                    while (s_textCursorPos > 0 && s_textEditBuffer[s_textCursorPos - 1] == ' ')
-                        s_textCursorPos--;
-                    while (s_textCursorPos > 0 && s_textEditBuffer[s_textCursorPos - 1] != ' '
-                           && s_textEditBuffer[s_textCursorPos - 1] != '.' && s_textEditBuffer[s_textCursorPos - 1] != ':')
-                        s_textCursorPos--;
-                } else {
-                    if (s_textCursorPos > 0) s_textCursorPos--;
-                }
+                s_textCursorPos = ctrlDown
+                    ? PreviousWordBoundary(s_textEditBuffer, s_textCursorPos)
+                    : PreviousUtf8Boundary(s_textEditBuffer, s_textCursorPos);
             }
             else if (vk == VK_RIGHT) {
-                if (ctrlDown) {
-                    // Ctrl+Right: jump to next word boundary
-                    while (s_textCursorPos < len && s_textEditBuffer[s_textCursorPos] != ' '
-                           && s_textEditBuffer[s_textCursorPos] != '.' && s_textEditBuffer[s_textCursorPos] != ':')
-                        s_textCursorPos++;
-                    while (s_textCursorPos < len && s_textEditBuffer[s_textCursorPos] == ' ')
-                        s_textCursorPos++;
-                } else {
-                    if (s_textCursorPos < len) s_textCursorPos++;
-                }
+                s_textCursorPos = ctrlDown
+                    ? NextWordBoundary(s_textEditBuffer, s_textCursorPos)
+                    : NextUtf8Boundary(s_textEditBuffer, s_textCursorPos);
             }
 
-            // Home / End
             else if (vk == VK_HOME) {
                 s_textCursorPos = 0;
             }
@@ -2008,76 +2563,41 @@ static void HandleTextEditing() {
                 s_textCursorPos = len;
             }
 
-            // Backspace: delete char before cursor
             else if (vk == VK_BACK) {
                 if (ctrlDown) {
-                    // Ctrl+Backspace: delete from cursor to start
                     memmove(s_textEditBuffer, s_textEditBuffer + s_textCursorPos, len - s_textCursorPos + 1);
                     s_textCursorPos = 0;
                 } else if (s_textCursorPos > 0) {
-                    memmove(s_textEditBuffer + s_textCursorPos - 1,
+                    const int eraseFrom = PreviousUtf8Boundary(s_textEditBuffer, s_textCursorPos);
+                    memmove(s_textEditBuffer + eraseFrom,
                             s_textEditBuffer + s_textCursorPos,
                             len - s_textCursorPos + 1);
-                    s_textCursorPos--;
+                    s_textCursorPos = eraseFrom;
                 }
             }
 
-            // Delete: delete char at cursor
             else if (vk == VK_DELETE) {
                 if (ctrlDown) {
-                    // Ctrl+Delete: delete from cursor to end
                     s_textEditBuffer[s_textCursorPos] = '\0';
                 } else if (s_textCursorPos < len) {
+                    const int eraseTo = NextUtf8Boundary(s_textEditBuffer, s_textCursorPos);
                     memmove(s_textEditBuffer + s_textCursorPos,
-                            s_textEditBuffer + s_textCursorPos + 1,
-                            len - s_textCursorPos);
+                            s_textEditBuffer + eraseTo,
+                            len - eraseTo + 1);
                 }
             }
 
-            // Numbers 0-9
-            else if (vk >= '0' && vk <= '9' && canInsert()) {
-                insertCharAtCursor((char)vk);
-            }
-            else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9 && canInsert()) {
-                insertCharAtCursor((char)('0' + (vk - VK_NUMPAD0)));
+            else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+                const wchar_t digit = (wchar_t)(L'0' + (vk - VK_NUMPAD0));
+                InsertWideTextAtCursor(s_textEditField, maxEditLen, &digit, 1);
             }
 
-            // Letters A-Z (skip if Ctrl is held — those are shortcuts)
-            else if (vk >= 'A' && vk <= 'Z' && !ctrlDown && canInsert()) {
-                insertCharAtCursor((char)(shiftDown ? vk : (vk + 32)));
-            }
-
-            // Space (nickname only)
-            else if (vk == VK_SPACE && s_textEditField == TextEditField::Nickname && canInsert()) {
-                insertCharAtCursor(' ');
-            }
-
-            // Period (for IP addresses)
-            else if ((vk == VK_OEM_PERIOD || vk == VK_DECIMAL) && canInsert()) {
-                insertCharAtCursor('.');
-            }
-
-            // Colon (Shift+; for ip:port)
-            else if (vk == VK_OEM_1 && canInsert()) {
-                insertCharAtCursor(shiftDown ? ':' : ';');
-            }
-
-            // Hyphen/Underscore (for nicknames)
-            else if (vk == VK_OEM_MINUS && canInsert()) {
-                insertCharAtCursor(shiftDown ? '_' : '-');
-            }
-
-            // Plus/Equals
-            else if (vk == VK_OEM_PLUS && canInsert()) {
-                insertCharAtCursor(shiftDown ? '+' : '=');
-            }
-
-            // [ and ] (required for bracketed IPv6 endpoint text)
-            else if (vk == VK_OEM_4 && canInsert()) {
-                insertCharAtCursor(shiftDown ? '{' : '[');
-            }
-            else if (vk == VK_OEM_6 && canInsert()) {
-                insertCharAtCursor(shiftDown ? '}' : ']');
+            else if (!ctrlDown) {
+                wchar_t translated[8] = {};
+                const int translatedCount = TranslateVirtualKeyToUnicode(vk, translated, (int)_countof(translated));
+                if (translatedCount > 0) {
+                    InsertWideTextAtCursor(s_textEditField, maxEditLen, translated, translatedCount);
+                }
             }
         }
         prevDown[vk] = down;
@@ -2106,7 +2626,7 @@ static void ApplyDiscoveredSpectatorEndpoint(const Net::SpectatorDiscoveryEntry&
     }
 
     CopyText(s_spectatorEndpoint, sizeof(s_spectatorEndpoint), entry.endpoint);
-    LOG_NETPLAY(LOG_INFO,
+    SPECTATE_MENU_LOG(LOG_INFO, "SMENU",
         "[NetMenu] Spectator LAN endpoint selected (%s): index=%u/%u endpoint=%s host=%s match_active=%d",
         reason ? reason : "unspecified",
         (unsigned)(index + 1),
@@ -2116,14 +2636,14 @@ static void ApplyDiscoveredSpectatorEndpoint(const Net::SpectatorDiscoveryEntry&
         entry.match_active ? 1 : 0);
 
     if (entry.match_active) {
-        SetStatus("LAN spectator %u/%u: %s (%s vs %s)",
+        SetStatus("LAN room %u/%u: %s (%s vs %s)",
             (unsigned)(index + 1),
             (unsigned)count,
             entry.endpoint,
             entry.p1_name[0] ? entry.p1_name : "P1",
             entry.p2_name[0] ? entry.p2_name : "P2");
     } else {
-        SetStatus("LAN spectator %u/%u: %s (no active match)",
+        SetStatus("LAN room %u/%u: %s (waiting for a match)",
             (unsigned)(index + 1),
             (unsigned)count,
             entry.endpoint);
@@ -2188,8 +2708,8 @@ static void SyncSpectatorClientState() {
     CopyDisplayedSpectatorEndpoint(activeEndpoint, sizeof(activeEndpoint), &spectator);
 
     if (spectator.state == Net::SpectatorClientState::Redirected && spectator.redirect_endpoint[0]) {
-        SetStatus("Following spectator redirect: %s", spectator.redirect_endpoint);
-        LOG_NETPLAY(LOG_INFO,
+        SetStatus("This watch address redirected you to %s.", spectator.redirect_endpoint);
+        SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
             "[SPROBE] redirect endpoint=%s",
             spectator.redirect_endpoint);
         if (!Net::SpectatorClient_StartConnect(spectator.redirect_endpoint)) {
@@ -2221,6 +2741,7 @@ static void SyncSpectatorClientState() {
         case Net::SpectatorClientState::Connecting:
         case Net::SpectatorClientState::Handshaking:
         case Net::SpectatorClientState::Redirected:
+            s_idleSpectatorPromptDeferred = false;
             if (s_state != MenuState::SpectatorConnecting) {
                 s_activeBranch = RootBranch::Spectate;
                 s_selectedIndex = 0;
@@ -2230,46 +2751,50 @@ static void SyncSpectatorClientState() {
 
         case Net::SpectatorClientState::ConnectedNoActiveMatch:
             if (s_joinSpectatorProbeActive) {
-                LOG_NETPLAY(LOG_INFO,
-                    "[SPROBE] active_match_available=0 connected_waiting=1 endpoint=%s",
-                    activeEndpoint[0] ? activeEndpoint : "(unset)");
-                LOG_NETPLAY(LOG_INFO,
-                    "[MENU] transition_to_spectate_waiting_from_probe endpoint=%s",
-                    activeEndpoint[0] ? activeEndpoint : "(unset)");
+                ClearActionPrompt("join_probe_idle_host");
                 ClearJoinSpectatorProbe("connected_waiting_for_match");
-                SetStatus("Connected to spectator host. Waiting for active match.");
+                OpenDisconnectError("The host is not currently in an active match.");
+                return;
             }
             if (s_state != MenuState::SpectatorConnected) {
                 s_activeBranch = RootBranch::Spectate;
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SpectatorConnected, "spectator waiting for active match");
             }
+            if (!s_idleSpectatorPromptDeferred && !IsActionPromptOpen()) {
+                OpenIdleSpectatorPrompt(spectator, activeEndpoint);
+            }
             break;
 
         case Net::SpectatorClientState::Streaming:
+            s_idleSpectatorPromptDeferred = false;
             if (s_joinSpectatorProbeActive) {
-                LOG_NETPLAY(LOG_INFO,
+                SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
                     "[SPROBE] active_match_available=1 switching_to_spectate=1 endpoint=%s",
                     activeEndpoint[0] ? activeEndpoint : "(unset)");
-                LOG_NETPLAY(LOG_INFO,
-                    "[MENU] transition_to_spectate_from_probe endpoint=%s",
-                    activeEndpoint[0] ? activeEndpoint : "(unset)");
-                ClearJoinSpectatorProbe("success");
-                SetStatus("Join target is already in-match. Switched to spectator stream.");
             }
             if (s_state != MenuState::SpectatorConnected) {
                 s_activeBranch = RootBranch::Spectate;
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SpectatorConnected, "spectator streaming");
             }
+            if (s_joinSpectatorProbeActive && s_actionPromptKind != ActionPromptKind::JoinAsSpectator) {
+                OpenJoinAsSpectatorPrompt(spectator, activeEndpoint);
+            } else if (IsActionPromptOpen() &&
+                       s_actionPromptKind == ActionPromptKind::JoinInsteadOfWaiting) {
+                ClearActionPrompt("active_match_started");
+                SetStatus("A match just started. You're now watching.");
+            }
             break;
 
         case Net::SpectatorClientState::Failed:
+            s_idleSpectatorPromptDeferred = false;
+            ClearActionPrompt("spectator_failed");
             if (s_joinSpectatorProbeActive) {
                 char errorBuf[128] = {};
                 ResolveJoinSpectatorProbeFailureMessage(spectator, errorBuf, sizeof(errorBuf));
                 if (IsSpectatorNoActiveMatchError(spectator.error)) {
-                    LOG_NETPLAY(LOG_INFO,
+                    SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
                         "[SPROBE] active_match_available=0 reason=no_active_match endpoint=%s",
                         activeEndpoint[0] ? activeEndpoint : "(unset)");
                     ClearJoinSpectatorProbe("no_active_match");
@@ -2277,12 +2802,12 @@ static void SyncSpectatorClientState() {
                     if (TryJoinSpectatorProbeFallback(spectator.error)) {
                         return;
                     }
-                    LOG_NETPLAY(LOG_WARNING,
+                    SPECTATE_MENU_LOG(LOG_WARNING, "SPROBE",
                         "[SPROBE] timeout endpoint=%s",
                         activeEndpoint[0] ? activeEndpoint : "(unset)");
                     ClearJoinSpectatorProbe("timeout");
                 } else {
-                    LOG_NETPLAY(LOG_WARNING,
+                    SPECTATE_MENU_LOG(LOG_WARNING, "SPROBE",
                         "[SPROBE] failure endpoint=%s reason=%s",
                         activeEndpoint[0] ? activeEndpoint : "(unset)",
                         errorBuf[0] ? errorBuf : "unknown");
@@ -2300,12 +2825,14 @@ static void SyncSpectatorClientState() {
             break;
 
         case Net::SpectatorClientState::Idle:
+            s_idleSpectatorPromptDeferred = false;
+            ClearActionPrompt("spectator_idle");
             if (s_state == MenuState::SpectatorConnecting ||
                 s_state == MenuState::SpectatorConnected) {
                 if (s_joinSpectatorProbeActive) {
                     char errorBuf[128] = {};
                     ResolveJoinSpectatorProbeFailureMessage(spectator, errorBuf, sizeof(errorBuf));
-                    LOG_NETPLAY(LOG_WARNING,
+                    SPECTATE_MENU_LOG(LOG_WARNING, "SPROBE",
                         "[SPROBE] failure endpoint=%s reason=%s",
                         activeEndpoint[0] ? activeEndpoint : "(unset)",
                         errorBuf[0] ? errorBuf : "idle_without_result");
@@ -2345,6 +2872,98 @@ static void HandleNavigationInput() {
         s_prevCDown = cDown;
     }
 
+    if (IsActionPromptOpen()) {
+        if (InputSystem_JustPressed(0, INPUT_UP) || InputSystem_JustPressed(0, INPUT_LEFT)) {
+            MoveActionPromptSelection(-1);
+        }
+        if (InputSystem_JustPressed(0, INPUT_DOWN) || InputSystem_JustPressed(0, INPUT_RIGHT)) {
+            MoveActionPromptSelection(1);
+        }
+        if (ConfirmPressed()) {
+            Net::SpectatorClientSnapshot spectator{};
+            Net::SpectatorClient_GetSnapshot(&spectator);
+            const uint32_t selected = s_actionPromptSelectedIndex;
+            if (s_actionPromptKind == ActionPromptKind::JoinAsSpectator) {
+                if (selected == 0) {
+                    ClearActionPrompt("accept_join_as_spectator");
+                    ClearJoinSpectatorProbe("accept_join_as_spectator");
+                    s_activeBranch = RootBranch::Spectate;
+                    s_selectedIndex = 0;
+                    SetStatus("Now watching the live match.");
+                    TransitionTo(MenuState::SpectatorConnected, "accept join as spectator");
+                } else {
+                    ClearActionPrompt("decline_join_as_spectator");
+                    ClearJoinSpectatorProbe("decline_join_as_spectator");
+                    Net::SpectatorClient_Disconnect("declined spectator redirect");
+                    s_activeBranch = RootBranch::DirectPlay;
+                    s_selectedIndex = 0;
+                    SetStatus("Returned to Join a Match.");
+                    TransitionTo(MenuState::JoinEntry, "decline join as spectator");
+                }
+            } else if (s_actionPromptKind == ActionPromptKind::JoinInsteadOfWaiting) {
+                if (selected == 0) {
+                    char joinEndpoint[96] = {};
+                    if (s_actionPromptJoinEndpoint[0]) {
+                        CopyText(joinEndpoint, sizeof(joinEndpoint), s_actionPromptJoinEndpoint);
+                    } else {
+                        BuildSessionEndpointFromSpectator(spectator, joinEndpoint, sizeof(joinEndpoint));
+                    }
+                    if (!joinEndpoint[0]) {
+                        SetStatus("This watch server did not advertise a room address to join.");
+                        return;
+                    }
+                    if (StartJoinSessionToEndpoint(
+                            joinEndpoint,
+                            "Connecting to host...",
+                            "join from idle spectator prompt")) {
+                        ClearActionPrompt("join_from_idle_spectator");
+                        s_idleSpectatorPromptDeferred = false;
+                        Net::SpectatorClient_Disconnect("join from spectator prompt");
+                    }
+                } else if (selected == 1) {
+                    ClearActionPrompt("wait_for_spectating");
+                    s_idleSpectatorPromptDeferred = true;
+                    s_activeBranch = RootBranch::Spectate;
+                    s_selectedIndex = 0;
+                    SetStatus("Waiting for the host to start a match.");
+                    TransitionTo(MenuState::SpectatorConnected, "wait for active spectator match");
+                } else {
+                    ClearActionPrompt("cancel_idle_spectator_prompt");
+                    s_idleSpectatorPromptDeferred = false;
+                    CancelSpectatorConnectionAndReturn(
+                        "spectator idle prompt canceled",
+                        "Returned to Watch a Match.",
+                        "cancel idle spectator prompt");
+                }
+            }
+            return;
+        }
+        if (BackPressed()) {
+            s_actionPromptSelectedIndex = GetActionPromptCancelIndex();
+            Net::SpectatorClientSnapshot spectator{};
+            Net::SpectatorClient_GetSnapshot(&spectator);
+            (void)spectator;
+            if (s_actionPromptKind == ActionPromptKind::JoinAsSpectator) {
+                ClearActionPrompt("back_decline_join_as_spectator");
+                ClearJoinSpectatorProbe("back_decline_join_as_spectator");
+                Net::SpectatorClient_Disconnect("declined spectator redirect");
+                s_activeBranch = RootBranch::DirectPlay;
+                s_selectedIndex = 0;
+                SetStatus("Returned to Join a Match.");
+                TransitionTo(MenuState::JoinEntry, "back decline join as spectator");
+            } else if (s_actionPromptKind == ActionPromptKind::JoinInsteadOfWaiting) {
+                ClearActionPrompt("back_cancel_idle_spectator_prompt");
+                s_idleSpectatorPromptDeferred = false;
+                CancelSpectatorConnectionAndReturn(
+                    "spectator idle prompt canceled",
+                    "Returned to Watch a Match.",
+                    "back cancel idle spectator prompt");
+            }
+            return;
+        }
+        return;
+    }
+
     // Repeat-aware Up/Down
     if (InputSystem_JustPressed(0, INPUT_UP))   MoveSelection(-1);
     if (InputSystem_JustPressed(0, INPUT_DOWN))  MoveSelection(1);
@@ -2357,9 +2976,10 @@ static void HandleNavigationInput() {
         bool natChanged = false;
         bool spectatorChanged = false;
         bool paletteChanged = false;
+        const int gid = SettingGlobalId();
 
         if (left || right) {
-            if (s_selectedIndex == 1) {
+            if (gid == 1) {
                 if (left && s_preferredDelay > 0) {
                     s_preferredDelay--;
                     changed = true;
@@ -2369,9 +2989,9 @@ static void HandleNavigationInput() {
                 }
                 if (changed) {
                     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
-                    SetStatus("Input delay: %d", s_preferredDelay);
+                    SetStatus("Input delay: %d frame%s", s_preferredDelay, s_preferredDelay == 1 ? "" : "s");
                 }
-            } else if (s_selectedIndex == 2) {
+            } else if (gid == 2) {
                 if (left && s_rollbackBudget > Net::ROLLBACK_BUDGET_MIN) {
                     s_rollbackBudget--;
                     changed = true;
@@ -2381,9 +3001,9 @@ static void HandleNavigationInput() {
                 }
                 if (changed) {
                     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
-                    SetStatus("Max rollback: %d", s_rollbackBudget);
+                    SetStatus("Max rollback: %d frame%s", s_rollbackBudget, s_rollbackBudget == 1 ? "" : "s");
                 }
-            } else if (s_selectedIndex == 3) {
+            } else if (gid == 3) {
                 if (left && s_rollbackTolerance > Net::ROLLBACK_TOLERANCE_MIN) {
                     s_rollbackTolerance--;
                     changed = true;
@@ -2393,9 +3013,9 @@ static void HandleNavigationInput() {
                 }
                 if (changed) {
                     Net::DelayPolicy_SetRollbackToleranceK(s_rollbackTolerance);
-                    SetStatus("Recommendation bias: %d", s_rollbackTolerance);
+                    SetStatus("Stability bias: %d", s_rollbackTolerance);
                 }
-            } else if (s_selectedIndex == 4) {
+            } else if (gid == 4) {
                 int mode = (int)s_connectPreference;
                 if (left) {
                     mode--;
@@ -2412,43 +3032,43 @@ static void HandleNavigationInput() {
                 }
                 if (changed) {
                     s_connectPreference = (Net::ConnectPreference)mode;
-                    SetStatus("Connection mode: %s", Net::ConnectPreferenceName(s_connectPreference));
+                    SetStatus("Connection route: %s", FriendlyConnectPreferenceLabel(s_connectPreference));
                 }
-            } else if (s_selectedIndex == 5) {
+            } else if (gid == 5) {
                 s_upnpEnabled = !s_upnpEnabled;
                 changed = true;
                 natChanged = true;
-                SetStatus("UPnP: %s", s_upnpEnabled ? "On" : "Off");
-            } else if (s_selectedIndex == 6) {
+                SetStatus("UPnP: %s", EnabledStateLabel(s_upnpEnabled));
+            } else if (gid == 6) {
                 s_stunEnabled = !s_stunEnabled;
                 changed = true;
                 natChanged = true;
-                SetStatus("STUN: %s", s_stunEnabled ? "On" : "Off");
-            } else if (s_selectedIndex == 7) {
+                SetStatus("STUN: %s", EnabledStateLabel(s_stunEnabled));
+            } else if (gid == 7) {
                 s_holePunchEnabled = !s_holePunchEnabled;
                 changed = true;
                 natChanged = true;
-                SetStatus("Hole punch: %s", s_holePunchEnabled ? "On" : "Off");
-            } else if (s_selectedIndex == 8) {
+                SetStatus("UDP hole punch: %s", EnabledStateLabel(s_holePunchEnabled));
+            } else if (gid == 8) {
                 s_allowIPv6Endpoint = !s_allowIPv6Endpoint;
                 changed = true;
                 natChanged = true;
-                SetStatus("IPv6 endpoint parse: %s", s_allowIPv6Endpoint ? "On" : "Off");
-            } else if (s_selectedIndex == 11) {
+                SetStatus("IPv6 addresses: %s", EnabledStateLabel(s_allowIPv6Endpoint));
+            } else if (gid == 11) {
                 s_spectatorsEnabled = !s_spectatorsEnabled;
                 changed = true;
                 spectatorChanged = true;
-                SetStatus("Spectator server: %s", s_spectatorsEnabled ? "On" : "Off");
-            } else if (s_selectedIndex == 13) {
+                SetStatus("Allow watchers: %s", EnabledStateLabel(s_spectatorsEnabled));
+            } else if (gid == 13) {
                 s_paletteSyncEnabled = !s_paletteSyncEnabled;
                 changed = true;
                 paletteChanged = true;
-                SetStatus("Palette sync: %s", s_paletteSyncEnabled ? "On" : "Off");
-            } else if (s_selectedIndex == 14) {
+                SetStatus("Palette sync: %s", EnabledStateLabel(s_paletteSyncEnabled));
+            } else if (gid == 14) {
                 s_remotePalettePreviewEnabled = !s_remotePalettePreviewEnabled;
                 changed = true;
                 paletteChanged = true;
-                SetStatus("Remote palette preview: %s", s_remotePalettePreviewEnabled ? "On" : "Off");
+                SetStatus("Remote palette preview: %s", EnabledStateLabel(s_remotePalettePreviewEnabled));
             }
 
             if (changed) {
@@ -2475,8 +3095,9 @@ static void HandleNavigationInput() {
                 if (cur > Net::ROLLBACK_BUDGET_MIN) {
                     s_rollbackBudget = cur - 1;
                     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
-                    SetStatus("Max rollback: %d  Rec: %d",
+                    SetStatus("Max rollback: %d frame%s | suggested %d",
                         s_rollbackBudget,
+                        s_rollbackBudget == 1 ? "" : "s",
                         Net::DelayPolicy_ComputeRecommendedMaxRollback());
                     SaveSettings();
                 }
@@ -2486,8 +3107,9 @@ static void HandleNavigationInput() {
                 if (cur < Net::ROLLBACK_BUDGET_MAX) {
                     s_rollbackBudget = cur + 1;
                     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
-                    SetStatus("Max rollback: %d  Rec: %d",
+                    SetStatus("Max rollback: %d frame%s | suggested %d",
                         s_rollbackBudget,
+                        s_rollbackBudget == 1 ? "" : "s",
                         Net::DelayPolicy_ComputeRecommendedMaxRollback());
                     SaveSettings();
                 }
@@ -2498,7 +3120,7 @@ static void HandleNavigationInput() {
                 if (s_preferredDelay > Net::DELAY_MIN) {
                     s_preferredDelay--;
                     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
-                    SetStatus("Input delay: %d", s_preferredDelay);
+                    SetStatus("Input delay: %d frame%s", s_preferredDelay, s_preferredDelay == 1 ? "" : "s");
                     SaveSettings();
                 }
             }
@@ -2506,7 +3128,7 @@ static void HandleNavigationInput() {
                 if (s_preferredDelay < Net::DELAY_MAX) {
                     s_preferredDelay++;
                     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
-                    SetStatus("Input delay: %d", s_preferredDelay);
+                    SetStatus("Input delay: %d frame%s", s_preferredDelay, s_preferredDelay == 1 ? "" : "s");
                     SaveSettings();
                 }
             }
@@ -2529,19 +3151,19 @@ static void ActivateCurrentSelection() {
             if (s_selectedIndex == 0) {
                 s_activeBranch = RootBranch::DirectPlay;
                 s_selectedIndex = 0;
-                SetStatus("Direct Play ready.");
+                SetStatus("Play Online selected.");
                 MenuUtils::BeginPublicIPFetch();
                 TransitionTo(MenuState::DirectConnectEntry, "open direct connect");
             } else if (s_selectedIndex == 1) {
                 s_activeBranch = RootBranch::Spectate;
                 s_selectedIndex = 0;
-                SetStatus("Spectate ready.");
+                SetStatus("Watch a Match selected.");
                 TransitionTo(MenuState::SpectateEntry, "open spectate");
             } else if (s_selectedIndex == 2) {
                 s_activeBranch = RootBranch::Settings;
                 s_selectedIndex = 0;
-                SetStatus("Settings opened.");
-                TransitionTo(MenuState::SettingsEntry, "open settings");
+                SetStatus("Connection settings opened.");
+                TransitionTo(MenuState::SettingsCategoryMenu, "open settings categories");
             } else {
                 BeginClose("close from root");
             }
@@ -2551,12 +3173,12 @@ static void ActivateCurrentSelection() {
             if (s_selectedIndex == 0) {
                 // Host
                 s_selectedIndex = 0;
-                SetStatus("Configure host settings.");
+                SetStatus("Set up your room.");
                 TransitionTo(MenuState::HostEntry, "open host config");
             } else if (s_selectedIndex == 1) {
                 // Join
                 s_selectedIndex = 0;
-                SetStatus("Configure join settings.");
+                SetStatus("Enter the host address.");
                 TransitionTo(MenuState::JoinEntry, "open join config");
             } else {
                 // Back
@@ -2576,7 +3198,7 @@ static void ActivateCurrentSelection() {
                 cfg.connect_preference = s_connectPreference;
                 Net::NatRuntimeConfig natCfg{};
                 if (!BuildNatRuntimeConfig(&natCfg)) {
-                    SetStatus("Invalid NAT/STUN settings.");
+                    SetStatus("Connection settings are invalid.");
                     break;
                 }
                 cfg.nat.enable_upnp = natCfg.enable_upnp;
@@ -2608,16 +3230,16 @@ static void ActivateCurrentSelection() {
                 ApplyNatSettingsToService("manual host start");
                 MenuUtils::BeginPublicIPFetch();
                 if (Net::Session_StartHost(&cfg)) {
-                    SetStatus("Waiting for peer...");
+                    SetStatus("Room is open. Waiting for another player...");
                     TransitionTo(MenuState::Connecting, "host started");
                 } else {
-                    SetStatus("Failed to start host.");
+                    SetStatus("Couldn't open the room.");
                 }
             } else if (s_selectedIndex == 1) {
                 // Edit port
                 char portBuf[8];
                 _snprintf_s(portBuf, sizeof(portBuf), _TRUNCATE, "%u", s_listenPort);
-                BeginTextEdit(TextEditField::ListenPort, portBuf, "Type port number (1-65535).");
+                BeginTextEdit(TextEditField::ListenPort, portBuf, "Enter the room port (1-65535).");
             } else {
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::DirectConnectEntry, "back from host");
@@ -2628,62 +3250,13 @@ static void ActivateCurrentSelection() {
             if (s_selectedIndex == 0) {
                 // Join
                 ClearJoinSpectatorProbe("manual_join_start");
-                char targetHost[96] = {};
-                uint16_t targetPort = 0;
-                if (!ParseEndpoint(s_remoteEndpoint, targetHost, sizeof(targetHost), &targetPort, s_allowIPv6Endpoint)) {
-                    SetStatus("Invalid endpoint. Use host:port or [ipv6]:port.");
-                    break;
-                }
-                Net::SessionConfig cfg{};
-                Net::SessionConfig_SetDefaults(&cfg);
-                cfg.listen_port = s_listenPort;
-                strncpy_s(cfg.target_host, sizeof(cfg.target_host), targetHost, _TRUNCATE);
-                cfg.target_port = targetPort;
-                cfg.connect_preference = s_connectPreference;
-                strncpy_s(cfg.nickname, sizeof(cfg.nickname), s_localNickname, _TRUNCATE);
-                Net::NatRuntimeConfig natCfg{};
-                if (!BuildNatRuntimeConfig(&natCfg)) {
-                    SetStatus("Invalid NAT/STUN settings.");
-                    break;
-                }
-                cfg.nat.enable_upnp = natCfg.enable_upnp;
-                cfg.nat.enable_stun = natCfg.enable_stun;
-                cfg.nat.enable_hole_punch = natCfg.enable_hole_punch;
-                cfg.nat.enable_turn = natCfg.enable_turn;
-                cfg.nat.enable_pcp_fallback = natCfg.enable_pcp_fallback;
-                cfg.nat.allow_ipv6_endpoint = natCfg.allow_ipv6_endpoint;
-                cfg.nat.prefer_portforwarded_direct = natCfg.prefer_portforwarded_direct;
-                strncpy_s(cfg.nat.stun_host, sizeof(cfg.nat.stun_host), natCfg.stun_host, _TRUNCATE);
-                cfg.nat.stun_port = natCfg.stun_port;
-                strncpy_s(cfg.nat.turn_host, sizeof(cfg.nat.turn_host), natCfg.turn_host, _TRUNCATE);
-                cfg.nat.turn_port = natCfg.turn_port;
-                strncpy_s(cfg.nat.turn_username, sizeof(cfg.nat.turn_username), natCfg.turn_username, _TRUNCATE);
-                strncpy_s(cfg.nat.turn_password, sizeof(cfg.nat.turn_password), natCfg.turn_password, _TRUNCATE);
-                cfg.nat.gather_timeout_ms = natCfg.gather_timeout_ms;
-                cfg.nat.connect_timeout_ms = natCfg.connect_timeout_ms;
-                cfg.nat.mapping_timeout_ms = natCfg.mapping_timeout_ms;
-                cfg.nat.traversal_log_verbosity = natCfg.traversal_log_verbosity;
-                if (s_relayEndpoint[0]) {
-                    char relayHost[96] = {};
-                    uint16_t relayPort = 0;
-                    if (!ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
-                        SetStatus("Invalid relay endpoint.");
-                        break;
-                    }
-                    strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
-                    cfg.nat.relay_port = relayPort;
-                }
-                ApplyDelaySettingsToPolicy("manual join start");
-                ApplyNatSettingsToService("manual join start");
-                if (Net::Session_StartJoin(&cfg)) {
-                    SetStatus("Connecting to host...");
-                    TransitionTo(MenuState::Connecting, "join started");
-                } else {
-                    SetStatus("Failed to start join.");
-                }
+                StartJoinSessionToEndpoint(
+                    s_remoteEndpoint,
+                    "Connecting to host...",
+                    "join started");
             } else if (s_selectedIndex == 1) {
                 // Edit endpoint
-                BeginTextEdit(TextEditField::RemoteEndpoint, s_remoteEndpoint, "Type host:port or [ipv6]:port.");
+                BeginTextEdit(TextEditField::RemoteEndpoint, s_remoteEndpoint, "Enter the host address as host:port or [ipv6]:port.");
             } else {
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::DirectConnectEntry, "back from join");
@@ -2693,22 +3266,26 @@ static void ActivateCurrentSelection() {
         case MenuState::SpectateEntry:
             if (s_selectedIndex == 0) {
                 if (!s_spectatorEndpoint[0]) {
-                    SetStatus("Set a spectator endpoint first.");
+                    SetStatus("Enter a watch address first.");
                     break;
                 }
                 ClearJoinSpectatorProbe("manual_spectate_start");
+                s_idleSpectatorPromptDeferred = false;
                 ClearError();
                 if (Net::SpectatorClient_StartConnect(s_spectatorEndpoint)) {
-                    SetStatus("Connecting to spectator stream...");
+                    SetStatus("Connecting to watch server...");
+                    SPECTATE_MENU_LOG(LOG_INFO, "SMENU",
+                        "[MENU] manual_spectate_connect endpoint=%s",
+                        s_spectatorEndpoint);
                     TransitionTo(MenuState::SpectatorConnecting, "spectator connect");
                 } else {
-                    SetStatus("Failed to start spectator connection.");
+                    SetStatus("Couldn't start the watch connection.");
                 }
             } else if (s_selectedIndex == 1) {
                 Net::SpectatorDiscoverySnapshot discovery{};
                 Net::SpectatorClient_GetDiscoverySnapshot(&discovery);
                 if (discovery.active) {
-                    SetStatus("%s", discovery.status[0] ? discovery.status : "Scanning LAN for spectator hosts...");
+                    SetStatus("%s", discovery.status[0] ? discovery.status : "Scanning the local network for watch hosts...");
                 } else if (discovery.result_count > 1) {
                     s_selectedLanSpectatorIndex =
                         (s_selectedLanSpectatorIndex + 1) % discovery.result_count;
@@ -2722,15 +3299,15 @@ static void ActivateCurrentSelection() {
                     s_lastLanSpectatorResultCount = 0;
                     s_lastLanSpectatorEndpoint[0] = '\0';
                     if (Net::SpectatorClient_BeginLanDiscovery()) {
-                        SetStatus("Scanning LAN for spectator hosts...");
+                        SetStatus("Scanning the local network for watch hosts...");
                     } else {
                         Net::SpectatorDiscoverySnapshot retry{};
                         Net::SpectatorClient_GetDiscoverySnapshot(&retry);
-                        SetStatus("%s", retry.status[0] ? retry.status : "Failed to start LAN discovery.");
+                        SetStatus("%s", retry.status[0] ? retry.status : "Couldn't start the local network scan.");
                     }
                 }
             } else if (s_selectedIndex == 2) {
-                BeginTextEdit(TextEditField::SpectatorEndpoint, s_spectatorEndpoint, "Type spectator host:port or [ipv6]:port.");
+                BeginTextEdit(TextEditField::SpectatorEndpoint, s_spectatorEndpoint, "Enter the watch address as host:port or [ipv6]:port.");
             } else {
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::MenuRoot, "back from spectate");
@@ -2740,35 +3317,56 @@ static void ActivateCurrentSelection() {
         case MenuState::SpectatorConnecting:
             CancelSpectatorConnectionAndReturn(
                 "spectator connect canceled",
-                "Spectator connection cancelled.",
+                "Watch connection cancelled.",
                 "cancel spectator connect");
             break;
 
         case MenuState::SpectatorConnected:
             CancelSpectatorConnectionAndReturn(
                 "spectator disconnected by user",
-                "Spectator stream disconnected.",
+                "Stopped watching the match.",
                 "spectator disconnect");
             break;
 
-        case MenuState::SettingsEntry:
-            if (s_selectedIndex == 0) {
-                // Edit nickname
-                BeginTextEdit(TextEditField::Nickname, s_localNickname, "Type your nickname.");
-            } else if (s_selectedIndex == 9) {
-                BeginTextEdit(TextEditField::RelayEndpoint, s_relayEndpoint, "Relay endpoint: host:port or [ipv6]:port.");
-            } else if (s_selectedIndex == 10) {
-                BeginTextEdit(TextEditField::StunEndpoint, s_stunEndpoint, "STUN server: host:port or [ipv6]:port.");
-            } else if (s_selectedIndex == 12) {
+        case MenuState::SettingsEntry: {
+            const int gid = SettingGlobalId();
+            if (gid == 0) {
+                BeginTextEdit(TextEditField::Nickname, s_localNickname, "Enter your display name.");
+            } else if (gid == 9) {
+                BeginTextEdit(TextEditField::RelayEndpoint, s_relayEndpoint, "Enter the relay server as host:port or [ipv6]:port.");
+            } else if (gid == 10) {
+                BeginTextEdit(TextEditField::StunEndpoint, s_stunEndpoint, "Enter the STUN server as host:port or [ipv6]:port.");
+            } else if (gid == 12) {
                 char portBuf[8];
                 _snprintf_s(portBuf, sizeof(portBuf), _TRUNCATE, "%u", s_spectatorListenPort);
-                BeginTextEdit(TextEditField::SpectatorPort, portBuf, "Type spectator listen port (1-65535).");
-            } else if (s_selectedIndex == 15) {
-                // Back
+                BeginTextEdit(TextEditField::SpectatorPort, portBuf, "Enter the watch port (1-65535).");
+            } else if (gid == -1) {
+                // Back to category menu
                 s_selectedIndex = 0;
-                TransitionTo(MenuState::MenuRoot, "back from settings");
+                TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
             }
             // Most settings are adjusted via left/right.
+            break;
+        }
+
+        case MenuState::SettingsCategoryMenu:
+            if (s_selectedIndex == 0) {
+                s_settingsCategory = SettingsCategory::Identity;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "open player settings");
+            } else if (s_selectedIndex == 1) {
+                s_settingsCategory = SettingsCategory::Endpoint;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "open network settings");
+            } else if (s_selectedIndex == 2) {
+                s_settingsCategory = SettingsCategory::SessionMatch;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "open watch settings");
+            } else {
+                // Back to main menu
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::MenuRoot, "back from settings categories");
+            }
             break;
 
         case MenuState::ConnectedSession:
@@ -2797,7 +3395,7 @@ static void ActivateCurrentSelection() {
             // Cancel
             Net::Session_Cancel();
             s_selectedIndex = 0;
-            SetStatus("Back to direct connect.");
+            SetStatus("Returned to Play Online.");
             TransitionTo(MenuState::DirectConnectEntry, "back from connection");
             break;
 
@@ -2861,25 +3459,28 @@ static void HandleBackNavigation() {
         case MenuState::SpectatorConnecting:
             CancelSpectatorConnectionAndReturn(
                 "spectator connect canceled",
-                "Spectator connection cancelled.",
+                "Watch connection cancelled.",
                 "cancel spectator connect");
             break;
         case MenuState::SpectatorConnected:
             CancelSpectatorConnectionAndReturn(
                 "spectator disconnected by user",
-                "Spectator stream disconnected.",
+                "Stopped watching the match.",
                 "back from spectator stream");
             break;
         case MenuState::SettingsCategoryMenu:
+            s_selectedIndex = 0;
+            TransitionTo(MenuState::MenuRoot, "back from settings categories");
+            break;
         case MenuState::SettingsEntry:
             s_selectedIndex = 0;
-            TransitionTo(MenuState::MenuRoot, "back from settings");
+            TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
             break;
         case MenuState::Connecting:
         case MenuState::Handshake:
             Net::Session_Cancel();
             s_selectedIndex = 0;
-            SetStatus("Back to direct connect.");
+            SetStatus("Returned to Play Online.");
             TransitionTo(MenuState::DirectConnectEntry, "cancel connection");
             break;
         case MenuState::ConnectedSession:
@@ -2916,6 +3517,8 @@ void Init() {
     s_phase = MenuPhase::Hidden;
     s_fadeFrames = 0;
     s_captureInput = false;
+    ClearActionPrompt("init");
+    s_idleSpectatorPromptDeferred = false;
     LoadSettings();
     ApplyDelaySettingsToPolicy("menu init");
     ApplyNatSettingsToService("menu init");
@@ -2936,8 +3539,10 @@ void Shutdown() {
     if (!s_initialized) return;
     ClearAutoConnectOverride();
     AutoConnectHarness_Shutdown();
+    ClearActionPrompt("shutdown");
     s_autoConnectState = AutoConnectState::Disabled;
     s_autoConnectCompletedMatches = 0;
+    s_idleSpectatorPromptDeferred = false;
     s_autoRematchCleanupApplied = false;
     s_autoRematchLastAttemptAt = 0;
     s_selectedLanSpectatorIndex = 0;
@@ -3035,10 +3640,11 @@ void HandlePostMatchReturn() {
     s_phase = MenuPhase::Active;
     s_fadeFrames = kFadeFrames;
     s_captureInput = true;
+    ClearActionPrompt("post_match_return");
     s_selectedIndex = 0;
     s_waitForNeutral = true;
     ClearError();
-    SetStatus("Match complete. Choose next action.");
+    SetStatus("Match complete. Choose what to do next.");
     TransitionTo(MenuState::PostMatch, "match ended");
 }
 
@@ -3052,6 +3658,34 @@ bool ConsumesGameInput() {
 
 void HideForLaunch(const char* reason) {
     HideMenuForLaunch(reason ? reason : "external launch");
+}
+
+void ShowMenuAfterExternalLaunch(const char* reason) {
+    if (!MenuVisible()) {
+        OpenMenu();
+    } else {
+        ModeOwnership::EnterCustomMenuContext();
+        ClearActionPrompt("external_return_menu");
+        ClearJoinSpectatorProbe("external_return_menu");
+        s_idleSpectatorPromptDeferred = false;
+        s_activeBranch = RootBranch::DirectPlay;
+        s_settingsCategory = SettingsCategory::Identity;
+        s_phase = MenuPhase::Active;
+        s_fadeFrames = kFadeFrames;
+        s_captureInput = true;
+        s_selectedIndex = 0;
+        s_waitForNeutral = true;
+        ClearError();
+        ClearTextEditState();
+        InputSystem_ResetRepeatState(0);
+        if (s_state == MenuState::Inactive) {
+            TransitionTo(MenuState::MenuRoot, "external return");
+        }
+    }
+
+    if (reason && reason[0]) {
+        SetStatus("%s", reason);
+    }
 }
 
 void GetSnapshot(MenuSnapshot* out) {
@@ -3157,6 +3791,15 @@ void GetSnapshot(MenuSnapshot* out) {
     CopyText(out->spectator_playback_status,
         sizeof(out->spectator_playback_status),
         spectatorPlayback.status);
+
+    out->prompt_active = IsActionPromptOpen();
+    out->prompt_selected_index = s_actionPromptSelectedIndex;
+    out->prompt_option_count = s_actionPromptOptionCount;
+    CopyText(out->prompt_title, sizeof(out->prompt_title), s_actionPromptTitle);
+    CopyText(out->prompt_body, sizeof(out->prompt_body), s_actionPromptBody);
+    CopyText(out->prompt_option_labels[0], sizeof(out->prompt_option_labels[0]), s_actionPromptOptions[0]);
+    CopyText(out->prompt_option_labels[1], sizeof(out->prompt_option_labels[1]), s_actionPromptOptions[1]);
+    CopyText(out->prompt_option_labels[2], sizeof(out->prompt_option_labels[2]), s_actionPromptOptions[2]);
 
     Net::SpectatorDiscoverySnapshot spectatorDiscovery{};
     Net::SpectatorClient_GetDiscoverySnapshot(&spectatorDiscovery);

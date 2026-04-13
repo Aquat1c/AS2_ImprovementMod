@@ -35,8 +35,8 @@ __declspec(dllexport) bool ModGetNetplayHudText(char* out, int cap);
 
 struct MatchHudData {
     bool     active;
-    char     p1_name[24];
-    char     p2_name[24];
+    char     p1_name[64];
+    char     p2_name[64];
     int      p1_wins;
     int      p2_wins;
     float    ping_ms;

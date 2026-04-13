@@ -26,6 +26,9 @@ namespace {
 
 using namespace Net;
 
+#define SPECTATE_LOG(frame, fmt, ...) \
+    Rollback::NetplayLog_WriteSpectator("SPECTATE", frame, fmt, ##__VA_ARGS__)
+
 struct ArchivedFrame {
     Spectator::FrameRecord record;
     bool valid;
@@ -43,9 +46,9 @@ static uint16_t s_listenPort = 10701;
 static uint32_t s_matchId = 0;
 static uint32_t s_matchOrdinal = 0;
 static LockedMatchConfig s_config{};
-static char s_p1Name[24] = "P1";
-static char s_p2Name[24] = "P2";
-static char s_status[128] = "Spectator runtime idle.";
+static char s_p1Name[64] = "P1";
+static char s_p2Name[64] = "P2";
+static char s_status[128] = "Watch server idle.";
 static uint16_t s_p1Wins = 0;
 static uint16_t s_p2Wins = 0;
 static uint16_t s_draws = 0;
@@ -112,6 +115,12 @@ static bool ShouldServeSpectators() {
     return ShouldListenForSpectators() && s_matchActive;
 }
 
+static uint16_t ResolveSessionListenPort() {
+    SessionSnapshot session{};
+    Session_GetSnapshot(&session);
+    return session.local_listen_port;
+}
+
 static void CloseLanDiscoverySocket() {
     if (s_discoverySocket == INVALID_SOCKET) {
         return;
@@ -131,7 +140,7 @@ static bool EnsureLanDiscoverySocket() {
 
     SOCKET socketHandle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socketHandle == INVALID_SOCKET) {
-        Rollback::NetplayLog_Write("SPECTATE", -1,
+        SPECTATE_LOG(-1,
             "LAN discovery responder socket create failed: err=%d",
             (int)WSAGetLastError());
         return false;
@@ -143,7 +152,7 @@ static bool EnsureLanDiscoverySocket() {
 
     u_long nonBlocking = 1;
     if (ioctlsocket(socketHandle, FIONBIO, &nonBlocking) != 0) {
-        Rollback::NetplayLog_Write("SPECTATE", -1,
+        SPECTATE_LOG(-1,
             "LAN discovery responder nonblocking failed: err=%d",
             (int)WSAGetLastError());
         closesocket(socketHandle);
@@ -155,7 +164,7 @@ static bool EnsureLanDiscoverySocket() {
     bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     bindAddr.sin_port = htons(Spectator::LAN_DISCOVERY_PORT);
     if (bind(socketHandle, reinterpret_cast<const sockaddr*>(&bindAddr), sizeof(bindAddr)) == SOCKET_ERROR) {
-        Rollback::NetplayLog_Write("SPECTATE", -1,
+        SPECTATE_LOG(-1,
             "LAN discovery responder bind failed: port=%u err=%d",
             Spectator::LAN_DISCOVERY_PORT,
             (int)WSAGetLastError());
@@ -164,7 +173,7 @@ static bool EnsureLanDiscoverySocket() {
     }
 
     s_discoverySocket = socketHandle;
-    Rollback::NetplayLog_Write("SPECTATE", -1,
+    SPECTATE_LOG(-1,
         "LAN discovery responder listening: port=%u",
         Spectator::LAN_DISCOVERY_PORT);
     return true;
@@ -194,7 +203,7 @@ static void PollLanDiscoveryRequests(bool shouldListen) {
         if (recvResult == SOCKET_ERROR) {
             const int error = WSAGetLastError();
             if (error != WSAEWOULDBLOCK) {
-                Rollback::NetplayLog_Write("SPECTATE", -1,
+                SPECTATE_LOG(-1,
                     "LAN discovery responder recv failed: err=%d",
                     error);
                 CloseLanDiscoverySocket();
@@ -220,6 +229,7 @@ static void PollLanDiscoveryRequests(bool shouldListen) {
         response.magic = Spectator::LAN_DISCOVERY_MAGIC;
         response.version = Spectator::LAN_DISCOVERY_VERSION;
         response.spectator_port = listenPort;
+        response.session_listen_port = ResolveSessionListenPort();
         response.nonce = query.nonce;
         response.match_id = s_matchId;
         response.match_state = s_matchActive
@@ -231,6 +241,14 @@ static void PollLanDiscoveryRequests(bool shouldListen) {
         CopyText(response.p1_name, sizeof(response.p1_name), s_p1Name);
         CopyText(response.p2_name, sizeof(response.p2_name), s_p2Name);
 
+        char hostAddress[64] = {};
+        if (!InetNtopA(AF_INET, &fromAddr.sin_addr, hostAddress, sizeof(hostAddress))) {
+            const char* legacyAddress = inet_ntoa(fromAddr.sin_addr);
+            if (legacyAddress && legacyAddress[0]) {
+                strncpy_s(hostAddress, sizeof(hostAddress), legacyAddress, _TRUNCATE);
+            }
+        }
+
         sendto(
             s_discoverySocket,
             reinterpret_cast<const char*>(&response),
@@ -238,6 +256,15 @@ static void PollLanDiscoveryRequests(bool shouldListen) {
             0,
             reinterpret_cast<const sockaddr*>(&fromAddr),
             fromAddrLen);
+
+        SPECTATE_LOG(-1,
+            "LAN discovery query served: from=%s nonce=0x%08X port=%u match_id=0x%08X match_state=%u spectators=%u",
+            hostAddress[0] ? hostAddress : "?",
+            query.nonce,
+            listenPort,
+            response.match_id,
+            response.match_state,
+            response.connected_spectators);
     }
 }
 
@@ -342,6 +369,7 @@ static void BuildMatchStatePayload(Spectator::MatchStatePayload* out) {
     out->p2_wins = s_p2Wins;
     out->draws = s_draws;
     out->completed_matches = s_completedMatches;
+    out->session_listen_port = ResolveSessionListenPort();
     out->config = s_config;
     CopyText(out->p1_name, sizeof(out->p1_name), s_p1Name);
     CopyText(out->p2_name, sizeof(out->p2_name), s_p2Name);
@@ -406,6 +434,53 @@ static bool SendPaletteSyncForPeer(uintptr_t peerId,
     return true;
 }
 
+static void SendInactiveHeartbeatIfNeeded(DWORD now) {
+    if (s_matchActive || s_matchId == 0 || (now - s_lastHeartbeatAt) < kHeartbeatIntervalMs) {
+        return;
+    }
+
+    SpectatorPeerSnapshot peers[kMaxPeers] = {};
+    const int peerCount = SpectatorManager_GetPeerSnapshots(peers, kMaxPeers);
+    if (peerCount <= 0) {
+        return;
+    }
+
+    Spectator::HeartbeatPayload heartbeat{};
+    heartbeat.match_id = s_matchId;
+    heartbeat.match_ordinal = s_matchOrdinal;
+    heartbeat.config_crc = CurrentConfigCrc();
+    heartbeat.session_seed = s_config.session_seed;
+    heartbeat.confirmed_rb_frame = s_confirmedRbFrame;
+    heartbeat.live_rb_frame = s_liveRbFrame;
+    heartbeat.session_listen_port = ResolveSessionListenPort();
+    heartbeat.match_state = Spectator::MATCH_STATE_ENDED;
+
+    int sentCount = 0;
+    for (int peerIndex = 0; peerIndex < peerCount; peerIndex++) {
+        const SpectatorPeerSnapshot& peer = peers[peerIndex];
+        if (!peer.handshake_complete || peer.needs_full_sync) {
+            continue;
+        }
+
+        if (SpectatorManager_SendHeartbeat(peer.peer_id, &heartbeat)) {
+            sentCount++;
+        }
+    }
+
+    if (sentCount <= 0) {
+        return;
+    }
+
+    s_lastHeartbeatAt = now;
+    SPECTATE_LOG(-1,
+        "Inactive spectator heartbeat peers=%d match_id=0x%08X ordinal=%u confirmed=%d live=%d",
+        sentCount,
+        s_matchId,
+        s_matchOrdinal,
+        s_confirmedRbFrame,
+        s_liveRbFrame);
+}
+
 } // namespace
 
 namespace Net {
@@ -416,17 +491,22 @@ void SpectatorRuntime_Init() {
     }
     LockedMatchConfig_Clear(&s_config);
     ResetArchive();
-    SetStatus("Spectator runtime idle.");
+    SetStatus("Watch server idle.");
     SpectatorManager_Init();
     s_lastListenState = false;
     s_lastServeState = false;
     s_initialized = true;
+    SPECTATE_LOG(-1,
+        "Spectator runtime init enabled=%d listen_port=%u",
+        s_enabled ? 1 : 0,
+        s_listenPort);
 }
 
 void SpectatorRuntime_Shutdown() {
     if (!s_initialized) {
         return;
     }
+    SPECTATE_LOG(-1, "Spectator runtime shutdown");
     SpectatorRuntime_OnDisconnect("shutdown");
     CloseLanDiscoverySocket();
     SpectatorManager_Shutdown();
@@ -442,7 +522,7 @@ void SpectatorRuntime_FrameUpdate() {
     const bool shouldServe = shouldListen && s_matchActive;
 
     if (shouldListen != s_lastListenState || shouldServe != s_lastServeState) {
-        Rollback::NetplayLog_Write("SPECTATE", -1,
+        SPECTATE_LOG(-1,
             "[SpectatorRuntime] listener=%d serve=%d role=%s session_connected=%d match_active=%d port=%u",
             shouldListen ? 1 : 0,
             shouldServe ? 1 : 0,
@@ -466,17 +546,18 @@ void SpectatorRuntime_FrameUpdate() {
         : s_listenPort;
 
     if (!shouldListen) {
-        SetStatus("Spectator runtime idle.");
+        SetStatus("Watch server idle.");
         return;
     }
 
     if (!shouldServe) {
+        SendInactiveHeartbeatIfNeeded(GetTickCount());
         if (effectiveListenPort != s_listenPort) {
-            SetStatus("Spectator server listening on %u (requested %u, no active match)",
+            SetStatus("Watch server ready on %u. Waiting for a match (requested %u).",
                 effectiveListenPort,
                 s_listenPort);
         } else {
-            SetStatus("Spectator server listening on %u (no active match)", effectiveListenPort);
+            SetStatus("Watch server ready on %u. Waiting for a match.", effectiveListenPort);
         }
         return;
     }
@@ -488,14 +569,14 @@ void SpectatorRuntime_FrameUpdate() {
     if (peerCount <= 0) {
         PruneArchive(0);
         if (effectiveListenPort != s_listenPort) {
-            SetStatus("Spectator server on %u (requested %u, G%u %u-%u, no spectators)",
+            SetStatus("Watch server on %u. Requested %u. Game %u, set score %u-%u. No viewers yet.",
                 effectiveListenPort,
                 s_listenPort,
                 s_matchOrdinal,
                 s_p1Wins,
                 s_p2Wins);
         } else {
-            SetStatus("Spectator server on %u (G%u %u-%u, no spectators)",
+            SetStatus("Watch server on %u. Game %u, set score %u-%u. No viewers yet.",
                 effectiveListenPort,
                 s_matchOrdinal,
                 s_p1Wins,
@@ -517,6 +598,15 @@ void SpectatorRuntime_FrameUpdate() {
             SendPaletteSyncForPeer(peer.peer_id, &palettePayload);
             SpectatorManager_SetPeerNextFrame(peer.peer_id, s_archiveBaseRbFrame);
             SpectatorManager_ClearPeerFullSync(peer.peer_id);
+            SPECTATE_LOG(-1,
+                "Full sync sent peer=0x%p match_id=0x%08X ordinal=%u archive_start=%d confirmed=%d live=%d palette_epoch=%u",
+                reinterpret_cast<void*>(peer.peer_id),
+                s_matchId,
+                s_matchOrdinal,
+                s_archiveBaseRbFrame,
+                s_confirmedRbFrame,
+                s_liveRbFrame,
+                palettePayload.palette_epoch);
         }
 
         const int32_t safeLiveFrame = s_confirmedRbFrame - kLiveEdgeSafetyFrames;
@@ -559,6 +649,10 @@ void SpectatorRuntime_FrameUpdate() {
     NetplayPaletteRuntime_GetSnapshot(&paletteSnapshot);
     if (paletteSnapshot.epoch != s_lastBroadcastPaletteEpoch) {
         s_lastBroadcastPaletteEpoch = paletteSnapshot.epoch;
+        SPECTATE_LOG(-1,
+            "Broadcast palette epoch=%u peers=%d",
+            paletteSnapshot.epoch,
+            peerCount);
         for (int peerIndex = 0; peerIndex < peerCount; peerIndex++) {
             SendPaletteSyncForPeer(peers[peerIndex].peer_id, &palettePayload);
         }
@@ -573,6 +667,7 @@ void SpectatorRuntime_FrameUpdate() {
         heartbeat.session_seed = s_config.session_seed;
         heartbeat.confirmed_rb_frame = s_confirmedRbFrame;
         heartbeat.live_rb_frame = s_liveRbFrame;
+        heartbeat.session_listen_port = ResolveSessionListenPort();
         heartbeat.match_state = s_matchActive
             ? Spectator::MATCH_STATE_ACTIVE
             : Spectator::MATCH_STATE_ENDED;
@@ -581,32 +676,31 @@ void SpectatorRuntime_FrameUpdate() {
     }
 
     if (effectiveListenPort != s_listenPort) {
-        SetStatus("Spectator server on %u (requested %u, %d spectators, G%u %u-%u, live=%d confirmed=%d)",
+        SetStatus("Watch server on %u. Requested %u. %d viewers. Game %u, set score %u-%u.",
             effectiveListenPort,
             s_listenPort,
             peerCount,
             s_matchOrdinal,
             s_p1Wins,
-            s_p2Wins,
-            s_liveRbFrame,
-            s_confirmedRbFrame);
+            s_p2Wins);
     } else {
-        SetStatus("Spectator server on %u (%d spectators, G%u %u-%u, live=%d confirmed=%d)",
+        SetStatus("Watch server on %u. %d viewers. Game %u, set score %u-%u.",
             effectiveListenPort,
             peerCount,
             s_matchOrdinal,
             s_p1Wins,
-            s_p2Wins,
-            s_liveRbFrame,
-            s_confirmedRbFrame);
+            s_p2Wins);
     }
 }
 
 void SpectatorRuntime_SetEnabled(bool enabled) {
     s_enabled = enabled;
+    SPECTATE_LOG(-1,
+        "Spectator runtime enabled=%d",
+        enabled ? 1 : 0);
     if (!enabled) {
         SpectatorManager_SetEnabled(false);
-        SetStatus("Spectator runtime disabled.");
+        SetStatus("Watch server disabled.");
     }
 }
 
@@ -616,6 +710,12 @@ bool SpectatorRuntime_GetEnabled() {
 
 void SpectatorRuntime_SetListenPort(uint16_t port) {
     if (port != 0) {
+        if (s_listenPort != port) {
+            SPECTATE_LOG(-1,
+                "Spectator runtime listen port %u -> %u",
+                s_listenPort,
+                port);
+        }
         s_listenPort = port;
     }
 }
@@ -644,12 +744,11 @@ void SpectatorRuntime_OnMatchBegin(const LockedMatchConfig* config) {
     ResetArchive();
     RefreshNamesFromSession();
     SpectatorManager_BeginMatch(s_matchId, s_matchOrdinal);
-    SetStatus("Spectator match prepared: G%u id=0x%08X score=%u-%u",
+    SetStatus("Watch server ready for game %u. Set score %u-%u.",
         s_matchOrdinal,
-        s_matchId,
         s_p1Wins,
         s_p2Wins);
-    Rollback::NetplayLog_Write("SPECTATE", -1,
+    SPECTATE_LOG(-1,
         "Spectator match begin: id=0x%08X ordinal=%u role=%s enabled=%d host_side=%u score=%u-%u draws=%u completed=%u",
         s_matchId,
         s_matchOrdinal,
@@ -666,7 +765,7 @@ void SpectatorRuntime_OnRollbackStarted(int32_t frame_origin_abs) {
     if (!s_matchActive) {
         return;
     }
-    Rollback::NetplayLog_Write("SPECTATE", frame_origin_abs,
+    SPECTATE_LOG(frame_origin_abs,
         "Spectator rollback stream armed: frame_origin_abs=%d match_id=0x%08X",
         frame_origin_abs,
         s_matchId);
@@ -724,13 +823,14 @@ void SpectatorRuntime_OnMatchEnd(const char* reason) {
     heartbeat.session_seed = s_config.session_seed;
     heartbeat.confirmed_rb_frame = s_confirmedRbFrame;
     heartbeat.live_rb_frame = s_liveRbFrame;
+    heartbeat.session_listen_port = ResolveSessionListenPort();
     heartbeat.match_state = Spectator::MATCH_STATE_ENDED;
     SpectatorManager_BroadcastHeartbeat(&heartbeat);
 
     SpectatorManager_EndMatch(reason ? reason : "match ended");
     s_matchActive = false;
-    SetStatus("Spectator match ended: %s", reason ? reason : "match ended");
-    Rollback::NetplayLog_Write("SPECTATE", -1,
+    SetStatus("The watch server finished the match.");
+    SPECTATE_LOG(-1,
         "Spectator match end: id=0x%08X reason=%s live=%d confirmed=%d",
         s_matchId,
         reason ? reason : "match ended",
@@ -739,6 +839,9 @@ void SpectatorRuntime_OnMatchEnd(const char* reason) {
 }
 
 void SpectatorRuntime_OnDisconnect(const char* reason) {
+    SPECTATE_LOG(-1,
+        "Spectator runtime disconnect reason=%s",
+        reason ? reason : "disconnect");
     SpectatorRuntime_OnMatchEnd(reason ? reason : "disconnect");
     ResetArchive();
     s_matchId = 0;
@@ -747,7 +850,7 @@ void SpectatorRuntime_OnDisconnect(const char* reason) {
     s_p2Wins = 0;
     s_draws = 0;
     s_completedMatches = 0;
-    SetStatus("Spectator runtime idle.");
+    SetStatus("Watch server idle.");
     s_lastServeState = false;
 }
 

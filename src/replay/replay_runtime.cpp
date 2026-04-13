@@ -4,12 +4,16 @@
 #include "core/game_state.h"
 #include "core/mod_main.h"
 #include "input/input_system.h"
+#include "net/netplay_palette_runtime.h"
+#include "net/player_side_mapping.h"
+#include "net/session_manager.h"
 #include "patches/memory_utils.h"
 #include "patches/tick_hooks.h"
 #include "rollback/game_snapshot.h"
 #include "rollback/resimulation.h"
 #include "ui/log_window.h"
 
+#include "MinHook.h"
 #include "imgui.h"
 
 #include <algorithm>
@@ -42,23 +46,76 @@ constexpr uint16_t kReplayInputMask =
 constexpr size_t kReplayHeaderSize = 0x48;
 constexpr size_t kReplayTapeSize = static_cast<size_t>(INPUT_HISTORY_MAX) * 2;
 constexpr size_t kReplayPlayerBlockSize = 22;
+constexpr size_t kReplayPaletteTrailerHeaderSize = 16;
+constexpr size_t kReplayPaletteTrailerRecordSize = 8 + Net::NETPLAY_PALETTE_BANK_SIZE;
 constexpr int32_t kReplayMenuSelectSubstate = 2;
 constexpr int32_t kReplayMenuFadeOutSubstate = 3;
+constexpr size_t kReplaySelectDisplayBytes = ADDR_REPLAY_HEADER_BASE - ADDR_REPLAY_SELECT_DISPLAY;
 constexpr int32_t kCoarseCheckpointInterval = 600;
 constexpr int32_t kSeekFramesPerHotkey = 60;
 constexpr int32_t kTakeoverCountdownFrames = 60;
-constexpr int32_t kReplayBrowserPageSize = 12;
+constexpr int32_t kReplayBrowserPageSize = 11;
 constexpr float kSeekScale = 16.0f;
 constexpr float kSpeedSteps[] = {0.5f, 1.0f, 1.25f, 1.5f, 2.0f, 4.0f};
+
+constexpr uintptr_t kAddrRenderFillRect = 0x5D2F50;
+constexpr uintptr_t kAddrRenderSetBlendMode = 0x5D2F80;
+constexpr uintptr_t kAddrRenderCreateColor = 0x5D3150;
+constexpr uintptr_t kAddrRenderDrawSprite = 0x5D3130;
+constexpr uintptr_t kAddrDrawFormatString = 0x629A20;
+constexpr uintptr_t kAddrReplayMenuBackgroundHandle = 0x815E04;
+
+constexpr int kReplayBrowserPanelLeft = 28;
+constexpr int kReplayBrowserPanelTop = 34;
+constexpr int kReplayBrowserPanelRight = 612;
+constexpr int kReplayBrowserPanelBottom = 446;
+constexpr int kReplayBrowserHeaderY = 46;
+constexpr int kReplayBrowserPathY = 64;
+constexpr int kReplayBrowserSubheaderY = 64;
+constexpr int kReplayBrowserListLeft = 42;
+constexpr int kReplayBrowserListRight = 308;
+constexpr int kReplayBrowserListTop = 88;
+constexpr int kReplayBrowserListBottom = 410;
+constexpr int kReplayBrowserRowHeight = 26;
+constexpr int kReplayBrowserDetailLeft = 322;
+constexpr int kReplayBrowserDetailRight = 598;
+constexpr int kReplayBrowserDetailTop = 88;
+constexpr int kReplayBrowserDetailBottom = 410;
+constexpr int kReplayBrowserStatusY = 424;
+
+constexpr uintptr_t kMenuInputWordUp = 0;
+constexpr uintptr_t kMenuInputWordDown = 2;
+constexpr uintptr_t kMenuInputWordLeft = 4;
+constexpr uintptr_t kMenuInputWordRight = 6;
+constexpr uintptr_t kMenuInputWordConfirmA = 8;
+constexpr uintptr_t kMenuInputWordCancelB = 10;
+constexpr uintptr_t kMenuInputWordConfirmC = 12;
+constexpr uintptr_t kMenuInputWordCancelD = 14;
+
+using RenderFillRect_t = int (__cdecl *)(int left, int top, int right, int bottom, int color, int drawFlag);
+using RenderSetBlendMode_t = int (__cdecl *)(int blendMode, unsigned __int8 alphaValue);
+using RenderCreateColor_t = int (__cdecl *)(unsigned __int8 r, unsigned __int8 g, unsigned __int8 b);
+using RenderDrawSprite_t = int (__cdecl *)(int x, int y, int spriteHandle, int transFlag);
+using DrawFormatString_t = int (__cdecl *)(int x, int y, unsigned int color, char* fmt, ...);
+using ReplaySave_t = char (__cdecl *)(int matchBase);
+using ReplaySelectDraw_t = int (__cdecl *)();
 
 constexpr int kHotkeyPause = VK_OEM_5;
 constexpr int kHotkeyStepForward = VK_OEM_6;
 constexpr int kHotkeyStepBackward = VK_OEM_4;
 constexpr int kHotkeySpeedSlower = VK_OEM_MINUS;
 constexpr int kHotkeySpeedFaster = VK_OEM_PLUS;
+constexpr int kHotkeyToggleHud = VK_INSERT;
 constexpr int kHotkeyTakeoverP1 = '1';
 constexpr int kHotkeyTakeoverP2 = '2';
 constexpr int kHotkeyTakeoverExit = '0';
+
+constexpr std::array<uint8_t, 8> kReplayPaletteTrailerMagic = {
+    'A', 'S', '2', 'R', 'P', 'A', 'L', '1'
+};
+constexpr uint32_t kReplayPaletteTrailerVersion = 1;
+constexpr uint32_t kReplayPaletteFlagP1 = 1u << 0;
+constexpr uint32_t kReplayPaletteFlagP2 = 1u << 1;
 
 struct PendingPreparedInputs {
     bool valid = false;
@@ -77,14 +134,36 @@ struct ReplayFileMetadata {
     std::string modified_time;
 };
 
+enum class ReplayBrowserEntryType {
+    ParentDirectory,
+    Directory,
+    ReplayFile,
+};
+
 struct ReplayBrowserEntry {
+    ReplayBrowserEntryType type = ReplayBrowserEntryType::ReplayFile;
     fs::path full_path;
     std::string relative_path;
+    std::string display_name;
     ReplayFileMetadata metadata;
 };
 
+struct ReplayPaletteOverrideState {
+    bool present = false;
+    Net::NetplayPaletteBank bank{};
+};
+
+struct ReplayFileDiskState {
+    uintmax_t size = 0;
+    fs::file_time_type modified = fs::file_time_type{};
+};
+
+using ReplayDirectorySnapshot = std::map<std::wstring, ReplayFileDiskState>;
+
 static bool s_initialized = false;
+static bool s_replayLaunchPending = false;
 static bool s_replayMatchActive = false;
+static bool s_replayHudVisible = true;
 static bool s_paused = false;
 static bool s_savedPauseBlocked = false;
 static int32_t s_currentFrame = -1;
@@ -107,6 +186,7 @@ static std::map<int32_t, uint16_t> s_overrideP2;
 static std::vector<ReplayBrowserEntry> s_browserEntries;
 static int32_t s_browserSelected = 0;
 static int32_t s_browserScroll = 0;
+static fs::path s_browserCurrentDirectory;
 static bool s_browserNeedsScan = true;
 static bool s_browserMenuWasActive = false;
 static std::string s_browserStatus;
@@ -116,6 +196,7 @@ static bool s_stepForwardKeyWasDown = false;
 static bool s_stepBackwardKeyWasDown = false;
 static bool s_speedSlowerKeyWasDown = false;
 static bool s_speedFasterKeyWasDown = false;
+static bool s_toggleHudKeyWasDown = false;
 static bool s_takeoverP1KeyWasDown = false;
 static bool s_takeoverP2KeyWasDown = false;
 static bool s_takeoverExitKeyWasDown = false;
@@ -129,14 +210,52 @@ static bool s_menuEndWasDown = false;
 static bool s_menuConfirmWasDown = false;
 static bool s_menuCancelWasDown = false;
 static bool s_menuBackWasDown = false;
+static ReplaySave_t s_originalReplaySave = nullptr;
+static ReplaySelectDraw_t s_originalReplaySelectDraw = nullptr;
+static ReplayPaletteOverrideState s_loadedReplayPalette[2] = {};
 
-static bool KeyDown(int vk) {
+static uint32_t ReadU32(const uint8_t* data);
+static std::string WideToUtf8(const std::wstring& text);
+static std::string WideToGameText(const std::wstring& text);
+static bool IsReplayExtension(const fs::path& path);
+static bool IsReplayMenuContext();
+static bool IsReplayMenuSelectContext();
+static void RenderReplayBrowserHud();
+static bool ReadReplayMetadata(const fs::path& path, ReplayFileMetadata* outMetadata);
+static bool ShouldRenameNetplayReplaySave(const Net::SessionSnapshot& session);
+static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
+                                       const ReplayFileMetadata& metadata,
+                                       fs::path* outRenamedPath);
+
+using GetWindowHandle_t = LPVOID (__cdecl *)();
+
+static bool RawKeyDown(int vk) {
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
+static HWND GetGameWindowHandle() {
+    auto getWindowHandle = reinterpret_cast<GetWindowHandle_t>(ADDR_SYS_GET_WINDOW_HANDLE);
+    return getWindowHandle ? reinterpret_cast<HWND>(getWindowHandle()) : nullptr;
+}
+
+static bool IsGameWindowFocused() {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground) {
+        return false;
+    }
+
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(foreground, &foregroundPid);
+    return foregroundPid == GetCurrentProcessId();
+}
+
+static bool KeyDown(int vk) {
+    return IsGameWindowFocused() && RawKeyDown(vk);
+}
+
 static bool ConsumeEdge(int vk, bool* wasDown) {
-    const bool down = KeyDown(vk);
-    const bool pressed = down && !*wasDown;
+    const bool down = RawKeyDown(vk);
+    const bool pressed = IsGameWindowFocused() && down && !*wasDown;
     *wasDown = down;
     return pressed;
 }
@@ -155,31 +274,385 @@ static void ClearReplayDispatcherState() {
     ResetPreparedInputs();
 }
 
+static bool ReplayMenuInputJustPressed(uint16_t button) {
+    return InputSystem_JustPressed(0, button) || InputSystem_JustPressed(1, button);
+}
+
 static void ResetMatchHotkeyEdges() {
-    s_pauseKeyWasDown = KeyDown(kHotkeyPause);
-    s_stepForwardKeyWasDown = KeyDown(kHotkeyStepForward);
-    s_stepBackwardKeyWasDown = KeyDown(kHotkeyStepBackward);
-    s_speedSlowerKeyWasDown = KeyDown(kHotkeySpeedSlower);
-    s_speedFasterKeyWasDown = KeyDown(kHotkeySpeedFaster);
-    s_takeoverP1KeyWasDown = KeyDown(kHotkeyTakeoverP1);
-    s_takeoverP2KeyWasDown = KeyDown(kHotkeyTakeoverP2);
-    s_takeoverExitKeyWasDown = KeyDown(kHotkeyTakeoverExit);
+    s_pauseKeyWasDown = RawKeyDown(kHotkeyPause);
+    s_stepForwardKeyWasDown = RawKeyDown(kHotkeyStepForward);
+    s_stepBackwardKeyWasDown = RawKeyDown(kHotkeyStepBackward);
+    s_speedSlowerKeyWasDown = RawKeyDown(kHotkeySpeedSlower);
+    s_speedFasterKeyWasDown = RawKeyDown(kHotkeySpeedFaster);
+    s_toggleHudKeyWasDown = RawKeyDown(kHotkeyToggleHud);
+    s_takeoverP1KeyWasDown = RawKeyDown(kHotkeyTakeoverP1);
+    s_takeoverP2KeyWasDown = RawKeyDown(kHotkeyTakeoverP2);
+    s_takeoverExitKeyWasDown = RawKeyDown(kHotkeyTakeoverExit);
 }
 
 static void ResetMenuHotkeyEdges() {
-    s_menuUpWasDown = KeyDown(VK_UP);
-    s_menuDownWasDown = KeyDown(VK_DOWN);
-    s_menuPageUpWasDown = KeyDown(VK_PRIOR);
-    s_menuPageDownWasDown = KeyDown(VK_NEXT);
-    s_menuHomeWasDown = KeyDown(VK_HOME);
-    s_menuEndWasDown = KeyDown(VK_END);
-    s_menuConfirmWasDown = KeyDown(VK_RETURN);
-    s_menuCancelWasDown = KeyDown(VK_ESCAPE);
-    s_menuBackWasDown = KeyDown(VK_BACK);
+    s_menuUpWasDown = false;
+    s_menuDownWasDown = false;
+    s_menuPageUpWasDown = false;
+    s_menuPageDownWasDown = false;
+    s_menuHomeWasDown = RawKeyDown(VK_HOME);
+    s_menuEndWasDown = RawKeyDown(VK_END);
+    s_menuConfirmWasDown = false;
+    s_menuCancelWasDown = RawKeyDown(VK_ESCAPE);
+    s_menuBackWasDown = RawKeyDown(VK_BACK);
+    InputSystem_ResetRepeatState(0);
+    InputSystem_ResetRepeatState(1);
+}
+
+static void ResetLoadedReplayPaletteState() {
+    memset(s_loadedReplayPalette, 0, sizeof(s_loadedReplayPalette));
+}
+
+static void AppendU32(std::vector<uint8_t>* bytes, uint32_t value) {
+    if (!bytes) {
+        return;
+    }
+
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&value);
+    bytes->insert(bytes->end(), raw, raw + sizeof(value));
+}
+
+static ReplayDirectorySnapshot CaptureReplayDirectorySnapshot() {
+    ReplayDirectorySnapshot snapshot;
+
+    std::error_code ec;
+    const fs::path root = fs::path(L"replay");
+    if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
+        return snapshot;
+    }
+
+    for (fs::directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+         it != end;
+         it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        const fs::directory_entry entry = *it;
+        if (!entry.is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+        if (!IsReplayExtension(entry.path())) {
+            continue;
+        }
+
+        ReplayFileDiskState state{};
+        state.size = entry.file_size(ec);
+        if (ec) {
+            ec.clear();
+            state.size = 0;
+        }
+
+        state.modified = entry.last_write_time(ec);
+        if (ec) {
+            ec.clear();
+            state.modified = fs::file_time_type{};
+        }
+
+        snapshot[entry.path().filename().wstring()] = state;
+    }
+
+    return snapshot;
+}
+
+static bool ResolveReplaySavePath(const ReplayDirectorySnapshot& before,
+                                  const ReplayDirectorySnapshot& after,
+                                  fs::path* outPath) {
+    if (!outPath) {
+        return false;
+    }
+
+    bool foundChanged = false;
+    std::wstring bestName;
+    ReplayFileDiskState bestState{};
+
+    for (const auto& [name, state] : after) {
+        const auto beforeIt = before.find(name);
+        const bool changed = beforeIt == before.end() ||
+            beforeIt->second.size != state.size ||
+            beforeIt->second.modified != state.modified;
+
+        if (!changed) {
+            continue;
+        }
+
+        if (!foundChanged || state.modified > bestState.modified) {
+            bestName = name;
+            bestState = state;
+            foundChanged = true;
+        }
+    }
+
+    if (!foundChanged) {
+        return false;
+    }
+
+    *outPath = fs::path(L"replay") / bestName;
+    return true;
+}
+
+static uint32_t BuildReplayPaletteFlags(const ReplayPaletteOverrideState (&banks)[2]) {
+    uint32_t flags = 0;
+    if (banks[0].present) {
+        flags |= kReplayPaletteFlagP1;
+    }
+    if (banks[1].present) {
+        flags |= kReplayPaletteFlagP2;
+    }
+    return flags;
+}
+
+static bool BuildReplayPaletteSaveData(ReplayPaletteOverrideState (&banks)[2]) {
+    memset(banks, 0, sizeof(banks));
+
+    bool anyPresent = false;
+    for (uint8_t slot = 0; slot < 2; ++slot) {
+        Net::NetplayPaletteBank bank{};
+        if (!Net::NetplayPaletteRuntime_CopySpectatorBank(slot, &bank) || !bank.valid) {
+            continue;
+        }
+
+        banks[slot].present = true;
+        banks[slot].bank = bank;
+        anyPresent = true;
+    }
+
+    return anyPresent;
+}
+
+static bool AppendReplayPaletteTrailer(const fs::path& path,
+                                       const ReplayPaletteOverrideState (&banks)[2]) {
+    const uint32_t flags = BuildReplayPaletteFlags(banks);
+    if (flags == 0) {
+        return true;
+    }
+
+    std::vector<uint8_t> trailer;
+    trailer.reserve(kReplayPaletteTrailerHeaderSize + 2 * kReplayPaletteTrailerRecordSize);
+    trailer.insert(trailer.end(), kReplayPaletteTrailerMagic.begin(), kReplayPaletteTrailerMagic.end());
+    AppendU32(&trailer, kReplayPaletteTrailerVersion);
+    AppendU32(&trailer, flags);
+
+    for (uint8_t slot = 0; slot < 2; ++slot) {
+        if (!banks[slot].present) {
+            continue;
+        }
+
+        const Net::NetplayPaletteBank& bank = banks[slot].bank;
+        const uint32_t crc = CalcCRC32(bank.data, Net::NETPLAY_PALETTE_BANK_SIZE);
+        trailer.push_back(bank.character_id);
+        trailer.push_back(bank.base_palette);
+        trailer.push_back(0);
+        trailer.push_back(0);
+        AppendU32(&trailer, crc);
+        trailer.insert(trailer.end(), bank.data, bank.data + Net::NETPLAY_PALETTE_BANK_SIZE);
+    }
+
+    std::ofstream stream(path, std::ios::binary | std::ios::app);
+    if (!stream) {
+        LOG_ERROR("[Replay] Failed to append palette trailer: %s", WideToUtf8(path.wstring()).c_str());
+        return false;
+    }
+
+    stream.write(reinterpret_cast<const char*>(trailer.data()), static_cast<std::streamsize>(trailer.size()));
+    if (!stream) {
+        LOG_ERROR("[Replay] Palette trailer write failed: %s", WideToUtf8(path.wstring()).c_str());
+        return false;
+    }
+
+    LOG_INFO("[Replay] Appended palette trailer to %s (p1=%d p2=%d)",
+        WideToUtf8(path.wstring()).c_str(),
+        banks[0].present ? 1 : 0,
+        banks[1].present ? 1 : 0);
+    return true;
+}
+
+static uint8_t ReplayHeaderPaletteForSlot(const ReplayFileMetadata& metadata, uint8_t slot) {
+    return slot == 0 ? metadata.header[0x0C] : metadata.header[0x22];
+}
+
+static uint32_t ReplayHeaderCharacterForSlot(const ReplayFileMetadata& metadata, uint8_t slot) {
+    return slot == 0 ? metadata.p1_char : metadata.p2_char;
+}
+
+static void ParseReplayPaletteTrailer(std::ifstream& stream,
+                                     const ReplayFileMetadata& metadata,
+                                     const char* replayPathForLog) {
+    ResetLoadedReplayPaletteState();
+
+    const std::streampos trailerStart = stream.tellg();
+    if (trailerStart < 0) {
+        return;
+    }
+
+    stream.seekg(0, std::ios::end);
+    const std::streampos fileEnd = stream.tellg();
+    if (fileEnd < trailerStart) {
+        stream.clear();
+        stream.seekg(trailerStart);
+        return;
+    }
+
+    const size_t trailerBytes = static_cast<size_t>(fileEnd - trailerStart);
+    stream.clear();
+    stream.seekg(trailerStart);
+    if (trailerBytes == 0) {
+        return;
+    }
+
+    std::vector<uint8_t> trailer(trailerBytes, 0);
+    stream.read(reinterpret_cast<char*>(trailer.data()), static_cast<std::streamsize>(trailer.size()));
+    if (!stream || stream.gcount() != static_cast<std::streamsize>(trailer.size())) {
+        LOG_WARN("[Replay] Failed to read trailer bytes for %s", replayPathForLog ? replayPathForLog : "(unknown)");
+        stream.clear();
+        return;
+    }
+
+    if (trailer.size() < kReplayPaletteTrailerHeaderSize ||
+        memcmp(trailer.data(), kReplayPaletteTrailerMagic.data(), kReplayPaletteTrailerMagic.size()) != 0) {
+        return;
+    }
+
+    const uint32_t version = ReadU32(trailer.data() + kReplayPaletteTrailerMagic.size());
+    const uint32_t flags = ReadU32(trailer.data() + kReplayPaletteTrailerMagic.size() + sizeof(uint32_t));
+    const uint32_t supportedFlags = kReplayPaletteFlagP1 | kReplayPaletteFlagP2;
+    if (version != kReplayPaletteTrailerVersion || (flags & ~supportedFlags) != 0) {
+        LOG_WARN("[Replay] Ignoring unsupported palette trailer in %s (version=%u flags=0x%08X)",
+            replayPathForLog ? replayPathForLog : "(unknown)",
+            version,
+            flags);
+        return;
+    }
+
+    size_t expectedSize = kReplayPaletteTrailerHeaderSize;
+    if ((flags & kReplayPaletteFlagP1) != 0) {
+        expectedSize += kReplayPaletteTrailerRecordSize;
+    }
+    if ((flags & kReplayPaletteFlagP2) != 0) {
+        expectedSize += kReplayPaletteTrailerRecordSize;
+    }
+    if (trailer.size() != expectedSize) {
+        LOG_WARN("[Replay] Ignoring malformed palette trailer in %s (bytes=%zu expected=%zu)",
+            replayPathForLog ? replayPathForLog : "(unknown)",
+            trailer.size(),
+            expectedSize);
+        return;
+    }
+
+    size_t offset = kReplayPaletteTrailerHeaderSize;
+    for (uint8_t slot = 0; slot < 2; ++slot) {
+        const uint32_t flag = slot == 0 ? kReplayPaletteFlagP1 : kReplayPaletteFlagP2;
+        if ((flags & flag) == 0) {
+            continue;
+        }
+
+        const uint8_t characterId = trailer[offset + 0];
+        const uint8_t basePalette = trailer[offset + 1];
+        const uint32_t storedCrc = ReadU32(trailer.data() + offset + 4);
+        const uint8_t* bankData = trailer.data() + offset + 8;
+        const uint32_t computedCrc = CalcCRC32(bankData, Net::NETPLAY_PALETTE_BANK_SIZE);
+        const uint32_t expectedCharacterId = ReplayHeaderCharacterForSlot(metadata, slot);
+        const uint8_t expectedBasePalette = ReplayHeaderPaletteForSlot(metadata, slot);
+
+        if (characterId != expectedCharacterId || basePalette != expectedBasePalette) {
+            LOG_WARN("[Replay] Ignoring mismatched palette trailer bank in %s for P%d (char=%u/%u base=%u/%u)",
+                replayPathForLog ? replayPathForLog : "(unknown)",
+                slot + 1,
+                characterId,
+                expectedCharacterId,
+                basePalette,
+                expectedBasePalette);
+            offset += kReplayPaletteTrailerRecordSize;
+            continue;
+        }
+
+        if (computedCrc != storedCrc) {
+            LOG_WARN("[Replay] Ignoring corrupt palette trailer bank in %s for P%d (stored=0x%08X actual=0x%08X)",
+                replayPathForLog ? replayPathForLog : "(unknown)",
+                slot + 1,
+                storedCrc,
+                computedCrc);
+            offset += kReplayPaletteTrailerRecordSize;
+            continue;
+        }
+
+        ReplayPaletteOverrideState& loaded = s_loadedReplayPalette[slot];
+        loaded.present = true;
+        loaded.bank.valid = true;
+        loaded.bank.character_id = characterId;
+        loaded.bank.base_palette = basePalette;
+        loaded.bank.crc32 = storedCrc;
+        memcpy(loaded.bank.data, bankData, Net::NETPLAY_PALETTE_BANK_SIZE);
+        offset += kReplayPaletteTrailerRecordSize;
+    }
+
+    LOG_INFO("[Replay] Loaded palette trailer from %s (p1=%d p2=%d)",
+        replayPathForLog ? replayPathForLog : "(unknown)",
+        s_loadedReplayPalette[0].present ? 1 : 0,
+        s_loadedReplayPalette[1].present ? 1 : 0);
+}
+
+static char __cdecl Hook_ReplaySave(int matchBase) {
+    Net::SessionSnapshot session{};
+    Net::Session_GetSnapshot(&session);
+
+    ReplayPaletteOverrideState banks[2] = {};
+    ReplayDirectorySnapshot before;
+    const bool hasPaletteTrailer = BuildReplayPaletteSaveData(banks);
+    const bool shouldRenameNetplayReplay = ShouldRenameNetplayReplaySave(session);
+    if (hasPaletteTrailer || shouldRenameNetplayReplay) {
+        before = CaptureReplayDirectorySnapshot();
+    }
+
+    const char result = s_originalReplaySave ? s_originalReplaySave(matchBase) : 0;
+
+    if (!hasPaletteTrailer && !shouldRenameNetplayReplay) {
+        return result;
+    }
+
+    const ReplayDirectorySnapshot after = CaptureReplayDirectorySnapshot();
+    fs::path replayPath;
+    if (!ResolveReplaySavePath(before, after, &replayPath)) {
+        LOG_WARN("[Replay] Saved replay could not be resolved for post-save processing");
+        return result;
+    }
+
+    if (hasPaletteTrailer) {
+        AppendReplayPaletteTrailer(replayPath, banks);
+    }
+
+    if (shouldRenameNetplayReplay) {
+        ReplayFileMetadata metadata{};
+        if (ReadReplayMetadata(replayPath, &metadata) && metadata.valid) {
+            RenameReplaySaveForNetplay(replayPath, metadata, nullptr);
+        } else {
+            LOG_WARN("[Replay] Skipped netplay replay rename because saved replay metadata could not be read");
+        }
+    }
+
+    return result;
+}
+
+static int __cdecl Hook_ReplaySelectDraw() {
+    if (!s_initialized || !IsReplayMenuContext()) {
+        return s_originalReplaySelectDraw ? s_originalReplaySelectDraw() : 0;
+    }
+
+    RenderReplayBrowserHud();
+    return 0;
 }
 
 static void ResetMatchRuntimeState() {
+    s_replayLaunchPending = false;
     s_replayMatchActive = false;
+    s_replayHudVisible = true;
     s_paused = false;
     s_savedPauseBlocked = false;
     s_currentFrame = -1;
@@ -204,6 +677,7 @@ static void ResetBrowserState() {
     s_browserEntries.clear();
     s_browserSelected = 0;
     s_browserScroll = 0;
+    s_browserCurrentDirectory.clear();
     s_browserNeedsScan = true;
     s_browserMenuWasActive = false;
     s_browserStatus.clear();
@@ -218,16 +692,18 @@ static bool IsReplayMenuSelectContext() {
 }
 
 static bool IsReplayMatchContext() {
-    if (GetGameType() != GAMETYPE_REPLAY) {
-        return false;
-    }
-
     if (GetGameMode() != MODE_MATCH) {
         return false;
     }
 
+    const bool replayOwned = GetGameType() == GAMETYPE_REPLAY || s_replayLaunchPending || s_replayMatchActive;
+    if (!replayOwned) {
+        return false;
+    }
+
     const uint32_t substate = GetSubstate();
-    return substate == MATCH_SUB_INIT ||
+    return substate == MATCH_SUB_SETUP ||
+           substate == MATCH_SUB_INIT ||
            substate == MATCH_SUB_GAMEPLAY ||
            substate == MATCH_SUB_PAUSE;
 }
@@ -262,24 +738,38 @@ static uint16_t ReadU16(const uint8_t* data) {
     return value;
 }
 
-static std::string WideToUtf8(const std::wstring& text) {
+static std::string WideToCodePage(const std::wstring& text, UINT codePage) {
     if (text.empty()) {
         return {};
     }
 
-    const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    const int size = WideCharToMultiByte(codePage, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (size <= 1) {
         return {};
     }
 
     std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, result.data(), size, nullptr, nullptr);
+    WideCharToMultiByte(codePage, 0, text.c_str(), -1, result.data(), size, nullptr, nullptr);
     result.resize(static_cast<size_t>(size - 1));
     return result;
 }
 
+static std::string WideToUtf8(const std::wstring& text) {
+    return WideToCodePage(text, CP_UTF8);
+}
+
+static std::string WideToGameText(const std::wstring& text) {
+    return WideToCodePage(text, 932);
+}
+
 static std::string NormalizeDisplayPath(const fs::path& path) {
     std::string result = WideToUtf8(path.wstring());
+    std::replace(result.begin(), result.end(), '\\', '/');
+    return result;
+}
+
+static std::string NormalizeGameDisplayPath(const fs::path& path) {
+    std::string result = WideToGameText(path.wstring());
     std::replace(result.begin(), result.end(), '\\', '/');
     return result;
 }
@@ -313,6 +803,176 @@ static std::string FormatLastWriteTime(const fs::path& path) {
     char buffer[32] = {};
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &localTime);
     return buffer;
+}
+
+static std::string FormatReplayTimestampForFilename(const fs::path& path) {
+    std::error_code ec;
+    fs::file_time_type fileTime = fs::last_write_time(path, ec);
+    if (ec) {
+        fileTime = fs::file_time_type::clock::now();
+    }
+
+    const auto systemNow = std::chrono::system_clock::now();
+    const auto fileNow = fs::file_time_type::clock::now();
+    const auto systemTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        fileTime - fileNow + systemNow);
+
+    const std::time_t rawTime = std::chrono::system_clock::to_time_t(systemTime);
+    std::tm localTime = {};
+    if (localtime_s(&localTime, &rawTime) != 0) {
+        return "replay";
+    }
+
+    char buffer[32] = {};
+    strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", &localTime);
+    return buffer;
+}
+
+static std::string GetCharacterDisplayName(uint32_t characterId) {
+    switch (characterId) {
+        case 0: return "Rance";
+        case 1: return "Hatsune";
+        case 2: return "Patton";
+        case 3: return "Seed";
+        case 4: return "Raysen";
+        case 5: return "Aria";
+        case 6: return "Maria";
+        case 7: return "Shizuka";
+        case 8: return "Fanel";
+        case 9: return "Miki";
+        case 10: return "Menad";
+        case 11: return "Hanny King";
+        case 12: return "Satsu";
+        case 13: return "Tiger Joe";
+        case 14: return "Escalayer";
+        case 15: return "Makutsudo";
+        case 16: return "Alietta";
+        case 17: return "Nalzgis";
+        default: {
+            char buffer[32] = {};
+            snprintf(buffer, sizeof(buffer), "Char%u", characterId);
+            return buffer;
+        }
+    }
+}
+
+static std::string SanitizeReplayFilenameComponent(const std::string& text,
+                                                   const char* fallback) {
+    std::string sanitized;
+    sanitized.reserve(text.size());
+
+    bool previousUnderscore = false;
+    for (unsigned char ch : text) {
+        char outChar = static_cast<char>(ch);
+        if (ch <= 31 || ch == '<' || ch == '>' || ch == ':' || ch == '"' ||
+            ch == '/' || ch == '\\' || ch == '|' || ch == '?' || ch == '*' ||
+            ch == ' ' || ch == '.') {
+            outChar = '_';
+        }
+
+        if (outChar == '_') {
+            if (previousUnderscore) {
+                continue;
+            }
+            previousUnderscore = true;
+        } else {
+            previousUnderscore = false;
+        }
+
+        sanitized.push_back(outChar);
+    }
+
+    while (!sanitized.empty() && sanitized.front() == '_') {
+        sanitized.erase(sanitized.begin());
+    }
+    while (!sanitized.empty() && sanitized.back() == '_') {
+        sanitized.pop_back();
+    }
+
+    if (!sanitized.empty()) {
+        return sanitized;
+    }
+
+    return fallback ? fallback : "Unknown";
+}
+
+static bool ShouldRenameNetplayReplaySave(const Net::SessionSnapshot& session) {
+    return session.remote_peer.nickname[0] != '\0' &&
+        (session.active || Net::PlayerMapping_IsAssigned());
+}
+
+static std::string BuildNetplayReplayFilename(const fs::path& replayPath,
+                                              const ReplayFileMetadata& metadata) {
+    Net::SessionSnapshot session{};
+    Net::Session_GetSnapshot(&session);
+
+    const std::string localNickname = SanitizeReplayFilenameComponent(
+        session.local_nickname[0] ? session.local_nickname : "Local",
+        "Local");
+    const std::string remoteNickname = SanitizeReplayFilenameComponent(
+        session.remote_peer.nickname[0] ? session.remote_peer.nickname : "Remote",
+        "Remote");
+
+    int localSlot = Net::PlayerMapping_GetLocalGameSlot();
+    if (localSlot != 0 && localSlot != 1) {
+        localSlot = Net::Session_GetRole() == Net::SessionRole::Host ? 0 : 1;
+    }
+
+    const std::string p1Nickname = localSlot == 0 ? localNickname : remoteNickname;
+    const std::string p2Nickname = localSlot == 0 ? remoteNickname : localNickname;
+    const std::string p1Character = SanitizeReplayFilenameComponent(GetCharacterDisplayName(metadata.p1_char), "P1Char");
+    const std::string p2Character = SanitizeReplayFilenameComponent(GetCharacterDisplayName(metadata.p2_char), "P2Char");
+
+    return FormatReplayTimestampForFilename(replayPath) + "_" +
+        p1Nickname + "_" + p1Character + "_vs_" +
+        p2Nickname + "_" + p2Character + ".rep";
+}
+
+static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
+                                       const ReplayFileMetadata& metadata,
+                                       fs::path* outRenamedPath) {
+    const std::string fileName = BuildNetplayReplayFilename(replayPath, metadata);
+    if (fileName.empty()) {
+        return false;
+    }
+
+    fs::path candidate = replayPath.parent_path() / fs::path(fileName);
+    const std::string stem = candidate.stem().string();
+    const std::string extension = candidate.extension().string();
+
+    int suffix = 2;
+    std::error_code ec;
+    while (candidate != replayPath && fs::exists(candidate, ec)) {
+        ec.clear();
+
+        char suffixBuffer[16] = {};
+        snprintf(suffixBuffer, sizeof(suffixBuffer), "_%d", suffix++);
+        candidate = replayPath.parent_path() / fs::path(stem + suffixBuffer + extension);
+    }
+
+    if (candidate == replayPath) {
+        if (outRenamedPath) {
+            *outRenamedPath = replayPath;
+        }
+        return true;
+    }
+
+    fs::rename(replayPath, candidate, ec);
+    if (ec) {
+        LOG_WARN("[Replay] Failed to rename saved replay %s -> %s (%s)",
+            WideToUtf8(replayPath.wstring()).c_str(),
+            WideToUtf8(candidate.wstring()).c_str(),
+            ec.message().c_str());
+        return false;
+    }
+
+    LOG_INFO("[Replay] Renamed saved replay: %s -> %s",
+        WideToUtf8(replayPath.wstring()).c_str(),
+        WideToUtf8(candidate.wstring()).c_str());
+    if (outRenamedPath) {
+        *outRenamedPath = candidate;
+    }
+    return true;
 }
 
 static bool IsReplayExtension(const fs::path& path) {
@@ -366,6 +1026,8 @@ static void ClampBrowserSelection() {
     if (s_browserEntries.empty()) {
         s_browserSelected = 0;
         s_browserScroll = 0;
+        WriteMemory<uint32_t>(ADDR_REPLAY_SELECT_COUNT, 0);
+        WriteMemory<uint32_t>(ADDR_REPLAY_SELECT_INDEX, 0);
         return;
     }
 
@@ -377,6 +1039,8 @@ static void ClampBrowserSelection() {
         s_browserScroll = s_browserSelected - kReplayBrowserPageSize + 1;
     }
     s_browserScroll = std::clamp(s_browserScroll, 0, maxScroll);
+    WriteMemory<uint32_t>(ADDR_REPLAY_SELECT_COUNT, static_cast<uint32_t>(s_browserEntries.size()));
+    WriteMemory<uint32_t>(ADDR_REPLAY_SELECT_INDEX, static_cast<uint32_t>(s_browserSelected));
 }
 
 static void ScanReplayBrowser() {
@@ -384,6 +1048,10 @@ static void ScanReplayBrowser() {
         (s_browserSelected >= 0 && s_browserSelected < static_cast<int32_t>(s_browserEntries.size()))
             ? s_browserEntries[s_browserSelected].relative_path
             : std::string();
+    const ReplayBrowserEntryType previousType =
+        (s_browserSelected >= 0 && s_browserSelected < static_cast<int32_t>(s_browserEntries.size()))
+            ? s_browserEntries[s_browserSelected].type
+            : ReplayBrowserEntryType::ReplayFile;
 
     s_browserEntries.clear();
     s_browserSelected = 0;
@@ -393,12 +1061,34 @@ static void ScanReplayBrowser() {
     const fs::path root = fs::path(L"replay");
     std::error_code ec;
     if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
+        s_browserCurrentDirectory.clear();
         SetBrowserStatus("No replay directory found at replay/.");
         s_browserNeedsScan = false;
         return;
     }
 
-    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+    fs::path currentDirectory = root / s_browserCurrentDirectory;
+    if (!fs::exists(currentDirectory, ec) || !fs::is_directory(currentDirectory, ec)) {
+        ec.clear();
+        s_browserCurrentDirectory.clear();
+        currentDirectory = root;
+    }
+
+    if (!s_browserCurrentDirectory.empty()) {
+        ReplayBrowserEntry parentEntry{};
+        parentEntry.type = ReplayBrowserEntryType::ParentDirectory;
+        parentEntry.full_path = currentDirectory.parent_path();
+        parentEntry.relative_path = NormalizeDisplayPath(s_browserCurrentDirectory.parent_path());
+        parentEntry.display_name = "...";
+        s_browserEntries.push_back(std::move(parentEntry));
+    }
+
+    std::vector<ReplayBrowserEntry> directoryEntries;
+    std::vector<ReplayBrowserEntry> replayEntries;
+    bool hasFolders = false;
+    bool hasReplays = false;
+
+    for (fs::directory_iterator it(currentDirectory, fs::directory_options::skip_permission_denied, ec), end;
          it != end;
          it.increment(ec)) {
         if (ec) {
@@ -407,6 +1097,28 @@ static void ScanReplayBrowser() {
         }
 
         const fs::directory_entry entry = *it;
+
+        if (entry.is_directory(ec)) {
+            ec.clear();
+            ReplayBrowserEntry browserEntry{};
+            browserEntry.type = ReplayBrowserEntryType::Directory;
+            browserEntry.full_path = entry.path();
+
+            fs::path relativePath = browserEntry.full_path.lexically_relative(root);
+            if (relativePath.empty()) {
+                relativePath = browserEntry.full_path.filename();
+            }
+
+            browserEntry.relative_path = NormalizeDisplayPath(relativePath);
+            browserEntry.display_name = WideToGameText(browserEntry.full_path.filename().wstring());
+            if (browserEntry.display_name.empty()) {
+                browserEntry.display_name = browserEntry.relative_path;
+            }
+            directoryEntries.push_back(std::move(browserEntry));
+            hasFolders = true;
+            continue;
+        }
+
         if (!entry.is_regular_file(ec)) {
             ec.clear();
             continue;
@@ -416,6 +1128,7 @@ static void ScanReplayBrowser() {
         }
 
         ReplayBrowserEntry browserEntry{};
+        browserEntry.type = ReplayBrowserEntryType::ReplayFile;
         browserEntry.full_path = entry.path();
 
         fs::path relativePath = browserEntry.full_path.lexically_relative(root);
@@ -423,17 +1136,28 @@ static void ScanReplayBrowser() {
             relativePath = browserEntry.full_path.filename();
         }
         browserEntry.relative_path = NormalizeDisplayPath(relativePath);
+        browserEntry.display_name = WideToGameText(browserEntry.full_path.stem().wstring());
+        if (browserEntry.display_name.empty()) {
+            browserEntry.display_name = NormalizeGameDisplayPath(browserEntry.full_path.filename());
+        }
         ReadReplayMetadata(browserEntry.full_path, &browserEntry.metadata);
-        s_browserEntries.push_back(std::move(browserEntry));
+        replayEntries.push_back(std::move(browserEntry));
+        hasReplays = true;
     }
 
-    std::sort(s_browserEntries.begin(), s_browserEntries.end(), [](const ReplayBrowserEntry& lhs, const ReplayBrowserEntry& rhs) {
-        return MakeSortKey(lhs.relative_path) < MakeSortKey(rhs.relative_path);
+    std::sort(directoryEntries.begin(), directoryEntries.end(), [](const ReplayBrowserEntry& lhs, const ReplayBrowserEntry& rhs) {
+        return MakeSortKey(lhs.display_name) < MakeSortKey(rhs.display_name);
     });
+    std::sort(replayEntries.begin(), replayEntries.end(), [](const ReplayBrowserEntry& lhs, const ReplayBrowserEntry& rhs) {
+        return MakeSortKey(lhs.display_name) < MakeSortKey(rhs.display_name);
+    });
+
+    s_browserEntries.insert(s_browserEntries.end(), directoryEntries.begin(), directoryEntries.end());
+    s_browserEntries.insert(s_browserEntries.end(), replayEntries.begin(), replayEntries.end());
 
     if (!previousPath.empty()) {
         for (int32_t i = 0; i < static_cast<int32_t>(s_browserEntries.size()); i++) {
-            if (s_browserEntries[i].relative_path == previousPath) {
+            if (s_browserEntries[i].relative_path == previousPath && s_browserEntries[i].type == previousType) {
                 s_browserSelected = i;
                 break;
             }
@@ -443,10 +1167,16 @@ static void ScanReplayBrowser() {
     ClampBrowserSelection();
     s_browserNeedsScan = false;
 
-    if (s_browserEntries.empty()) {
-        SetBrowserStatus("No replay files found under replay/.");
+    if (!hasFolders && !hasReplays) {
+        if (s_browserCurrentDirectory.empty()) {
+            SetBrowserStatus("No replay folders or files found under replay/.");
+        } else {
+            SetBrowserStatus("Folder is empty. Press Esc or Backspace to return.");
+        }
     } else {
-        LOG_INFO("[Replay] Browser scanned %zu replay file(s)", s_browserEntries.size());
+        LOG_INFO("[Replay] Browser scanned %zu entry(s) in %s",
+            s_browserEntries.size(),
+            s_browserCurrentDirectory.empty() ? "replay/" : NormalizeDisplayPath(s_browserCurrentDirectory).c_str());
     }
 }
 
@@ -454,6 +1184,49 @@ static void EnsureBrowserScanned() {
     if (s_browserNeedsScan) {
         ScanReplayBrowser();
     }
+}
+
+static bool EnterBrowserDirectory(const ReplayBrowserEntry& entry) {
+    if (entry.type != ReplayBrowserEntryType::Directory) {
+        return false;
+    }
+
+    const fs::path root = fs::path(L"replay");
+    fs::path relativeDirectory = entry.full_path.lexically_relative(root);
+    if (relativeDirectory.empty()) {
+        relativeDirectory = entry.full_path.filename();
+    }
+
+    s_browserCurrentDirectory = relativeDirectory;
+    s_browserNeedsScan = true;
+    EnsureBrowserScanned();
+    LOG_INFO("[Replay] Browser entered folder: %s", entry.relative_path.c_str());
+    return true;
+}
+
+static bool ReturnToBrowserParentDirectory() {
+    if (s_browserCurrentDirectory.empty()) {
+        return false;
+    }
+
+    const fs::path childDirectory = s_browserCurrentDirectory;
+    s_browserCurrentDirectory = s_browserCurrentDirectory.parent_path();
+    s_browserNeedsScan = true;
+    EnsureBrowserScanned();
+
+    const std::string childPath = NormalizeDisplayPath(childDirectory);
+    for (int32_t i = 0; i < static_cast<int32_t>(s_browserEntries.size()); ++i) {
+        if (s_browserEntries[i].type == ReplayBrowserEntryType::Directory &&
+            s_browserEntries[i].relative_path == childPath) {
+            s_browserSelected = i;
+            ClampBrowserSelection();
+            break;
+        }
+    }
+
+    LOG_INFO("[Replay] Browser returned to folder: %s",
+        s_browserCurrentDirectory.empty() ? "replay/" : NormalizeDisplayPath(s_browserCurrentDirectory).c_str());
+    return true;
 }
 
 static int32_t ClampReplayFrame(int32_t frame) {
@@ -856,6 +1629,11 @@ static void ChangeSpeed(int delta) {
 static void HandleMatchHotkeys() {
     const bool shiftDown = KeyDown(VK_SHIFT);
 
+    if (ConsumeEdge(kHotkeyToggleHud, &s_toggleHudKeyWasDown)) {
+        s_replayHudVisible = !s_replayHudVisible;
+        LOG_INFO("[Replay] HUD %s", s_replayHudVisible ? "shown" : "hidden");
+    }
+
     if (ConsumeEdge(kHotkeyPause, &s_pauseKeyWasDown)) {
         s_paused = !s_paused;
         if (!s_paused) {
@@ -917,23 +1695,28 @@ static void TransitionReplayMenu(uint32_t resultValue) {
 }
 
 static bool LaunchReplayEntry(const ReplayBrowserEntry& entry) {
+    if (entry.type != ReplayBrowserEntryType::ReplayFile) {
+        return false;
+    }
+
     ReplayFileMetadata metadata;
+    ResetLoadedReplayPaletteState();
     if (!ReadReplayMetadata(entry.full_path, &metadata) || !metadata.valid) {
-        SetBrowserStatus("Cannot load invalid replay: %s", entry.relative_path.c_str());
+        SetBrowserStatus("Cannot load invalid replay: %s", entry.display_name.c_str());
         LOG_ERROR("[Replay] Invalid replay selected: %s", entry.relative_path.c_str());
         return false;
     }
 
     std::ifstream stream(entry.full_path, std::ios::binary);
     if (!stream) {
-        SetBrowserStatus("Failed to open replay: %s", entry.relative_path.c_str());
+        SetBrowserStatus("Failed to open replay: %s", entry.display_name.c_str());
         LOG_ERROR("[Replay] Failed to open replay: %s", entry.relative_path.c_str());
         return false;
     }
 
     stream.read(reinterpret_cast<char*>(metadata.header.data()), static_cast<std::streamsize>(metadata.header.size()));
     if (!stream || stream.gcount() != static_cast<std::streamsize>(metadata.header.size())) {
-        SetBrowserStatus("Failed to read replay header: %s", entry.relative_path.c_str());
+        SetBrowserStatus("Failed to read replay header: %s", entry.display_name.c_str());
         LOG_ERROR("[Replay] Failed to read replay header: %s", entry.relative_path.c_str());
         return false;
     }
@@ -943,22 +1726,26 @@ static bool LaunchReplayEntry(const ReplayBrowserEntry& entry) {
     if (frameBytes > 0) {
         stream.read(reinterpret_cast<char*>(tape.data()), static_cast<std::streamsize>(tape.size()));
         if (!stream || stream.gcount() != static_cast<std::streamsize>(tape.size())) {
-            SetBrowserStatus("Replay input data is truncated: %s", entry.relative_path.c_str());
+            SetBrowserStatus("Replay input data is truncated: %s", entry.display_name.c_str());
             LOG_ERROR("[Replay] Replay input data truncated: %s", entry.relative_path.c_str());
             return false;
         }
     }
 
+    ParseReplayPaletteTrailer(stream, metadata, entry.relative_path.c_str());
+
     if (!WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_REPLAY_HEADER_BASE),
                               metadata.header.data(),
                               metadata.header.size())) {
         SetBrowserStatus("Failed to write replay header into game memory.");
+        ResetLoadedReplayPaletteState();
         return false;
     }
 
     if (frameBytes > 0 &&
         !WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_REPLAY_INPUT_BASE), tape.data(), tape.size())) {
         SetBrowserStatus("Failed to write replay input data into game memory.");
+        ResetLoadedReplayPaletteState();
         return false;
     }
 
@@ -968,6 +1755,7 @@ static bool LaunchReplayEntry(const ReplayBrowserEntry& entry) {
                                   zeros.data(),
                                   zeros.size())) {
             SetBrowserStatus("Failed to clear trailing replay input memory.");
+            ResetLoadedReplayPaletteState();
             return false;
         }
     }
@@ -986,6 +1774,12 @@ static bool LaunchReplayEntry(const ReplayBrowserEntry& entry) {
     WriteMemory<uint8_t>(ADDR_CHARSEL_P2_VARIANT_EXTRA, metadata.header[0x3D]);
     WriteMemory<uint16_t>(ADDR_MATCH_CONFIG_FLAGS, ReadU16(metadata.header.data() + 0x3E));
 
+    static const uint8_t zeroDisplay[kReplaySelectDisplayBytes] = {};
+    WriteMemory<uint32_t>(ADDR_REPLAY_SELECT_COUNT, 0);
+    WriteMemory<uint32_t>(ADDR_REPLAY_SELECT_INDEX, 0);
+    WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_REPLAY_SELECT_DISPLAY), zeroDisplay, sizeof(zeroDisplay));
+
+    s_replayLaunchPending = true;
     TransitionReplayMenu(0);
     ResetMenuHotkeyEdges();
     LOG_INFO("[Replay] Launching replay from browser: %s (%d frames)",
@@ -1003,7 +1797,7 @@ static void CancelReplaySelection() {
 static void HandleReplayMenuInput() {
     EnsureBrowserScanned();
 
-    if (ConsumeEdge(VK_UP, &s_menuUpWasDown)) {
+    if (ReplayMenuInputJustPressed(INPUT_UP)) {
         if (!s_browserEntries.empty()) {
             s_browserSelected = (s_browserSelected + static_cast<int32_t>(s_browserEntries.size()) - 1) %
                 static_cast<int32_t>(s_browserEntries.size());
@@ -1011,19 +1805,19 @@ static void HandleReplayMenuInput() {
         }
     }
 
-    if (ConsumeEdge(VK_DOWN, &s_menuDownWasDown)) {
+    if (ReplayMenuInputJustPressed(INPUT_DOWN)) {
         if (!s_browserEntries.empty()) {
             s_browserSelected = (s_browserSelected + 1) % static_cast<int32_t>(s_browserEntries.size());
             ClampBrowserSelection();
         }
     }
 
-    if (ConsumeEdge(VK_PRIOR, &s_menuPageUpWasDown)) {
+    if (ReplayMenuInputJustPressed(INPUT_LEFT)) {
         s_browserSelected -= kReplayBrowserPageSize;
         ClampBrowserSelection();
     }
 
-    if (ConsumeEdge(VK_NEXT, &s_menuPageDownWasDown)) {
+    if (ReplayMenuInputJustPressed(INPUT_RIGHT)) {
         s_browserSelected += kReplayBrowserPageSize;
         ClampBrowserSelection();
     }
@@ -1038,18 +1832,36 @@ static void HandleReplayMenuInput() {
         ClampBrowserSelection();
     }
 
-    if (ConsumeEdge(VK_RETURN, &s_menuConfirmWasDown)) {
+    if (ReplayMenuInputJustPressed(INPUT_A) ||
+        ReplayMenuInputJustPressed(INPUT_C) ||
+        ReplayMenuInputJustPressed(INPUT_START)) {
         if (s_browserEntries.empty()) {
-            SetBrowserStatus("No replay files are available to load.");
+            SetBrowserStatus("No replay folders or files are available here.");
         } else {
-            LaunchReplayEntry(s_browserEntries[s_browserSelected]);
+            const ReplayBrowserEntry& entry = s_browserEntries[s_browserSelected];
+            switch (entry.type) {
+                case ReplayBrowserEntryType::ParentDirectory:
+                    ReturnToBrowserParentDirectory();
+                    break;
+                case ReplayBrowserEntryType::Directory:
+                    EnterBrowserDirectory(entry);
+                    break;
+                case ReplayBrowserEntryType::ReplayFile:
+                    LaunchReplayEntry(entry);
+                    break;
+            }
         }
     }
 
-    const bool cancelPressed = ConsumeEdge(VK_ESCAPE, &s_menuCancelWasDown) ||
+    const bool cancelPressed = ReplayMenuInputJustPressed(INPUT_B) ||
+        ReplayMenuInputJustPressed(INPUT_D) ||
+        ReplayMenuInputJustPressed(INPUT_SELECT) ||
+        ConsumeEdge(VK_ESCAPE, &s_menuCancelWasDown) ||
         ConsumeEdge(VK_BACK, &s_menuBackWasDown);
     if (cancelPressed) {
-        CancelReplaySelection();
+        if (!ReturnToBrowserParentDirectory()) {
+            CancelReplaySelection();
+        }
     }
 }
 
@@ -1067,10 +1879,12 @@ static void UpdateReplayMenuContext() {
     if (menuActive) {
         HandleReplayMenuInput();
     }
+
 }
 
 static void ActivateReplayMatch() {
     ResetMatchRuntimeState();
+    s_replayLaunchPending = false;
     s_replayMatchActive = true;
     s_savedGlobalTickScale = GetGlobalTickScale();
     s_savedPauseBlocked = InputSystem_IsPauseBlocked();
@@ -1100,11 +1914,12 @@ static void DeactivateReplayMatch(const char* reason) {
     SetGlobalTickScale(s_savedGlobalTickScale);
     Rollback::StateHistory_Reset();
     ResetMatchRuntimeState();
+    ResetLoadedReplayPaletteState();
     ResetMatchHotkeyEdges();
 }
 
 static void RenderReplayMatchHud() {
-    if (!s_replayMatchActive) {
+    if (!s_replayMatchActive || !s_replayHudVisible) {
         return;
     }
 
@@ -1113,7 +1928,7 @@ static void RenderReplayMatchHud() {
         return;
     }
 
-    char lines[7][128] = {};
+    char lines[8][128] = {};
     snprintf(lines[0], sizeof(lines[0]), "REPLAY %d / %d  %.2fx",
         (std::max)(s_currentFrame, 0),
         (std::max)(s_totalFrames - 1, 0),
@@ -1135,9 +1950,11 @@ static void RenderReplayMatchHud() {
         }
     }
 
-    snprintf(lines[3], sizeof(lines[3]), "\\ Pause  ] Step  [ Back  Shift+[ Rewind 60");
-    snprintf(lines[4], sizeof(lines[4]), "= Faster  - Slower  1 P1 Takeover  2 P2 Takeover  0 Exit");
-    snprintf(lines[5], sizeof(lines[5]), "Press the same takeover key again to retry from the takeover start.");
+    snprintf(lines[3], sizeof(lines[3]), "\\ Pause  ] Fwd  [ Back  Shift+[ Rewind");
+    snprintf(lines[4], sizeof(lines[4]), "+/- Speed  1 P1  2 P2  0 Exit  Ins HUD");
+    snprintf(lines[5], sizeof(lines[5]), "Press takeover key again to restart.");
+    lines[6][0] = '\0';
+    lines[7][0] = '\0';
 
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
     float maxWidth = 0.0f;
@@ -1159,7 +1976,7 @@ static void RenderReplayMatchHud() {
 
     const float pad = 8.0f * ModUI_GetScale();
     const float x = 12.0f * ModUI_GetScale();
-    const float y = 28.0f * ModUI_GetScale();
+    const float y = 90.0f * ModUI_GetScale();
     const float width = maxWidth + pad * 2.0f;
     const float height = lineCount * lineHeight + pad * 2.0f + (lineCount - 1) * 2.0f;
 
@@ -1185,107 +2002,422 @@ static void RenderReplayMatchHud() {
     }
 }
 
+static int GameCreateColor(uint8_t r, uint8_t g, uint8_t b) {
+    return reinterpret_cast<RenderCreateColor_t>(kAddrRenderCreateColor)(r, g, b);
+}
+
+static void GameDrawSprite(int x, int y, int spriteHandle) {
+    if (spriteHandle <= 0) {
+        return;
+    }
+
+    reinterpret_cast<RenderDrawSprite_t>(kAddrRenderDrawSprite)(x, y, spriteHandle, 1);
+}
+
+static void GameSetBlend(int mode, uint8_t alpha) {
+    reinterpret_cast<RenderSetBlendMode_t>(kAddrRenderSetBlendMode)(mode, alpha);
+}
+
+static void GameFillRect(int left, int top, int right, int bottom, uint8_t r, uint8_t g, uint8_t b) {
+    reinterpret_cast<RenderFillRect_t>(kAddrRenderFillRect)(
+        left,
+        top,
+        right,
+        bottom,
+        GameCreateColor(r, g, b),
+        1);
+}
+
+static void GameDrawTextShadowed(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* text) {
+    if (!text || !text[0]) {
+        return;
+    }
+
+    const unsigned int shadowColor = static_cast<unsigned int>(GameCreateColor(0, 0, 0));
+    const unsigned int textColor = static_cast<unsigned int>(GameCreateColor(r, g, b));
+    reinterpret_cast<DrawFormatString_t>(kAddrDrawFormatString)(x + 1, y + 1, shadowColor, (char*)"%s", (char*)text);
+    reinterpret_cast<DrawFormatString_t>(kAddrDrawFormatString)(x, y, textColor, (char*)"%s", (char*)text);
+}
+
+static bool IsGameTextLeadByte(unsigned char value) {
+    return IsDBCSLeadByteEx(932, value) != FALSE;
+}
+
+static size_t GameTextPrefixBytes(const char* text, size_t displayUnits) {
+    size_t offset = 0;
+    size_t units = 0;
+    while (text && text[offset]) {
+        const bool wideChar = IsGameTextLeadByte((unsigned char)text[offset]) && text[offset + 1];
+        const size_t charUnits = wideChar ? 2 : 1;
+        if (units + charUnits > displayUnits) {
+            break;
+        }
+        offset += wideChar ? 2 : 1;
+        units += charUnits;
+    }
+    return offset;
+}
+
+static size_t GameTextCountChars(const char* text) {
+    size_t units = 0;
+    for (size_t offset = 0; text && text[offset]; ) {
+        if (IsGameTextLeadByte((unsigned char)text[offset]) && text[offset + 1]) {
+            offset += 2;
+            units += 2;
+        } else {
+            ++offset;
+            units += 1;
+        }
+    }
+    return units;
+}
+
+static void ClipGameText(char* out, size_t outCap, const char* in, size_t maxChars) {
+    if (!out || outCap == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (!in || !in[0]) {
+        return;
+    }
+
+    const size_t charCount = GameTextCountChars(in);
+    if (charCount <= maxChars || maxChars < 4) {
+        strncpy_s(out, outCap, in, _TRUNCATE);
+        return;
+    }
+
+    const size_t prefixBytes = GameTextPrefixBytes(in, maxChars - 3);
+    _snprintf_s(out, outCap, _TRUNCATE, "%.*s...", static_cast<int>(prefixBytes), in);
+}
+
+static std::string GetBrowserCurrentPathText() {
+    if (s_browserCurrentDirectory.empty()) {
+        return "replay/";
+    }
+
+    return std::string("replay/") + NormalizeGameDisplayPath(s_browserCurrentDirectory);
+}
+
+static std::string GetBrowserEntryValueText(const ReplayBrowserEntry& entry) {
+    switch (entry.type) {
+        case ReplayBrowserEntryType::ParentDirectory:
+            return "Up";
+        case ReplayBrowserEntryType::Directory:
+            return "Folder";
+        case ReplayBrowserEntryType::ReplayFile:
+            if (!entry.metadata.valid) {
+                return "Invalid";
+            }
+
+            break;
+    }
+
+    const int32_t seconds = entry.metadata.frames / 60;
+    char buffer[32] = {};
+    snprintf(buffer, sizeof(buffer), "%d:%02d", seconds / 60, seconds % 60);
+    return buffer;
+}
+
+static std::string GetBrowserEntryMatchupText(const ReplayBrowserEntry& entry) {
+    if (entry.type != ReplayBrowserEntryType::ReplayFile || !entry.metadata.valid) {
+        return {};
+    }
+
+    return GetCharacterDisplayName(entry.metadata.p1_char) + " / " +
+        GetCharacterDisplayName(entry.metadata.p2_char);
+}
+
 static void RenderReplayBrowserHud() {
-    if (!IsReplayMenuSelectContext()) {
+    if (!IsReplayMenuContext()) {
         return;
     }
 
     EnsureBrowserScanned();
 
-    const float scale = ModUI_GetScale();
-    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    GameDrawSprite(0, 0, ReadMemory<int>(kAddrReplayMenuBackgroundHandle));
 
-    ImGui::SetNextWindowPos(ImVec2(24.0f * scale, 24.0f * scale), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(displaySize.x - 48.0f * scale, displaySize.y - 48.0f * scale), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.94f);
+    // Dim overlay
+    GameSetBlend(1, 100);
+    GameFillRect(0, 0, 639, 479, 0, 0, 0);
+    GameSetBlend(0, 255);
 
-    const ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove;
+    const int totalEntries = static_cast<int>(s_browserEntries.size());
+    const int visibleEntries = totalEntries -
+        (!s_browserCurrentDirectory.empty() && totalEntries > 0 ? 1 : 0);
+    const bool hasSelection = totalEntries > 0 &&
+        s_browserSelected >= 0 && s_browserSelected < totalEntries;
+    const ReplayBrowserEntry* selectedEntry = hasSelection
+        ? &s_browserEntries[s_browserSelected]
+        : nullptr;
+    const int32_t listEnd = (std::min)(s_browserScroll + kReplayBrowserPageSize,
+        static_cast<int32_t>(s_browserEntries.size()));
+    const int listRowsTop = kReplayBrowserListTop + 30;
 
-    if (!ImGui::Begin("Replay Browser", nullptr, flags)) {
-        ImGui::End();
-        return;
-    }
+    GameSetBlend(0, 255);
 
-    ImGui::Text("Replay Browser");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%d file(s)", static_cast<int>(s_browserEntries.size()));
-    ImGui::Separator();
+    // Header shadow
+    GameSetBlend(1, 40);
+    GameFillRect(kReplayBrowserPanelLeft + 8, kReplayBrowserHeaderY - 4, kReplayBrowserPanelRight - 8, kReplayBrowserListTop - 2, 0, 0, 0);
+    GameSetBlend(0, 255);
 
-    const float detailsHeight = 118.0f * scale;
-    const float statusHeight = 44.0f * scale;
-    const float listHeight = (std::max)(80.0f * scale, ImGui::GetContentRegionAvail().y - detailsHeight - statusHeight);
+    // List area shadow
+    GameSetBlend(1, 30);
+    GameFillRect(kReplayBrowserListLeft - 2, kReplayBrowserListTop - 2, kReplayBrowserListRight + 2, kReplayBrowserListBottom + 2, 0, 0, 0);
+    GameSetBlend(0, 255);
 
-    if (ImGui::BeginChild("ReplayList", ImVec2(0.0f, listHeight), true)) {
-        if (s_browserEntries.empty()) {
-            ImGui::TextUnformatted("No replay files were found under replay/.");
-        } else {
-            const int32_t listEnd = (std::min)(s_browserScroll + kReplayBrowserPageSize,
-                static_cast<int32_t>(s_browserEntries.size()));
-            for (int32_t i = s_browserScroll; i < listEnd; i++) {
-                const ReplayBrowserEntry& entry = s_browserEntries[i];
-                const bool selected = i == s_browserSelected;
-                if (selected) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 220, 120, 255));
-                } else if (!entry.metadata.valid) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(220, 120, 120, 255));
-                }
+    // Detail area shadow
+    GameSetBlend(1, 30);
+    GameFillRect(kReplayBrowserDetailLeft - 2, kReplayBrowserDetailTop - 2, kReplayBrowserDetailRight + 2, kReplayBrowserDetailBottom + 2, 0, 0, 0);
+    GameSetBlend(0, 255);
 
-                char label[768] = {};
-                snprintf(label, sizeof(label), "%c %s%s",
-                    selected ? '>' : ' ',
-                    entry.metadata.valid ? "" : "[invalid] ",
-                    entry.relative_path.c_str());
-                ImGui::TextUnformatted(label);
+    // Header
+    const std::string pathText = GetBrowserCurrentPathText();
+    char clippedPath[192] = {};
+    ClipGameText(clippedPath, sizeof(clippedPath), pathText.c_str(), 38);
 
-                if (selected || !entry.metadata.valid) {
-                    ImGui::PopStyleColor();
-                }
-            }
-        }
-    }
-    ImGui::EndChild();
-
-    ImGui::Separator();
-    if (!s_browserEntries.empty()) {
-        const ReplayBrowserEntry& entry = s_browserEntries[s_browserSelected];
-        ImGui::Text("Selected: %d / %d", s_browserSelected + 1, static_cast<int>(s_browserEntries.size()));
-        ImGui::TextWrapped("Path: %s", entry.relative_path.c_str());
-        if (entry.metadata.valid) {
-            const int32_t seconds = entry.metadata.frames / 60;
-            ImGui::Text("Frames: %d   Duration: %d:%02d", entry.metadata.frames, seconds / 60, seconds % 60);
-            ImGui::Text("P1 #%u   P2 #%u", entry.metadata.p1_char, entry.metadata.p2_char);
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "Replay header is invalid and cannot be launched.");
-        }
-        if (!entry.metadata.modified_time.empty()) {
-            ImGui::Text("Modified: %s", entry.metadata.modified_time.c_str());
-        }
-    }
-
-    if (!s_browserStatus.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.88f, 0.40f, 1.0f), "%s", s_browserStatus.c_str());
+    char headerRight[64] = {};
+    if (hasSelection) {
+        snprintf(headerRight, sizeof(headerRight), "%d/%d  (%d items)",
+            s_browserSelected + 1, totalEntries,
+            (std::max)(visibleEntries, 0));
     } else {
-        ImGui::TextUnformatted("Recursive scan includes nested folders and long filenames.");
+        snprintf(headerRight, sizeof(headerRight), "%d items",
+            (std::max)(visibleEntries, 0));
     }
 
-    ImGui::Separator();
-    ImGui::TextUnformatted("Up/Down Select  PgUp/PgDn Page  Home/End Jump  Enter Load  Esc/Backspace Back");
+    GameDrawTextShadowed(kReplayBrowserPanelLeft + 14, kReplayBrowserHeaderY, 248, 238, 220, "Replays");
+    GameDrawTextShadowed(kReplayBrowserPanelLeft + 80, kReplayBrowserHeaderY, 148, 140, 128, clippedPath);
+    GameDrawTextShadowed(kReplayBrowserPanelRight - 160, kReplayBrowserPathY, 148, 140, 128, headerRight);
 
-    ImGui::End();
+    GameSetBlend(0, 255);
+
+    // List entries
+    for (int32_t i = s_browserScroll; i < listEnd; ++i) {
+        const ReplayBrowserEntry& entry = s_browserEntries[i];
+        const int rowIndex = i - s_browserScroll;
+        const int rowTop = listRowsTop + rowIndex * kReplayBrowserRowHeight;
+        const bool selected = i == s_browserSelected;
+
+        if (selected) {
+            GameSetBlend(1, 30);
+            GameFillRect(
+                kReplayBrowserListLeft + 4,
+                rowTop - 4,
+                kReplayBrowserListRight - 4,
+                rowTop + kReplayBrowserRowHeight - 1,
+                0, 0, 0);
+            GameSetBlend(1, 128);
+            GameFillRect(
+                kReplayBrowserListLeft + 6,
+                rowTop - 2,
+                kReplayBrowserListRight - 6,
+                rowTop + kReplayBrowserRowHeight - 3,
+                180, 60, 50);
+        } else {
+            GameSetBlend(1, 22);
+            GameFillRect(
+                kReplayBrowserListLeft + 4,
+                rowTop - 4,
+                kReplayBrowserListRight - 4,
+                rowTop + kReplayBrowserRowHeight - 1,
+                0, 0, 0);
+        }
+        GameSetBlend(0, 255);
+
+        const char* typeTag = "RPL";
+        uint8_t tagR = 200, tagG = 204, tagB = 216;
+        if (entry.type == ReplayBrowserEntryType::ParentDirectory) {
+            typeTag = "UP";
+            tagR = 160; tagG = 200; tagB = 236;
+        } else if (entry.type == ReplayBrowserEntryType::Directory) {
+            typeTag = "DIR";
+            tagR = 224; tagG = 200; tagB = 130;
+        } else if (!entry.metadata.valid) {
+            typeTag = "BAD";
+            tagR = 240; tagG = 140; tagB = 140;
+        }
+
+        char label[160] = {};
+        ClipGameText(label, sizeof(label), entry.display_name.c_str(), 18);
+        const std::string valueText = GetBrowserEntryValueText(entry);
+        char clippedValue[64] = {};
+        ClipGameText(clippedValue, sizeof(clippedValue), valueText.c_str(), 6);
+
+        GameDrawTextShadowed(kReplayBrowserListLeft + 14, rowTop + 5, tagR, tagG, tagB, typeTag);
+        GameDrawTextShadowed(kReplayBrowserListLeft + 50, rowTop + 5,
+            entry.type == ReplayBrowserEntryType::ReplayFile && !entry.metadata.valid
+                ? (selected ? 255 : 240) : (selected ? 255 : 220),
+            entry.type == ReplayBrowserEntryType::ReplayFile && !entry.metadata.valid
+                ? (selected ? 150 : 140) : (selected ? 244 : 216),
+            entry.type == ReplayBrowserEntryType::ReplayFile && !entry.metadata.valid
+                ? (selected ? 150 : 140) : (selected ? 228 : 212),
+            label);
+        GameDrawTextShadowed(kReplayBrowserListLeft + 200, rowTop + 5, 140, 148, 164, clippedValue);
+    }
+
+    // Scrollbar
+    if (totalEntries > kReplayBrowserPageSize) {
+        const int trackLeft = kReplayBrowserListRight - 10;
+        const int trackTop = listRowsTop;
+        const int trackBottom = kReplayBrowserListBottom - 8;
+        const int trackHeight = trackBottom - trackTop;
+        const int thumbHeight = (std::max)(20, trackHeight * kReplayBrowserPageSize / totalEntries);
+        const int maxScroll = (std::max)(1, totalEntries - kReplayBrowserPageSize);
+        const int thumbTop = trackTop + (trackHeight - thumbHeight) * s_browserScroll / maxScroll;
+
+        GameSetBlend(1, 48);
+        GameFillRect(trackLeft, trackTop, trackLeft + 3, trackBottom, 80, 80, 100);
+        GameSetBlend(1, 120);
+        GameFillRect(trackLeft, thumbTop, trackLeft + 3, thumbTop + thumbHeight, 180, 160, 140);
+        GameSetBlend(0, 255);
+    }
+
+    // Detail panel content
+    auto drawDetailPair = [&](int y, const char* label, const char* value, uint8_t vr, uint8_t vg, uint8_t vb) {
+        if (!value || !value[0]) return;
+        char clippedValue[192] = {};
+        ClipGameText(clippedValue, sizeof(clippedValue), value, 30);
+        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, y, 148, 140, 128, label);
+        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, y + 14, vr, vg, vb, clippedValue);
+    };
+
+    auto drawDetailNote = [&](int y, uint8_t r, uint8_t g, uint8_t b, const char* value) {
+        if (!value || !value[0]) return;
+        char clippedValue[192] = {};
+        ClipGameText(clippedValue, sizeof(clippedValue), value, 30);
+        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, y, r, g, b, clippedValue);
+    };
+
+    if (selectedEntry) {
+        char clippedName[192] = {};
+        ClipGameText(clippedName, sizeof(clippedName), selectedEntry->display_name.c_str(), 30);
+        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, kReplayBrowserDetailTop + 38, 240, 220, 160, clippedName);
+
+        const char* typeLabel = "Replay File";
+        uint8_t typeR = 200, typeG = 204, typeB = 216;
+        if (selectedEntry->type == ReplayBrowserEntryType::ParentDirectory) {
+            typeLabel = "Parent Folder";
+            typeR = 160; typeG = 200; typeB = 236;
+        } else if (selectedEntry->type == ReplayBrowserEntryType::Directory) {
+            typeLabel = "Folder";
+            typeR = 224; typeG = 200; typeB = 130;
+        } else if (!selectedEntry->metadata.valid) {
+            typeLabel = "Invalid Replay";
+            typeR = 240; typeG = 140; typeB = 140;
+        }
+        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, kReplayBrowserDetailTop + 60, typeR, typeG, typeB, typeLabel);
+
+        std::string locationText = NormalizeGameDisplayPath(selectedEntry->full_path.lexically_relative(fs::path(L"replay")));
+        if (locationText.empty()) {
+            locationText = selectedEntry->display_name;
+        }
+
+        if (selectedEntry->type == ReplayBrowserEntryType::ReplayFile) {
+            if (selectedEntry->metadata.valid) {
+                const std::string matchupText = GetBrowserEntryMatchupText(*selectedEntry);
+                const std::string durationText = GetBrowserEntryValueText(*selectedEntry);
+
+                char frameText[64] = {};
+                snprintf(frameText, sizeof(frameText), "%d", selectedEntry->metadata.frames);
+
+                drawDetailPair(kReplayBrowserDetailTop + 86, "Matchup", matchupText.c_str(), 210, 210, 220);
+                drawDetailPair(kReplayBrowserDetailTop + 118, "Length", durationText.c_str(), 210, 210, 220);
+                drawDetailPair(kReplayBrowserDetailTop + 150, "Frames", frameText, 210, 210, 220);
+                drawDetailPair(kReplayBrowserDetailTop + 182, "Updated",
+                    selectedEntry->metadata.modified_time.empty() ? "Unknown" : selectedEntry->metadata.modified_time.c_str(),
+                    210, 210, 220);
+                drawDetailPair(kReplayBrowserDetailTop + 214, "Location", locationText.c_str(), 160, 168, 184);
+
+                drawDetailNote(kReplayBrowserDetailBottom - 38, 180, 190, 210,
+                    "A/C or Enter to load.");
+                drawDetailNote(kReplayBrowserDetailBottom - 20, 140, 148, 164,
+                    "L/R page  Home/End jump");
+            } else {
+                drawDetailPair(kReplayBrowserDetailTop + 92, "Status",
+                    "Invalid replay header.",
+                    240, 140, 140);
+                drawDetailPair(kReplayBrowserDetailTop + 124, "Location", locationText.c_str(), 160, 168, 184);
+                drawDetailNote(kReplayBrowserDetailBottom - 24, 180, 190, 210,
+                    "Select another replay.");
+            }
+        } else if (selectedEntry->type == ReplayBrowserEntryType::Directory) {
+            drawDetailPair(kReplayBrowserDetailTop + 92, "Location", locationText.c_str(), 210, 210, 220);
+            drawDetailNote(kReplayBrowserDetailTop + 136, 180, 190, 210,
+                "A/C or Enter to open.");
+        } else {
+            drawDetailPair(kReplayBrowserDetailTop + 92, "Back to",
+                s_browserCurrentDirectory.empty() ? "replay/" : NormalizeGameDisplayPath(s_browserCurrentDirectory.parent_path()).c_str(),
+                210, 210, 220);
+            drawDetailNote(kReplayBrowserDetailTop + 136, 180, 190, 210,
+                "A/C or B/D to go up.");
+        }
+    } else {
+        drawDetailNote(kReplayBrowserDetailTop + 38, 200, 204, 216,
+            "No entries here.");
+        drawDetailNote(kReplayBrowserDetailTop + 60, 140, 148, 164,
+            "Add replays or go back.");
+    }
+
+    // Footer shadow
+    GameSetBlend(1, 40);
+    GameFillRect(kReplayBrowserPanelLeft + 8, kReplayBrowserStatusY - 8, kReplayBrowserPanelRight - 8, kReplayBrowserPanelBottom + 2, 0, 0, 0);
+
+    // Footer
+    GameSetBlend(0, 255);
+
+    const char* footerText = s_browserStatus.empty()
+        ? (!s_browserCurrentDirectory.empty()
+            ? "U/D Move  L/R Page  A Open  B/Esc Up"
+            : "U/D Move  L/R Page  A Open  B/Esc Exit")
+        : s_browserStatus.c_str();
+    char clippedFooter[192] = {};
+    ClipGameText(clippedFooter, sizeof(clippedFooter), footerText, 62);
+    GameDrawTextShadowed(
+        kReplayBrowserPanelLeft + 16,
+        kReplayBrowserStatusY,
+        s_browserStatus.empty() ? 148 : 240,
+        s_browserStatus.empty() ? 148 : 208,
+        s_browserStatus.empty() ? 164 : 128,
+        clippedFooter);
 }
 
 } // namespace
 
+bool ReplayRuntime_InstallHooks() {
+    MH_STATUS status = MH_CreateHook(
+        reinterpret_cast<void*>(ADDR_REPLAY_SAVE),
+        reinterpret_cast<void*>(&Hook_ReplaySave),
+        reinterpret_cast<void**>(&s_originalReplaySave));
+    if (status != MH_OK) {
+        LOG_ERROR("[Replay] Failed to hook replay save function! Status: %d", status);
+        return false;
+    }
+
+    LOG_INFO("[Replay] Hooked sub_59B830 (replay save post-process)");
+
+    status = MH_CreateHook(
+        reinterpret_cast<void*>(ADDR_REPLAY_SELECT_DRAW),
+        reinterpret_cast<void*>(&Hook_ReplaySelectDraw),
+        reinterpret_cast<void**>(&s_originalReplaySelectDraw));
+    if (status != MH_OK) {
+        LOG_ERROR("[Replay] Failed to hook replay select draw function! Status: %d", status);
+        return false;
+    }
+
+    LOG_INFO("[Replay] Hooked sub_59BF90 (replay select draw)");
+    return true;
+}
+
 void ReplayRuntime_Init() {
     ResetMatchRuntimeState();
+    ResetLoadedReplayPaletteState();
     ResetBrowserState();
     ResetMatchHotkeyEdges();
     ResetMenuHotkeyEdges();
     s_initialized = true;
-    LOG_INFO("[Replay] Runtime initialized (\\ pause, ] step, [ back, Shift+[ rewind, 1/2 takeover)");
+    LOG_INFO("[Replay] Runtime initialized (\\ pause, ] step, [ back, Shift+[ rewind, Insert HUD, 1/2 takeover)");
 }
 
 void ReplayRuntime_Shutdown() {
@@ -1294,6 +2426,7 @@ void ReplayRuntime_Shutdown() {
     }
 
     DeactivateReplayMatch("shutdown");
+    ResetLoadedReplayPaletteState();
     ResetBrowserState();
     s_initialized = false;
     LOG_INFO("[Replay] Runtime shutdown");
@@ -1327,7 +2460,6 @@ void ReplayRuntime_RenderHUD() {
     }
 
     RenderReplayMatchHud();
-    RenderReplayBrowserHud();
 }
 
 bool ReplayRuntime_ShouldFreezeFrame() {
@@ -1344,6 +2476,26 @@ bool ReplayRuntime_IsReplayMenuActive() {
 
 bool ReplayRuntime_ShouldConsumeMenuInput() {
     return IsReplayMenuSelectContext();
+}
+
+void ReplayRuntime_OnFrontendInputsProcessed() {
+    if (!s_initialized || !IsReplayMenuSelectContext()) {
+        return;
+    }
+}
+
+bool ReplayRuntime_CopyPaletteOverrideBank(uint8_t gameSlot, Net::NetplayPaletteBank* out) {
+    if (!out || gameSlot > 1 || GetGameType() != GAMETYPE_REPLAY) {
+        return false;
+    }
+
+    const ReplayPaletteOverrideState& loaded = s_loadedReplayPalette[gameSlot];
+    if (!loaded.present || !loaded.bank.valid) {
+        return false;
+    }
+
+    *out = loaded.bank;
+    return true;
 }
 
 void ReplayRuntime_OnDispatcherAdvance(int16_t* outputInputs) {

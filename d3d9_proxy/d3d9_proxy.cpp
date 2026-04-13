@@ -65,6 +65,7 @@ typedef void (*ModOnFrame_t)();
 typedef void (*ModOnPresent_t)(void* pDevice);
 typedef void (*ModSetImGuiContext_t)(void* ctx);
 typedef void (*ModOnGameExit_t)(int exitCode, const char* reason);
+typedef void (*ModToggleMenu_t)();
 typedef bool (*ModGetNetplayHudText_t)(char* out, int cap);
 typedef bool (*ModWantsExclusiveOverlay_t)();
 typedef void (*ModSetLogDir_t)(const char* dir);
@@ -72,8 +73,8 @@ typedef void (*ModSetLogDir_t)(const char* dir);
 // Match HUD structured data (must match as2_rollback.cpp MatchHudData)
 struct MatchHudData {
     bool     active;
-    char     p1_name[24];
-    char     p2_name[24];
+    char     p1_name[64];
+    char     p2_name[64];
     int      p1_wins;
     int      p2_wins;
     float    ping_ms;
@@ -112,6 +113,7 @@ static ModOnFrame_t g_pModOnFrame = nullptr;
 static ModOnPresent_t g_pModOnPresent = nullptr;
 static ModSetImGuiContext_t g_pModSetImGuiContext = nullptr;
 static ModOnGameExit_t g_pModOnGameExit = nullptr;
+static ModToggleMenu_t g_pModToggleMenu = nullptr;
 static ModGetNetplayHudText_t g_pModGetNetplayHudText = nullptr;
 static ModGetMatchHudData_t g_pModGetMatchHudData = nullptr;
 static ModWantsExclusiveOverlay_t g_pModWantsExclusiveOverlay = nullptr;
@@ -885,10 +887,50 @@ static void DisplayConfig_Save() {
 // If we later centralize versioning, these can move into a shared header.
 static const wchar_t* kAs2GameVersion = L"1.060B";
 static const wchar_t* kAs2ModName = L"ImprovementMod";
-static const wchar_t* kAs2ModVersion = L"v0.3";
+static const wchar_t* kAs2ModVersion = L"v0.4";
 
 static HWND g_titleWindow = nullptr;
 static bool g_titleApplied = false;
+
+static void ConfigureOverlayFonts(ImGuiIO& io) {
+    ImFont* loadedFont = nullptr;
+    const ImWchar* glyphRanges = io.Fonts->GetGlyphRangesJapanese();
+
+    char windowsDir[MAX_PATH] = {};
+    if (GetWindowsDirectoryA(windowsDir, MAX_PATH) == 0) {
+        io.Fonts->AddFontDefault();
+        ProxyLog("[IMGUI] WARNING: GetWindowsDirectoryA failed, using default font only");
+        return;
+    }
+
+    const char* candidates[] = {
+        "YuGothM.ttc",
+        "YuGothL.ttc",
+        "msgothic.ttc",
+    };
+
+    char fontPath[MAX_PATH] = {};
+    ImFontConfig fontConfig{};
+    fontConfig.OversampleH = 2;
+    fontConfig.OversampleV = 2;
+    fontConfig.FontNo = 0;
+
+    for (const char* candidate : candidates) {
+        snprintf(fontPath, sizeof(fontPath), "%s\\Fonts\\%s", windowsDir, candidate);
+        loadedFont = io.Fonts->AddFontFromFileTTF(fontPath, 16.0f, &fontConfig, glyphRanges);
+        if (loadedFont) {
+            ProxyLog("[IMGUI] Loaded overlay font: %s", fontPath);
+            break;
+        }
+    }
+
+    if (!loadedFont) {
+        ProxyLog("[IMGUI] WARNING: Failed to load a Japanese-capable system font, using default font only");
+        loadedFont = io.Fonts->AddFontDefault();
+    }
+
+    io.FontDefault = loadedFont;
+}
 
 static void ApplyCustomWindowTitle(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd)) return;
@@ -1399,7 +1441,7 @@ void InitConsole() {
         
         printf("\033[36m");
         printf("========================================\n");
-        printf("  Alice Senki 2 - Improvement Mod v0.3\n");
+        printf("  Alice Senki 2 - Improvement Mod v0.4\n");
         printf("  Debug Console\n");
         printf("========================================\n");
         printf("\033[0m\n");
@@ -2848,6 +2890,7 @@ bool InitImGui(IDirect3DDevice9* pDevice, HWND hWnd) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ConfigureOverlayFonts(io);
     
     // Set ini file path
     static char iniPath[MAX_PATH];
@@ -3084,10 +3127,20 @@ void RenderImGui() {
     
     // Main menu bar
     const bool exclusiveOverlay = IsExclusiveModOverlayActive();
+    const ImVec4 menuBarBg = ImGui::GetStyleColorVec4(ImGuiCol_MenuBarBg);
+    const ImVec4 popupBg = ImGui::GetStyleColorVec4(ImGuiCol_PopupBg);
+    ImGui::PushStyleColor(ImGuiCol_MenuBarBg,
+        ImVec4(menuBarBg.x, menuBarBg.y, menuBarBg.z, 0.76f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,
+        ImVec4(popupBg.x, popupBg.y, popupBg.z, 0.94f));
     if (g_showMenu && !exclusiveOverlay && ImGui::BeginMainMenuBar()) {
-        ImGui::Text("Alice Senki 2 - Improvement Mod v0.3");
+        ImGui::Text("Alice Senki 2 - Improvement Mod v0.4");
         ImGui::Separator();
         if (ImGui::BeginMenu("Options")) {
+            if (ImGui::MenuItem("AS2 Mod", nullptr, false, g_pModToggleMenu != nullptr)) {
+                g_pModToggleMenu();
+            }
+            ImGui::Separator();
             ImGui::MenuItem("Show Menu", "F1", &g_showMenu);
             {
                 bool borderlessChecked = g_isCurrentlyBorderless;
@@ -3107,6 +3160,7 @@ void RenderImGui() {
         }
         ImGui::EndMainMenuBar();
     }
+    ImGui::PopStyleColor(2);
     
     // Always call mod's render function (it handles menu visibility internally)
     // This allows overlays like hitbox display to render even when menu is hidden
@@ -5156,6 +5210,7 @@ bool LoadCoreModDLL() {
     g_pModOnPresent = (ModOnPresent_t)GetProcAddress(g_hModDLL, "ModOnPresent");
     g_pModSetImGuiContext = (ModSetImGuiContext_t)GetProcAddress(g_hModDLL, "ModSetImGuiContext");
     g_pModOnGameExit = (ModOnGameExit_t)GetProcAddress(g_hModDLL, "ModOnGameExit");
+    g_pModToggleMenu = (ModToggleMenu_t)GetProcAddress(g_hModDLL, "ModToggleMenu");
     g_pModGetNetplayHudText = (ModGetNetplayHudText_t)GetProcAddress(g_hModDLL, "ModGetNetplayHudText");
     g_pModGetMatchHudData = (ModGetMatchHudData_t)GetProcAddress(g_hModDLL, "ModGetMatchHudData");
     g_pModWantsExclusiveOverlay = (ModWantsExclusiveOverlay_t)GetProcAddress(g_hModDLL, "ModWantsExclusiveOverlay");
@@ -5166,8 +5221,8 @@ bool LoadCoreModDLL() {
         pModSetLogDir(g_logDir);
     }
     
-    ProxyLog("[MOD] Exports - Init:0x%p Shutdown:0x%p OnFrame:0x%p OnPresent:0x%p SetCtx:0x%p Exit:0x%p Hud:0x%p MatchHud:0x%p Exclusive:0x%p",
-             g_pModInit, g_pModShutdown, g_pModOnFrame, g_pModOnPresent, g_pModSetImGuiContext, g_pModOnGameExit, g_pModGetNetplayHudText, g_pModGetMatchHudData, g_pModWantsExclusiveOverlay);
+    ProxyLog("[MOD] Exports - Init:0x%p Shutdown:0x%p OnFrame:0x%p OnPresent:0x%p SetCtx:0x%p Exit:0x%p ToggleMenu:0x%p Hud:0x%p MatchHud:0x%p Exclusive:0x%p",
+             g_pModInit, g_pModShutdown, g_pModOnFrame, g_pModOnPresent, g_pModSetImGuiContext, g_pModOnGameExit, g_pModToggleMenu, g_pModGetNetplayHudText, g_pModGetMatchHudData, g_pModWantsExclusiveOverlay);
     
     return true;
 }
@@ -5194,7 +5249,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             InitConsole();
             
             ProxyLog("========================================");
-            ProxyLog("Alice Senki 2 - D3D9 Proxy v0.3");
+            ProxyLog("Alice Senki 2 - D3D9 Proxy v0.4");
             ProxyLog("Build: %s %s", __DATE__, __TIME__);
             ProxyLog("Crash handler installed!");
             ProxyLog("========================================");

@@ -10,6 +10,8 @@
 
 namespace Net {
 
+struct NetplayPaletteBank;
+
 enum class SpectatorPlaybackState : uint8_t {
     Disconnected = 0,
     Connecting,
@@ -25,6 +27,12 @@ enum class SpectatorPlaybackState : uint8_t {
     EndOfMatch,
     WaitingNextMatch,
     PlaybackError,
+};
+
+enum class SpectatorDispatchAction : uint8_t {
+    Unhandled = 0,
+    BreakLoop,
+    ProduceFrame,
 };
 
 const char* SpectatorPlaybackStateName(SpectatorPlaybackState state);
@@ -46,6 +54,7 @@ struct SpectatorPlaybackSnapshot {
     int32_t  confirmed_edge_rb_frame;
     int32_t  live_edge_rb_frame;
     float    tick_scale_target;
+    float    manual_catchup_scale;
     char     state_label[32];
     char     status[128];
 };
@@ -53,6 +62,13 @@ struct SpectatorPlaybackSnapshot {
 void SpectatorPlayback_Init();
 void SpectatorPlayback_Shutdown();
 void SpectatorPlayback_FrameUpdate();
+SpectatorDispatchAction SpectatorPlayback_GetDispatcherFrame(uint16_t* outP1,
+                                                            uint16_t* outP2,
+                                                            int32_t* outRbFrame);
+bool SpectatorPlayback_CopyPaletteOverrideBank(uint8_t game_slot,
+                                               uint8_t character_id,
+                                               uint8_t base_palette,
+                                               NetplayPaletteBank* out);
 
 void SpectatorPlayback_GetSnapshot(SpectatorPlaybackSnapshot* out);
 

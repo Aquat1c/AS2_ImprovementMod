@@ -121,8 +121,8 @@ struct MenuSnapshot {
     char          last_error[128];
     char          your_address[96];
     char          clipboard_flash[48];
-    char          local_nickname[32];
-    char          peer_nickname[32];
+    char          local_nickname[64];
+    char          peer_nickname[64];
     float         rtt_ms;
     int           local_wins;
     int           remote_wins;
@@ -152,8 +152,8 @@ struct MenuSnapshot {
     bool          spectator_client_active;
     uint32_t      spectator_client_match_id;
     uint32_t      spectator_client_match_ordinal;
-    char          spectator_p1_name[24];
-    char          spectator_p2_name[24];
+    char          spectator_p1_name[64];
+    char          spectator_p2_name[64];
     int           spectator_p1_wins;
     int           spectator_p2_wins;
     uint32_t      spectator_client_buffered_frames;
@@ -173,6 +173,14 @@ struct MenuSnapshot {
     bool          spectator_playback_active;
     int32_t       spectator_playback_frame;
     char          spectator_playback_status[128];
+
+    // Decision prompt overlay
+    bool          prompt_active;
+    uint32_t      prompt_selected_index;
+    uint32_t      prompt_option_count;
+    char          prompt_title[96];
+    char          prompt_body[160];
+    char          prompt_option_labels[3][32];
 
     // Session display
     bool          is_host;

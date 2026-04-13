@@ -9,8 +9,65 @@
 #include "core/mod_main.h"
 
 #include "imgui.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+
+namespace {
+
+static bool IsUtf8ContinuationByte(unsigned char value) {
+    return (value & 0xC0) == 0x80;
+}
+
+static size_t Utf8PrefixBytes(const char* text, size_t codepointCount) {
+    size_t offset = 0;
+    size_t count = 0;
+    while (text && text[offset] && count < codepointCount) {
+        ++offset;
+        while (text[offset] && IsUtf8ContinuationByte((unsigned char)text[offset])) {
+            ++offset;
+        }
+        ++count;
+    }
+    return offset;
+}
+
+static size_t Utf8CountCodepoints(const char* text) {
+    size_t count = 0;
+    for (size_t offset = 0; text && text[offset]; ++offset) {
+        if (!IsUtf8ContinuationByte((unsigned char)text[offset])) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static void ClipUtf8Text(char* out, size_t outCap, const char* text, size_t maxChars) {
+    if (!out || outCap == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (!text || !text[0]) {
+        return;
+    }
+
+    if (Utf8CountCodepoints(text) <= maxChars || maxChars < 4) {
+        strncpy_s(out, outCap, text, _TRUNCATE);
+        return;
+    }
+
+    const size_t prefixBytes = Utf8PrefixBytes(text, maxChars - 3);
+    _snprintf_s(out, outCap, _TRUNCATE, "%.*s...", (int)prefixBytes, text);
+}
+
+static void BuildPlayerLabel(char* out, size_t outCap, const char* name, int wins) {
+    char clippedName[96] = {};
+    ClipUtf8Text(clippedName, sizeof(clippedName), name && name[0] ? name : "Player", 18);
+    _snprintf_s(out, outCap, _TRUNCATE, "%s (%d)", clippedName, wins);
+}
+
+} // namespace
 
 // ============================================================================
 // Rendering
@@ -31,14 +88,10 @@ void NetplayHud_Render() {
     {
         const float topY = 2.0f;
 
-        char p1text[48];
-        char p2text[48];
-        snprintf(p1text, sizeof(p1text), "%s (%d)", hud.p1_name, hud.p1_wins);
-        snprintf(p2text, sizeof(p2text), "%s (%d)", hud.p2_name, hud.p2_wins);
-
-        // Convert to uppercase for consistency
-        for (char* p = p1text; *p; ++p) if (*p >= 'a' && *p <= 'z') *p -= 32;
-        for (char* p = p2text; *p; ++p) if (*p >= 'a' && *p <= 'z') *p -= 32;
+        char p1text[128];
+        char p2text[128];
+        BuildPlayerLabel(p1text, sizeof(p1text), hud.p1_name, hud.p1_wins);
+        BuildPlayerLabel(p2text, sizeof(p2text), hud.p2_name, hud.p2_wins);
 
         ImVec2 p1sz = ImGui::CalcTextSize(p1text);
         ImVec2 p2sz = ImGui::CalcTextSize(p2text);
