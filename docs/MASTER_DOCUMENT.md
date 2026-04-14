@@ -1457,7 +1457,6 @@ mod/
 
   docs/
     MASTER_DOCUMENT.md          Primary long-form technical reference
-    CHARSEL_SYNC_ANALYSIS.md      Design analysis comparing vanilla, mod, and CCCaster approaches
 
   CMakeLists.txt                Build configuration (4 targets, 7+ libraries)
   build.bat                     Automated build script
