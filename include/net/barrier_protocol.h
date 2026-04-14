@@ -21,7 +21,7 @@
  *   BOOTSTRAP BARRIERS (match_bootstrap.cpp):
  *     - ConfigExchange/ConfigAck: match config agreement
  *     - LoadBarrier: both peers finished asset loading
- *     - BaselineReady/BaselineDigest: savestate baseline agreement
+ *     - BaselineReady/BaselineDigest: normalized bootstrap agreement
  *     - GameplayStart: coordinated gameplay kickoff
  *     → All reliable, CHANNEL_CONTROL
  *

@@ -39,6 +39,12 @@ constexpr size_t kBaselineHashHeaderSize = 16;
 constexpr size_t kBaselineHashContextSize = ADDR_EFFECT_ARRAY - (ADDR_MATCH_BASE + kBaselineHashHeaderSize);
 constexpr size_t kBaselineHashEffectSize = ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY;
 constexpr size_t kBaselineHashSummonSize = ADDR_P1_ENTITY_BASE - ADDR_SUMMON_ARRAY;
+constexpr size_t kAgreementHeaderStableBytes = 14;
+constexpr size_t kAgreementEntityStablePrefixSize = 0x07D0;
+constexpr size_t kAgreementEntityAnimDataOffset = 0x1000;
+constexpr size_t kAgreementEntityAnimDataSize = 0x9000;
+constexpr size_t kAgreementEntityCharStateOffset = 0xA000;
+constexpr size_t kAgreementEntityCharStateSize = 0x0660;
 
 static uint32_t SafeRegionCRC(uintptr_t address, size_t size) {
     __try {
@@ -56,6 +62,30 @@ static void SafeCopyBytes(uint8_t* dst, uintptr_t src, size_t size) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // Keep zeroed bytes; this still makes failure visible in logs.
     }
+}
+
+static uint32_t BuildHeaderAgreementCRC() {
+    uint8_t stableBytes[kAgreementHeaderStableBytes] = {};
+    SafeCopyBytes(stableBytes, ADDR_MATCH_BASE, sizeof(stableBytes));
+    return CalcCRC32(stableBytes, sizeof(stableBytes));
+}
+
+static uint32_t BuildEntityAgreementCRC(uintptr_t entityBase) {
+    struct EntityAgreementParts {
+        uint32_t stable_prefix_crc;
+        uint32_t anim_data_crc;
+        uint32_t char_state_crc;
+    } parts{};
+
+    // Exclude the timers/handle window (0x7D0-0x1000) and the large tail
+    // region (0xA660-end). Those ranges currently pick up process-local
+    // handle/resource allocations during match bootstrap.
+    parts.stable_prefix_crc = SafeRegionCRC(entityBase, kAgreementEntityStablePrefixSize);
+    parts.anim_data_crc = SafeRegionCRC(entityBase + kAgreementEntityAnimDataOffset,
+                                        kAgreementEntityAnimDataSize);
+    parts.char_state_crc = SafeRegionCRC(entityBase + kAgreementEntityCharStateOffset,
+                                         kAgreementEntityCharStateSize);
+    return CalcCRC32(&parts, sizeof(parts));
 }
 
 static void BytesToHex(const uint8_t* bytes, size_t len, char* out, size_t outSize) {
@@ -94,6 +124,8 @@ static void WriteBreakdownSection(FILE* f, const char* label, const BaselineBrea
     fprintf(f, "\n[%s]\n", label ? label : "breakdown");
     fprintf(f, "main=0x%08X header=0x%08X context=0x%08X effects=0x%08X summons=0x%08X p1=0x%08X p2=0x%08X\n",
             p.main_crc, p.header_crc, p.context_crc, p.effect_crc, p.summon_crc, p.p1_entity_crc, p.p2_entity_crc);
+    fprintf(f, "agreement: header=0x%08X p1=0x%08X p2=0x%08X\n",
+            p.header_agreement_crc, p.p1_agreement_crc, p.p2_agreement_crc);
     fprintf(f, "pre_gap=0x%08X p1_input=0x%08X p2_input=0x%08X temp=0x%08X\n",
             p.pre_match_gap_crc, p.p1_input_crc, p.p2_input_crc, p.per_frame_temp_crc);
     fprintf(f, "rng=0x%08X sim=%u display=%u mode=%u sub=%u type=%u phase_timer=%u\n",
@@ -113,7 +145,7 @@ static void LogBreakdownToNetplayLog(const char* label,
 
     Rollback::NetplayLog_Write(
         "BASELINE", frame,
-        "%s checked: phase=%s main=0x%08X header=0x%08X context=0x%08X effects=0x%08X summons=0x%08X p1=0x%08X p2=0x%08X ref=0x%08X ref_match=%d",
+        "%s checked: phase=%s main=0x%08X header=0x%08X context=0x%08X effects=0x%08X summons=0x%08X p1=0x%08X p2=0x%08X agree_header=0x%08X agree_p1=0x%08X agree_p2=0x%08X ref=0x%08X ref_match=%d",
         label ? label : "Baseline",
         state.phase_name ? state.phase_name : "?",
         p.main_crc,
@@ -123,6 +155,9 @@ static void LogBreakdownToNetplayLog(const char* label,
         p.summon_crc,
         p.p1_entity_crc,
         p.p2_entity_crc,
+        p.header_agreement_crc,
+        p.p1_agreement_crc,
+        p.p2_agreement_crc,
         referenceCrc,
         refMatch ? 1 : 0);
 
@@ -249,6 +284,9 @@ static void WriteMismatchDetailFile(const BaselineSyncStateView& state,
             {"summon_crc", local.summon_crc, remote.summon_crc},
             {"p1_entity_crc", local.p1_entity_crc, remote.p1_entity_crc},
             {"p2_entity_crc", local.p2_entity_crc, remote.p2_entity_crc},
+            {"header_agreement_crc", local.header_agreement_crc, remote.header_agreement_crc},
+            {"p1_agreement_crc", local.p1_agreement_crc, remote.p1_agreement_crc},
+            {"p2_agreement_crc", local.p2_agreement_crc, remote.p2_agreement_crc},
             {"pre_match_gap_crc", local.pre_match_gap_crc, remote.pre_match_gap_crc},
             {"p1_input_crc", local.p1_input_crc, remote.p1_input_crc},
             {"p2_input_crc", local.p2_input_crc, remote.p2_input_crc},
@@ -291,6 +329,9 @@ static BaselineBreakdownPayload CaptureCurrentBreakdown() {
     out.summon_crc = SafeRegionCRC(ADDR_SUMMON_ARRAY, kBaselineHashSummonSize);
     out.p1_entity_crc = SafeRegionCRC(ADDR_P1_ENTITY_BASE, ENTITY_SIZE);
     out.p2_entity_crc = SafeRegionCRC(ADDR_P2_ENTITY_BASE, ENTITY_SIZE);
+    out.header_agreement_crc = BuildHeaderAgreementCRC();
+    out.p1_agreement_crc = BuildEntityAgreementCRC(ADDR_P1_ENTITY_BASE);
+    out.p2_agreement_crc = BuildEntityAgreementCRC(ADDR_P2_ENTITY_BASE);
 
     out.pre_match_gap_crc = SafeRegionCRC(ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE);
     out.p1_input_crc = SafeRegionCRC(ADDR_P1_INPUT_BUFFER, INPUT_BUFFER_SIZE);
@@ -455,6 +496,9 @@ void BaselineSync_LogMismatchAndDump(const BaselineSyncStateView& state) {
             {"summon_crc", s_localBreakdown.summon_crc, s_remoteBreakdown.summon_crc},
             {"p1_entity_crc", s_localBreakdown.p1_entity_crc, s_remoteBreakdown.p1_entity_crc},
             {"p2_entity_crc", s_localBreakdown.p2_entity_crc, s_remoteBreakdown.p2_entity_crc},
+            {"header_agreement_crc", s_localBreakdown.header_agreement_crc, s_remoteBreakdown.header_agreement_crc},
+            {"p1_agreement_crc", s_localBreakdown.p1_agreement_crc, s_remoteBreakdown.p1_agreement_crc},
+            {"p2_agreement_crc", s_localBreakdown.p2_agreement_crc, s_remoteBreakdown.p2_agreement_crc},
             {"pre_match_gap_crc", s_localBreakdown.pre_match_gap_crc, s_remoteBreakdown.pre_match_gap_crc},
             {"p1_input_crc", s_localBreakdown.p1_input_crc, s_remoteBreakdown.p1_input_crc},
             {"p2_input_crc", s_localBreakdown.p2_input_crc, s_remoteBreakdown.p2_input_crc},
@@ -514,27 +558,35 @@ void BaselineSync_LogMismatchAndDump(const BaselineSyncStateView& state) {
 
 uint32_t BaselineSync_ComputeAgreementDigest(const BaselineBreakdownPayload& payload) {
     struct AgreementFields {
-        uint32_t header_crc;
-        uint32_t context_crc;
+        uint32_t header_agreement_crc;
         uint32_t summon_crc;
-        uint32_t p1_entity_crc;
-        uint32_t p2_entity_crc;
+        uint32_t p1_agreement_crc;
+        uint32_t p2_agreement_crc;
         uint32_t rng_seed;
         uint32_t sim_frame;
+        uint32_t game_mode;
+        uint32_t substate;
+        uint32_t game_type;
+        uint32_t match_phase_timer;
         uint32_t frame_simulation;
         uint32_t frame_write_idx;
         uint32_t frame_net_idx;
     } fields{};
 
-    // Exclude volatile effect/input/audio-adjacent bytes from bootstrap
-    // agreement to avoid false rematch mismatches.
-    fields.header_crc = payload.header_crc;
-    fields.context_crc = payload.context_crc;
+    // Use only authoritative bootstrap state here. Raw header/context/full
+    // entity CRCs still remain in the breakdown payload for diagnostics, but
+    // they currently include process-local loader handles and frame-local UI
+    // counters that differ even when the actual match configuration agrees.
+    fields.header_agreement_crc = payload.header_agreement_crc;
     fields.summon_crc = payload.summon_crc;
-    fields.p1_entity_crc = payload.p1_entity_crc;
-    fields.p2_entity_crc = payload.p2_entity_crc;
+    fields.p1_agreement_crc = payload.p1_agreement_crc;
+    fields.p2_agreement_crc = payload.p2_agreement_crc;
     fields.rng_seed = payload.rng_seed;
     fields.sim_frame = payload.sim_frame;
+    fields.game_mode = payload.game_mode;
+    fields.substate = payload.substate;
+    fields.game_type = payload.game_type;
+    fields.match_phase_timer = payload.match_phase_timer;
     fields.frame_simulation = payload.frame_simulation;
     fields.frame_write_idx = payload.frame_write_idx;
     fields.frame_net_idx = payload.frame_net_idx;

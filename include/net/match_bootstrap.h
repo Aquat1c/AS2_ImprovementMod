@@ -5,7 +5,7 @@
  *   1. Config exchange — host sends LockedMatchConfig, join validates
  *   2. Load barrier — both peers wait for asset loading to complete
  *   3. Baseline capture — both capture pre-frame-0 savestate
- *   4. Baseline agreement — exchange CRC32 checksums to verify determinism
+ *   4. Baseline agreement — exchange normalized bootstrap digests to verify determinism
  *   5. Gameplay start — coordinated signal to begin gameplay
  */
 

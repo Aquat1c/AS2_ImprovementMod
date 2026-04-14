@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 8;
+constexpr uint16_t PROTOCOL_VERSION = 9;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -64,7 +64,7 @@ enum class PacketType : uint16_t {
     ConfigAck       = 15,   // Join acknowledges config (includes config hash)
     LoadBarrier     = 16,   // Peer finished loading assets
     BaselineReady   = 17,   // Peer captured baseline savestate
-    BaselineDigest  = 18,   // CRC32 of baseline savestate for agreement
+    BaselineDigest  = 18,   // Normalized bootstrap agreement digest
     GameplayStart   = 19,   // Both peers ready — begin gameplay
     BaselineBreakdown = 25, // Detailed per-region baseline CRCs for mismatch diagnosis
 
@@ -293,7 +293,7 @@ struct BaselineReadyPayload {
 };
 
 struct BaselineDigestPayload {
-    uint32_t crc32;              // CRC32 of baseline savestate
+    uint32_t crc32;              // Normalized bootstrap agreement digest
 };
 
 struct BaselineBreakdownPayload {
@@ -305,6 +305,13 @@ struct BaselineBreakdownPayload {
     uint32_t summon_crc;
     uint32_t p1_entity_crc;
     uint32_t p2_entity_crc;
+
+    // Normalized bootstrap-agreement CRCs. These intentionally exclude
+    // volatile loader/handle regions that are useful for diagnostics but
+    // not authoritative for baseline agreement.
+    uint32_t header_agreement_crc;
+    uint32_t p1_agreement_crc;
+    uint32_t p2_agreement_crc;
 
     // Adjacent/non-hash diagnostics
     uint32_t pre_match_gap_crc;
