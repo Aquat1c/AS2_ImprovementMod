@@ -654,6 +654,10 @@ __declspec(dllexport) void ModToggleMenu() {
     ModMenu_Toggle();
 }
 
+__declspec(dllexport) bool ModIsMenuRequestedOpen() {
+    return ModMenu_IsRequestedOpen();
+}
+
 __declspec(dllexport) bool ModGetNetplayHudText(char* out, int cap) {
     (void)out; (void)cap;
     return false;

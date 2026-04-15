@@ -11,6 +11,8 @@
 
 // Menu API
 void ModMenu_Init();
+void ModMenu_SetOpen(bool open);
 void ModMenu_Toggle();
+bool ModMenu_IsRequestedOpen();
 bool ModMenu_IsOpen();
 void ModMenu_Render();

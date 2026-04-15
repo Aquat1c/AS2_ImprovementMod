@@ -26,7 +26,11 @@
 #include "rollback/savestate.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/game_snapshot.h"
+#include "rollback/rollback_session.h"
 #include "training/practice_tools.h"
+#include "net/gameplay_bridge.h"
+#include "net/session_manager.h"
+#include "net/spectator_playback.h"
 #include "as2_constants.h"
 #include "patches/memory_utils.h"
 #include "log_window.h"
@@ -56,6 +60,12 @@ struct SavestateSlot {
 };
 
 static SavestateSlot g_slot;
+static bool g_offlineMatchContextActive = false;
+static bool g_roundStartAutosaveArmed = false;
+
+// Edge detection for F5/F6
+static bool g_f5WasDown = false;
+static bool g_f6WasDown = false;
 
 // ============================================================================
 // File Logging (integrates with determinism log directory)
@@ -133,13 +143,108 @@ static uint32_t ComputeMainChecksum() {
 }
 
 // ============================================================================
+// Context helpers
+// ============================================================================
+
+static void ClearSavestateSlot(const char* reason) {
+    const bool hadState = g_slot.info.valid;
+
+    memset(&g_slot, 0, sizeof(g_slot));
+    Rollback::GameSnapshot_Clear(&g_slot.snapshot);
+
+    if (hadState) {
+        LOG_INFO("[Savestate] Cleared slot: %s", reason ? reason : "unknown");
+        LogToFile("CLEAR reason=%s\n", reason ? reason : "unknown");
+    }
+}
+
+static bool IsOfflineSavestateGameType(uint32_t gameType) {
+    switch (gameType) {
+        case GAMETYPE_ARCADE:
+        case GAMETYPE_VS_CPU:
+        case GAMETYPE_VS_HUMAN:
+        case GAMETYPE_TRAINING:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool IsOnlineOwnedContext() {
+    if (Net::Session_IsConnected()) {
+        return true;
+    }
+
+    if (Net::GameplayBridge_IsSessionActive()) {
+        return true;
+    }
+
+    if (Rollback::RollbackSession_IsActive()) {
+        return true;
+    }
+
+    Net::SpectatorPlaybackSnapshot spectatorPlayback{};
+    Net::SpectatorPlayback_GetSnapshot(&spectatorPlayback);
+    return spectatorPlayback.active || spectatorPlayback.gameplay_owned || spectatorPlayback.playing;
+}
+
+static bool IsOfflineMatchContextActive() {
+    return GetGameMode() == MODE_MATCH &&
+           IsOfflineSavestateGameType(GetGameType()) &&
+           !IsOnlineOwnedContext();
+}
+
+static bool IsOfflinePlayableSavestateContext() {
+    return IsOfflineMatchContextActive() &&
+           IsInPlayableMatchGameplay();
+}
+
+static void UpdateSavestateContext() {
+    const bool offlineMatchActive = IsOfflineMatchContextActive();
+
+    if (g_offlineMatchContextActive && !offlineMatchActive) {
+        ClearSavestateSlot("left offline match context");
+        g_roundStartAutosaveArmed = false;
+    }
+
+    if (!g_offlineMatchContextActive && offlineMatchActive) {
+        g_roundStartAutosaveArmed = true;
+        LOG_INFO("[Savestate] Offline match entered — round-start auto-save armed");
+    }
+
+    g_offlineMatchContextActive = offlineMatchActive;
+    if (!offlineMatchActive) {
+        return;
+    }
+
+    // Match substate 2 is the round setup path before the opening lock, and the
+    // intro-active signal covers the remaining "ROUND/FIGHT" pacing inside substate 3.
+    if (GetSubstate() == MATCH_SUB_INIT || IsMatchIntroActive()) {
+        g_roundStartAutosaveArmed = true;
+    }
+
+    if (g_roundStartAutosaveArmed && IsOfflinePlayableSavestateContext()) {
+        if (Savestate_Save()) {
+            LOG_INFO("[Savestate] Auto-saved first interactable offline frame");
+            LogToFile("AUTO_SAVE frame=%u reason=first_interactable_offline_frame\n",
+                      g_slot.info.frame);
+        } else {
+            LOG_WARN("[Savestate] Round-start auto-save failed");
+        }
+        g_roundStartAutosaveArmed = false;
+    }
+}
+
+// ============================================================================
 // Lifecycle
 // ============================================================================
 
 void Savestate_Init() {
-    memset(&g_slot, 0, sizeof(g_slot));
-    g_slot.info.valid = false;
-    Rollback::GameSnapshot_Clear(&g_slot.snapshot);
+    ClearSavestateSlot("init");
+    g_offlineMatchContextActive = false;
+    g_roundStartAutosaveArmed = false;
+    g_f5WasDown = false;
+    g_f6WasDown = false;
     LOG_INFO("[Savestate] Initialized (main region: 0x%08X, %u bytes / %u KB)",
              ADDR_MATCH_BASE,
              (unsigned)Rollback::GAME_SNAPSHOT_MAIN_SIZE,
@@ -159,15 +264,7 @@ void Savestate_Shutdown() {
 // ============================================================================
 
 bool Savestate_CanSaveLoad() {
-    uint32_t mode = ReadMemory<uint32_t>(ADDR_GAME_MODE);
-    uint32_t sub  = ReadMemory<uint32_t>(ADDR_SUB_STATE);
-
-    // Only allow during active gameplay (MODE_MATCH, substate GAMEPLAY)
-    // Also allow during INIT (substate 2) for early-frame testing
-    if (mode != MODE_MATCH) return false;
-    if (sub != MATCH_SUB_GAMEPLAY && sub != MATCH_SUB_INIT) return false;
-
-    return true;
+    return IsOfflinePlayableSavestateContext();
 }
 
 // ============================================================================
@@ -176,8 +273,12 @@ bool Savestate_CanSaveLoad() {
 
 bool Savestate_Save() {
     if (!Savestate_CanSaveLoad()) {
-        LOG_WARN("[Savestate] Cannot save — not in active gameplay (mode=%d sub=%d)",
-                 ReadMemory<uint32_t>(ADDR_GAME_MODE), ReadMemory<uint32_t>(ADDR_SUB_STATE));
+        LOG_WARN("[Savestate] Cannot save — offline playable match required (mode=%d sub=%d type=%d net=%d rb=%d)",
+                 ReadMemory<uint32_t>(ADDR_GAME_MODE),
+                 ReadMemory<uint32_t>(ADDR_SUB_STATE),
+                 ReadMemory<uint32_t>(ADDR_GAME_TYPE),
+                 Net::Session_IsConnected() ? 1 : 0,
+                 Rollback::RollbackSession_IsActive() ? 1 : 0);
         return false;
     }
 
@@ -224,8 +325,12 @@ bool Savestate_Load() {
     }
 
     if (!Savestate_CanSaveLoad()) {
-        LOG_WARN("[Savestate] Cannot load — not in active gameplay (mode=%d sub=%d)",
-                 ReadMemory<uint32_t>(ADDR_GAME_MODE), ReadMemory<uint32_t>(ADDR_SUB_STATE));
+        LOG_WARN("[Savestate] Cannot load — offline playable match required (mode=%d sub=%d type=%d net=%d rb=%d)",
+                 ReadMemory<uint32_t>(ADDR_GAME_MODE),
+                 ReadMemory<uint32_t>(ADDR_SUB_STATE),
+                 ReadMemory<uint32_t>(ADDR_GAME_TYPE),
+                 Net::Session_IsConnected() ? 1 : 0,
+                 Rollback::RollbackSession_IsActive() ? 1 : 0);
         return false;
     }
 
@@ -287,15 +392,19 @@ const SavestateInfo* Savestate_GetInfo() {
 // ============================================================================
 
 void Savestate_ProcessHotkeys() {
-    // Use GetAsyncKeyState for edge detection (key-down transition)
-    static bool s_f5WasDown = false;
-    static bool s_f6WasDown = false;
+    UpdateSavestateContext();
 
     bool f5Down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
     bool f6Down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
 
+    if (!Savestate_CanSaveLoad()) {
+        g_f5WasDown = f5Down;
+        g_f6WasDown = f6Down;
+        return;
+    }
+
     // F5: Save (on key-down edge)
-    if (f5Down && !s_f5WasDown) {
+    if (f5Down && !g_f5WasDown) {
         if (Savestate_Save()) {
             char buf[64];
             snprintf(buf, sizeof(buf), "State Saved (F%d)", g_slot.info.frame);
@@ -306,7 +415,7 @@ void Savestate_ProcessHotkeys() {
     }
 
     // F6: Load (on key-down edge)
-    if (f6Down && !s_f6WasDown) {
+    if (f6Down && !g_f6WasDown) {
         if (Savestate_Load()) {
             char buf[64];
             snprintf(buf, sizeof(buf), "State Loaded (F%d)", g_slot.info.frame);
@@ -316,8 +425,8 @@ void Savestate_ProcessHotkeys() {
         }
     }
 
-    s_f5WasDown = f5Down;
-    s_f6WasDown = f6Down;
+    g_f5WasDown = f5Down;
+    g_f6WasDown = f6Down;
 }
 
 // ============================================================================
@@ -327,7 +436,7 @@ void Savestate_ProcessHotkeys() {
 void Savestate_RenderImGui() {
     const SavestateInfo* info = &g_slot.info;
 
-    ImGui::Text("Manual Savestate (F5 save / F6 load)");
+    ImGui::Text("Offline Savestate (Auto-save + F5/F6)");
     ImGui::Separator();
 
     if (info->valid) {
@@ -338,13 +447,14 @@ void Savestate_RenderImGui() {
         ImGui::Text("Mode:     %d  Sub: %d", info->game_mode, info->substate);
     } else {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Slot: EMPTY");
-        ImGui::TextDisabled("Press F5 during a match to save state");
+        ImGui::TextDisabled("Auto-saves on the first playable offline frame of each round");
     }
 
     ImGui::Separator();
 
     bool canSaveLoad = Savestate_CanSaveLoad();
     ImGui::Text("Can Save/Load: %s", canSaveLoad ? "Yes" : "No");
+    ImGui::TextDisabled("Offline Mode 8 gameplay only. Disabled for netplay, spectator, replay, and demo.");
 
     if (canSaveLoad) {
         // Show current live state for comparison

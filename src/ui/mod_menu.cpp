@@ -45,25 +45,68 @@ static const char* g_buttonNames[] = {
 };
 
 typedef bool (__cdecl *IsProxyMenuVisible_t)();
+typedef void (__cdecl *SetProxyMenuVisible_t)(bool visible);
 
-static bool ProxyMenuVisible() {
-    static HMODULE s_d3d9Module = nullptr;
-    static IsProxyMenuVisible_t s_isMenuVisible = nullptr;
-    static bool s_lookedUp = false;
+static HMODULE s_d3d9Module = nullptr;
+static IsProxyMenuVisible_t s_isMenuVisible = nullptr;
+static SetProxyMenuVisible_t s_setMenuVisible = nullptr;
+static bool s_proxyMenuApiLookedUp = false;
 
-    if (!s_lookedUp) {
-        s_lookedUp = true;
-        s_d3d9Module = GetModuleHandleA("d3d9.dll");
-        if (s_d3d9Module) {
-            s_isMenuVisible = (IsProxyMenuVisible_t)GetProcAddress(s_d3d9Module, "IsMenuVisible");
-        }
+static void ResolveProxyMenuApi() {
+    if (s_proxyMenuApiLookedUp) {
+        return;
     }
 
+    s_proxyMenuApiLookedUp = true;
+    s_d3d9Module = GetModuleHandleA("d3d9.dll");
+    if (!s_d3d9Module) {
+        return;
+    }
+
+    s_isMenuVisible = (IsProxyMenuVisible_t)GetProcAddress(s_d3d9Module, "IsMenuVisible");
+    s_setMenuVisible = (SetProxyMenuVisible_t)GetProcAddress(s_d3d9Module, "SetMenuVisible");
+}
+
+static bool ProxyMenuVisible() {
+    ResolveProxyMenuApi();
     return s_isMenuVisible ? s_isMenuVisible() : true;
+}
+
+static void ProxySetMenuVisible(bool visible, const char* reason) {
+    ResolveProxyMenuApi();
+    if (!s_setMenuVisible) {
+        LOG_WARN("[ModMenu] Failed to set proxy visibility=%d reason=%s (SetMenuVisible export unavailable)",
+                 visible ? 1 : 0,
+                 reason ? reason : "unknown");
+        return;
+    }
+
+    LOG_INFO("[ModMenu] Requesting proxy visibility=%d reason=%s requested_open=%d actual_open=%d",
+             visible ? 1 : 0,
+             reason ? reason : "unknown",
+             g_menuOpen ? 1 : 0,
+             (visible && g_menuOpen) ? 1 : 0);
+    s_setMenuVisible(visible);
 }
 
 static bool IsMenuActuallyOpen() {
     return g_menuOpen && ProxyMenuVisible();
+}
+
+static void SetMenuRequestedOpen(bool open, const char* reason) {
+    const bool previous = g_menuOpen;
+    if (previous == open) {
+        return;
+    }
+
+    g_menuOpen = open;
+    const bool proxyVisible = ProxyMenuVisible();
+    LOG_INFO("[ModMenu] Requested open %d -> %d reason=%s proxy_visible=%d actual_open=%d",
+             previous ? 1 : 0,
+             g_menuOpen ? 1 : 0,
+             reason ? reason : "unknown",
+             proxyVisible ? 1 : 0,
+             IsMenuActuallyOpen() ? 1 : 0);
 }
 
 // ============================================================================
@@ -380,8 +423,16 @@ void ModMenu_Init() {
     PaletteEditor_Init();
 }
 
+void ModMenu_SetOpen(bool open) {
+    SetMenuRequestedOpen(open, "ModMenu_SetOpen");
+}
+
 void ModMenu_Toggle() {
-    g_menuOpen = !g_menuOpen;
+    SetMenuRequestedOpen(!g_menuOpen, "ModMenu_Toggle");
+}
+
+bool ModMenu_IsRequestedOpen() {
+    return g_menuOpen;
 }
 
 bool ModMenu_IsOpen() {
@@ -402,8 +453,12 @@ void ModMenu_Render() {
     
     ImGui::SetNextWindowBgAlpha(0.85f);
     
-    if (!ImGui::Begin("Settings", &g_menuOpen, flags)) {
+    bool windowOpen = g_menuOpen;
+    if (!ImGui::Begin("Settings", &windowOpen, flags)) {
         ImGui::End();
+        if (windowOpen != g_menuOpen) {
+            SetMenuRequestedOpen(windowOpen, windowOpen ? "Settings window reopened" : "Settings window closed");
+        }
         return;
     }
 
@@ -425,8 +480,8 @@ void ModMenu_Render() {
                 LOG_INFO("Config loaded");
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Close Menu", "F1")) {
-                g_menuOpen = false;
+            if (ImGui::MenuItem("Hide Menu", "F1")) {
+                ProxySetMenuVisible(false, "Settings/File Hide Menu");
             }
             ImGui::EndMenu();
         }
@@ -483,4 +538,7 @@ void ModMenu_Render() {
     }
     
     ImGui::End();
+    if (windowOpen != g_menuOpen) {
+        SetMenuRequestedOpen(windowOpen, windowOpen ? "Settings window reopened" : "Settings window closed");
+    }
 }

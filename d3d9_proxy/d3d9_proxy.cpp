@@ -66,6 +66,7 @@ typedef void (*ModOnPresent_t)(void* pDevice);
 typedef void (*ModSetImGuiContext_t)(void* ctx);
 typedef void (*ModOnGameExit_t)(int exitCode, const char* reason);
 typedef void (*ModToggleMenu_t)();
+typedef bool (*ModIsMenuRequestedOpen_t)();
 typedef bool (*ModGetNetplayHudText_t)(char* out, int cap);
 typedef bool (*ModWantsExclusiveOverlay_t)();
 typedef void (*ModSetLogDir_t)(const char* dir);
@@ -114,6 +115,7 @@ static ModOnPresent_t g_pModOnPresent = nullptr;
 static ModSetImGuiContext_t g_pModSetImGuiContext = nullptr;
 static ModOnGameExit_t g_pModOnGameExit = nullptr;
 static ModToggleMenu_t g_pModToggleMenu = nullptr;
+static ModIsMenuRequestedOpen_t g_pModIsMenuRequestedOpen = nullptr;
 static ModGetNetplayHudText_t g_pModGetNetplayHudText = nullptr;
 static ModGetMatchHudData_t g_pModGetMatchHudData = nullptr;
 static ModWantsExclusiveOverlay_t g_pModWantsExclusiveOverlay = nullptr;
@@ -460,6 +462,8 @@ static bool g_imguiDrawDataReady = false;
 
 // Menu state
 static bool g_showMenu = true;
+static bool g_menuHotkeyF1Down = false;
+static bool g_menuHotkeyF11Down = false;
 static bool g_winKeyPressed = false;
 static bool g_winKeyChordUsed = false;
 static bool g_altShiftLayoutToggleActive = false;
@@ -2391,8 +2395,144 @@ static bool IsShiftVirtualKey(WPARAM wParam) {
     return wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT;
 }
 
-static bool IsFirstModifierKeydown(UINT uMsg, LPARAM lParam) {
+static bool IsFirstKeydown(UINT uMsg, LPARAM lParam) {
     return (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) && (lParam & 0x40000000u) == 0;
+}
+
+static int QueryModMenuRequestedOpenState() {
+    if (!g_pModIsMenuRequestedOpen) {
+        return -1;
+    }
+
+    return g_pModIsMenuRequestedOpen() ? 1 : 0;
+}
+
+static void LogOverlayMenuHotkeyEvent(const char* stage,
+                                      const char* source,
+                                      const char* keyName,
+                                      HWND hWnd,
+                                      UINT uMsg,
+                                      WPARAM wParam,
+                                      LPARAM lParam,
+                                      bool wasDown) {
+    ProxyLog("[MENUHOTKEY][%s] source=%s key=%s msg=%s hwnd=0x%p wParam=0x%08X lParam=0x%08X repeat=%d wasDown=%d showMenu=%d modRequested=%d imgui=%d fg=0x%p active=0x%p focus=0x%p",
+             stage ? stage : "unknown",
+             source ? source : "unknown",
+             keyName ? keyName : "?",
+             DescribeShellHotkeyTraceMessage(uMsg, wParam),
+             hWnd,
+             (unsigned int)wParam,
+             (unsigned int)lParam,
+             (lParam & 0x40000000u) ? 1 : 0,
+             wasDown ? 1 : 0,
+             g_showMenu ? 1 : 0,
+             QueryModMenuRequestedOpenState(),
+             g_imguiInitialized ? 1 : 0,
+             GetForegroundWindow(),
+             GetActiveWindow(),
+             GetFocus());
+}
+
+static void SetProxyMenuVisibleInternal(bool visible,
+                                        const char* reason,
+                                        const char* source,
+                                        HWND hWnd,
+                                        UINT uMsg,
+                                        WPARAM wParam,
+                                        LPARAM lParam) {
+    const bool previous = g_showMenu;
+    const int modRequested = QueryModMenuRequestedOpenState();
+    g_showMenu = visible;
+
+    ProxyLog("[MENU] Visibility %s -> %s source=%s reason=%s msg=%s hwnd=0x%p repeat=%d modRequested=%d settingsVisibleNow=%d",
+             previous ? "ON" : "OFF",
+             g_showMenu ? "ON" : "OFF",
+             source ? source : "unknown",
+             reason ? reason : "unknown",
+             DescribeShellHotkeyTraceMessage(uMsg, wParam),
+             hWnd,
+             (lParam & 0x40000000u) ? 1 : 0,
+             modRequested,
+             (g_showMenu && modRequested == 1) ? 1 : 0);
+}
+
+static void ResetOverlayHotkeyState(const char* source, const char* reason, HWND hWnd, UINT uMsg) {
+    if (!g_menuHotkeyF1Down && !g_menuHotkeyF11Down) {
+        return;
+    }
+
+    ProxyLog("[MENUHOTKEY][reset] source=%s reason=%s msg=0x%04X hwnd=0x%p f1Down=%d f11Down=%d showMenu=%d modRequested=%d",
+             source ? source : "unknown",
+             reason ? reason : "unknown",
+             (unsigned int)uMsg,
+             hWnd,
+             g_menuHotkeyF1Down ? 1 : 0,
+             g_menuHotkeyF11Down ? 1 : 0,
+             g_showMenu ? 1 : 0,
+             QueryModMenuRequestedOpenState());
+
+    g_menuHotkeyF1Down = false;
+    g_menuHotkeyF11Down = false;
+}
+
+static bool HandleOverlayHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, const char* source) {
+    if (wParam != VK_F1 && wParam != VK_F11) {
+        return false;
+    }
+
+    const bool isKeyDown = (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN);
+    const bool isKeyUp = (uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP);
+    if (!isKeyDown && !isKeyUp) {
+        return false;
+    }
+
+    bool* downState = (wParam == VK_F1) ? &g_menuHotkeyF1Down : &g_menuHotkeyF11Down;
+    const char* keyName = (wParam == VK_F1) ? "F1" : "F11";
+
+    if (isKeyDown) {
+        if (*downState && (GetAsyncKeyState((int)wParam) & 0x8000) == 0) {
+            ProxyLog("[MENUHOTKEY][stale-recover] source=%s key=%s msg=%s hwnd=0x%p lParam=0x%08X",
+                     source ? source : "unknown",
+                     keyName,
+                     DescribeShellHotkeyTraceMessage(uMsg, wParam),
+                     hWnd,
+                     (unsigned int)lParam);
+            *downState = false;
+        }
+
+        const bool wasDown = *downState;
+        LogOverlayMenuHotkeyEvent("down", source, keyName, hWnd, uMsg, wParam, lParam, wasDown);
+        if (wasDown) {
+            ProxyLog("[MENUHOTKEY][duplicate] source=%s key=%s msg=%s hwnd=0x%p repeat=%d firstKeydown=%d ignored=1",
+                     source ? source : "unknown",
+                     keyName,
+                     DescribeShellHotkeyTraceMessage(uMsg, wParam),
+                     hWnd,
+                     (lParam & 0x40000000u) ? 1 : 0,
+                     IsFirstKeydown(uMsg, lParam) ? 1 : 0);
+            return true;
+        }
+
+        *downState = true;
+        if (wParam == VK_F1) {
+            SetProxyMenuVisibleInternal(!g_showMenu, "F1 hotkey", source, hWnd, uMsg, wParam, lParam);
+            return true;
+        }
+
+        const bool beforeBorderless = g_isCurrentlyBorderless;
+        ToggleBorderlessFullscreen(hWnd);
+        ProxyLog("[MENUHOTKEY][toggle] source=%s key=F11 borderless=%d->%d hwnd=0x%p",
+                 source ? source : "unknown",
+                 beforeBorderless ? 1 : 0,
+                 g_isCurrentlyBorderless ? 1 : 0,
+                 hWnd);
+        return true;
+    }
+
+    const bool wasDown = *downState;
+    *downState = false;
+    LogOverlayMenuHotkeyEvent(wasDown ? "up" : "stray-up", source, keyName, hWnd, uMsg, wParam, lParam, wasDown);
+    return true;
 }
 
 static bool IsGameWindowInputActive(HWND hWnd) {
@@ -2566,7 +2706,7 @@ static bool HandleAltShiftLayoutToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
         return false;
     }
 
-    if (!IsFirstModifierKeydown(uMsg, lParam)) {
+    if (!IsFirstKeydown(uMsg, lParam)) {
         return false;
     }
 
@@ -2618,12 +2758,16 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         NotifyGameExitOnce(0, "WM_CLOSE - Normal exit");
     } else if (msg == WM_DESTROY) {
         ProxyLog("[IMGUIWNDPROC] WM_DESTROY received hwnd=0x%p", hWnd);
+        ResetOverlayHotkeyState("HookedWndProc", "WM_DESTROY", hWnd, msg);
         NotifyGameExitOnce(0, "WM_DESTROY");
         PostQuitMessageOnce("HookedWndProc WM_DESTROY");
     } else if (msg == WM_NCDESTROY) {
         ProxyLog("[IMGUIWNDPROC] WM_NCDESTROY received hwnd=0x%p", hWnd);
+        ResetOverlayHotkeyState("HookedWndProc", "WM_NCDESTROY", hWnd, msg);
         NotifyGameExitOnce(0, "WM_NCDESTROY");
         PostQuitMessageOnce("HookedWndProc WM_NCDESTROY");
+    } else if (msg == WM_ACTIVATEAPP && wParam == FALSE) {
+        ResetOverlayHotkeyState("HookedWndProc", "WM_ACTIVATEAPP deactivate", hWnd, msg);
     }
 
     if (msg == kMsgRelayStandaloneWinKey) {
@@ -2647,16 +2791,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         return 0;
     }
 
-    // Toggle menu with F1
-    if (msg == WM_KEYDOWN && wParam == VK_F1) {
-        g_showMenu = !g_showMenu;
-        ProxyLog("[INPUT] Menu toggled: %s", g_showMenu ? "ON" : "OFF");
-        return 0;
-    }
-    
-    // Toggle borderless fullscreen with F11
-    if (msg == WM_KEYDOWN && wParam == VK_F11) {
-        ToggleBorderlessFullscreen(hWnd);
+    if (HandleOverlayHotkeys(hWnd, msg, wParam, lParam, "HookedWndProc")) {
         return 0;
     }
     
@@ -3152,9 +3287,15 @@ void RenderImGui() {
         if (ImGui::BeginMenu("Options")) {
             if (ImGui::MenuItem("Settings", nullptr, false, g_pModToggleMenu != nullptr)) {
                 g_pModToggleMenu();
+                ProxyLog("[MENU] Settings toggle requested from proxy menu modRequested=%d showMenu=%d",
+                         QueryModMenuRequestedOpenState(),
+                         g_showMenu ? 1 : 0);
             }
             ImGui::Separator();
-            ImGui::MenuItem("Show Menu", "F1", &g_showMenu);
+            bool showMenu = g_showMenu;
+            if (ImGui::MenuItem("Show Menu", "F1", &showMenu)) {
+                SetProxyMenuVisibleInternal(showMenu, "Options/Show Menu item", "ProxyMenuBar", g_gameWindow, WM_APP, VK_F1, 0);
+            }
             {
                 bool borderlessChecked = g_isCurrentlyBorderless;
                 if (ImGui::MenuItem("Borderless Fullscreen", "F11", borderlessChecked)) {
@@ -3868,6 +4009,7 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             if (kEnableInputMessageLogs) {
                 ProxyLog("[WNDPROC] App deactivated (alt-tab / focus lost)");
             }
+            ResetOverlayHotkeyState("ProxyWndProc", "WM_ACTIVATEAPP deactivate", hWnd, uMsg);
             g_winKeyPressed = false;
             g_winKeyChordUsed = false;
             g_altShiftLayoutToggleActive = false;
@@ -3885,6 +4027,10 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                      (unsigned int)wParam, (unsigned int)lParam);
         }
         return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+
+    if (HandleOverlayHotkeys(hWnd, uMsg, wParam, lParam, "ProxyWndProc")) {
+        return 0;
     }
 
     if (HandleAltShiftLayoutToggle(hWnd, uMsg, wParam, lParam)) {
@@ -4140,11 +4286,13 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
     }
     if (uMsg == WM_DESTROY) {
         ProxyLog("[WNDPROC] WM_DESTROY received");
+        ResetOverlayHotkeyState("ProxyWndProc", "WM_DESTROY", hWnd, uMsg);
         NotifyGameExitOnce(0, "WM_DESTROY");
         PostQuitMessageOnce("ProxyWndProc WM_DESTROY");
     }
     if (uMsg == WM_NCDESTROY) {
         ProxyLog("[WNDPROC] WM_NCDESTROY received");
+        ResetOverlayHotkeyState("ProxyWndProc", "WM_NCDESTROY", hWnd, uMsg);
         NotifyGameExitOnce(0, "WM_NCDESTROY");
         PostQuitMessageOnce("ProxyWndProc WM_NCDESTROY");
     }
@@ -5238,6 +5386,7 @@ bool LoadCoreModDLL() {
     g_pModSetImGuiContext = (ModSetImGuiContext_t)GetProcAddress(g_hModDLL, "ModSetImGuiContext");
     g_pModOnGameExit = (ModOnGameExit_t)GetProcAddress(g_hModDLL, "ModOnGameExit");
     g_pModToggleMenu = (ModToggleMenu_t)GetProcAddress(g_hModDLL, "ModToggleMenu");
+    g_pModIsMenuRequestedOpen = (ModIsMenuRequestedOpen_t)GetProcAddress(g_hModDLL, "ModIsMenuRequestedOpen");
     g_pModGetNetplayHudText = (ModGetNetplayHudText_t)GetProcAddress(g_hModDLL, "ModGetNetplayHudText");
     g_pModGetMatchHudData = (ModGetMatchHudData_t)GetProcAddress(g_hModDLL, "ModGetMatchHudData");
     g_pModWantsExclusiveOverlay = (ModWantsExclusiveOverlay_t)GetProcAddress(g_hModDLL, "ModWantsExclusiveOverlay");
@@ -5248,8 +5397,8 @@ bool LoadCoreModDLL() {
         pModSetLogDir(g_logDir);
     }
     
-    ProxyLog("[MOD] Exports - Init:0x%p Shutdown:0x%p OnFrame:0x%p OnPresent:0x%p SetCtx:0x%p Exit:0x%p ToggleMenu:0x%p Hud:0x%p MatchHud:0x%p Exclusive:0x%p",
-             g_pModInit, g_pModShutdown, g_pModOnFrame, g_pModOnPresent, g_pModSetImGuiContext, g_pModOnGameExit, g_pModToggleMenu, g_pModGetNetplayHudText, g_pModGetMatchHudData, g_pModWantsExclusiveOverlay);
+    ProxyLog("[MOD] Exports - Init:0x%p Shutdown:0x%p OnFrame:0x%p OnPresent:0x%p SetCtx:0x%p Exit:0x%p ToggleMenu:0x%p MenuState:0x%p Hud:0x%p MatchHud:0x%p Exclusive:0x%p",
+             g_pModInit, g_pModShutdown, g_pModOnFrame, g_pModOnPresent, g_pModSetImGuiContext, g_pModOnGameExit, g_pModToggleMenu, g_pModIsMenuRequestedOpen, g_pModGetNetplayHudText, g_pModGetMatchHudData, g_pModWantsExclusiveOverlay);
     
     return true;
 }
@@ -5370,7 +5519,7 @@ extern "C" __declspec(dllexport) bool IsMenuVisible() {
 }
 
 extern "C" __declspec(dllexport) void SetMenuVisible(bool visible) {
-    g_showMenu = visible;
+    SetProxyMenuVisibleInternal(visible, "SetMenuVisible export", "Export", g_gameWindow, WM_APP, VK_F1, 0);
 }
 // Borderless fullscreen exports for mod DLL
 extern "C" __declspec(dllexport) bool IsBorderlessFullscreen() {
