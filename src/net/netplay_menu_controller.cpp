@@ -72,6 +72,8 @@ static char          s_status[128]       = "Choose an online option.";
 static char          s_lastError[128]    = "";
 static char          s_textEditBuffer[96] = "";
 static int           s_textCursorPos      = 0;   // Cursor position within text edit buffer
+static bool          s_textEditPrevKeyDown[256] = {};
+static bool          s_textEditPrevKeyInitialized = false;
 static char          s_localNickname[64]  = "Player";
 static uint16_t      s_listenPort         = 10700;
 static char          s_remoteEndpoint[96] = "127.0.0.1:10700";
@@ -597,11 +599,47 @@ static bool NormalizeWideCharForField(TextEditField field, wchar_t* ch) {
     return *ch >= 0x20 && *ch != 0x7F;
 }
 
+static bool IsTextEditWindowFocused() {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground) {
+        return false;
+    }
+
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(foreground, &foregroundPid);
+    return foregroundPid == GetCurrentProcessId();
+}
+
+static void BuildAsyncKeyboardStateSnapshot(BYTE* keyState, size_t keyStateCount) {
+    if (!keyState || keyStateCount < 256) {
+        return;
+    }
+
+    memset(keyState, 0, keyStateCount);
+    for (int vk = 0; vk < 256; ++vk) {
+        if (GetAsyncKeyState(vk) & 0x8000) {
+            keyState[vk] |= 0x80;
+        }
+    }
+
+    if (GetKeyState(VK_CAPITAL) & 0x0001) {
+        keyState[VK_CAPITAL] |= 0x01;
+    }
+    if (GetKeyState(VK_NUMLOCK) & 0x0001) {
+        keyState[VK_NUMLOCK] |= 0x01;
+    }
+    if (GetKeyState(VK_SCROLL) & 0x0001) {
+        keyState[VK_SCROLL] |= 0x01;
+    }
+}
+
 static int TranslateVirtualKeyToUnicode(int vk, wchar_t* outChars, int outCharCount) {
     BYTE keyState[256] = {};
-    if (!outChars || outCharCount <= 0 || !GetKeyboardState(keyState)) {
+    if (!outChars || outCharCount <= 0) {
         return 0;
     }
+
+    BuildAsyncKeyboardStateSnapshot(keyState, sizeof(keyState));
 
     const UINT scanCode = MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
     int translatedCount = ToUnicode(vk, scanCode, keyState, outChars, outCharCount, 0);
@@ -2370,6 +2408,8 @@ static bool MenuJustPressed(uint16_t button) { return InputSystem_JustPressed(0,
 static bool ConfirmPressed() { return MenuJustPressed(INPUT_A) || MenuJustPressed(INPUT_START); }
 static bool BackPressed()    { return MenuJustPressed(INPUT_B) || MenuJustPressed(INPUT_SELECT); }
 
+static void ResetTextEditKeyState();
+
 // ============================================================================
 // Text editing (keyboard input for nickname/endpoint/port)
 // ============================================================================
@@ -2483,15 +2523,18 @@ static void FinishTextEdit(bool commit) {
 }
 
 static void HandleTextEditing() {
-    bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    static bool prevDown[256] = {};
-    static bool s_prevDownInitialized = false;
+    if (!IsTextEditWindowFocused()) {
+        ResetTextEditKeyState();
+        return;
+    }
 
-    if (!s_prevDownInitialized) {
+    bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+
+    if (!s_textEditPrevKeyInitialized) {
         for (int vk = 0; vk < 256; ++vk) {
-            prevDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            s_textEditPrevKeyDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
         }
-        s_prevDownInitialized = true;
+        s_textEditPrevKeyInitialized = true;
         return;
     }
 
@@ -2510,37 +2553,37 @@ static void HandleTextEditing() {
 
     {
         bool vDown = (GetAsyncKeyState('V') & 0x8000) != 0;
-        if (ctrlDown && vDown && !prevDown['V']) {
+        if (ctrlDown && vDown && !s_textEditPrevKeyDown['V']) {
             char pasteBuffer[128] = {};
             if (MenuUtils::PasteFromClipboard(pasteBuffer, sizeof(pasteBuffer))) {
                 InsertClipboardTextAtCursor(s_textEditField, maxEditLen, pasteBuffer);
             }
-            prevDown['V'] = true;
+            s_textEditPrevKeyDown['V'] = true;
             return;
         }
     }
 
     {
         bool aDown = (GetAsyncKeyState('A') & 0x8000) != 0;
-        if (ctrlDown && aDown && !prevDown['A']) {
+        if (ctrlDown && aDown && !s_textEditPrevKeyDown['A']) {
             s_textEditBuffer[0] = '\0';
             s_textCursorPos = 0;
-            prevDown['A'] = true;
+            s_textEditPrevKeyDown['A'] = true;
             return;
         }
     }
 
     for (int vk = 0; vk < 256; ++vk) {
         bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-        if (down && !prevDown[vk]) {
+        if (down && !s_textEditPrevKeyDown[vk]) {
             len = (int)strlen(s_textEditBuffer);
 
             if (vk == VK_RETURN) {
-                s_prevDownInitialized = false;
+                ResetTextEditKeyState();
                 FinishTextEdit(true);
                 return;
             } else if (vk == VK_ESCAPE) {
-                s_prevDownInitialized = false;
+                ResetTextEditKeyState();
                 FinishTextEdit(false);
                 return;
             }
@@ -2600,14 +2643,14 @@ static void HandleTextEditing() {
                 }
             }
         }
-        prevDown[vk] = down;
+        s_textEditPrevKeyDown[vk] = down;
     }
 }
 
 /// Reset the text editing key state tracker (call when entering/leaving text edit)
 static void ResetTextEditKeyState() {
-    // The static prevDown in HandleTextEditing will be re-initialized on next entry
-    // via the s_prevDownInitialized flag — no separate action needed here.
+    memset(s_textEditPrevKeyDown, 0, sizeof(s_textEditPrevKeyDown));
+    s_textEditPrevKeyInitialized = false;
 }
 
 // ============================================================================

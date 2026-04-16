@@ -185,6 +185,46 @@ static StageWatchdogState ReadLocalStageWatchdogState() {
     return state;
 }
 
+static void ApplyAuthoritativeStageStateToLocalMenu(const StageWatchdogState& state) {
+    WriteMemory<uint8_t>(ADDR_STAGE_CURSOR, state.stage_cursor);
+    WriteMemory<uint8_t>(ADDR_STAGE_CURSOR + 1, state.stage_confirmed);
+    WriteMemory<uint8_t>(ADDR_STAGE_CURSOR + 2, state.stage_counter);
+    WriteMemory<uint8_t>(ADDR_STAGE_AUX, state.stage_aux);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_CANCEL, state.stage_cancel);
+    WriteMemory<uint8_t>(ADDR_STAGE_CONFIRM_MENU_CURSOR, state.confirm_menu_cursor);
+    WriteMemory<uint8_t>(ADDR_STAGE_CONFIRM_MENU_ACTION, state.confirm_menu_action);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID, state.committed_stage_id);
+}
+
+static void MirrorHostStageStateOnClient(const StageWatchdogState& state, const char* reason) {
+    if (s_isHost || !s_inStagePhase) {
+        return;
+    }
+
+    ApplyAuthoritativeStageStateToLocalMenu(state);
+    s_localStageState = state;
+    s_localStage = ResolveFinalStageId(state);
+
+    if (state.stage_confirmed ||
+        state.committed_stage_id != 0 ||
+        IsStageSelCommittedSubstate(state.substate)) {
+        s_localStageLocked = true;
+        s_stageBoundaryState = MakeStageBoundaryState(state);
+        s_stageBoundaryStateValid = true;
+    }
+
+    Rollback::NetplayLog_Verbose(
+        "STAGESEL", -1,
+        "Client mirrored host stage state: stage=%u cursor=%u confirmed=%u menu_cursor=%u menu_action=%u committed=%u reason=%s",
+        ResolveFinalStageId(state),
+        state.stage_cursor,
+        state.stage_confirmed,
+        state.confirm_menu_cursor,
+        state.confirm_menu_action,
+        state.committed_stage_id,
+        reason ? reason : "?");
+}
+
 static void SendStageWatchdog(const StageWatchdogState& state, bool confirmed, const char* reason) {
     StageSyncPayload payload{};
     payload.epoch_id = FrontendInputSync_GetEpochId();
@@ -667,6 +707,8 @@ void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
     if (accepted.confirmed) {
         s_remoteStageLocked = true;
     }
+
+    MirrorHostStageStateOnClient(s_remoteStageState, StageWatchdogApplyResultName(applyResult));
 
     Rollback::NetplayLog_Verbose(
         "STAGESEL", -1,

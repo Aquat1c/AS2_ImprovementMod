@@ -2321,6 +2321,12 @@ int __cdecl Hook_InputProcess(int gameState) {
             const uint16_t adjPrevHeld = edgeReset ? (uint16_t)0 : prevHeldP1;
             const uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~adjPrevHeld);
 
+            // g_origInputProcess already populated the stage-select raw input
+            // block from unsynchronized local hardware state. Clear the safe
+            // frontend-owned span so the merged lockstep input becomes the only
+            // remaining source for held/current/just-pressed stage UI reads.
+            clearLiveInputBuffers();
+
             for (int i = 0; i < 10; i++) {
                 const uint16_t mask = g_buttonMasks[i];
 
