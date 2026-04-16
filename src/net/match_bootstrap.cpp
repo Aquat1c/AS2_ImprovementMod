@@ -511,9 +511,9 @@ static void UpdateBaseline() {
             LOG_NETPLAY(LOG_INFO, "[MatchBoot] RNG seed asserted: 0x%08X before baseline capture",
                 s_config.session_seed);
 
-            // Capture savestate
-            if (Savestate_Save()) {
-                const SavestateInfo* info = Savestate_GetInfo();
+            // Capture bootstrap baseline into the dedicated netplay slot.
+            if (Savestate_CaptureRollbackBaseline()) {
+                const SavestateInfo* info = Savestate_GetRollbackBaselineInfo();
                 if (info && info->valid) {
                     s_localBaselineCRC = info->checksum;
                     BaselineBreakdownPayload localBreakdown{};
@@ -684,6 +684,7 @@ void MatchBootstrap_BeginLoading() {
 }
 
 void MatchBootstrap_BeginBaseline() {
+    Savestate_ClearRollbackBaseline("begin baseline capture");
     s_localBaselineReady = false;
     s_localBaselineMode = 0;
     s_localBaselineSubstate = 0;
@@ -713,6 +714,7 @@ void MatchBootstrap_BeginBaseline() {
 }
 
 void MatchBootstrap_Abort() {
+    Savestate_ClearRollbackBaseline("bootstrap abort");
     s_phase = BootPhase::Idle;
     s_error[0] = '\0';
     s_configSent = false;

@@ -377,15 +377,28 @@
 
 // Attack type flag bits (entity+1740)
 #define ATTACK_FLAG_LOW_HIT      0x00001  // Low hit type (stand vs crouch)
-#define ATTACK_FLAG_PROJ_IMMUNE  0x00800  // Projectile immunity / bypasses invincibility (entity+1932)
+#define ATTACK_FLAG_PROJ_IMMUNE  0x00800  // Projectile immunity / bypasses the defender +1932 gate in melee/summon checks
 #define ATTACK_FLAG_FORCE_ACTIVE 0x20000  // Force active / super armor (bypasses box dimension checks)
 
-// Invincibility flag (entity+1932 / +0x78C, WORD)
-// Non-zero = invincible to melee and summon attacks.
-// Bypassed by ATTACK_FLAG_PROJ_IMMUNE (0x800).
-// Checked by: Entity_UpdateGrabAlignment, Entity_UpdateDamageApplication,
-//             Entity_UpdateSummonHitDetection.
-#define ENTITY_OFF_INVINCIBILITY 0x078C   // +1932, WORD — invincibility flag
+// Verified clash / max-hit block (entity+0x77C..0x79D).
+// Entity_SetClashData writes the raw clash payload used by Entity_ResolveAttackCollision.
+// Entity_UpdateMaxHitData writes the raw max-hit lanes consulted by clash/melee/summon logic.
+// Only clash rank (+1916) and continuation ID (+1928) are fully named; the raw A-D fields
+// are used directly in overlap math but their higher-level gameplay labels remain partially unverified.
+#define ENTITY_OFF_CLASH_RANK        0x077C  // +1916, BYTE  — clash rank / priority
+#define ENTITY_OFF_CLASH_RAW_A       0x077E  // +1918, WORD  — raw clash field A
+#define ENTITY_OFF_CLASH_RAW_B       0x0780  // +1920, WORD  — raw clash field B
+#define ENTITY_OFF_CLASH_RAW_C       0x0782  // +1922, WORD  — raw clash field C
+#define ENTITY_OFF_CLASH_RAW_D       0x0784  // +1924, WORD  — raw clash field D
+#define ENTITY_OFF_CLASH_ID          0x0788  // +1928, DWORD — clash continuation action / ID
+#define ENTITY_OFF_MAX_HIT_RAW_A     0x078C  // +1932, WORD  — max-hit raw lane A
+#define ENTITY_OFF_MAX_HIT_RAW_B     0x078E  // +1934, WORD  — max-hit raw lane B
+#define ENTITY_OFF_MAX_HIT_RAW_C     0x0790  // +1936, WORD  — max-hit raw lane C
+#define ENTITY_OFF_MAX_HIT_RAW_D     0x0792  // +1938, WORD  — max-hit raw aux value
+#define ENTITY_OFF_MAX_HIT_ID        0x0794  // +1940, DWORD — max-hit raw aux ID
+#define ENTITY_OFF_MAX_HIT_ACTIVE    0x0798  // +1944, DWORD — max-hit block active flag
+#define ENTITY_OFF_HIT_MARKER_1948   0x079C  // +1948, BYTE  — special hit marker
+#define ENTITY_OFF_HIT_MARKER_1949   0x079D  // +1949, BYTE  — special hit marker
 
 // Active rect / pushbox (entity-relative single rects).
 // Managed by Input_SetNextRect / Input_ApplyNextRect.

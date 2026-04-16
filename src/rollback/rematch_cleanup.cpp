@@ -17,13 +17,21 @@
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/winscreen_sync.h"
+#include "patches/memory_utils.h"
 #include "patches/input_sync_hooks.h"
 #include "rollback/netplay_log.h"
 #include "rollback/rollback_debug.h"
+#include "core/as2_constants.h"
 #include "core/game_state.h"
 #include "ui/log_window.h"
 
 namespace {
+
+constexpr size_t kEffectStateBytes = EFFECT_MAX_SLOTS * EFFECT_ENTRY_SIZE;
+constexpr size_t kSummonStateBytes = SUMMON_MAX_SLOTS * SUMMON_ENTRY_SIZE;
+
+static_assert(kEffectStateBytes == (ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY),
+    "Effect array size should span exactly to summon array");
 
 static void LogBoundaryState(const char* label) {
     Net::SessionSnapshot session{};
@@ -82,6 +90,22 @@ static void ClearInputResidue() {
     InputSystem_SetControlSwap(false);
 }
 
+static void ClearMatchVolatileResidue() {
+    static const uint8_t zeroEffects[kEffectStateBytes] = {};
+    static const uint8_t zeroSummons[kSummonStateBytes] = {};
+
+    const bool effectsCleared =
+        WriteMemoryBlockSafe((void*)ADDR_EFFECT_ARRAY, zeroEffects, sizeof(zeroEffects));
+    const bool summonsCleared =
+        WriteMemoryBlockSafe((void*)ADDR_SUMMON_ARRAY, zeroSummons, sizeof(zeroSummons));
+
+    Rollback::NetplayLog_Write(
+        "REMATCH", -1,
+        "Clearing stale match-owned volatile state: effects=%d summons=%d preserve_effect_index=1 preserve_frame_counters=1",
+        effectsCleared ? 1 : 0,
+        summonsCleared ? 1 : 0);
+}
+
 } // anonymous namespace
 
 namespace Rollback {
@@ -134,6 +158,7 @@ void RematchCleanup_PrepareForNextMatch(const char* reason) {
     Rollback::RollbackDebug_SetDigestEnabled(false);
     Rollback::RollbackDebug_ResetSession();
 
+    ClearMatchVolatileResidue();
     ClearInputResidue();
 
     LogBoundaryState("AfterCleanup");

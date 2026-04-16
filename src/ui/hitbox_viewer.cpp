@@ -72,6 +72,7 @@ static const ImU32 COL_THROWBOX  = IM_COL32(0, 200, 255, 255);
 static const ImU32 COL_HITDEF_PT = IM_COL32(255, 80, 80, 255);
 static const ImU32 COL_P1_CROSS  = IM_COL32(255, 120, 120, 255);
 static const ImU32 COL_P2_CROSS  = IM_COL32(120, 120, 255, 255);
+static const ImU32 COL_CANCEL    = IM_COL32(255, 245, 120, 255);
 static const ImU32 COL_ARMOR     = IM_COL32(255, 160, 0, 255);
 static const ImU32 COL_IMMUNE    = IM_COL32(180, 0, 255, 255);
 
@@ -87,6 +88,11 @@ struct ScreenTransform {
     int16_t scrollY;
     float   scaleX;
     float   scaleY;
+};
+
+enum class BoxRenderPass {
+    FillOnly,
+    OutlineOnly,
 };
 
 static ScreenTransform GetTransform() {
@@ -110,12 +116,16 @@ static ImVec2 WorldToDisplay(int16_t wx, int16_t wy, const ScreenTransform& t) {
 }
 
 static void DrawBox(ImDrawList* dl, float l, float top, float r, float bot,
-                    ImU32 outline, float alpha, const ScreenTransform& t) {
+                    ImU32 outline, float alpha, const ScreenTransform& t,
+                    BoxRenderPass pass) {
     ImVec2 p1 = GameToDisplay(l, top, t);
     ImVec2 p2 = GameToDisplay(r, bot, t);
     if (p1.x > p2.x) { float tmp = p1.x; p1.x = p2.x; p2.x = tmp; }
     if (p1.y > p2.y) { float tmp = p1.y; p1.y = p2.y; p2.y = tmp; }
-    dl->AddRectFilled(p1, p2, ColFill(outline, alpha));
+    if (pass == BoxRenderPass::FillOnly) {
+        dl->AddRectFilled(p1, p2, ColFill(outline, alpha));
+        return;
+    }
     dl->AddRect(p1, p2, outline, 0.0f, 0, 2.0f);
 }
 
@@ -125,6 +135,66 @@ struct BoxEntry {
     int16_t halfW;
     int16_t halfH;
 };
+
+struct ClashSnapshot {
+    uint8_t rank;
+    int16_t rawA;
+    int16_t rawB;
+    int16_t rawC;
+    int16_t rawD;
+    uint32_t continuationId;
+};
+
+struct MaxHitSnapshot {
+    uint16_t rawA;
+    uint16_t rawB;
+    uint16_t rawC;
+    int16_t rawD;
+    uint32_t rawId;
+    uint32_t active;
+    uint8_t marker1948;
+    uint8_t marker1949;
+};
+
+struct CancelRouteSnapshot {
+    uint32_t charId;
+    uint16_t meter;
+    uint8_t familyType;
+    uint8_t gate16;
+    uint8_t gate22;
+    uint8_t gate26;
+    uint8_t airborne;
+    uint16_t airMoveInput;
+    uint32_t gateState;
+    uint16_t action107Threshold;
+    uint8_t readyActionCount;
+    uint16_t readyActions[4];
+};
+
+struct Action107RouteConfig {
+    bool valid;
+    uintptr_t gateOffset;
+    uint16_t meterThreshold;
+};
+
+static constexpr uint8_t kCancelFamilyTypeByCharId[22] = {
+    3, 6, 3, 2, 6, 3, 5, 4, 2, 5, 4, 5, 6, 3, 4, 5, 4, 1, 3, 5, 5, 1,
+};
+
+static constexpr uintptr_t kEntityOffRawInputWord30 = 30;
+static constexpr uintptr_t kEntityOffAirMoveInput = 78;
+static constexpr uintptr_t kEntityOffCommandSlot16Gate = 783;
+static constexpr uintptr_t kEntityOffCommandSlot22Gate = 807;
+static constexpr uintptr_t kEntityOffCommandSlot26Gate = 823;
+static constexpr uintptr_t kEntityOffAirborneFlag = 1732;
+static constexpr uintptr_t kEntityOffCancelGateState = 1952;
+static constexpr uint16_t kAction49 = 49;
+static constexpr uint16_t kAction52 = 52;
+static constexpr uint16_t kAction59 = 59;
+static constexpr uint16_t kAction60 = 60;
+static constexpr uint16_t kAction61 = 61;
+static constexpr uint16_t kAction62 = 62;
+static constexpr uint16_t kAction107 = 107;
 
 struct HitboxViewerFrameContext {
     ScreenTransform transform;
@@ -151,6 +221,7 @@ struct AnimFrameSnapshot {
 
 struct EntitySnapshot {
     const char* label;
+    int playerIndex;
     uintptr_t base;
     int16_t posX;
     int16_t posY;
@@ -161,7 +232,9 @@ struct EntitySnapshot {
     uint8_t attackState;
     uint32_t attackType;
     uint8_t hitActive;
-    uint16_t invincibility;
+    ClashSnapshot clash;
+    MaxHitSnapshot maxHit;
+    CancelRouteSnapshot cancelRoutes;
     const AnimFrameSnapshot* animFrame;
 };
 
@@ -224,15 +297,26 @@ static void RenderBoxSet(ImDrawList* dl,
                          int count,
                          ImU32 colour,
                          const ScreenTransform& t,
-                         const char* boxLabel);
-static void RenderHurtboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
-static void RenderEntityHitboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
-static void RenderThrowboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
+                         const char* boxLabel,
+                         BoxRenderPass pass);
+static void RenderHurtboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t, BoxRenderPass pass);
+static void RenderEntityHitboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t, BoxRenderPass pass);
+static void RenderThrowboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t, BoxRenderPass pass);
 static void RenderStateFlags(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
-static void RenderHitDefs(ImDrawList* dl, const HitDefSnapshot* hitDefs, int hitDefCount, const ScreenTransform& t);
-static void RenderPushbox(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
+static void RenderHitDefs(ImDrawList* dl, const HitDefSnapshot* hitDefs, int hitDefCount, const ScreenTransform& t, BoxRenderPass pass);
+static void RenderPushbox(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t, BoxRenderPass pass);
 static void RenderPosition(ImDrawList* dl, const EntitySnapshot& entity, ImU32 colour, const ScreenTransform& t);
 static void RenderInfoOverlay(ImDrawList* dl, const HitboxViewerFrameContext& ctx, const EntitySnapshot& p1, const EntitySnapshot& p2);
+static uint32_t ReadPlayerCharacterId(int playerIndex);
+static bool IsCancelGroundAction(uint32_t actionId);
+static bool IsCancelAirAction(uint32_t actionId);
+static Action107RouteConfig GetAction107RouteConfig(uint32_t charId);
+static void AppendReadyCancelAction(CancelRouteSnapshot* snapshot, uint16_t actionId);
+static void FormatReadyCancelActions(const CancelRouteSnapshot& snapshot, char* out, size_t outCap);
+static CancelRouteSnapshot BuildCancelRouteSnapshot(int playerIndex,
+                                                    uintptr_t entityBase,
+                                                    uint32_t actionId,
+                                                    int16_t posY);
 
 static BoxEntry DecodeBoxEntry(const uint8_t* frameBytes, size_t offset) {
     BoxEntry box{};
@@ -377,11 +461,139 @@ static HitboxViewerFrameContext BuildFrameContext() {
     return ctx;
 }
 
+static uint32_t ReadPlayerCharacterId(int playerIndex) {
+    return ReadMemory<uint32_t>(playerIndex == 0 ? ADDR_CHARSEL_P1_CHAR_ID : ADDR_CHARSEL_P2_CHAR_ID);
+}
+
+static bool IsCancelGroundAction(uint32_t actionId) {
+    return actionId == 64 || actionId == 65 || actionId == 67 || actionId == 68;
+}
+
+static bool IsCancelAirAction(uint32_t actionId) {
+    return actionId == 70 || actionId == 71;
+}
+
+static Action107RouteConfig GetAction107RouteConfig(uint32_t charId) {
+    switch (charId) {
+        case 9:
+            return {true, kEntityOffCommandSlot16Gate, 0x07D0u};
+        case 10:
+            return {true, kEntityOffCommandSlot16Gate, 0x1388u};
+        case 11:
+            return {true, kEntityOffCommandSlot16Gate, 0x01F4u};
+        case 12:
+            return {true, kEntityOffCommandSlot16Gate, 0x0BB8u};
+        case 16:
+            return {true, kEntityOffCommandSlot26Gate, 0x03E8u};
+        case 18:
+            return {true, kEntityOffCommandSlot22Gate, 0x07D0u};
+        case 19:
+            return {true, kEntityOffCommandSlot16Gate, 0x03E8u};
+        case 20:
+            return {true, kEntityOffCommandSlot16Gate, 0x03E8u};
+        default:
+            return {false, 0, 0};
+    }
+}
+
+static void AppendReadyCancelAction(CancelRouteSnapshot* snapshot, uint16_t actionId) {
+    if (!snapshot) {
+        return;
+    }
+
+    for (uint8_t i = 0; i < snapshot->readyActionCount; ++i) {
+        if (snapshot->readyActions[i] == actionId) {
+            return;
+        }
+    }
+
+    if (snapshot->readyActionCount >= static_cast<uint8_t>(sizeof(snapshot->readyActions) / sizeof(snapshot->readyActions[0]))) {
+        return;
+    }
+
+    snapshot->readyActions[snapshot->readyActionCount++] = actionId;
+}
+
+static void FormatReadyCancelActions(const CancelRouteSnapshot& snapshot, char* out, size_t outCap) {
+    if (!out || outCap == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (snapshot.readyActionCount == 0) {
+        snprintf(out, outCap, "none");
+        return;
+    }
+
+    size_t pos = 0;
+    for (uint8_t i = 0; i < snapshot.readyActionCount && pos + 1 < outCap; ++i) {
+        pos += snprintf(out + pos, outCap - pos, i == 0 ? "%u" : ",%u", snapshot.readyActions[i]);
+        if (pos >= outCap) {
+            out[outCap - 1] = '\0';
+            return;
+        }
+    }
+}
+
+static CancelRouteSnapshot BuildCancelRouteSnapshot(int playerIndex,
+                                                    uintptr_t entityBase,
+                                                    uint32_t actionId,
+                                                    int16_t posY) {
+    CancelRouteSnapshot snapshot{};
+    snapshot.charId = ReadPlayerCharacterId(playerIndex);
+    snapshot.meter = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_METER);
+    if (snapshot.charId < (sizeof(kCancelFamilyTypeByCharId) / sizeof(kCancelFamilyTypeByCharId[0]))) {
+        snapshot.familyType = kCancelFamilyTypeByCharId[snapshot.charId];
+    }
+    snapshot.gate16 = ReadMemory<uint8_t>(entityBase + kEntityOffCommandSlot16Gate);
+    snapshot.gate22 = ReadMemory<uint8_t>(entityBase + kEntityOffCommandSlot22Gate);
+    snapshot.gate26 = ReadMemory<uint8_t>(entityBase + kEntityOffCommandSlot26Gate);
+    snapshot.airborne = ReadMemory<uint8_t>(entityBase + kEntityOffAirborneFlag);
+    snapshot.airMoveInput = ReadMemory<uint16_t>(entityBase + kEntityOffAirMoveInput);
+    snapshot.gateState = ReadMemory<uint32_t>(entityBase + kEntityOffCancelGateState);
+
+    const Action107RouteConfig action107 = GetAction107RouteConfig(snapshot.charId);
+    snapshot.action107Threshold = action107.meterThreshold;
+    if (action107.valid) {
+        const uint8_t gate = ReadMemory<uint8_t>(entityBase + action107.gateOffset);
+        if (gate != 0 &&
+            snapshot.gateState == 1 &&
+            snapshot.airborne == 0 &&
+            snapshot.meter >= action107.meterThreshold) {
+            AppendReadyCancelAction(&snapshot, kAction107);
+        }
+    }
+
+    if (snapshot.familyType == 5 && snapshot.gate26 != 0) {
+        if (IsCancelGroundAction(actionId)) {
+            AppendReadyCancelAction(&snapshot, kAction49);
+        }
+        if (IsCancelAirAction(actionId) && posY < 6960) {
+            AppendReadyCancelAction(&snapshot, kAction52);
+        }
+    }
+
+    if (snapshot.familyType == 6 && snapshot.meter >= 0x01F4u && snapshot.airMoveInput == 1) {
+        if (IsCancelGroundAction(actionId)) {
+            AppendReadyCancelAction(&snapshot,
+                                    ReadMemory<uint16_t>(entityBase + kEntityOffRawInputWord30) == 1 ? kAction60 : kAction59);
+        }
+        if (IsCancelAirAction(actionId)) {
+            AppendReadyCancelAction(&snapshot,
+                                    ReadMemory<uint16_t>(entityBase + kEntityOffRawInputWord30) == 1 ? kAction62 : kAction61);
+        }
+    }
+
+    return snapshot;
+}
+
 static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
                                           uintptr_t entityBase,
+                                          int playerIndex,
                                           const char* label) {
     EntitySnapshot snapshot{};
     snapshot.label = label;
+    snapshot.playerIndex = playerIndex;
     snapshot.base = entityBase;
     snapshot.posX = ReadMemory<int16_t>(entityBase + ENTITY_OFF_X_POS);
     snapshot.posY = ReadMemory<int16_t>(entityBase + ENTITY_OFF_Y_POS);
@@ -392,7 +604,21 @@ static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
     snapshot.attackState = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_ATTACK_STATE);
     snapshot.attackType = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ATTACK_TYPE);
     snapshot.hitActive = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_ACTIVE);
-    snapshot.invincibility = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_INVINCIBILITY);
+    snapshot.clash.rank = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_CLASH_RANK);
+    snapshot.clash.rawA = ReadMemory<int16_t>(entityBase + ENTITY_OFF_CLASH_RAW_A);
+    snapshot.clash.rawB = ReadMemory<int16_t>(entityBase + ENTITY_OFF_CLASH_RAW_B);
+    snapshot.clash.rawC = ReadMemory<int16_t>(entityBase + ENTITY_OFF_CLASH_RAW_C);
+    snapshot.clash.rawD = ReadMemory<int16_t>(entityBase + ENTITY_OFF_CLASH_RAW_D);
+    snapshot.clash.continuationId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_CLASH_ID);
+    snapshot.maxHit.rawA = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_A);
+    snapshot.maxHit.rawB = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_B);
+    snapshot.maxHit.rawC = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_C);
+    snapshot.maxHit.rawD = ReadMemory<int16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_D);
+    snapshot.maxHit.rawId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ID);
+    snapshot.maxHit.active = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ACTIVE);
+    snapshot.maxHit.marker1948 = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_MARKER_1948);
+    snapshot.maxHit.marker1949 = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_MARKER_1949);
+    snapshot.cancelRoutes = BuildCancelRouteSnapshot(playerIndex, entityBase, snapshot.actionId, snapshot.posY);
     snapshot.animFrame = GetOrLoadAnimFrameSnapshot(cache, entityBase, snapshot.animIdx, label);
     return snapshot;
 }
@@ -474,7 +700,8 @@ static void RenderBoxSet(ImDrawList* dl,
                          int count,
                          ImU32 colour,
                          const ScreenTransform& t,
-                         const char* boxLabel) {
+                         const char* boxLabel,
+                         BoxRenderPass pass) {
     if (!boxes) {
         return;
     }
@@ -524,35 +751,38 @@ static void RenderBoxSet(ImDrawList* dl,
                      bot);
         }
 
-        DrawBox(dl, left, top, right, bot, colour, g_fillAlpha, t);
+        DrawBox(dl, left, top, right, bot, colour, g_fillAlpha, t, pass);
     }
 }
 
 static void RenderHurtboxes(ImDrawList* dl,
                             const EntitySnapshot& entity,
-                            const ScreenTransform& t) {
+                            const ScreenTransform& t,
+                            BoxRenderPass pass) {
     if (!entity.animFrame) {
         return;
     }
-    RenderBoxSet(dl, entity, entity.animFrame->hurtBoxes, HURTBOX_COUNT_PER_FRAME, COL_HURTBOX, t, "hurt");
+    RenderBoxSet(dl, entity, entity.animFrame->hurtBoxes, HURTBOX_COUNT_PER_FRAME, COL_HURTBOX, t, "hurt", pass);
 }
 
 static void RenderEntityHitboxes(ImDrawList* dl,
                                  const EntitySnapshot& entity,
-                                 const ScreenTransform& t) {
+                                 const ScreenTransform& t,
+                                 BoxRenderPass pass) {
     if (!entity.animFrame) {
         return;
     }
-    RenderBoxSet(dl, entity, entity.animFrame->hitBoxes, HURTBOX_COUNT_PER_FRAME, COL_HITBOX, t, "hit");
+    RenderBoxSet(dl, entity, entity.animFrame->hitBoxes, HURTBOX_COUNT_PER_FRAME, COL_HITBOX, t, "hit", pass);
 }
 
 static void RenderThrowboxes(ImDrawList* dl,
                              const EntitySnapshot& entity,
-                             const ScreenTransform& t) {
+                             const ScreenTransform& t,
+                             BoxRenderPass pass) {
     if (!entity.animFrame) {
         return;
     }
-    RenderBoxSet(dl, entity, entity.animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME, COL_THROWBOX, t, "ext");
+    RenderBoxSet(dl, entity, entity.animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME, COL_THROWBOX, t, "ext", pass);
 }
 
 static void RenderStateFlags(ImDrawList* dl,
@@ -560,51 +790,42 @@ static void RenderStateFlags(ImDrawList* dl,
                              const ScreenTransform& t) {
     ImVec2 pos = WorldToDisplay(entity.posX, entity.posY, t);
     float yOff = -20.0f * t.scaleY;
+    char buf[96];
 
-    if (entity.invincibility != 0) {
-        const char* txt = "INVINCIBLE";
+    auto drawLabel = [&](ImU32 colour, const char* txt) {
         ImVec2 sz = ImGui::CalcTextSize(txt);
         float x = pos.x - sz.x * 0.5f;
         float y = pos.y + yOff;
         dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
-        dl->AddText(ImVec2(x, y), COL_THROWBOX, txt);
+        dl->AddText(ImVec2(x, y), colour, txt);
         yOff -= (sz.y + 4.0f);
+    };
+
+    if (entity.cancelRoutes.readyActionCount != 0) {
+        char readyText[32];
+        FormatReadyCancelActions(entity.cancelRoutes, readyText, sizeof(readyText));
+        snprintf(buf, sizeof(buf), "CANCEL %s", readyText);
+        drawLabel(COL_CANCEL, buf);
     }
 
     if (entity.attackType & ATTACK_FLAG_FORCE_ACTIVE) {
-        const char* txt = "ARMOR";
-        ImVec2 sz = ImGui::CalcTextSize(txt);
-        float x = pos.x - sz.x * 0.5f;
-        float y = pos.y + yOff;
-        dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
-        dl->AddText(ImVec2(x, y), COL_ARMOR, txt);
-        yOff -= (sz.y + 4.0f);
+        drawLabel(COL_ARMOR, "ARMOR");
     }
 
     if (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE) {
-        const char* txt = "PROJ IMMUNE";
-        ImVec2 sz = ImGui::CalcTextSize(txt);
-        float x = pos.x - sz.x * 0.5f;
-        float y = pos.y + yOff;
-        dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
-        dl->AddText(ImVec2(x, y), COL_IMMUNE, txt);
-        yOff -= (sz.y + 4.0f);
+        drawLabel(COL_IMMUNE, "PROJ IMMUNE");
     }
 
     if (entity.attackState == 1 && entity.hitActive != 0) {
-        const char* txt = "ATK";
-        ImVec2 sz = ImGui::CalcTextSize(txt);
-        float x = pos.x - sz.x * 0.5f;
-        float y = pos.y + yOff;
-        dl->AddRectFilled(ImVec2(x - 2, y - 1), ImVec2(x + sz.x + 2, y + sz.y + 1), IM_COL32(0, 0, 0, 180));
-        dl->AddText(ImVec2(x, y), COL_HITBOX, txt);
+        drawLabel(COL_HITBOX, "ATK");
     }
 }
 
 static void RenderHitDefs(ImDrawList* dl,
                           const HitDefSnapshot* hitDefs,
                           int hitDefCount,
-                          const ScreenTransform& t) {
+                          const ScreenTransform& t,
+                          BoxRenderPass pass) {
     int activeCount = 0;
     for (int i = 0; i < hitDefCount; i++) {
         const HitDefSnapshot& hitDef = hitDefs[i];
@@ -651,7 +872,8 @@ static void RenderHitDefs(ImDrawList* dl,
                     cy + hh - t.scrollY,
                     COL_HITBOX,
                     g_fillAlpha,
-                    t);
+                    t,
+                    pass);
             anyDrawn = true;
         }
 
@@ -673,12 +895,13 @@ static void RenderHitDefs(ImDrawList* dl,
                     cy + hh - t.scrollY,
                     COL_HURTBOX,
                     g_fillAlpha,
-                    t);
+                    t,
+                    pass);
                 anyDrawn = true;
             }
         }
 
-        if (!anyDrawn) {
+        if (!anyDrawn && pass == BoxRenderPass::FillOnly) {
             ImVec2 p = WorldToDisplay(hitDef.worldX, hitDef.worldY, t);
             dl->AddCircleFilled(p, 5.0f * t.scaleX, COL_HITDEF_PT);
         }
@@ -691,7 +914,8 @@ static void RenderHitDefs(ImDrawList* dl,
 
 static void RenderPushbox(ImDrawList* dl,
                           const EntitySnapshot& entity,
-                          const ScreenTransform& t) {
+                          const ScreenTransform& t,
+                          BoxRenderPass pass) {
     if (!entity.animFrame) {
         return;
     }
@@ -715,7 +939,8 @@ static void RenderPushbox(ImDrawList* dl,
             cy + hh - t.scrollY,
             COL_PUSHBOX,
             g_fillAlpha,
-            t);
+            t,
+            pass);
 }
 
 static void RenderPosition(ImDrawList* dl,
@@ -751,7 +976,7 @@ static void RenderInfoOverlay(ImDrawList* dl,
 
     const EntitySnapshot* players[2] = { &p1, &p2 };
     for (int pi = 0; pi < 2; pi++) {
-        totalLines += 1;
+        totalLines += 2;
         const AnimFrameSnapshot* animFrame = players[pi]->animFrame;
         if (!animFrame) {
             continue;
@@ -764,7 +989,7 @@ static void RenderInfoOverlay(ImDrawList* dl,
         totalLines += CountActiveBoxes(animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME);
     }
 
-    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 500, y + lineH * totalLines + 6), bg);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 680, y + lineH * totalLines + 6), bg);
 
     auto line = [&](ImU32 col, const char* fmt, ...) {
         va_list ap;
@@ -799,7 +1024,7 @@ static void RenderInfoOverlay(ImDrawList* dl,
         line(dim, "P1Base:0x%08X P2Base:0x%08X Stride:%d",
              (uint32_t)p1.base, (uint32_t)p2.base,
              ENTITY_SIZE);
-        line(dim, "AnimData +0x%X  Stride:%d  Coll@%d Hit@%d Hurt@%d Throw@%d  %d×%dB",
+        line(dim, "AnimData +0x%X  Stride:%d  Coll@%d Hit@%d Hurt@%d Ext@%d  %d×%dB",
              ENTITY_OFF_ANIM_DATA, ANIM_DATA_STRIDE,
              ANIM_COLLISION_OFFSET, ANIM_HITBOX_OFFSET, ANIM_HURTBOX_OFFSET, ANIM_EXT_HURTBOX_OFFSET,
              HURTBOX_COUNT_PER_FRAME, HURTBOX_ENTRY_SIZE);
@@ -809,9 +1034,22 @@ static void RenderInfoOverlay(ImDrawList* dl,
         const EntitySnapshot& entity = *players[pi];
         const AnimFrameSnapshot* animFrame = entity.animFrame;
         ImU32 col = (pi == 0) ? COL_P1_CROSS : COL_P2_CROSS;
+           char readyText[32];
+           FormatReadyCancelActions(entity.cancelRoutes, readyText, sizeof(readyText));
         line(col, "P%d Pos:%d,%d Face:%d HP:%d Act:%u Anim:%u Atk:%u Flags:0x%X",
              pi + 1, entity.posX, entity.posY, entity.facing, entity.hp,
              entity.actionId, entity.animIdx, entity.attackState, entity.attackType);
+           line(col, "  cancel c:%u f:%u m:%u 107:%u g:%u/%u/%u air:%u mv:%u r:%s",
+               entity.cancelRoutes.charId,
+               entity.cancelRoutes.familyType,
+               entity.cancelRoutes.meter,
+               entity.cancelRoutes.action107Threshold,
+               entity.cancelRoutes.gate16,
+               entity.cancelRoutes.gate22,
+               entity.cancelRoutes.gate26,
+               entity.cancelRoutes.airborne,
+               entity.cancelRoutes.airMoveInput,
+               readyText);
 
         if (!animFrame) {
             continue;
@@ -838,7 +1076,7 @@ static void RenderInfoOverlay(ImDrawList* dl,
                      i, hitBox.xOff, hitBox.yOff, hitBox.halfW, hitBox.halfH);
             }
             if (throwBox.halfW > 0 && throwBox.halfH > 0) {
-                line(col, "  throw%d off(%d,%d) half(%d,%d)",
+                line(col, "  ext%d off(%d,%d) half(%d,%d)",
                      i, throwBox.xOff, throwBox.yOff, throwBox.halfW, throwBox.halfH);
             }
         }
@@ -869,8 +1107,8 @@ void HitboxViewer_Render() {
     AnimFrameCache animCache{};
     const uintptr_t p1EntityBase = GetEntityBase(0);
     const uintptr_t p2EntityBase = GetEntityBase(1);
-    EntitySnapshot p1 = BuildEntitySnapshot(&animCache, p1EntityBase, "P1");
-    EntitySnapshot p2 = BuildEntitySnapshot(&animCache, p2EntityBase, "P2");
+    EntitySnapshot p1 = BuildEntitySnapshot(&animCache, p1EntityBase, 0, "P1");
+    EntitySnapshot p2 = BuildEntitySnapshot(&animCache, p2EntityBase, 1, "P2");
 
     if (p1.actionId != s_lastP1Action) {
         if (g_logPerFrame) {
@@ -895,23 +1133,29 @@ void HitboxViewer_Render() {
         hitDefCount = BuildHitDefSnapshots(&animCache, hitDefs, SUMMON_MAX_SLOTS, p1EntityBase, p2EntityBase);
     }
 
-    if (g_showHurtboxes) {
-        RenderHurtboxes(dl, p1, frameCtx.transform);
-        RenderHurtboxes(dl, p2, frameCtx.transform);
-    }
-    if (g_showHitboxes) {
-        RenderEntityHitboxes(dl, p1, frameCtx.transform);
-        RenderEntityHitboxes(dl, p2, frameCtx.transform);
-        RenderHitDefs(dl, hitDefs, hitDefCount, frameCtx.transform);
-    }
-    if (g_showThrowboxes) {
-        RenderThrowboxes(dl, p1, frameCtx.transform);
-        RenderThrowboxes(dl, p2, frameCtx.transform);
-    }
-    if (g_showPushboxes) {
-        RenderPushbox(dl, p1, frameCtx.transform);
-        RenderPushbox(dl, p2, frameCtx.transform);
-    }
+    auto renderBoxes = [&](BoxRenderPass pass) {
+        if (g_showPushboxes) {
+            RenderPushbox(dl, p1, frameCtx.transform, pass);
+            RenderPushbox(dl, p2, frameCtx.transform, pass);
+        }
+        if (g_showHurtboxes) {
+            RenderHurtboxes(dl, p1, frameCtx.transform, pass);
+            RenderHurtboxes(dl, p2, frameCtx.transform, pass);
+        }
+        if (g_showThrowboxes) {
+            RenderThrowboxes(dl, p1, frameCtx.transform, pass);
+            RenderThrowboxes(dl, p2, frameCtx.transform, pass);
+        }
+        if (g_showHitboxes) {
+            RenderEntityHitboxes(dl, p1, frameCtx.transform, pass);
+            RenderEntityHitboxes(dl, p2, frameCtx.transform, pass);
+            RenderHitDefs(dl, hitDefs, hitDefCount, frameCtx.transform, pass);
+        }
+    };
+
+    renderBoxes(BoxRenderPass::FillOnly);
+    renderBoxes(BoxRenderPass::OutlineOnly);
+
     if (g_showPositions) {
         RenderPosition(dl, p1, COL_P1_CROSS, frameCtx.transform);
         RenderPosition(dl, p2, COL_P2_CROSS, frameCtx.transform);
@@ -936,11 +1180,11 @@ void HitboxViewer_RenderControls() {
     ImGui::Separator();
     ImGui::Checkbox("Hurtboxes (green, @40)", &g_showHurtboxes);
     ImGui::Checkbox("Hitboxes / attacks (red, @8)", &g_showHitboxes);
-    ImGui::Checkbox("Ext. hurtbox (cyan, @72)", &g_showThrowboxes);
+    ImGui::Checkbox("Ext. hurtboxes (cyan, @72)", &g_showThrowboxes);
     ImGui::Checkbox("Collision / pushbox (yellow, @0)", &g_showPushboxes);
-    ImGui::Checkbox("State flags (ATK / ARMOR / IMMUNE)", &g_showStateFlags);
+    ImGui::Checkbox("State flags (ATK / ARMOR / IMMUNE / CANCEL)", &g_showStateFlags);
     ImGui::Checkbox("Position markers", &g_showPositions);
-    ImGui::Checkbox("Info overlay", &g_showInfo);
+    ImGui::Checkbox("Info overlay (boxes + clash data)", &g_showInfo);
     ImGui::Checkbox("Match state debug", &g_showMatchState);
     ImGui::SliderFloat("Fill alpha", &g_fillAlpha, 0.0f, 1.0f, "%.2f");
     ImGui::Separator();

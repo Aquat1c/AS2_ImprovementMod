@@ -897,13 +897,19 @@ static bool     s_dispatchFirstLog = false;
 // a frame) then -1 to break out. This flag resets when -1 is returned.
 static bool s_charsel_produced_this_loop = false;
 
-// WinScreen: same dispatcher while-loop semantics as charsel lockstep.
-static bool s_winscreen_produced_this_loop = false;
+// WinScreen input is driven from Hook_InputProcess because Mode 9 does not
+// enter the dispatcher loop in the reproduced rematch path.
 static uint16_t s_winscreenPrevP1 = 0;
 static uint16_t s_winscreenPrevP2 = 0;
 static uint32_t s_winscreenDispatchCount = 0;
 static uint32_t s_winscreenWaitCount = 0;
 static bool s_winscreenFirstLog = false;
+static bool s_winscreenFrameProduced = false;
+static uint16_t s_winscreenFrameP1 = 0;
+static uint16_t s_winscreenFrameP2 = 0;
+static uint16_t s_winscreenFrameJustP1 = 0;
+static uint16_t s_winscreenFrameJustP2 = 0;
+static uint32_t s_winscreenLastProcessFrame = 0xFFFFFFFFu;
 static bool s_spectatorDispatchActive = false;
 static uint16_t s_spectatorPrevP1 = 0;
 static uint16_t s_spectatorPrevP2 = 0;
@@ -1169,144 +1175,6 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
 
         s_charsel_produced_this_loop = true;
         return 0;
-    }
-
-    // ── WinScreen lockstep (Mode 9, no rollback) ───────────────────
-    // Mode 9 is input-driven across multiple substates. We keep rollback
-    // disabled here, but still consume synchronized per-frame P1/P2 inputs
-    // so both peers route post-match identically.
-    if (gameMode == MODE_WINSCREEN &&
-        !Net::WinScreenSync_IsActive() &&
-        Net::MatchLifecycle_IsMatchOwned() &&
-        Net::Session_IsConnected()) {
-        Rollback::NetplayLog_Write("WINLOCK", -1,
-            "Dispatcher activating winscreen lockstep on-demand (mode=%u sub=%u)",
-            gameMode, subState);
-        Net::WinScreenSync_Begin();
-    }
-
-    if (Net::WinScreenSync_IsActive()) {
-        if (gameMode != MODE_WINSCREEN) {
-            Rollback::NetplayLog_Write("WINLOCK", -1,
-                "Lockstep abort request: sync active outside Mode 9 (mode=%u sub=%u)",
-                gameMode, subState);
-            Net::WinScreenSync_Abort();
-            return -1;
-        }
-
-        if (!s_winscreenFirstLog) {
-            s_winscreenFirstLog = true;
-            s_winscreenDispatchCount = 0;
-            s_winscreenWaitCount = 0;
-            s_winscreen_produced_this_loop = false;
-            s_winscreenPrevP1 = 0;
-            s_winscreenPrevP2 = 0;
-
-            Rollback::NetplayLog_Write("WINLOCK", -1,
-                "Dispatcher lockstep ACTIVE: mode=%u sub=%u consume=%u remote_latest=%u",
-                gameMode,
-                subState,
-                Net::WinScreenSync_GetConsumeFrame(),
-                Net::WinScreenSync_GetRemoteLatestFrame());
-        }
-
-        if (s_winscreen_produced_this_loop) {
-            s_winscreen_produced_this_loop = false;
-            return -1;
-        }
-
-        InputSystem_Update();
-        const uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
-        Net::WinScreenSync_CaptureLocalInput(localInput);
-
-        if (!Net::WinScreenSync_HasInputsForCurrentFrame()) {
-            s_winscreenWaitCount++;
-            if (s_winscreenWaitCount <= 5 || (s_winscreenWaitCount % 120) == 0) {
-                Rollback::NetplayLog_Write("WINLOCK", -1,
-                    "Waiting for remote frame: wait#%u consume=%u remote_latest=%u sub=%u",
-                    s_winscreenWaitCount,
-                    Net::WinScreenSync_GetConsumeFrame(),
-                    Net::WinScreenSync_GetRemoteLatestFrame(),
-                    subState);
-            }
-            return -1;
-        }
-
-        uint16_t p1 = 0;
-        uint16_t p2 = 0;
-        if (!Net::WinScreenSync_ConsumeCurrentFrame(&p1, &p2)) {
-            Rollback::NetplayLog_Write("WINLOCK", -1,
-                "Consume failed despite ready frame: consume=%u remote_latest=%u",
-                Net::WinScreenSync_GetConsumeFrame(),
-                Net::WinScreenSync_GetRemoteLatestFrame());
-            return -1;
-        }
-
-        s_winscreenDispatchCount++;
-        s_winscreenWaitCount = 0;
-
-        outputInputs[0] = (__int16)p1;
-        outputInputs[1] = (__int16)p2;
-
-        // Mirror vanilla dispatcher bookkeeping.
-        volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
-        const uint32_t writeIdx = (uint32_t)*pFrameWrite;
-        if (writeIdx < INPUT_HISTORY_MAX) {
-            *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p1;
-            *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p2;
-        }
-        *pFrameWrite = (int32_t)(writeIdx + 1);
-
-        // Update raw held/just-pressed arrays used directly by Mode 9 handlers.
-        const uint16_t justP1 = p1 & ~s_winscreenPrevP1;
-        const uint16_t justP2 = p2 & ~s_winscreenPrevP2;
-        s_winscreenPrevP1 = p1;
-        s_winscreenPrevP2 = p2;
-
-        __try {
-            for (int i = 0; i < 10; i++) {
-                const uint16_t mask = (uint16_t)(1 << i);
-                WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (i * 2),
-                    (uint16_t)((p1 & mask) ? 1 : 0));
-                WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
-                    (uint16_t)((justP1 & mask) ? 1 : 0));
-                WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (i * 2),
-                    (uint16_t)((p2 & mask) ? 1 : 0));
-                WriteMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
-                    (uint16_t)((justP2 & mask) ? 1 : 0));
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            LOG_NETPLAY(LOG_ERROR, "[InputDispatch] EXCEPTION writing win-screen raw input buffers");
-            return -1;
-        }
-
-        if (s_winscreenDispatchCount <= 5 || (s_winscreenDispatchCount % 120) == 0) {
-            Rollback::NetplayLog_Write("WINLOCK", -1,
-                "Advance frame#%u sub=%u P1=0x%04X P2=0x%04X writeIdx=%u->%u",
-                s_winscreenDispatchCount,
-                subState,
-                p1,
-                p2,
-                writeIdx,
-                writeIdx + 1);
-        }
-
-        s_winscreen_produced_this_loop = true;
-        return 0;
-    }
-
-    if (s_winscreenFirstLog) {
-        Rollback::NetplayLog_Write("WINLOCK", -1,
-            "Dispatcher lockstep INACTIVE: mode=%u sub=%u consumed=%u",
-            gameMode,
-            subState,
-            s_winscreenDispatchCount);
-        s_winscreenFirstLog = false;
-        s_winscreenDispatchCount = 0;
-        s_winscreenWaitCount = 0;
-        s_winscreen_produced_this_loop = false;
-        s_winscreenPrevP1 = 0;
-        s_winscreenPrevP2 = 0;
     }
 
     {
@@ -2353,6 +2221,43 @@ int __cdecl Hook_InputProcess(int gameState) {
         WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_STATE, zeroState, sizeof(zeroState));
     };
 
+    auto writeLiveInputBuffers = [](uint16_t currentP1,
+                                    uint16_t currentP2,
+                                    uint16_t pressedP1,
+                                    uint16_t pressedP2) {
+        for (int i = 0; i < 10; i++) {
+            const uint16_t mask = g_buttonMasks[i];
+
+            {
+                const uintptr_t heldAddr = ADDR_P1_INPUT_BUFFER + (i * 2);
+                const uintptr_t justPressedAddr = ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2);
+                WriteMemory<uint16_t>(heldAddr, (currentP1 & mask) ? 1 : 0);
+                WriteMemory<uint16_t>(justPressedAddr, (pressedP1 & mask) ? 1 : 0);
+            }
+
+            {
+                const uintptr_t heldAddr = ADDR_P2_INPUT_BUFFER + (i * 2);
+                const uintptr_t justPressedAddr = ADDR_P2_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2);
+                WriteMemory<uint16_t>(heldAddr, (currentP2 & mask) ? 1 : 0);
+                WriteMemory<uint16_t>(justPressedAddr, (pressedP2 & mask) ? 1 : 0);
+            }
+        }
+    };
+
+    auto resetWinScreenProcessState = []() {
+        s_winscreenDispatchCount = 0;
+        s_winscreenWaitCount = 0;
+        s_winscreenPrevP1 = 0;
+        s_winscreenPrevP2 = 0;
+        s_winscreenFrameProduced = false;
+        s_winscreenFrameP1 = 0;
+        s_winscreenFrameP2 = 0;
+        s_winscreenFrameJustP1 = 0;
+        s_winscreenFrameJustP2 = 0;
+        s_winscreenLastProcessFrame = 0xFFFFFFFFu;
+        s_winscreenFirstLog = false;
+    };
+
     if (consumeForCustomMenu) {
         if (Replay::ReplayRuntime_ShouldConsumeMenuInput()) {
             Replay::ReplayRuntime_OnFrontendInputsProcessed();
@@ -2430,6 +2335,124 @@ int __cdecl Hook_InputProcess(int gameState) {
 
             return result;
         }
+    }
+
+    if (gameMode == MODE_WINSCREEN &&
+        !Net::WinScreenSync_IsActive() &&
+        Net::MatchLifecycle_IsMatchOwned() &&
+        Net::Session_IsConnected()) {
+        Rollback::NetplayLog_Write("WINLOCK", -1,
+            "InputProcess activating winscreen lockstep on-demand (mode=%u sub=%u)",
+            gameMode, subState);
+        Net::WinScreenSync_Begin();
+    }
+
+    if (Net::WinScreenSync_IsActive()) {
+        if (gameMode != MODE_WINSCREEN) {
+            Rollback::NetplayLog_Write("WINLOCK", -1,
+                "InputProcess lockstep abort request: sync active outside Mode 9 (mode=%u sub=%u)",
+                gameMode, subState);
+            Net::WinScreenSync_Abort();
+            clearLiveInputBuffers();
+            resetWinScreenProcessState();
+            return result;
+        }
+
+        if (!s_winscreenFirstLog) {
+            resetWinScreenProcessState();
+            s_winscreenFirstLog = true;
+            Rollback::NetplayLog_Write("WINLOCK", -1,
+                "InputProcess lockstep ACTIVE: mode=%u sub=%u consume=%u remote_latest=%u",
+                gameMode,
+                subState,
+                Net::WinScreenSync_GetConsumeFrame(),
+                Net::WinScreenSync_GetRemoteLatestFrame());
+        }
+
+        const uint32_t absFrame = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
+        if (absFrame == s_winscreenLastProcessFrame) {
+            if (s_winscreenFrameProduced) {
+                writeLiveInputBuffers(
+                    s_winscreenFrameP1,
+                    s_winscreenFrameP2,
+                    s_winscreenFrameJustP1,
+                    s_winscreenFrameJustP2);
+            } else {
+                clearLiveInputBuffers();
+            }
+            return result;
+        }
+        s_winscreenLastProcessFrame = absFrame;
+
+        const uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
+        Net::WinScreenSync_CaptureLocalInput(localInput);
+
+        if (!Net::WinScreenSync_HasInputsForCurrentFrame()) {
+            s_winscreenFrameProduced = false;
+            s_winscreenFrameP1 = 0;
+            s_winscreenFrameP2 = 0;
+            s_winscreenFrameJustP1 = 0;
+            s_winscreenFrameJustP2 = 0;
+            s_winscreenWaitCount++;
+            if (s_winscreenWaitCount <= 5 || (s_winscreenWaitCount % 120) == 0) {
+                Rollback::NetplayLog_Write("WINLOCK", -1,
+                    "InputProcess waiting for remote frame: wait#%u consume=%u remote_latest=%u sub=%u",
+                    s_winscreenWaitCount,
+                    Net::WinScreenSync_GetConsumeFrame(),
+                    Net::WinScreenSync_GetRemoteLatestFrame(),
+                    subState);
+            }
+            clearLiveInputBuffers();
+            return result;
+        }
+
+        uint16_t p1 = 0;
+        uint16_t p2 = 0;
+        if (!Net::WinScreenSync_ConsumeCurrentFrame(&p1, &p2)) {
+            s_winscreenFrameProduced = false;
+            clearLiveInputBuffers();
+            Rollback::NetplayLog_Write("WINLOCK", -1,
+                "InputProcess consume failed despite ready frame: consume=%u remote_latest=%u",
+                Net::WinScreenSync_GetConsumeFrame(),
+                Net::WinScreenSync_GetRemoteLatestFrame());
+            return result;
+        }
+
+        s_winscreenDispatchCount++;
+        s_winscreenWaitCount = 0;
+
+        const uint16_t justP1 = p1 & ~s_winscreenPrevP1;
+        const uint16_t justP2 = p2 & ~s_winscreenPrevP2;
+        s_winscreenPrevP1 = p1;
+        s_winscreenPrevP2 = p2;
+        s_winscreenFrameProduced = true;
+        s_winscreenFrameP1 = p1;
+        s_winscreenFrameP2 = p2;
+        s_winscreenFrameJustP1 = justP1;
+        s_winscreenFrameJustP2 = justP2;
+
+        writeLiveInputBuffers(p1, p2, justP1, justP2);
+
+        if (s_winscreenDispatchCount <= 5 || (s_winscreenDispatchCount % 120) == 0) {
+            Rollback::NetplayLog_Write("WINLOCK", -1,
+                "InputProcess advance frame#%u sub=%u abs=%u P1=0x%04X P2=0x%04X",
+                s_winscreenDispatchCount,
+                subState,
+                absFrame,
+                p1,
+                p2);
+        }
+
+        return result;
+    }
+
+    if (s_winscreenFirstLog) {
+        Rollback::NetplayLog_Write("WINLOCK", -1,
+            "InputProcess lockstep INACTIVE: mode=%u sub=%u consumed=%u",
+            gameMode,
+            subState,
+            s_winscreenDispatchCount);
+        resetWinScreenProcessState();
     }
 
     // Netplay override: when rollback session is active, inject rollback-controlled

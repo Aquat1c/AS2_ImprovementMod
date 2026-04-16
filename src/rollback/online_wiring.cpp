@@ -568,7 +568,7 @@ static bool PrepareBaselineForInteractiveRelease() {
         s_baselineCRC,
         (preRestoreCRC == s_baselineCRC) ? "YES" : "NO");
 
-    if (Savestate_Load()) {
+    if (Savestate_RestoreRollbackBaseline()) {
         WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, 0);
         WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, 0);
 

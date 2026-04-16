@@ -21,9 +21,10 @@
  *
  * Entity state indicators:
  *   - ATK:         entity+0x6C8 == 1 && entity+0x6D4 != 0
+ *   - CLASH:       entity+0x77C rank, entity+0x788 continuation ID
+ *   - MAX HIT:     entity+0x78C/+0x78E/+0x790 raw max-hit lanes
  *   - ARMOR:       entity+0x6CC & 0x20000 (force active)
  *   - PROJ IMMUNE: entity+0x6CC & 0x800
- *   - INVINCIBLE:  entity+0x78C != 0 (invincibility flag)
  */
 
 #pragma once

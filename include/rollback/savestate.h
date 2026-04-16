@@ -2,7 +2,8 @@
  * Alice Senki 2 - Manual Savestate System
  *
  * Captures and restores the full authoritative match state for
- * manual save/load verification (F5 save, F6 load).
+ * manual save/load verification (F5 save, F6 load) and the
+ * rollback bootstrap baseline handoff.
  *
  * State captured:
  *   1. Main contiguous region: ADDR_MATCH_BASE through end of P2 entity
@@ -62,12 +63,28 @@ bool Savestate_Save(void);
 // Only valid if a savestate exists and game is in a safe state to restore.
 bool Savestate_Load(void);
 
+// Capture the rollback bootstrap baseline into a dedicated netplay slot.
+// Returns true if the baseline capture succeeded.
+// Only valid during online-owned MODE_MATCH substate 3 before rollback start.
+bool Savestate_CaptureRollbackBaseline(void);
+
+// Restore the stored rollback bootstrap baseline from the dedicated netplay slot.
+// Returns true if the baseline restore succeeded.
+// Only valid during online-owned MODE_MATCH substate 3 before rollback start.
+bool Savestate_RestoreRollbackBaseline(void);
+
+// Clear the rollback bootstrap baseline slot.
+void Savestate_ClearRollbackBaseline(const char* reason);
+
 // ============================================================================
 // Queries
 // ============================================================================
 
 // Get info about the current savestate slot (for UI display).
 const SavestateInfo* Savestate_GetInfo(void);
+
+// Get info about the current rollback bootstrap baseline slot.
+const SavestateInfo* Savestate_GetRollbackBaselineInfo(void);
 
 // Returns true if we are in a state where save/load is allowed.
 bool Savestate_CanSaveLoad(void);

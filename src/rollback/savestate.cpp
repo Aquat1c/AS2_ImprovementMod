@@ -6,7 +6,8 @@
  *   - Scattered globals: RNG seed, frame counter, mode/substate, input buffers,
  *     per-frame temp scratch, match phase timer, pre-match gap
  *
- * This is NOT a rollback savestate yet. Manual F5/F6 only.
+ * This is NOT the live rollback history ring. Manual F5/F6 uses one slot,
+ * and rollback bootstrap baseline handoff uses a separate netplay-only slot.
  *
  * Verified state region (from determinism system):
  *   Start: ADDR_MATCH_BASE       = 0x76C5F8
@@ -61,7 +62,8 @@ struct SavestateSlot {
     uint32_t fpu_mxcsr;
 };
 
-static SavestateSlot g_slot;
+static SavestateSlot g_manualSlot;
+static SavestateSlot g_rollbackBaselineSlot;
 static bool g_offlineMatchContextActive = false;
 static bool g_roundStartAutosaveArmed = false;
 
@@ -148,16 +150,34 @@ static uint32_t ComputeMainChecksum() {
 // Context helpers
 // ============================================================================
 
-static void ClearSavestateSlot(const char* reason) {
-    const bool hadState = g_slot.info.valid;
+static void ClearSavestateSlot(SavestateSlot* slot,
+                               const char* slotLabel,
+                               const char* reason) {
+    if (!slot) {
+        return;
+    }
 
-    memset(&g_slot, 0, sizeof(g_slot));
-    Rollback::GameSnapshot_Clear(&g_slot.snapshot);
+    const bool hadState = slot->info.valid;
+
+    memset(slot, 0, sizeof(*slot));
+    Rollback::GameSnapshot_Clear(&slot->snapshot);
 
     if (hadState) {
-        LOG_INFO("[Savestate] Cleared slot: %s", reason ? reason : "unknown");
-        LogToFile("CLEAR reason=%s\n", reason ? reason : "unknown");
+        LOG_INFO("[Savestate] Cleared %s slot: %s",
+                 slotLabel ? slotLabel : "savestate",
+                 reason ? reason : "unknown");
+        LogToFile("CLEAR slot=%s reason=%s\n",
+                  slotLabel ? slotLabel : "savestate",
+                  reason ? reason : "unknown");
     }
+}
+
+static void ClearManualSavestateSlot(const char* reason) {
+    ClearSavestateSlot(&g_manualSlot, "manual", reason);
+}
+
+static void ClearRollbackBaselineSlot(const char* reason) {
+    ClearSavestateSlot(&g_rollbackBaselineSlot, "rollback_baseline", reason);
 }
 
 static bool IsOfflineSavestateGameType(uint32_t gameType) {
@@ -201,11 +221,18 @@ static bool IsOfflinePlayableSavestateContext() {
            IsInPlayableMatchGameplay();
 }
 
+static bool IsRollbackBaselineContext() {
+    return GetGameMode() == MODE_MATCH &&
+           GetSubstate() == MATCH_SUB_GAMEPLAY &&
+           Net::Session_IsConnected() &&
+           !Rollback::RollbackSession_IsActive();
+}
+
 static void UpdateSavestateContext() {
     const bool offlineMatchActive = IsOfflineMatchContextActive();
 
     if (g_offlineMatchContextActive && !offlineMatchActive) {
-        ClearSavestateSlot("left offline match context");
+        ClearManualSavestateSlot("left offline match context");
         g_roundStartAutosaveArmed = false;
     }
 
@@ -229,7 +256,7 @@ static void UpdateSavestateContext() {
         if (Savestate_Save()) {
             LOG_INFO("[Savestate] Auto-saved first interactable offline frame");
             LogToFile("AUTO_SAVE frame=%u reason=first_interactable_offline_frame\n",
-                      g_slot.info.frame);
+                      g_manualSlot.info.frame);
         } else {
             LOG_WARN("[Savestate] Round-start auto-save failed");
         }
@@ -242,7 +269,8 @@ static void UpdateSavestateContext() {
 // ============================================================================
 
 void Savestate_Init() {
-    ClearSavestateSlot("init");
+    ClearManualSavestateSlot("init");
+    ClearRollbackBaselineSlot("init");
     g_offlineMatchContextActive = false;
     g_roundStartAutosaveArmed = false;
     g_f5WasDown = false;
@@ -285,36 +313,85 @@ bool Savestate_Save() {
     }
 
     if (!Rollback::GameSnapshot_Capture(
-            &g_slot.snapshot,
+            &g_manualSlot.snapshot,
             (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER))) {
         LOG_ERROR("[Savestate] FAILED — snapshot capture rejected");
         return false;
     }
 
     // Capture FPU state (diagnostic only — NOT restored on load)
-    g_slot.fpu_cw    = CaptureX87CW();
-    g_slot.fpu_mxcsr = CaptureMXCSR();
+    g_manualSlot.fpu_cw    = CaptureX87CW();
+    g_manualSlot.fpu_mxcsr = CaptureMXCSR();
 
     // Fill info
-    g_slot.info.valid     = true;
-    g_slot.info.frame     = g_slot.snapshot.sim_frame;
-    g_slot.info.checksum  = g_slot.snapshot.checksum;
-    g_slot.info.rng_seed  = g_slot.snapshot.rng_seed;
-    g_slot.info.game_mode = g_slot.snapshot.game_mode;
-    g_slot.info.substate  = g_slot.snapshot.substate;
-    g_slot.practice_control_swap = PracticeTools_IsControlSwapped();
+    g_manualSlot.info.valid     = true;
+    g_manualSlot.info.frame     = g_manualSlot.snapshot.sim_frame;
+    g_manualSlot.info.checksum  = g_manualSlot.snapshot.checksum;
+    g_manualSlot.info.rng_seed  = g_manualSlot.snapshot.rng_seed;
+    g_manualSlot.info.game_mode = g_manualSlot.snapshot.game_mode;
+    g_manualSlot.info.substate  = g_manualSlot.snapshot.substate;
+    g_manualSlot.practice_control_swap = PracticeTools_IsControlSwapped();
 
     LOG_INFO("[Savestate] SAVED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d swap=%d",
-             g_slot.info.frame, g_slot.info.checksum, g_slot.info.rng_seed,
-             g_slot.info.game_mode, g_slot.info.substate,
-             g_slot.practice_control_swap ? 1 : 0);
+             g_manualSlot.info.frame, g_manualSlot.info.checksum, g_manualSlot.info.rng_seed,
+             g_manualSlot.info.game_mode, g_manualSlot.info.substate,
+             g_manualSlot.practice_control_swap ? 1 : 0);
 
     // Log to file for determinism analysis
     LogToFile("SAVE frame=%d checksum=0x%08X rng=0x%08X mode=%d sub=%d timer=%d swap=%d fpu_cw=0x%04X mxcsr=0x%08X\n",
-              g_slot.info.frame, g_slot.info.checksum, g_slot.info.rng_seed,
-              g_slot.info.game_mode, g_slot.info.substate, g_slot.snapshot.match_phase_timer,
-              g_slot.practice_control_swap ? 1 : 0,
-              g_slot.fpu_cw, g_slot.fpu_mxcsr);
+              g_manualSlot.info.frame, g_manualSlot.info.checksum, g_manualSlot.info.rng_seed,
+              g_manualSlot.info.game_mode, g_manualSlot.info.substate, g_manualSlot.snapshot.match_phase_timer,
+              g_manualSlot.practice_control_swap ? 1 : 0,
+              g_manualSlot.fpu_cw, g_manualSlot.fpu_mxcsr);
+
+    return true;
+}
+
+bool Savestate_CaptureRollbackBaseline() {
+    if (!IsRollbackBaselineContext()) {
+        LOG_WARN("[Savestate] Cannot capture rollback baseline — online match sub3 required (mode=%d sub=%d type=%d net=%d rb=%d)",
+                 ReadMemory<uint32_t>(ADDR_GAME_MODE),
+                 ReadMemory<uint32_t>(ADDR_SUB_STATE),
+                 ReadMemory<uint32_t>(ADDR_GAME_TYPE),
+                 Net::Session_IsConnected() ? 1 : 0,
+                 Rollback::RollbackSession_IsActive() ? 1 : 0);
+        return false;
+    }
+
+    if (!Rollback::GameSnapshot_Capture(
+            &g_rollbackBaselineSlot.snapshot,
+            (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER))) {
+        LOG_ERROR("[Savestate] Rollback baseline capture FAILED — snapshot capture rejected");
+        return false;
+    }
+
+    g_rollbackBaselineSlot.fpu_cw = CaptureX87CW();
+    g_rollbackBaselineSlot.fpu_mxcsr = CaptureMXCSR();
+
+    g_rollbackBaselineSlot.info.valid = true;
+    g_rollbackBaselineSlot.info.frame = g_rollbackBaselineSlot.snapshot.sim_frame;
+    g_rollbackBaselineSlot.info.checksum = g_rollbackBaselineSlot.snapshot.checksum;
+    g_rollbackBaselineSlot.info.rng_seed = g_rollbackBaselineSlot.snapshot.rng_seed;
+    g_rollbackBaselineSlot.info.game_mode = g_rollbackBaselineSlot.snapshot.game_mode;
+    g_rollbackBaselineSlot.info.substate = g_rollbackBaselineSlot.snapshot.substate;
+    g_rollbackBaselineSlot.practice_control_swap = false;
+
+    LOG_INFO("[Savestate] ROLLBACK BASELINE CAPTURED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d",
+             g_rollbackBaselineSlot.info.frame,
+             g_rollbackBaselineSlot.info.checksum,
+             g_rollbackBaselineSlot.info.rng_seed,
+             g_rollbackBaselineSlot.info.game_mode,
+             g_rollbackBaselineSlot.info.substate);
+
+    LogToFile("RB_BASELINE_SAVE frame=%d checksum=0x%08X rng=0x%08X mode=%d sub=%d timer=%d fpu_cw=0x%04X mxcsr=0x%08X\n",
+              g_rollbackBaselineSlot.info.frame,
+              g_rollbackBaselineSlot.info.checksum,
+              g_rollbackBaselineSlot.info.rng_seed,
+              g_rollbackBaselineSlot.info.game_mode,
+              g_rollbackBaselineSlot.info.substate,
+              g_rollbackBaselineSlot.snapshot.match_phase_timer,
+              g_rollbackBaselineSlot.fpu_cw,
+              g_rollbackBaselineSlot.fpu_mxcsr);
 
     return true;
 }
@@ -324,7 +401,7 @@ bool Savestate_Save() {
 // ============================================================================
 
 bool Savestate_Load() {
-    if (!g_slot.info.valid) {
+    if (!g_manualSlot.info.valid) {
         LOG_WARN("[Savestate] Cannot load — no savestate exists. Press F5 first.");
         return false;
     }
@@ -345,22 +422,22 @@ bool Savestate_Load() {
     uint32_t preChecksum = ComputeMainChecksum();
 
     LOG_INFO("[Savestate] LOADING — restoring frame %d (current frame %d, swap=%d)",
-             g_slot.info.frame, preFrame, g_slot.practice_control_swap ? 1 : 0);
+             g_manualSlot.info.frame, preFrame, g_manualSlot.practice_control_swap ? 1 : 0);
 
-    if (!Rollback::GameSnapshot_Restore(&g_slot.snapshot)) {
+    if (!Rollback::GameSnapshot_Restore(&g_manualSlot.snapshot)) {
         LOG_ERROR("[Savestate] FAILED — snapshot restore rejected");
         return false;
     }
 
-    PracticeTools_ApplyControlSwapState(g_slot.practice_control_swap);
+    PracticeTools_ApplyControlSwapState(g_manualSlot.practice_control_swap);
     PracticeTools_SyncControlSwapState();
 
     // FPU state: NOT restored by default. If desync investigation reveals
     // that FPU drift is causing issues, uncomment these lines:
     // {
-    //     uint16_t cw = g_slot.fpu_cw;
+    //     uint16_t cw = g_manualSlot.fpu_cw;
     //     __asm { fldcw word ptr [cw] }
-    //     _mm_setcsr(g_slot.fpu_mxcsr);
+    //     _mm_setcsr(g_manualSlot.fpu_mxcsr);
     // }
 
     // Verify restoration
@@ -368,14 +445,14 @@ bool Savestate_Load() {
     uint32_t postRng      = DetVer_GetRngSeed();
     uint32_t postFrame    = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
 
-    bool checksumMatch = (postChecksum == g_slot.info.checksum);
+    bool checksumMatch = (postChecksum == g_manualSlot.info.checksum);
 
     if (checksumMatch) {
         LOG_INFO("[Savestate] LOADED OK — frame %d->%d checksum=0x%08X (match) rng=0x%08X",
                  preFrame, postFrame, postChecksum, postRng);
     } else {
         LOG_ERROR("[Savestate] LOADED with CHECKSUM MISMATCH! expected=0x%08X got=0x%08X",
-                  g_slot.info.checksum, postChecksum);
+                  g_manualSlot.info.checksum, postChecksum);
     }
 
     // Log to file
@@ -387,12 +464,80 @@ bool Savestate_Load() {
     return true;
 }
 
+bool Savestate_RestoreRollbackBaseline() {
+    if (!g_rollbackBaselineSlot.info.valid) {
+        LOG_WARN("[Savestate] Cannot restore rollback baseline — no baseline exists.");
+        return false;
+    }
+
+    if (!IsRollbackBaselineContext()) {
+        LOG_WARN("[Savestate] Cannot restore rollback baseline — online match sub3 required (mode=%d sub=%d type=%d net=%d rb=%d)",
+                 ReadMemory<uint32_t>(ADDR_GAME_MODE),
+                 ReadMemory<uint32_t>(ADDR_SUB_STATE),
+                 ReadMemory<uint32_t>(ADDR_GAME_TYPE),
+                 Net::Session_IsConnected() ? 1 : 0,
+                 Rollback::RollbackSession_IsActive() ? 1 : 0);
+        return false;
+    }
+
+    uint32_t preFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    uint32_t preRng = DetVer_GetRngSeed();
+    uint32_t preChecksum = ComputeMainChecksum();
+
+    LOG_INFO("[Savestate] ROLLBACK BASELINE RESTORE — restoring frame %d (current frame %d)",
+             g_rollbackBaselineSlot.info.frame,
+             preFrame);
+
+    if (!Rollback::GameSnapshot_Restore(&g_rollbackBaselineSlot.snapshot)) {
+        LOG_ERROR("[Savestate] Rollback baseline restore FAILED — snapshot restore rejected");
+        return false;
+    }
+
+    uint32_t postChecksum = ComputeMainChecksum();
+    uint32_t postRng = DetVer_GetRngSeed();
+    uint32_t postFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+
+    const bool checksumMatch = (postChecksum == g_rollbackBaselineSlot.info.checksum);
+
+    if (checksumMatch) {
+        LOG_INFO("[Savestate] ROLLBACK BASELINE RESTORED OK — frame %d->%d checksum=0x%08X (match) rng=0x%08X",
+                 preFrame,
+                 postFrame,
+                 postChecksum,
+                 postRng);
+    } else {
+        LOG_ERROR("[Savestate] ROLLBACK BASELINE RESTORED with CHECKSUM MISMATCH! expected=0x%08X got=0x%08X",
+                  g_rollbackBaselineSlot.info.checksum,
+                  postChecksum);
+    }
+
+    LogToFile("RB_BASELINE_LOAD pre_frame=%d pre_checksum=0x%08X pre_rng=0x%08X\n",
+              preFrame,
+              preChecksum,
+              preRng);
+    LogToFile("                restored_frame=%d post_checksum=0x%08X rng=0x%08X match=%s\n",
+              postFrame,
+              postChecksum,
+              postRng,
+              checksumMatch ? "YES" : "NO");
+
+    return true;
+}
+
 // ============================================================================
 // Queries
 // ============================================================================
 
 const SavestateInfo* Savestate_GetInfo() {
-    return &g_slot.info;
+    return &g_manualSlot.info;
+}
+
+const SavestateInfo* Savestate_GetRollbackBaselineInfo() {
+    return &g_rollbackBaselineSlot.info;
+}
+
+void Savestate_ClearRollbackBaseline(const char* reason) {
+    ClearRollbackBaselineSlot(reason);
 }
 
 // ============================================================================
@@ -415,7 +560,7 @@ void Savestate_ProcessHotkeys() {
     if (f5Down && !g_f5WasDown) {
         if (Savestate_Save()) {
             char buf[64];
-            snprintf(buf, sizeof(buf), "State Saved (F%d)", g_slot.info.frame);
+            snprintf(buf, sizeof(buf), "State Saved (F%d)", g_manualSlot.info.frame);
             PracticeTools_Toast(buf, 0xFF64FF64);  // green
         } else {
             PracticeTools_Toast("Save Failed", 0xFF6464FF);  // red
@@ -426,7 +571,7 @@ void Savestate_ProcessHotkeys() {
     if (f6Down && !g_f6WasDown) {
         if (Savestate_Load()) {
             char buf[64];
-            snprintf(buf, sizeof(buf), "State Loaded (F%d)", g_slot.info.frame);
+            snprintf(buf, sizeof(buf), "State Loaded (F%d)", g_manualSlot.info.frame);
             PracticeTools_Toast(buf, 0xFF64C8FF);  // cyan
         } else {
             PracticeTools_Toast("Load Failed", 0xFF6464FF);  // red
@@ -442,7 +587,7 @@ void Savestate_ProcessHotkeys() {
 // ============================================================================
 
 void Savestate_RenderImGui() {
-    const SavestateInfo* info = &g_slot.info;
+    const SavestateInfo* info = &g_manualSlot.info;
 
     ImGui::Text("Offline Savestate (Auto-save + F5/F6)");
     ImGui::Separator();
