@@ -46,6 +46,8 @@ void PracticeTools_OnFrameAdvanced();
 bool PracticeTools_IsPracticeModeActive();
 bool PracticeTools_IsPaused();
 bool PracticeTools_IsControlSwapped();
+void PracticeTools_ApplyControlSwapState(bool swapped);
+void PracticeTools_SyncControlSwapState();
 void PracticeTools_SetPaused(bool paused);
 
 // Push a toast notification to the in-game HUD.

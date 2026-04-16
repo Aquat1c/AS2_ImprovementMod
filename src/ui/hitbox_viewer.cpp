@@ -31,26 +31,27 @@
 #include "log_window.h"
 #include "game_state.h"
 #include "imgui.h"
+#include <cstdarg>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 // ============================================================================
 // Toggle state
 // ============================================================================
 
 static bool  g_enabled         = false;
-static bool  g_showHurtboxes   = true;   // per-animation boxes (green)
-static bool  g_showHitboxes    = true;   // global HitDef entries (red)
-static bool  g_showPushboxes   = true;   // active rect (yellow)
-static bool  g_showThrowboxes  = true;   // extended hurtboxes (cyan)
-static bool  g_showPositions   = true;   // axis cross + facing arrow
-static bool  g_showStateFlags  = true;   // attack state / super armor / proj immunity indicators
-static bool  g_showInfo        = false;  // text overlay with box data
-static bool  g_showMatchState  = false;  // match context debug info
-static float g_fillAlpha       = 0.25f;  // fill transparency [0..1]
-static bool  g_logPerFrame     = false;  // per-frame logging (VERY verbose)
+static bool  g_showHurtboxes   = true;
+static bool  g_showHitboxes    = true;
+static bool  g_showPushboxes   = true;
+static bool  g_showThrowboxes  = true;
+static bool  g_showPositions   = true;
+static bool  g_showStateFlags  = true;
+static bool  g_showInfo        = false;
+static bool  g_showMatchState  = false;
+static float g_fillAlpha       = 0.25f;
+static bool  g_logPerFrame     = false;
 
-// Tracking for animation changes (log on change)
 static uint32_t s_lastP1Anim = 0xFFFFFFFF;
 static uint32_t s_lastP2Anim = 0xFFFFFFFF;
 static uint32_t s_lastP1Action = 0xFFFFFFFF;
@@ -67,12 +68,12 @@ static ImU32 ColFill(ImU32 rgb, float a) {
 static const ImU32 COL_HURTBOX   = IM_COL32(0, 220, 0, 255);
 static const ImU32 COL_HITBOX    = IM_COL32(255, 40, 40, 255);
 static const ImU32 COL_PUSHBOX   = IM_COL32(255, 220, 0, 255);
-static const ImU32 COL_THROWBOX  = IM_COL32(0, 200, 255, 255);   // cyan — extended hurtbox (@72)
-static const ImU32 COL_HITDEF_PT = IM_COL32(255, 80, 80, 255);   // HitDef position dot
+static const ImU32 COL_THROWBOX  = IM_COL32(0, 200, 255, 255);
+static const ImU32 COL_HITDEF_PT = IM_COL32(255, 80, 80, 255);
 static const ImU32 COL_P1_CROSS  = IM_COL32(255, 120, 120, 255);
 static const ImU32 COL_P2_CROSS  = IM_COL32(120, 120, 255, 255);
-static const ImU32 COL_ARMOR     = IM_COL32(255, 160, 0, 255);   // super armor indicator
-static const ImU32 COL_IMMUNE    = IM_COL32(180, 0, 255, 255);   // projectile immunity
+static const ImU32 COL_ARMOR     = IM_COL32(255, 160, 0, 255);
+static const ImU32 COL_IMMUNE    = IM_COL32(180, 0, 255, 255);
 
 // ============================================================================
 // Helpers
@@ -84,7 +85,7 @@ static const float GAME_H = 480.0f;
 struct ScreenTransform {
     int16_t scrollX;
     int16_t scrollY;
-    float   scaleX;   // displayPixels / gamePixel
+    float   scaleX;
     float   scaleY;
 };
 
@@ -98,238 +99,469 @@ static ScreenTransform GetTransform() {
     return t;
 }
 
-/// Convert a game-screen-space point (after /10 and -scroll) to display pixels.
 static ImVec2 GameToDisplay(float gx, float gy, const ScreenTransform& t) {
     return ImVec2(gx * t.scaleX, gy * t.scaleY);
 }
 
-/// World position (×10 fixed-point) → display pixels.
 static ImVec2 WorldToDisplay(int16_t wx, int16_t wy, const ScreenTransform& t) {
     float gx = (float)(wx / 10) - (float)t.scrollX;
     float gy = (float)(wy / 10) - (float)t.scrollY;
     return GameToDisplay(gx, gy, t);
 }
 
-/// Draw an outlined filled rectangle (game-screen coords).
 static void DrawBox(ImDrawList* dl, float l, float top, float r, float bot,
                     ImU32 outline, float alpha, const ScreenTransform& t) {
     ImVec2 p1 = GameToDisplay(l, top, t);
     ImVec2 p2 = GameToDisplay(r, bot, t);
-    // Normalise
     if (p1.x > p2.x) { float tmp = p1.x; p1.x = p2.x; p2.x = tmp; }
     if (p1.y > p2.y) { float tmp = p1.y; p1.y = p2.y; p2.y = tmp; }
     dl->AddRectFilled(p1, p2, ColFill(outline, alpha));
     dl->AddRect(p1, p2, outline, 0.0f, 0, 2.0f);
 }
 
-// ============================================================================
-// Animation-frame box reader  (generic for all box sets)
-// ============================================================================
-
 struct BoxEntry {
-    int16_t xOff;      // centre x offset (raw — multiply by 2*facing for screen)
-    int16_t yOff;      // centre y offset (raw — multiply by 2 for screen)
-    int16_t halfW;     // half-extent width
-    int16_t halfH;     // half-extent height
+    int16_t xOff;
+    int16_t yOff;
+    int16_t halfW;
+    int16_t halfH;
 };
 
-/// Read 'count' box entries from an animation frame at a given offset.
-/// If animIdxOverride >= 0, uses that instead of entity's current anim index.
-static int ReadAnimBoxes(uintptr_t entity, int frameOffset, BoxEntry* out, int count,
-                         bool doLog, const char* label, int animIdxOverride = -1) {
-    uint32_t animIdx = (animIdxOverride >= 0)
-        ? (uint32_t)animIdxOverride
-        : ReadMemory<uint32_t>(entity + ENTITY_OFF_ANIM_INDEX);
-    uintptr_t frameBase = entity + ENTITY_OFF_ANIM_DATA
-                        + (uintptr_t)ANIM_DATA_STRIDE * animIdx
-                        + frameOffset;
-    int active = 0;
+struct HitboxViewerFrameContext {
+    ScreenTransform transform;
+    uint32_t gameMode;
+    uint32_t subState;
+    uint32_t gameType;
+    uint32_t simFrame;
+    uint32_t dispFrame;
+    uint32_t phaseTimer;
+    uint32_t roundTimer;
+    int16_t scrollVicinity[8];
+};
 
-    if (doLog) {
-        LOG_INFO("[HBV] %s animIdx=%u entity=0x%08X off=%d frameBase=0x%08X",
-                 label, animIdx, (uint32_t)entity, frameOffset, (uint32_t)frameBase);
+struct AnimFrameSnapshot {
+    bool valid;
+    uintptr_t entityBase;
+    uint32_t animIdx;
+    uint8_t rawFrame[ANIM_DATA_STRIDE];
+    BoxEntry collisionBox;
+    BoxEntry hitBoxes[HURTBOX_COUNT_PER_FRAME];
+    BoxEntry hurtBoxes[HURTBOX_COUNT_PER_FRAME];
+    BoxEntry throwBoxes[HURTBOX_COUNT_PER_FRAME];
+};
+
+struct EntitySnapshot {
+    const char* label;
+    uintptr_t base;
+    int16_t posX;
+    int16_t posY;
+    int8_t facing;
+    int16_t hp;
+    uint32_t animIdx;
+    uint32_t actionId;
+    uint8_t attackState;
+    uint32_t attackType;
+    uint8_t hitActive;
+    uint16_t invincibility;
+    const AnimFrameSnapshot* animFrame;
+};
+
+struct HitDefSnapshot {
+    int index;
+    uint32_t id;
+    uint8_t owner;
+    uint8_t animOwner;
+    uint16_t summonAnimIdx;
+    int16_t worldX;
+    int16_t worldY;
+    int8_t facing;
+    uint8_t type;
+    uint8_t invuln;
+    uint8_t flag;
+    uint32_t damage;
+    const AnimFrameSnapshot* animFrame;
+};
+
+struct AnimFrameCache {
+    static const int kMaxEntries = SUMMON_MAX_SLOTS + 2;
+    AnimFrameSnapshot entries[kMaxEntries];
+    int count;
+};
+
+template<typename T>
+static T ReadLocalValue(const uint8_t* bytes, size_t offset) {
+    T value{};
+    if (!bytes) {
+        return value;
     }
+    memcpy(&value, bytes + offset, sizeof(T));
+    return value;
+}
 
+static BoxEntry DecodeBoxEntry(const uint8_t* frameBytes, size_t offset);
+static void DecodeBoxEntries(const uint8_t* frameBytes, int frameOffset, BoxEntry* out, int count);
+static int CountActiveBoxes(const BoxEntry* boxes, int count);
+static uintptr_t GetAnimFrameBase(uintptr_t entityBase, uint32_t animIdx);
+static void CopyAnimFrameBytes(uintptr_t entityBase, uint32_t animIdx, uint8_t* outFrame);
+static void LogAnimFrameSnapshot(const AnimFrameSnapshot& snapshot, const char* label);
+static const AnimFrameSnapshot* GetOrLoadAnimFrameSnapshot(AnimFrameCache* cache,
+                                                           uintptr_t entityBase,
+                                                           uint32_t animIdx,
+                                                           const char* label);
+static HitboxViewerFrameContext BuildFrameContext();
+static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
+                                          uintptr_t entityBase,
+                                          const char* label);
+template<typename T>
+static T ReadHitDefValue(const uint8_t* entryBytes, uintptr_t entryBase, size_t offset);
+static int BuildHitDefSnapshots(AnimFrameCache* cache,
+                                HitDefSnapshot* out,
+                                int capacity,
+                                uintptr_t p1EntityBase,
+                                uintptr_t p2EntityBase);
+static void RenderBoxSet(ImDrawList* dl,
+                         const EntitySnapshot& entity,
+                         const BoxEntry* boxes,
+                         int count,
+                         ImU32 colour,
+                         const ScreenTransform& t,
+                         const char* boxLabel);
+static void RenderHurtboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
+static void RenderEntityHitboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
+static void RenderThrowboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
+static void RenderStateFlags(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
+static void RenderHitDefs(ImDrawList* dl, const HitDefSnapshot* hitDefs, int hitDefCount, const ScreenTransform& t);
+static void RenderPushbox(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t);
+static void RenderPosition(ImDrawList* dl, const EntitySnapshot& entity, ImU32 colour, const ScreenTransform& t);
+static void RenderInfoOverlay(ImDrawList* dl, const HitboxViewerFrameContext& ctx, const EntitySnapshot& p1, const EntitySnapshot& p2);
+
+static BoxEntry DecodeBoxEntry(const uint8_t* frameBytes, size_t offset) {
+    BoxEntry box{};
+    box.xOff = ReadLocalValue<int16_t>(frameBytes, offset + 0);
+    box.yOff = ReadLocalValue<int16_t>(frameBytes, offset + 2);
+    box.halfW = ReadLocalValue<int16_t>(frameBytes, offset + 4);
+    box.halfH = ReadLocalValue<int16_t>(frameBytes, offset + 6);
+    return box;
+}
+
+static void DecodeBoxEntries(const uint8_t* frameBytes, int frameOffset, BoxEntry* out, int count) {
+    if (!out) {
+        return;
+    }
     for (int i = 0; i < count; i++) {
-        uintptr_t ep = frameBase + (uintptr_t)i * HURTBOX_ENTRY_SIZE;
-        BoxEntry e;
-        e.xOff  = ReadMemory<int16_t>(ep + 0);
-        e.yOff  = ReadMemory<int16_t>(ep + 2);
-        e.halfW = ReadMemory<int16_t>(ep + 4);
-        e.halfH = ReadMemory<int16_t>(ep + 6);
-        out[i] = e;
-        if (e.halfW > 0 && e.halfH > 0) active++;
-
-        if (doLog) {
-            LOG_INFO("[HBV]   %s box[%d] @0x%08X: off(%d,%d) half(%d,%d) %s",
-                     label, i, (uint32_t)ep,
-                     e.xOff, e.yOff, e.halfW, e.halfH,
-                     (e.halfW > 0 && e.halfH > 0) ? "ACTIVE" : "skip");
-        }
+        out[i] = DecodeBoxEntry(frameBytes, frameOffset + (i * HURTBOX_ENTRY_SIZE));
     }
+}
 
-    // Raw hex dump for diagnosis
-    if (doLog) {
-        uintptr_t rawBase = entity + ENTITY_OFF_ANIM_DATA
-                          + (uintptr_t)ANIM_DATA_STRIDE * animIdx;
-        char hex[256];
-        int pos = 0;
-        for (int i = 0; i < 104 && pos < 240; i++) {
-            pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ",
-                            ReadMemory<uint8_t>(rawBase + i));
+static int CountActiveBoxes(const BoxEntry* boxes, int count) {
+    int active = 0;
+    if (!boxes) {
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        if (boxes[i].halfW > 0 && boxes[i].halfH > 0) {
+            active++;
         }
-        LOG_INFO("[HBV] %s raw frame[%u] 104B: %s", label, animIdx, hex);
     }
     return active;
 }
 
-static void RenderHurtboxes(ImDrawList* dl, uintptr_t entity,
-                             const char* label,
-                             const ScreenTransform& t) {
-    int16_t posX   = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
-    int16_t posY   = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
-    int8_t  facing = ReadMemory<int8_t>(entity + ENTITY_OFF_FACING);
+static uintptr_t GetAnimFrameBase(uintptr_t entityBase, uint32_t animIdx) {
+    return entityBase + ENTITY_OFF_ANIM_DATA + ((uintptr_t)ANIM_DATA_STRIDE * animIdx);
+}
 
-    bool doLog = g_logPerFrame;
-
-    BoxEntry boxes[4];
-    ReadAnimBoxes(entity, ANIM_HURTBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME, doLog, label);
-
-    float ex = (float)(posX / 10);
-    float ey = (float)(posY / 10);
-
-    if (doLog) {
-        LOG_INFO("[HBV] %s pos=(%d,%d) pos/10=(%.1f,%.1f) facing=%d scroll=(%d,%d)",
-                 label, posX, posY, ex, ey, facing, t.scrollX, t.scrollY);
+static void CopyAnimFrameBytes(uintptr_t entityBase, uint32_t animIdx, uint8_t* outFrame) {
+    if (!outFrame) {
+        return;
     }
 
-    for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
-        const BoxEntry& b = boxes[i];
-        if (b.halfW <= 0 || b.halfH <= 0) continue;
+    const uintptr_t frameBase = GetAnimFrameBase(entityBase, animIdx);
+    if (CopyMemorySafe(outFrame, (const void*)frameBase, ANIM_DATA_STRIDE)) {
+        return;
+    }
 
-        float cx = ex + 2.0f * b.xOff * facing;
-        float cy = ey + 2.0f * b.yOff;
-        // Decompilation: collision test uses abs(diff)/2 <= halfW_A + halfW_B
-        // => true screen half-extent = 2 * halfW (and 2 * halfH)
-        float hw = 2.0f * b.halfW;
-        float hh = 2.0f * b.halfH;
+    for (int i = 0; i < ANIM_DATA_STRIDE; i++) {
+        outFrame[i] = ReadMemory<uint8_t>(frameBase + i);
+    }
+}
 
-        // Convert to game-screen coords (subtract scroll)
-        float left  = cx - hw - t.scrollX;
-        float right = cx + hw - t.scrollX;
-        float top   = cy - hh - t.scrollY;
-        float bot   = cy + hh - t.scrollY;
+static void LogAnimFrameSnapshot(const AnimFrameSnapshot& snapshot, const char* label) {
+    if (!g_logPerFrame || !label || !label[0] || !snapshot.valid) {
+        return;
+    }
 
-        if (doLog) {
-            LOG_INFO("[HBV]   %s draw[%d]: centre=(%.1f,%.1f) hw=%.1f hh=%.1f -> screen L=%.1f T=%.1f R=%.1f B=%.1f",
-                     label, i, cx, cy, hw, hh, left, top, right, bot);
+    const uintptr_t frameBase = GetAnimFrameBase(snapshot.entityBase, snapshot.animIdx);
+    LOG_INFO("[HBV] %s animIdx=%u entity=0x%08X frameBase=0x%08X",
+             label, snapshot.animIdx, (uint32_t)snapshot.entityBase, (uint32_t)frameBase);
+
+    auto logBoxes = [&](const char* groupLabel, const BoxEntry* boxes, int count, int frameOffset) {
+        for (int i = 0; i < count; i++) {
+            const BoxEntry& box = boxes[i];
+            LOG_INFO("[HBV]   %s.%s box[%d] @0x%08X: off(%d,%d) half(%d,%d) %s",
+                     label,
+                     groupLabel,
+                     i,
+                     (uint32_t)(frameBase + frameOffset + ((uintptr_t)i * HURTBOX_ENTRY_SIZE)),
+                     box.xOff,
+                     box.yOff,
+                     box.halfW,
+                     box.halfH,
+                     (box.halfW > 0 && box.halfH > 0) ? "ACTIVE" : "skip");
+        }
+    };
+
+    logBoxes("coll", &snapshot.collisionBox, 1, ANIM_COLLISION_OFFSET);
+    logBoxes("hit", snapshot.hitBoxes, HURTBOX_COUNT_PER_FRAME, ANIM_HITBOX_OFFSET);
+    logBoxes("hurt", snapshot.hurtBoxes, HURTBOX_COUNT_PER_FRAME, ANIM_HURTBOX_OFFSET);
+    logBoxes("ext", snapshot.throwBoxes, HURTBOX_COUNT_PER_FRAME, ANIM_EXT_HURTBOX_OFFSET);
+
+    char hex[256];
+    int pos = 0;
+    for (int i = 0; i < ANIM_DATA_STRIDE && pos < 240; i++) {
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", snapshot.rawFrame[i]);
+    }
+    LOG_INFO("[HBV] %s raw frame[%u] 104B: %s", label, snapshot.animIdx, hex);
+}
+
+static const AnimFrameSnapshot* GetOrLoadAnimFrameSnapshot(AnimFrameCache* cache,
+                                                           uintptr_t entityBase,
+                                                           uint32_t animIdx,
+                                                           const char* label) {
+    if (!cache) {
+        return nullptr;
+    }
+
+    for (int i = 0; i < cache->count; i++) {
+        AnimFrameSnapshot& cached = cache->entries[i];
+        if (cached.valid &&
+            cached.entityBase == entityBase &&
+            cached.animIdx == animIdx) {
+            return &cached;
+        }
+    }
+
+    if (cache->count >= AnimFrameCache::kMaxEntries) {
+        return nullptr;
+    }
+
+    AnimFrameSnapshot& snapshot = cache->entries[cache->count++];
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.valid = true;
+    snapshot.entityBase = entityBase;
+    snapshot.animIdx = animIdx;
+
+    CopyAnimFrameBytes(entityBase, animIdx, snapshot.rawFrame);
+    snapshot.collisionBox = DecodeBoxEntry(snapshot.rawFrame, ANIM_COLLISION_OFFSET);
+    DecodeBoxEntries(snapshot.rawFrame, ANIM_HITBOX_OFFSET, snapshot.hitBoxes, HURTBOX_COUNT_PER_FRAME);
+    DecodeBoxEntries(snapshot.rawFrame, ANIM_HURTBOX_OFFSET, snapshot.hurtBoxes, HURTBOX_COUNT_PER_FRAME);
+    DecodeBoxEntries(snapshot.rawFrame, ANIM_EXT_HURTBOX_OFFSET, snapshot.throwBoxes, HURTBOX_COUNT_PER_FRAME);
+
+    LogAnimFrameSnapshot(snapshot, label);
+    return &snapshot;
+}
+
+static HitboxViewerFrameContext BuildFrameContext() {
+    HitboxViewerFrameContext ctx{};
+    ctx.transform = GetTransform();
+    ctx.gameMode = GetGameMode();
+    ctx.subState = GetSubstate();
+    ctx.gameType = GetGameType();
+    ctx.simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    ctx.dispFrame = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
+    ctx.phaseTimer = GetMatchPhaseTimer();
+    ctx.roundTimer = ReadMemory<uint32_t>(ADDR_ROUND_TIMER);
+
+    int scrollIndex = 0;
+    for (int i = -4; i < 12 && scrollIndex < 8; i += 2) {
+        ctx.scrollVicinity[scrollIndex++] = ReadMemory<int16_t>(ADDR_SCROLL_X + i);
+    }
+    return ctx;
+}
+
+static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
+                                          uintptr_t entityBase,
+                                          const char* label) {
+    EntitySnapshot snapshot{};
+    snapshot.label = label;
+    snapshot.base = entityBase;
+    snapshot.posX = ReadMemory<int16_t>(entityBase + ENTITY_OFF_X_POS);
+    snapshot.posY = ReadMemory<int16_t>(entityBase + ENTITY_OFF_Y_POS);
+    snapshot.facing = ReadMemory<int8_t>(entityBase + ENTITY_OFF_FACING);
+    snapshot.hp = ReadMemory<int16_t>(entityBase + ENTITY_OFF_HP);
+    snapshot.animIdx = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ANIM_INDEX);
+    snapshot.actionId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID);
+    snapshot.attackState = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_ATTACK_STATE);
+    snapshot.attackType = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ATTACK_TYPE);
+    snapshot.hitActive = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_ACTIVE);
+    snapshot.invincibility = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_INVINCIBILITY);
+    snapshot.animFrame = GetOrLoadAnimFrameSnapshot(cache, entityBase, snapshot.animIdx, label);
+    return snapshot;
+}
+
+template<typename T>
+static T ReadHitDefValue(const uint8_t* entryBytes, uintptr_t entryBase, size_t offset) {
+    if (entryBytes) {
+        return ReadLocalValue<T>(entryBytes, offset);
+    }
+    return ReadMemory<T>(entryBase + offset);
+}
+
+static int BuildHitDefSnapshots(AnimFrameCache* cache,
+                                HitDefSnapshot* out,
+                                int capacity,
+                                uintptr_t p1EntityBase,
+                                uintptr_t p2EntityBase) {
+    if (!cache || !out || capacity <= 0) {
+        return 0;
+    }
+
+    uint8_t summonBytes[SUMMON_MAX_SLOTS * SUMMON_ENTRY_SIZE] = {};
+    const bool bulkCopied = CopyMemorySafe(summonBytes, (const void*)ADDR_SUMMON_ARRAY, sizeof(summonBytes));
+    int count = 0;
+
+    for (int i = 0; i < SUMMON_MAX_SLOTS && count < capacity; i++) {
+        const uintptr_t entryBase = ADDR_SUMMON_ARRAY + ((uintptr_t)i * SUMMON_ENTRY_SIZE);
+        const uint8_t* entryBytes = bulkCopied ? (summonBytes + ((uintptr_t)i * SUMMON_ENTRY_SIZE)) : nullptr;
+
+        const uint32_t id = ReadHitDefValue<uint32_t>(entryBytes, entryBase, HITDEF_OFF_ID);
+        if (id == 0) {
+            continue;
         }
 
-        DrawBox(dl, left, top, right, bot, COL_HURTBOX, g_fillAlpha, t);
+        const uint8_t owner = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_OWNER);
+        if (owner == 0xFF) {
+            continue;
+        }
+
+        const uint16_t summonAnimIdx = ReadHitDefValue<uint16_t>(entryBytes, entryBase, HITDEF_OFF_ANIM_FRAME_IDX);
+        if (summonAnimIdx == 0xFFFF) {
+            continue;
+        }
+
+        HitDefSnapshot& snapshot = out[count++];
+        memset(&snapshot, 0, sizeof(snapshot));
+        snapshot.index = i;
+        snapshot.id = id;
+        snapshot.owner = owner;
+        snapshot.animOwner = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_ANIM_OWNER);
+        snapshot.summonAnimIdx = summonAnimIdx;
+        snapshot.worldX = ReadHitDefValue<int16_t>(entryBytes, entryBase, HITDEF_OFF_X);
+        snapshot.worldY = ReadHitDefValue<int16_t>(entryBytes, entryBase, HITDEF_OFF_Y);
+        snapshot.facing = ReadHitDefValue<int8_t>(entryBytes, entryBase, HITDEF_OFF_FACING);
+        snapshot.type = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_TYPE);
+        snapshot.invuln = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_ACTIVE);
+        snapshot.flag = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_ACTIVE_FLAG);
+        snapshot.damage = ReadHitDefValue<uint32_t>(entryBytes, entryBase, HITDEF_OFF_DAMAGE);
+
+        const uintptr_t ownerEntity = (snapshot.animOwner == 0)
+            ? p1EntityBase
+            : p2EntityBase;
+
+        char label[32];
+        const char* logLabel = nullptr;
+        if (g_logPerFrame) {
+            snprintf(label, sizeof(label), "HitDef[%d]", i);
+            logLabel = label;
+        }
+        snapshot.animFrame = GetOrLoadAnimFrameSnapshot(cache, ownerEntity, snapshot.summonAnimIdx, logLabel);
+    }
+
+    return count;
+}
+
+static void RenderBoxSet(ImDrawList* dl,
+                         const EntitySnapshot& entity,
+                         const BoxEntry* boxes,
+                         int count,
+                         ImU32 colour,
+                         const ScreenTransform& t,
+                         const char* boxLabel) {
+    if (!boxes) {
+        return;
+    }
+
+    const float ex = (float)(entity.posX / 10);
+    const float ey = (float)(entity.posY / 10);
+    if (g_logPerFrame) {
+        LOG_INFO("[HBV] %s.%s pos=(%d,%d) pos/10=(%.1f,%.1f) facing=%d scroll=(%d,%d)",
+                 entity.label ? entity.label : "Entity",
+                 boxLabel ? boxLabel : "boxes",
+                 entity.posX,
+                 entity.posY,
+                 ex,
+                 ey,
+                 entity.facing,
+                 t.scrollX,
+                 t.scrollY);
+    }
+
+    for (int i = 0; i < count; i++) {
+        const BoxEntry& box = boxes[i];
+        if (box.halfW <= 0 || box.halfH <= 0) {
+            continue;
+        }
+
+        const float cx = ex + (2.0f * box.xOff * entity.facing);
+        const float cy = ey + (2.0f * box.yOff);
+        const float hw = 2.0f * box.halfW;
+        const float hh = 2.0f * box.halfH;
+        const float left = cx - hw - t.scrollX;
+        const float right = cx + hw - t.scrollX;
+        const float top = cy - hh - t.scrollY;
+        const float bot = cy + hh - t.scrollY;
+
+        if (g_logPerFrame) {
+            LOG_INFO("[HBV]   %s.%s draw[%d]: centre=(%.1f,%.1f) hw=%.1f hh=%.1f -> screen L=%.1f T=%.1f R=%.1f B=%.1f",
+                     entity.label ? entity.label : "Entity",
+                     boxLabel ? boxLabel : "boxes",
+                     i,
+                     cx,
+                     cy,
+                     hw,
+                     hh,
+                     left,
+                     top,
+                     right,
+                     bot);
+        }
+
+        DrawBox(dl, left, top, right, bot, colour, g_fillAlpha, t);
     }
 }
 
-// ============================================================================
-// Per-entity hitboxes / attack boxes  (offset 8 in animation frame)
-// ============================================================================
-
-static void RenderEntityHitboxes(ImDrawList* dl, uintptr_t entity,
-                                  const char* label,
-                                  const ScreenTransform& t) {
-    int16_t posX   = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
-    int16_t posY   = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
-    int8_t  facing = ReadMemory<int8_t>(entity + ENTITY_OFF_FACING);
-
-    BoxEntry boxes[4];
-    ReadAnimBoxes(entity, ANIM_HITBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
-                  g_logPerFrame, label);
-
-    float ex = (float)(posX / 10);
-    float ey = (float)(posY / 10);
-
-    for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
-        const BoxEntry& b = boxes[i];
-        if (b.halfW <= 0 || b.halfH <= 0) continue;
-
-        float cx = ex + 2.0f * b.xOff * facing;
-        float cy = ey + 2.0f * b.yOff;
-        float hw = 2.0f * b.halfW;
-        float hh = 2.0f * b.halfH;
-
-        float left  = cx - hw - t.scrollX;
-        float right = cx + hw - t.scrollX;
-        float top   = cy - hh - t.scrollY;
-        float bot   = cy + hh - t.scrollY;
-
-        DrawBox(dl, left, top, right, bot, COL_HITBOX, g_fillAlpha, t);
+static void RenderHurtboxes(ImDrawList* dl,
+                            const EntitySnapshot& entity,
+                            const ScreenTransform& t) {
+    if (!entity.animFrame) {
+        return;
     }
+    RenderBoxSet(dl, entity, entity.animFrame->hurtBoxes, HURTBOX_COUNT_PER_FRAME, COL_HURTBOX, t, "hurt");
 }
 
-// ============================================================================
-// Per-entity extended hurtboxes  (offset 72 in animation frame)
-// ============================================================================
-// Additional vulnerable area checked only by player melee attacks.
-// Entity_UpdateDamageApplication: attacker hitbox@8 vs defender ext-hurtbox@72.
-// Entity_UpdateThrowInteraction: mutual @72 overlap = tech throw.
-// NOT checked by Entity_UpdateSummonHitDetection (summons only use hurtbox@40).
-// Both Entity_UpdateGrabAlignment (@40) and Entity_UpdateDamageApplication (@72)
-// dispatch to the same character-specific handler table (dword_73E070).
-
-static void RenderThrowboxes(ImDrawList* dl, uintptr_t entity,
-                              const char* label,
-                              const ScreenTransform& t) {
-    int16_t posX   = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
-    int16_t posY   = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
-    int8_t  facing = ReadMemory<int8_t>(entity + ENTITY_OFF_FACING);
-
-    BoxEntry boxes[4];
-    char lbl[32];
-    snprintf(lbl, sizeof(lbl), "%s.ext", label);
-    ReadAnimBoxes(entity, ANIM_EXT_HURTBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
-                  g_logPerFrame, lbl);
-
-    float ex = (float)(posX / 10);
-    float ey = (float)(posY / 10);
-
-    for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
-        const BoxEntry& b = boxes[i];
-        if (b.halfW <= 0 || b.halfH <= 0) continue;
-
-        float cx = ex + 2.0f * b.xOff * facing;
-        float cy = ey + 2.0f * b.yOff;
-        float hw = 2.0f * b.halfW;
-        float hh = 2.0f * b.halfH;
-
-        float left  = cx - hw - t.scrollX;
-        float right = cx + hw - t.scrollX;
-        float top   = cy - hh - t.scrollY;
-        float bot   = cy + hh - t.scrollY;
-
-        DrawBox(dl, left, top, right, bot, COL_THROWBOX, g_fillAlpha, t);
+static void RenderEntityHitboxes(ImDrawList* dl,
+                                 const EntitySnapshot& entity,
+                                 const ScreenTransform& t) {
+    if (!entity.animFrame) {
+        return;
     }
+    RenderBoxSet(dl, entity, entity.animFrame->hitBoxes, HURTBOX_COUNT_PER_FRAME, COL_HITBOX, t, "hit");
 }
 
-// ============================================================================
-// Entity state flag indicators (attack state, super armor, proj immunity)
-// ============================================================================
-// Draws small text labels near the entity position to indicate active flags.
-// Verified from Entity_InitHitData (entity+1736, +1740, +1748).
+static void RenderThrowboxes(ImDrawList* dl,
+                             const EntitySnapshot& entity,
+                             const ScreenTransform& t) {
+    if (!entity.animFrame) {
+        return;
+    }
+    RenderBoxSet(dl, entity, entity.animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME, COL_THROWBOX, t, "ext");
+}
 
-static void RenderStateFlags(ImDrawList* dl, uintptr_t entity,
-                              const char* playerLabel,
-                              const ScreenTransform& t) {
-    int16_t posX = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
-    int16_t posY = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
-    ImVec2 pos = WorldToDisplay(posX, posY, t);
+static void RenderStateFlags(ImDrawList* dl,
+                             const EntitySnapshot& entity,
+                             const ScreenTransform& t) {
+    ImVec2 pos = WorldToDisplay(entity.posX, entity.posY, t);
+    float yOff = -20.0f * t.scaleY;
 
-    uint8_t  atkState = ReadMemory<uint8_t>(entity + ENTITY_OFF_ATTACK_STATE);
-    uint32_t atkType  = ReadMemory<uint32_t>(entity + ENTITY_OFF_ATTACK_TYPE);
-    uint8_t  hitActive = ReadMemory<uint8_t>(entity + ENTITY_OFF_HIT_ACTIVE);
-    uint16_t invincibility = ReadMemory<uint16_t>(entity + ENTITY_OFF_INVINCIBILITY);
-
-    float yOff = -20.0f * t.scaleY;  // start above entity position
-
-    if (invincibility != 0) {
+    if (entity.invincibility != 0) {
         const char* txt = "INVINCIBLE";
         ImVec2 sz = ImGui::CalcTextSize(txt);
         float x = pos.x - sz.x * 0.5f;
@@ -339,7 +571,7 @@ static void RenderStateFlags(ImDrawList* dl, uintptr_t entity,
         yOff -= (sz.y + 4.0f);
     }
 
-    if (atkType & ATTACK_FLAG_FORCE_ACTIVE) {
+    if (entity.attackType & ATTACK_FLAG_FORCE_ACTIVE) {
         const char* txt = "ARMOR";
         ImVec2 sz = ImGui::CalcTextSize(txt);
         float x = pos.x - sz.x * 0.5f;
@@ -349,7 +581,7 @@ static void RenderStateFlags(ImDrawList* dl, uintptr_t entity,
         yOff -= (sz.y + 4.0f);
     }
 
-    if (atkType & ATTACK_FLAG_PROJ_IMMUNE) {
+    if (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE) {
         const char* txt = "PROJ IMMUNE";
         ImVec2 sz = ImGui::CalcTextSize(txt);
         float x = pos.x - sz.x * 0.5f;
@@ -359,8 +591,7 @@ static void RenderStateFlags(ImDrawList* dl, uintptr_t entity,
         yOff -= (sz.y + 4.0f);
     }
 
-    // Show active attack indicator (entity+1736 == 1 && entity+1748 != 0)
-    if (atkState == 1 && hitActive != 0) {
+    if (entity.attackState == 1 && entity.hitActive != 0) {
         const char* txt = "ATK";
         ImVec2 sz = ImGui::CalcTextSize(txt);
         float x = pos.x - sz.x * 0.5f;
@@ -370,107 +601,85 @@ static void RenderStateFlags(ImDrawList* dl, uintptr_t entity,
     }
 }
 
-// ============================================================================
-// HitDef / projectile hitbox reader  (global array, 100 entries)
-// ============================================================================
-
-static void RenderHitDefs(ImDrawList* dl, const ScreenTransform& t) {
+static void RenderHitDefs(ImDrawList* dl,
+                          const HitDefSnapshot* hitDefs,
+                          int hitDefCount,
+                          const ScreenTransform& t) {
     int activeCount = 0;
-    for (int i = 0; i < SUMMON_MAX_SLOTS; i++) {
-        uintptr_t entry = ADDR_SUMMON_ARRAY + (uintptr_t)i * SUMMON_ENTRY_SIZE;
-
-        uint32_t id = ReadMemory<uint32_t>(entry + HITDEF_OFF_ID);
-        if (id == 0) continue;                          // free slot
-
-        uint8_t owner = ReadMemory<uint8_t>(entry + HITDEF_OFF_OWNER);
-        if (owner == 0xFF) continue;                    // invalid owner
-
-        // Skip entries with no visual/anim assignment yet (freshly created)
-        uint16_t summonAnimIdx = ReadMemory<uint16_t>(entry + HITDEF_OFF_ANIM_FRAME_IDX);
-        if (summonAnimIdx == 0xFFFF) continue;
+    for (int i = 0; i < hitDefCount; i++) {
+        const HitDefSnapshot& hitDef = hitDefs[i];
+        if (!hitDef.animFrame) {
+            continue;
+        }
 
         activeCount++;
 
-        int16_t wx = ReadMemory<int16_t>(entry + HITDEF_OFF_X);
-        int16_t wy = ReadMemory<int16_t>(entry + HITDEF_OFF_Y);
-        int8_t  facing = ReadMemory<int8_t>(entry + HITDEF_OFF_FACING);
-
-        // Resolve animation data owner (offset 201, NOT damage owner at offset 0)
-        uint8_t animOwner = ReadMemory<uint8_t>(entry + HITDEF_OFF_ANIM_OWNER);
-        uintptr_t ownerEntity = (animOwner == 0)
-            ? (uintptr_t)ADDR_P1_ENTITY_BASE
-            : (uintptr_t)ADDR_P2_ENTITY_BASE;
-
         if (g_logPerFrame) {
-            uint8_t type = ReadMemory<uint8_t>(entry + HITDEF_OFF_TYPE);
-            uint8_t invuln = ReadMemory<uint8_t>(entry + HITDEF_OFF_ACTIVE);
-            uint8_t flag = ReadMemory<uint8_t>(entry + HITDEF_OFF_ACTIVE_FLAG);
-            uint32_t dmg = ReadMemory<uint32_t>(entry + HITDEF_OFF_DAMAGE);
             LOG_INFO("[HBV] HitDef[%d] id=%u owner=%u animOwner=%u type=%u invuln=%u flag=%d pos=(%d,%d) face=%d dmg=%u animIdx=%u",
-                     i, id, owner, animOwner, type, invuln, (int)(int8_t)flag, wx, wy, facing, dmg, summonAnimIdx);
+                     hitDef.index,
+                     hitDef.id,
+                     hitDef.owner,
+                     hitDef.animOwner,
+                     hitDef.type,
+                     hitDef.invuln,
+                     (int)(int8_t)hitDef.flag,
+                     hitDef.worldX,
+                     hitDef.worldY,
+                     hitDef.facing,
+                     hitDef.damage,
+                     hitDef.summonAnimIdx);
         }
 
-        float hx = (float)(wx / 10);
-        float hy = (float)(wy / 10);
+        const float hx = (float)(hitDef.worldX / 10);
+        const float hy = (float)(hitDef.worldY / 10);
         bool anyDrawn = false;
 
-        // Render summon hitboxes (attack boxes, red) at frame offset 8
-        {
-            BoxEntry boxes[4];
-            char lbl[32];
-            snprintf(lbl, sizeof(lbl), "HitDef[%d].hit", i);
-            ReadAnimBoxes(ownerEntity, ANIM_HITBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
-                          g_logPerFrame, lbl, (int)summonAnimIdx);
-
-            for (int j = 0; j < HURTBOX_COUNT_PER_FRAME; j++) {
-                const BoxEntry& b = boxes[j];
-                if (b.halfW <= 0 || b.halfH <= 0) continue;
-
-                float cx = hx + 2.0f * b.xOff * facing;
-                float cy = hy + 2.0f * b.yOff;
-                float hw = 2.0f * b.halfW;
-                float hh = 2.0f * b.halfH;
-
-                float left  = cx - hw - t.scrollX;
-                float right = cx + hw - t.scrollX;
-                float top   = cy - hh - t.scrollY;
-                float bot   = cy + hh - t.scrollY;
-
-                DrawBox(dl, left, top, right, bot, COL_HITBOX, g_fillAlpha, t);
-                anyDrawn = true;
+        for (int j = 0; j < HURTBOX_COUNT_PER_FRAME; j++) {
+            const BoxEntry& box = hitDef.animFrame->hitBoxes[j];
+            if (box.halfW <= 0 || box.halfH <= 0) {
+                continue;
             }
+
+            const float cx = hx + (2.0f * box.xOff * hitDef.facing);
+            const float cy = hy + (2.0f * box.yOff);
+            const float hw = 2.0f * box.halfW;
+            const float hh = 2.0f * box.halfH;
+            DrawBox(dl,
+                    cx - hw - t.scrollX,
+                    cy - hh - t.scrollY,
+                    cx + hw - t.scrollX,
+                    cy + hh - t.scrollY,
+                    COL_HITBOX,
+                    g_fillAlpha,
+                    t);
+            anyDrawn = true;
         }
 
-        // Render summon hurtboxes (vulnerable boxes, green) at frame offset 40
         if (g_showHurtboxes) {
-            BoxEntry boxes[4];
-            char lbl[32];
-            snprintf(lbl, sizeof(lbl), "HitDef[%d].hurt", i);
-            ReadAnimBoxes(ownerEntity, ANIM_HURTBOX_OFFSET, boxes, HURTBOX_COUNT_PER_FRAME,
-                          g_logPerFrame, lbl, (int)summonAnimIdx);
-
             for (int j = 0; j < HURTBOX_COUNT_PER_FRAME; j++) {
-                const BoxEntry& b = boxes[j];
-                if (b.halfW <= 0 || b.halfH <= 0) continue;
+                const BoxEntry& box = hitDef.animFrame->hurtBoxes[j];
+                if (box.halfW <= 0 || box.halfH <= 0) {
+                    continue;
+                }
 
-                float cx = hx + 2.0f * b.xOff * facing;
-                float cy = hy + 2.0f * b.yOff;
-                float hw = 2.0f * b.halfW;
-                float hh = 2.0f * b.halfH;
-
-                float left  = cx - hw - t.scrollX;
-                float right = cx + hw - t.scrollX;
-                float top   = cy - hh - t.scrollY;
-                float bot   = cy + hh - t.scrollY;
-
-                DrawBox(dl, left, top, right, bot, COL_HURTBOX, g_fillAlpha, t);
+                const float cx = hx + (2.0f * box.xOff * hitDef.facing);
+                const float cy = hy + (2.0f * box.yOff);
+                const float hw = 2.0f * box.halfW;
+                const float hh = 2.0f * box.halfH;
+                DrawBox(dl,
+                    cx - hw - t.scrollX,
+                    cy - hh - t.scrollY,
+                    cx + hw - t.scrollX,
+                    cy + hh - t.scrollY,
+                    COL_HURTBOX,
+                    g_fillAlpha,
+                    t);
                 anyDrawn = true;
             }
         }
 
-        // Always draw a position marker for the HitDef
         if (!anyDrawn) {
-            ImVec2 p = WorldToDisplay(wx, wy, t);
+            ImVec2 p = WorldToDisplay(hitDef.worldX, hitDef.worldY, t);
             dl->AddCircleFilled(p, 5.0f * t.scaleX, COL_HITDEF_PT);
         }
     }
@@ -480,67 +689,53 @@ static void RenderHitDefs(ImDrawList* dl, const ScreenTransform& t) {
     }
 }
 
-// ============================================================================
-// Collision / push box  (offset 0 in animation frame, single entry)
-// ============================================================================
-
-static void RenderPushbox(ImDrawList* dl, uintptr_t entity,
-                          const char* label,
+static void RenderPushbox(ImDrawList* dl,
+                          const EntitySnapshot& entity,
                           const ScreenTransform& t) {
-    // Collision box is the single entry at frame offset 0
-    BoxEntry box;
-    ReadAnimBoxes(entity, ANIM_COLLISION_OFFSET, &box, 1,
-                  g_logPerFrame, label);
+    if (!entity.animFrame) {
+        return;
+    }
 
-    if (box.halfW <= 0 || box.halfH <= 0) return;
+    const BoxEntry& box = entity.animFrame->collisionBox;
+    if (box.halfW <= 0 || box.halfH <= 0) {
+        return;
+    }
 
-    int16_t posX   = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
-    int16_t posY   = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
-    int8_t  facing = ReadMemory<int8_t>(entity + ENTITY_OFF_FACING);
+    const float ex = (float)(entity.posX / 10);
+    const float ey = (float)(entity.posY / 10);
+    const float cx = ex + (2.0f * box.xOff * entity.facing);
+    const float cy = ey + (2.0f * box.yOff);
+    const float hw = 2.0f * box.halfW;
+    const float hh = 2.0f * box.halfH;
 
-    float ex = (float)(posX / 10);
-    float ey = (float)(posY / 10);
-    float cx = ex + 2.0f * box.xOff * facing;
-    float cy = ey + 2.0f * box.yOff;
-    float hw = 2.0f * box.halfW;
-    float hh = 2.0f * box.halfH;
-
-    float left  = cx - hw - t.scrollX;
-    float right = cx + hw - t.scrollX;
-    float top   = cy - hh - t.scrollY;
-    float bot   = cy + hh - t.scrollY;
-
-    DrawBox(dl, left, top, right, bot, COL_PUSHBOX, g_fillAlpha, t);
+    DrawBox(dl,
+            cx - hw - t.scrollX,
+            cy - hh - t.scrollY,
+            cx + hw - t.scrollX,
+            cy + hh - t.scrollY,
+            COL_PUSHBOX,
+            g_fillAlpha,
+            t);
 }
 
-// ============================================================================
-// Position / facing marker
-// ============================================================================
-
-static void RenderPosition(ImDrawList* dl, uintptr_t entity, ImU32 colour,
+static void RenderPosition(ImDrawList* dl,
+                           const EntitySnapshot& entity,
+                           ImU32 colour,
                            const ScreenTransform& t) {
-    int16_t posX = ReadMemory<int16_t>(entity + ENTITY_OFF_X_POS);
-    int16_t posY = ReadMemory<int16_t>(entity + ENTITY_OFF_Y_POS);
-    int8_t  face = ReadMemory<int8_t>(entity + ENTITY_OFF_FACING);
-
-    ImVec2 c = WorldToDisplay(posX, posY, t);
+    ImVec2 c = WorldToDisplay(entity.posX, entity.posY, t);
     float  r = 4.0f * t.scaleX;
 
     dl->AddCircleFilled(c, r, colour);
-    // Cross
     dl->AddLine(ImVec2(c.x - r * 2, c.y), ImVec2(c.x + r * 2, c.y), colour, 1.5f);
     dl->AddLine(ImVec2(c.x, c.y - r * 2), ImVec2(c.x, c.y + r * 2), colour, 1.5f);
-    // Facing arrow
-    float arrowLen = 12.0f * t.scaleX * face;
+    float arrowLen = 12.0f * t.scaleX * entity.facing;
     dl->AddLine(c, ImVec2(c.x + arrowLen, c.y), colour, 2.5f);
 }
 
-// ============================================================================
-// Info overlay text
-// ============================================================================
-
-static void RenderInfoOverlay(ImDrawList* dl, uintptr_t p1, uintptr_t p2,
-                              const ScreenTransform& t) {
+static void RenderInfoOverlay(ImDrawList* dl,
+                              const HitboxViewerFrameContext& ctx,
+                              const EntitySnapshot& p1,
+                              const EntitySnapshot& p2) {
     char buf[256];
     float y = 10.0f;
     const float x = 10.0f;
@@ -549,24 +744,24 @@ static void RenderInfoOverlay(ImDrawList* dl, uintptr_t p1, uintptr_t p2,
     const ImU32 white = IM_COL32(200, 200, 200, 255);
     const ImU32 dim   = IM_COL32(150, 150, 150, 255);
 
-    // Count lines to size the panel
-    int totalLines = 3; // camera + match header + separator
-    if (g_showMatchState) totalLines += 6;
+    int totalLines = 3;
+    if (g_showMatchState) {
+        totalLines += 6;
+    }
+
+    const EntitySnapshot* players[2] = { &p1, &p2 };
     for (int pi = 0; pi < 2; pi++) {
-        totalLines += 1; // P header
-        uintptr_t ent = (pi == 0) ? p1 : p2;
-        BoxEntry hurtBoxes[4], hitBoxes[4], throwBoxes[4];
-        BoxEntry collBox;
-        ReadAnimBoxes(ent, ANIM_HURTBOX_OFFSET, hurtBoxes, HURTBOX_COUNT_PER_FRAME, false, nullptr);
-        ReadAnimBoxes(ent, ANIM_HITBOX_OFFSET, hitBoxes, HURTBOX_COUNT_PER_FRAME, false, nullptr);
-        ReadAnimBoxes(ent, ANIM_EXT_HURTBOX_OFFSET, throwBoxes, HURTBOX_COUNT_PER_FRAME, false, nullptr);
-        ReadAnimBoxes(ent, ANIM_COLLISION_OFFSET, &collBox, 1, false, nullptr);
-        if (collBox.halfW > 0 && collBox.halfH > 0) totalLines++;
-        for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
-            if (hurtBoxes[i].halfW > 0 && hurtBoxes[i].halfH > 0) totalLines++;
-            if (hitBoxes[i].halfW > 0 && hitBoxes[i].halfH > 0) totalLines++;
-            if (throwBoxes[i].halfW > 0 && throwBoxes[i].halfH > 0) totalLines++;
+        totalLines += 1;
+        const AnimFrameSnapshot* animFrame = players[pi]->animFrame;
+        if (!animFrame) {
+            continue;
         }
+        if (animFrame->collisionBox.halfW > 0 && animFrame->collisionBox.halfH > 0) {
+            totalLines++;
+        }
+        totalLines += CountActiveBoxes(animFrame->hurtBoxes, HURTBOX_COUNT_PER_FRAME);
+        totalLines += CountActiveBoxes(animFrame->hitBoxes, HURTBOX_COUNT_PER_FRAME);
+        totalLines += CountActiveBoxes(animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME);
     }
 
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 500, y + lineH * totalLines + 6), bg);
@@ -581,76 +776,71 @@ static void RenderInfoOverlay(ImDrawList* dl, uintptr_t p1, uintptr_t p2,
     };
 
     line(white, "Scroll: %d,%d  Display: %.0fx%.0f  Scale: %.2f,%.2f",
-         t.scrollX, t.scrollY,
+         ctx.transform.scrollX, ctx.transform.scrollY,
          ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y,
-         t.scaleX, t.scaleY);
+         ctx.transform.scaleX, ctx.transform.scaleY);
 
-    // Match state block
     if (g_showMatchState) {
-        uint32_t gameMode  = ReadMemory<uint32_t>(ADDR_GAME_MODE);
-        uint32_t subState  = ReadMemory<uint32_t>(ADDR_SUB_STATE);
-        uint32_t gameType  = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
-        uint32_t simFrame  = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-        uint32_t dispFrame = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
-        uint32_t phaseTimer= ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
-        uint32_t roundTimer= ReadMemory<uint32_t>(ADDR_ROUND_TIMER);
-
         line(dim, "Mode:%u Sub:%u Type:%u SimF:%u DispF:%u",
-             gameMode, subState, gameType, simFrame, dispFrame);
+             ctx.gameMode, ctx.subState, ctx.gameType, ctx.simFrame, ctx.dispFrame);
         line(dim, "PhaseTimer:%u RoundTimer:%u MatchBase:0x%08X",
-             phaseTimer, roundTimer, (uint32_t)ADDR_MATCH_BASE);
+             ctx.phaseTimer, ctx.roundTimer, (uint32_t)ADDR_MATCH_BASE);
         line(dim, "ScrollAddr: X=0x%08X Y=0x%08X",
              (uint32_t)ADDR_SCROLL_X, (uint32_t)ADDR_SCROLL_Y);
 
-        // Raw bytes around the scroll addresses for verification
         char scrollHex[128];
         int pos = 0;
-        for (int i = -4; i < 12 && pos < 120; i += 2) {
-            int16_t v = ReadMemory<int16_t>(ADDR_SCROLL_X + i);
-            pos += snprintf(scrollHex + pos, sizeof(scrollHex) - pos, "%04X ", (uint16_t)v);
+        for (int i = 0; i < 8 && pos < 120; i++) {
+            pos += snprintf(scrollHex + pos, sizeof(scrollHex) - pos, "%04X ",
+                            (uint16_t)ctx.scrollVicinity[i]);
         }
         line(dim, "Scroll vicinity: %s", scrollHex);
 
         line(dim, "P1Base:0x%08X P2Base:0x%08X Stride:%d",
-             (uint32_t)ADDR_P1_ENTITY_BASE, (uint32_t)ADDR_P2_ENTITY_BASE,
+             (uint32_t)p1.base, (uint32_t)p2.base,
              ENTITY_SIZE);
-        line(dim, "AnimData +0x%X  Stride:%d  Coll@%d Hit@%d Hurt@%d Throw@%d  %d\u00d7%dB",
+        line(dim, "AnimData +0x%X  Stride:%d  Coll@%d Hit@%d Hurt@%d Throw@%d  %d×%dB",
              ENTITY_OFF_ANIM_DATA, ANIM_DATA_STRIDE,
              ANIM_COLLISION_OFFSET, ANIM_HITBOX_OFFSET, ANIM_HURTBOX_OFFSET, ANIM_EXT_HURTBOX_OFFSET,
              HURTBOX_COUNT_PER_FRAME, HURTBOX_ENTRY_SIZE);
     }
 
-    // Player info
     for (int pi = 0; pi < 2; pi++) {
-        uintptr_t ent = (pi == 0) ? p1 : p2;
+        const EntitySnapshot& entity = *players[pi];
+        const AnimFrameSnapshot* animFrame = entity.animFrame;
         ImU32 col = (pi == 0) ? COL_P1_CROSS : COL_P2_CROSS;
-        int16_t px = ReadMemory<int16_t>(ent + ENTITY_OFF_X_POS);
-        int16_t py = ReadMemory<int16_t>(ent + ENTITY_OFF_Y_POS);
-        int8_t  pf = ReadMemory<int8_t>(ent + ENTITY_OFF_FACING);
-        int16_t hp = ReadMemory<int16_t>(ent + ENTITY_OFF_HP);
-        uint32_t animIdx  = ReadMemory<uint32_t>(ent + ENTITY_OFF_ANIM_INDEX);
-        uint32_t actionId = ReadMemory<uint32_t>(ent + ENTITY_OFF_ACTION_ID);
-        uint8_t  atkState = ReadMemory<uint8_t>(ent + ENTITY_OFF_ATTACK_STATE);
-        uint32_t atkType  = ReadMemory<uint32_t>(ent + ENTITY_OFF_ATTACK_TYPE);
-
         line(col, "P%d Pos:%d,%d Face:%d HP:%d Act:%u Anim:%u Atk:%u Flags:0x%X",
-             pi + 1, px, py, pf, hp, actionId, animIdx, atkState, atkType);
+             pi + 1, entity.posX, entity.posY, entity.facing, entity.hp,
+             entity.actionId, entity.animIdx, entity.attackState, entity.attackType);
 
-        BoxEntry hurtB[4], hitB[4], throwB[4];
-        BoxEntry collB;
-        ReadAnimBoxes(ent, ANIM_HURTBOX_OFFSET, hurtB, HURTBOX_COUNT_PER_FRAME, false, nullptr);
-        ReadAnimBoxes(ent, ANIM_HITBOX_OFFSET, hitB, HURTBOX_COUNT_PER_FRAME, false, nullptr);
-        ReadAnimBoxes(ent, ANIM_EXT_HURTBOX_OFFSET, throwB, HURTBOX_COUNT_PER_FRAME, false, nullptr);
-        ReadAnimBoxes(ent, ANIM_COLLISION_OFFSET, &collB, 1, false, nullptr);
-        if (collB.halfW > 0 && collB.halfH > 0)
-            line(col, "  coll off(%d,%d) half(%d,%d)", collB.xOff, collB.yOff, collB.halfW, collB.halfH);
+        if (!animFrame) {
+            continue;
+        }
+
+        if (animFrame->collisionBox.halfW > 0 && animFrame->collisionBox.halfH > 0) {
+            line(col, "  coll off(%d,%d) half(%d,%d)",
+                 animFrame->collisionBox.xOff,
+                 animFrame->collisionBox.yOff,
+                 animFrame->collisionBox.halfW,
+                 animFrame->collisionBox.halfH);
+        }
+
         for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
-            if (hurtB[i].halfW > 0 && hurtB[i].halfH > 0)
-                line(col, "  hurt%d off(%d,%d) half(%d,%d)", i, hurtB[i].xOff, hurtB[i].yOff, hurtB[i].halfW, hurtB[i].halfH);
-            if (hitB[i].halfW > 0 && hitB[i].halfH > 0)
-                line(col, "  hit%d off(%d,%d) half(%d,%d)", i, hitB[i].xOff, hitB[i].yOff, hitB[i].halfW, hitB[i].halfH);
-            if (throwB[i].halfW > 0 && throwB[i].halfH > 0)
-                line(col, "  throw%d off(%d,%d) half(%d,%d)", i, throwB[i].xOff, throwB[i].yOff, throwB[i].halfW, throwB[i].halfH);
+            const BoxEntry& hurtBox = animFrame->hurtBoxes[i];
+            const BoxEntry& hitBox = animFrame->hitBoxes[i];
+            const BoxEntry& throwBox = animFrame->throwBoxes[i];
+            if (hurtBox.halfW > 0 && hurtBox.halfH > 0) {
+                line(col, "  hurt%d off(%d,%d) half(%d,%d)",
+                     i, hurtBox.xOff, hurtBox.yOff, hurtBox.halfW, hurtBox.halfH);
+            }
+            if (hitBox.halfW > 0 && hitBox.halfH > 0) {
+                line(col, "  hit%d off(%d,%d) half(%d,%d)",
+                     i, hitBox.xOff, hitBox.yOff, hitBox.halfW, hitBox.halfH);
+            }
+            if (throwBox.halfW > 0 && throwBox.halfH > 0) {
+                line(col, "  throw%d off(%d,%d) half(%d,%d)",
+                     i, throwBox.xOff, throwBox.yOff, throwBox.halfW, throwBox.halfH);
+            }
         }
     }
 }
@@ -675,61 +865,63 @@ void HitboxViewer_Render() {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     if (!dl) return;
 
-    ScreenTransform t = GetTransform();
+    HitboxViewerFrameContext frameCtx = BuildFrameContext();
+    AnimFrameCache animCache{};
+    const uintptr_t p1EntityBase = GetEntityBase(0);
+    const uintptr_t p2EntityBase = GetEntityBase(1);
+    EntitySnapshot p1 = BuildEntitySnapshot(&animCache, p1EntityBase, "P1");
+    EntitySnapshot p2 = BuildEntitySnapshot(&animCache, p2EntityBase, "P2");
 
-    uintptr_t p1 = (uintptr_t)ADDR_P1_ENTITY_BASE;
-    uintptr_t p2 = (uintptr_t)ADDR_P2_ENTITY_BASE;
-
-    // Track animation/action changes for logging
-    uint32_t p1Anim   = ReadMemory<uint32_t>(p1 + ENTITY_OFF_ANIM_INDEX);
-    uint32_t p2Anim   = ReadMemory<uint32_t>(p2 + ENTITY_OFF_ANIM_INDEX);
-    uint32_t p1Action = ReadMemory<uint32_t>(p1 + ENTITY_OFF_ACTION_ID);
-    uint32_t p2Action = ReadMemory<uint32_t>(p2 + ENTITY_OFF_ACTION_ID);
-
-    if (p1Action != s_lastP1Action) {
+    if (p1.actionId != s_lastP1Action) {
         if (g_logPerFrame) {
             LOG_INFO("[HBV] P1 action %u -> %u  anim %u -> %u",
-                     s_lastP1Action, p1Action, s_lastP1Anim, p1Anim);
+                     s_lastP1Action, p1.actionId, s_lastP1Anim, p1.animIdx);
         }
-        s_lastP1Action = p1Action;
+        s_lastP1Action = p1.actionId;
     }
-    if (p2Action != s_lastP2Action) {
+    if (p2.actionId != s_lastP2Action) {
         if (g_logPerFrame) {
             LOG_INFO("[HBV] P2 action %u -> %u  anim %u -> %u",
-                     s_lastP2Action, p2Action, s_lastP2Anim, p2Anim);
+                     s_lastP2Action, p2.actionId, s_lastP2Anim, p2.animIdx);
         }
-        s_lastP2Action = p2Action;
+        s_lastP2Action = p2.actionId;
     }
-    s_lastP1Anim = p1Anim;
-    s_lastP2Anim = p2Anim;
+    s_lastP1Anim = p1.animIdx;
+    s_lastP2Anim = p2.animIdx;
+
+    HitDefSnapshot hitDefs[SUMMON_MAX_SLOTS] = {};
+    int hitDefCount = 0;
+    if (g_showHitboxes) {
+        hitDefCount = BuildHitDefSnapshots(&animCache, hitDefs, SUMMON_MAX_SLOTS, p1EntityBase, p2EntityBase);
+    }
 
     if (g_showHurtboxes) {
-        RenderHurtboxes(dl, p1, "P1", t);
-        RenderHurtboxes(dl, p2, "P2", t);
+        RenderHurtboxes(dl, p1, frameCtx.transform);
+        RenderHurtboxes(dl, p2, frameCtx.transform);
     }
     if (g_showHitboxes) {
-        RenderEntityHitboxes(dl, p1, "P1", t);
-        RenderEntityHitboxes(dl, p2, "P2", t);
-        RenderHitDefs(dl, t);
+        RenderEntityHitboxes(dl, p1, frameCtx.transform);
+        RenderEntityHitboxes(dl, p2, frameCtx.transform);
+        RenderHitDefs(dl, hitDefs, hitDefCount, frameCtx.transform);
     }
     if (g_showThrowboxes) {
-        RenderThrowboxes(dl, p1, "P1", t);
-        RenderThrowboxes(dl, p2, "P2", t);
+        RenderThrowboxes(dl, p1, frameCtx.transform);
+        RenderThrowboxes(dl, p2, frameCtx.transform);
     }
     if (g_showPushboxes) {
-        RenderPushbox(dl, p1, "P1", t);
-        RenderPushbox(dl, p2, "P2", t);
+        RenderPushbox(dl, p1, frameCtx.transform);
+        RenderPushbox(dl, p2, frameCtx.transform);
     }
     if (g_showPositions) {
-        RenderPosition(dl, p1, COL_P1_CROSS, t);
-        RenderPosition(dl, p2, COL_P2_CROSS, t);
+        RenderPosition(dl, p1, COL_P1_CROSS, frameCtx.transform);
+        RenderPosition(dl, p2, COL_P2_CROSS, frameCtx.transform);
     }
     if (g_showStateFlags) {
-        RenderStateFlags(dl, p1, "P1", t);
-        RenderStateFlags(dl, p2, "P2", t);
+        RenderStateFlags(dl, p1, frameCtx.transform);
+        RenderStateFlags(dl, p2, frameCtx.transform);
     }
     if (g_showInfo) {
-        RenderInfoOverlay(dl, p1, p2, t);
+        RenderInfoOverlay(dl, frameCtx, p1, p2);
     }
 }
 
@@ -759,7 +951,6 @@ void HitboxViewer_RenderControls() {
         ImGui::SetTooltip("Logs every box read every frame.\nWill flood the log. Use briefly.");
 
     if (ImGui::Button("Log Once Now")) {
-        // Force a one-shot log by resetting the anim trackers
         s_lastP1Anim = 0xFFFFFFFF;
         s_lastP2Anim = 0xFFFFFFFF;
         LOG_INFO("[HBV] --- Manual one-shot log triggered ---");

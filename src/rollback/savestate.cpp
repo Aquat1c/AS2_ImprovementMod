@@ -52,6 +52,8 @@ struct SavestateSlot {
 
     Rollback::GameSnapshot snapshot;
 
+    bool practice_control_swap;
+
     // FPU state — captured for diagnostics but NOT restored by default.
     // Uncomment the restore lines in Savestate_Load if desync evidence
     // points to FPU drift being the cause.
@@ -300,15 +302,18 @@ bool Savestate_Save() {
     g_slot.info.rng_seed  = g_slot.snapshot.rng_seed;
     g_slot.info.game_mode = g_slot.snapshot.game_mode;
     g_slot.info.substate  = g_slot.snapshot.substate;
+    g_slot.practice_control_swap = PracticeTools_IsControlSwapped();
 
-    LOG_INFO("[Savestate] SAVED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d",
+    LOG_INFO("[Savestate] SAVED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d swap=%d",
              g_slot.info.frame, g_slot.info.checksum, g_slot.info.rng_seed,
-             g_slot.info.game_mode, g_slot.info.substate);
+             g_slot.info.game_mode, g_slot.info.substate,
+             g_slot.practice_control_swap ? 1 : 0);
 
     // Log to file for determinism analysis
-    LogToFile("SAVE frame=%d checksum=0x%08X rng=0x%08X mode=%d sub=%d timer=%d fpu_cw=0x%04X mxcsr=0x%08X\n",
+    LogToFile("SAVE frame=%d checksum=0x%08X rng=0x%08X mode=%d sub=%d timer=%d swap=%d fpu_cw=0x%04X mxcsr=0x%08X\n",
               g_slot.info.frame, g_slot.info.checksum, g_slot.info.rng_seed,
               g_slot.info.game_mode, g_slot.info.substate, g_slot.snapshot.match_phase_timer,
+              g_slot.practice_control_swap ? 1 : 0,
               g_slot.fpu_cw, g_slot.fpu_mxcsr);
 
     return true;
@@ -339,13 +344,16 @@ bool Savestate_Load() {
     uint32_t preRng      = DetVer_GetRngSeed();
     uint32_t preChecksum = ComputeMainChecksum();
 
-    LOG_INFO("[Savestate] LOADING — restoring frame %d (current frame %d)",
-             g_slot.info.frame, preFrame);
+    LOG_INFO("[Savestate] LOADING — restoring frame %d (current frame %d, swap=%d)",
+             g_slot.info.frame, preFrame, g_slot.practice_control_swap ? 1 : 0);
 
     if (!Rollback::GameSnapshot_Restore(&g_slot.snapshot)) {
         LOG_ERROR("[Savestate] FAILED — snapshot restore rejected");
         return false;
     }
+
+    PracticeTools_ApplyControlSwapState(g_slot.practice_control_swap);
+    PracticeTools_SyncControlSwapState();
 
     // FPU state: NOT restored by default. If desync investigation reveals
     // that FPU drift is causing issues, uncomment these lines:

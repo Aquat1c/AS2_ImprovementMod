@@ -116,11 +116,20 @@ float ModUI_GetScale() {
     static HMODULE s_proxyModule = nullptr;
     static ProxyGetResolution_t s_getNativeResolution = nullptr;
     static ProxyGetResolution_t s_getScreenResolution = nullptr;
-    static bool s_lookedUp = false;
+    static int s_cachedNativeWidth = 0;
+    static int s_cachedNativeHeight = 0;
+    static int s_cachedScreenWidth = 0;
+    static int s_cachedScreenHeight = 0;
+    static float s_cachedScale = 1.0f;
+    static bool s_hasCachedScale = false;
 
-    if (!s_lookedUp) {
-        s_lookedUp = true;
-        s_proxyModule = GetModuleHandleA("d3d9.dll");
+    HMODULE currentProxyModule = GetModuleHandleA("d3d9.dll");
+    if (currentProxyModule != s_proxyModule || !s_getNativeResolution || !s_getScreenResolution) {
+        s_proxyModule = currentProxyModule;
+        s_getNativeResolution = nullptr;
+        s_getScreenResolution = nullptr;
+        s_hasCachedScale = false;
+
         if (s_proxyModule) {
             s_getNativeResolution = (ProxyGetResolution_t)GetProcAddress(s_proxyModule, "GetNativeResolution");
             s_getScreenResolution = (ProxyGetResolution_t)GetProcAddress(s_proxyModule, "GetScreenResolution");
@@ -138,7 +147,16 @@ float ModUI_GetScale() {
     s_getNativeResolution(&nativeWidth, &nativeHeight);
     s_getScreenResolution(&screenWidth, &screenHeight);
     if (nativeWidth <= 0 || nativeHeight <= 0 || screenWidth <= 0 || screenHeight <= 0) {
+        s_hasCachedScale = false;
         return 1.0f;
+    }
+
+    if (s_hasCachedScale &&
+        s_cachedNativeWidth == nativeWidth &&
+        s_cachedNativeHeight == nativeHeight &&
+        s_cachedScreenWidth == screenWidth &&
+        s_cachedScreenHeight == screenHeight) {
+        return s_cachedScale;
     }
 
     const float scaleX = (float)screenWidth / (float)nativeWidth;
@@ -148,7 +166,13 @@ float ModUI_GetScale() {
         upscale = 1.0f;
     }
 
-    return ClampFloat(1.0f / upscale, 0.40f, 1.0f);
+    s_cachedNativeWidth = nativeWidth;
+    s_cachedNativeHeight = nativeHeight;
+    s_cachedScreenWidth = screenWidth;
+    s_cachedScreenHeight = screenHeight;
+    s_cachedScale = ClampFloat(1.0f / upscale, 0.40f, 1.0f);
+    s_hasCachedScale = true;
+    return s_cachedScale;
 }
 
 float ModUI_Scale(float value) {
@@ -584,15 +608,12 @@ __declspec(dllexport) void ModOnFrame() {
         Rollback::RollbackDebug_FrameUpdate();
     }
 
-    // Update debug info
-    UpdateInputDebugInfo();
-
     // Log when SDL input changes
     static uint16_t prevSdlP1 = 0;
     static uint16_t prevSdlP2 = 0;
 
-    uint16_t sdlP1 = g_inputDebug.sdlInputP1;
-    uint16_t sdlP2 = g_inputDebug.sdlInputP2;
+    uint16_t sdlP1 = InputSystem_GetInput(0);
+    uint16_t sdlP2 = InputSystem_GetInput(1);
 
     if (sdlP1 != prevSdlP1) {
         if (g_config.verboseLogging) {
@@ -640,7 +661,7 @@ __declspec(dllexport) void ModOnFrame() {
         LOG_DEBUG("[STATUS] Hooks: KB=%d(%d inj) Joy=%d(%d inj) | SDL P1=0x%04X P2=0x%04X",
             g_inputDebug.keyboardHookCalls, g_inputDebug.keyboardInjectedCount,
             g_inputDebug.joystickHookCalls, g_inputDebug.joystickInjectedCount,
-            g_inputDebug.sdlInputP1, g_inputDebug.sdlInputP2);
+            sdlP1, sdlP2);
     }
 
     // Determinism verification: end previous frame, begin next

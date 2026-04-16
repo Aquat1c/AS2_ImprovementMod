@@ -2618,27 +2618,56 @@ uint16_t ReadPlayerInput(int player) {
 void UpdateInputDebugInfo() {
     g_inputDebug.sdlInputP1 = InputSystem_GetInput(0);
     g_inputDebug.sdlInputP2 = InputSystem_GetInput(1);
-    
-    for (int i = 0; i < 10; i++) {
-        g_inputDebug.gameBufferP1[i] = ReadMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + i * 2);
-        g_inputDebug.gameBufferP2[i] = ReadMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + i * 2);
+
+    uint16_t localBufferP1[10] = {};
+    uint16_t localBufferP2[10] = {};
+    if (CopyMemorySafe(localBufferP1, (const void*)ADDR_P1_INPUT_BUFFER, sizeof(localBufferP1))) {
+        memcpy(g_inputDebug.gameBufferP1, localBufferP1, sizeof(localBufferP1));
+    } else {
+        for (int i = 0; i < 10; i++) {
+            g_inputDebug.gameBufferP1[i] = ReadMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + i * 2);
+        }
     }
-    
+    if (CopyMemorySafe(localBufferP2, (const void*)ADDR_P2_INPUT_BUFFER, sizeof(localBufferP2))) {
+        memcpy(g_inputDebug.gameBufferP2, localBufferP2, sizeof(localBufferP2));
+    } else {
+        for (int i = 0; i < 10; i++) {
+            g_inputDebug.gameBufferP2[i] = ReadMemory<uint16_t>(ADDR_P2_INPUT_BUFFER + i * 2);
+        }
+    }
+
     uintptr_t joyBase = ADDR_DINPUT_JOYSTICK;
-    g_inputDebug.dinputJoyAxisX = ReadMemory<int32_t>(joyBase + 0);
-    g_inputDebug.dinputJoyAxisY = ReadMemory<int32_t>(joyBase + 4);
-    for (int i = 0; i < 8; i++) {
-        g_inputDebug.dinputJoyButtons[i] = ReadMemory<uint8_t>(joyBase + 64 + i);
+    uint8_t joyState[72] = {};
+    if (CopyMemorySafe(joyState, (const void*)joyBase, sizeof(joyState))) {
+        memcpy(&g_inputDebug.dinputJoyAxisX, joyState + 0, sizeof(g_inputDebug.dinputJoyAxisX));
+        memcpy(&g_inputDebug.dinputJoyAxisY, joyState + 4, sizeof(g_inputDebug.dinputJoyAxisY));
+        memcpy(g_inputDebug.dinputJoyButtons, joyState + 64, sizeof(g_inputDebug.dinputJoyButtons));
+    } else {
+        g_inputDebug.dinputJoyAxisX = ReadMemory<int32_t>(joyBase + 0);
+        g_inputDebug.dinputJoyAxisY = ReadMemory<int32_t>(joyBase + 4);
+        for (int i = 0; i < 8; i++) {
+            g_inputDebug.dinputJoyButtons[i] = ReadMemory<uint8_t>(joyBase + 64 + i);
+        }
     }
-    
-    uint8_t* keyBuffer = reinterpret_cast<uint8_t*>(ADDR_DINPUT_KEYBOARD);
-    g_inputDebug.keyState_Up    = keyBuffer[SCANCODE_UP];
-    g_inputDebug.keyState_Down  = keyBuffer[SCANCODE_DOWN];
-    g_inputDebug.keyState_Left  = keyBuffer[SCANCODE_LEFT];
-    g_inputDebug.keyState_Right = keyBuffer[SCANCODE_RIGHT];
-    g_inputDebug.keyState_Z     = keyBuffer[SCANCODE_Z];
-    g_inputDebug.keyState_X     = keyBuffer[SCANCODE_X];
-    g_inputDebug.keyState_Enter = keyBuffer[SCANCODE_ENTER];
+
+    uint8_t keyBuffer[256] = {};
+    if (CopyMemorySafe(keyBuffer, (const void*)ADDR_DINPUT_KEYBOARD, sizeof(keyBuffer))) {
+        g_inputDebug.keyState_Up    = keyBuffer[SCANCODE_UP];
+        g_inputDebug.keyState_Down  = keyBuffer[SCANCODE_DOWN];
+        g_inputDebug.keyState_Left  = keyBuffer[SCANCODE_LEFT];
+        g_inputDebug.keyState_Right = keyBuffer[SCANCODE_RIGHT];
+        g_inputDebug.keyState_Z     = keyBuffer[SCANCODE_Z];
+        g_inputDebug.keyState_X     = keyBuffer[SCANCODE_X];
+        g_inputDebug.keyState_Enter = keyBuffer[SCANCODE_ENTER];
+    } else {
+        g_inputDebug.keyState_Up    = ReadMemory<uint8_t>(ADDR_DINPUT_KEYBOARD + SCANCODE_UP);
+        g_inputDebug.keyState_Down  = ReadMemory<uint8_t>(ADDR_DINPUT_KEYBOARD + SCANCODE_DOWN);
+        g_inputDebug.keyState_Left  = ReadMemory<uint8_t>(ADDR_DINPUT_KEYBOARD + SCANCODE_LEFT);
+        g_inputDebug.keyState_Right = ReadMemory<uint8_t>(ADDR_DINPUT_KEYBOARD + SCANCODE_RIGHT);
+        g_inputDebug.keyState_Z     = ReadMemory<uint8_t>(ADDR_DINPUT_KEYBOARD + SCANCODE_Z);
+        g_inputDebug.keyState_X     = ReadMemory<uint8_t>(ADDR_DINPUT_KEYBOARD + SCANCODE_X);
+        g_inputDebug.keyState_Enter = ReadMemory<uint8_t>(ADDR_DINPUT_KEYBOARD + SCANCODE_ENTER);
+    }
 }
 
 void RenderInputDebugContent() {

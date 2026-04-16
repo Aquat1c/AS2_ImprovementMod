@@ -199,6 +199,8 @@ void PracticeTools_FrameUpdate() {
 
     if (!active) return;
 
+    PracticeTools_SyncControlSwapState();
+
     // --- Advance toast timers ---
     // Use a fixed dt since game runs at 60fps
     UpdateToasts(1.0f / 60.0f);
@@ -418,6 +420,38 @@ void PracticeTools_RenderHUD() {
             dl->AddText(ImVec2(x, y), col, t.text);
         }
     }
+}
+
+void PracticeTools_ApplyControlSwapState(bool swapped) {
+    InputSystem_SetControlSwap(swapped);
+
+    if (IsPracticeModeNow()) {
+        ApplyControlSwap(swapped);
+    }
+}
+
+void PracticeTools_SyncControlSwapState() {
+    if (!IsPracticeModeNow()) {
+        return;
+    }
+
+    const bool swapped = InputSystem_GetControlSwap();
+    const uint8_t expectedP1Cpu = swapped ? 1 : 0;
+    const uint8_t expectedP2Cpu = swapped ? 0 : 1;
+    const uint8_t p1Cpu = ReadMemory<uint8_t>(ADDR_P1_CPU_FLAG);
+    const uint8_t p2Cpu = ReadMemory<uint8_t>(ADDR_P2_CPU_FLAG);
+
+    if (p1Cpu == expectedP1Cpu && p2Cpu == expectedP2Cpu) {
+        return;
+    }
+
+    LOG_INFO("[Practice] Re-syncing control swap state after game-state change (swap=%d, p1_cpu=%u->%u, p2_cpu=%u->%u)",
+             swapped ? 1 : 0,
+             (unsigned int)p1Cpu,
+             (unsigned int)expectedP1Cpu,
+             (unsigned int)p2Cpu,
+             (unsigned int)expectedP2Cpu);
+    ApplyControlSwap(swapped);
 }
 
 bool PracticeTools_HasVisibleHud() {
