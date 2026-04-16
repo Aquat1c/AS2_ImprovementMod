@@ -420,6 +420,12 @@ void PracticeTools_RenderHUD() {
     }
 }
 
+bool PracticeTools_HasVisibleHud() {
+    return s_initialized &&
+           IsPracticeModeNow() &&
+           (s_paused || s_toastCount > 0);
+}
+
 // ============================================================================
 // Command History Hook
 // ============================================================================

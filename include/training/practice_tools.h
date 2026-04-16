@@ -32,6 +32,7 @@ void PracticeTools_RenderImGui();
 // In-game HUD overlay — drawn every present frame via ImGui foreground draw list.
 // Shows frame step state, toast notifications, etc.
 void PracticeTools_RenderHUD();
+bool PracticeTools_HasVisibleHud();
 
 // Freeze query — checked by input_sync_hooks to suppress frame advancement.
 // IMPORTANT: This is a pure query — does NOT modify step state.

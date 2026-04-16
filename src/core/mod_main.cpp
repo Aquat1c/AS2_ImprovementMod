@@ -178,6 +178,36 @@ static void ApplySharedImGuiScale() {
     g_lastAppliedImGuiScale = scale;
 }
 
+static bool HasVisibleImGuiOverlay() {
+    if (!g_initialized) {
+        return false;
+    }
+
+    if (ModMenu_IsOpen()) {
+        return true;
+    }
+
+    if (!Rollback::RollbackSession_IsActive() &&
+        HitboxViewer_IsEnabled() &&
+        AS2_IsInMatch()) {
+        return true;
+    }
+
+    if (NetplayHud_HasVisibleHud()) {
+        return true;
+    }
+
+    if (PracticeTools_HasVisibleHud()) {
+        return true;
+    }
+
+    if (Replay::ReplayRuntime_HasVisibleHud()) {
+        return true;
+    }
+
+    return false;
+}
+
 // ============================================================================
 // Verbose logging control
 // ============================================================================
@@ -656,6 +686,10 @@ __declspec(dllexport) void ModToggleMenu() {
 
 __declspec(dllexport) bool ModIsMenuRequestedOpen() {
     return ModMenu_IsRequestedOpen();
+}
+
+__declspec(dllexport) bool ModShouldRenderImGui() {
+    return HasVisibleImGuiOverlay();
 }
 
 __declspec(dllexport) bool ModGetNetplayHudText(char* out, int cap) {

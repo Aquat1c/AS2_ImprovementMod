@@ -67,6 +67,7 @@ typedef void (*ModSetImGuiContext_t)(void* ctx);
 typedef void (*ModOnGameExit_t)(int exitCode, const char* reason);
 typedef void (*ModToggleMenu_t)();
 typedef bool (*ModIsMenuRequestedOpen_t)();
+typedef bool (*ModShouldRenderImGui_t)();
 typedef bool (*ModGetNetplayHudText_t)(char* out, int cap);
 typedef bool (*ModWantsExclusiveOverlay_t)();
 typedef void (*ModSetLogDir_t)(const char* dir);
@@ -116,6 +117,7 @@ static ModSetImGuiContext_t g_pModSetImGuiContext = nullptr;
 static ModOnGameExit_t g_pModOnGameExit = nullptr;
 static ModToggleMenu_t g_pModToggleMenu = nullptr;
 static ModIsMenuRequestedOpen_t g_pModIsMenuRequestedOpen = nullptr;
+static ModShouldRenderImGui_t g_pModShouldRenderImGui = nullptr;
 static ModGetNetplayHudText_t g_pModGetNetplayHudText = nullptr;
 static ModGetMatchHudData_t g_pModGetMatchHudData = nullptr;
 static ModWantsExclusiveOverlay_t g_pModWantsExclusiveOverlay = nullptr;
@@ -3256,9 +3258,17 @@ static bool RenderPreparedImGuiToScalingTarget(IDirect3DDevice9* pDevice,
 
 void RenderImGui() {
     if (!g_imguiInitialized || !g_pDevice) return;
-    
-    // F1 toggle is now handled in HookedWndProc via WM_KEYDOWN
-    
+
+    const bool exclusiveOverlay = IsExclusiveModOverlayActive();
+    bool modShouldRender = true;
+    if (!g_showMenu && !exclusiveOverlay) {
+        modShouldRender = g_pModShouldRenderImGui ? g_pModShouldRenderImGui() : true;
+        if (!modShouldRender) {
+            g_imguiDrawDataReady = false;
+            return;
+        }
+    }
+
     // Start new frame
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -3274,51 +3284,51 @@ void RenderImGui() {
     ImGui::NewFrame();
     
     // Main menu bar
-    const bool exclusiveOverlay = IsExclusiveModOverlayActive();
-    const ImVec4 menuBarBg = ImGui::GetStyleColorVec4(ImGuiCol_MenuBarBg);
-    const ImVec4 popupBg = ImGui::GetStyleColorVec4(ImGuiCol_PopupBg);
-    ImGui::PushStyleColor(ImGuiCol_MenuBarBg,
-        ImVec4(menuBarBg.x, menuBarBg.y, menuBarBg.z, 0.76f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg,
-        ImVec4(popupBg.x, popupBg.y, popupBg.z, 0.94f));
-    if (g_showMenu && !exclusiveOverlay && ImGui::BeginMainMenuBar()) {
-        ImGui::Text("Alice Senki 2 - Improvement Mod v0.4");
-        ImGui::Separator();
-        if (ImGui::BeginMenu("Options")) {
-            if (ImGui::MenuItem("Settings", nullptr, false, g_pModToggleMenu != nullptr)) {
-                g_pModToggleMenu();
-                ProxyLog("[MENU] Settings toggle requested from proxy menu modRequested=%d showMenu=%d",
-                         QueryModMenuRequestedOpenState(),
-                         g_showMenu ? 1 : 0);
-            }
+    if (g_showMenu && !exclusiveOverlay) {
+        const ImVec4 menuBarBg = ImGui::GetStyleColorVec4(ImGuiCol_MenuBarBg);
+        const ImVec4 popupBg = ImGui::GetStyleColorVec4(ImGuiCol_PopupBg);
+        ImGui::PushStyleColor(ImGuiCol_MenuBarBg,
+            ImVec4(menuBarBg.x, menuBarBg.y, menuBarBg.z, 0.76f));
+        ImGui::PushStyleColor(ImGuiCol_PopupBg,
+            ImVec4(popupBg.x, popupBg.y, popupBg.z, 0.94f));
+        if (ImGui::BeginMainMenuBar()) {
+            ImGui::Text("Alice Senki 2 - Improvement Mod v0.4");
             ImGui::Separator();
-            bool showMenu = g_showMenu;
-            if (ImGui::MenuItem("Show Menu", "F1", &showMenu)) {
-                SetProxyMenuVisibleInternal(showMenu, "Options/Show Menu item", "ProxyMenuBar", g_gameWindow, WM_APP, VK_F1, 0);
-            }
-            {
-                bool borderlessChecked = g_isCurrentlyBorderless;
-                if (ImGui::MenuItem("Borderless Fullscreen", "F11", borderlessChecked)) {
-                    ToggleBorderlessFullscreen(g_gameWindow ? g_gameWindow : GetActiveWindow());
+            if (ImGui::BeginMenu("Options")) {
+                if (ImGui::MenuItem("Settings", nullptr, false, g_pModToggleMenu != nullptr)) {
+                    g_pModToggleMenu();
+                    ProxyLog("[MENU] Settings toggle requested from proxy menu modRequested=%d showMenu=%d",
+                             QueryModMenuRequestedOpenState(),
+                             g_showMenu ? 1 : 0);
                 }
+                ImGui::Separator();
+                bool showMenu = g_showMenu;
+                if (ImGui::MenuItem("Show Menu", "F1", &showMenu)) {
+                    SetProxyMenuVisibleInternal(showMenu, "Options/Show Menu item", "ProxyMenuBar", g_gameWindow, WM_APP, VK_F1, 0);
+                }
+                {
+                    bool borderlessChecked = g_isCurrentlyBorderless;
+                    if (ImGui::MenuItem("Borderless Fullscreen", "F11", borderlessChecked)) {
+                        ToggleBorderlessFullscreen(g_gameWindow ? g_gameWindow : GetActiveWindow());
+                    }
+                }
+                ImGui::MenuItem("Keep Aspect Ratio", nullptr, &g_keepAspectRatio);
+                if (ImGui::MenuItem(g_consoleVisible ? "Hide Debug Console" : "Show Debug Console")) {
+                    ToggleConsole();
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Exit Game")) {
+                    RequestGameShutdown("overlay Exit Game", g_gameWindow);
+                }
+                ImGui::EndMenu();
             }
-            ImGui::MenuItem("Keep Aspect Ratio", nullptr, &g_keepAspectRatio);
-            if (ImGui::MenuItem(g_consoleVisible ? "Hide Debug Console" : "Show Debug Console")) {
-                ToggleConsole();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Exit Game")) {
-                RequestGameShutdown("overlay Exit Game", g_gameWindow);
-            }
-            ImGui::EndMenu();
+            ImGui::EndMainMenuBar();
         }
-        ImGui::EndMainMenuBar();
+        ImGui::PopStyleColor(2);
     }
-    ImGui::PopStyleColor(2);
     
-    // Always call mod's render function (it handles menu visibility internally)
-    // This allows overlays like hitbox display to render even when menu is hidden
-    if (g_pModOnPresent) {
+    // Render mod overlays only when the mod reports something visible this frame.
+    if (g_pModOnPresent && modShouldRender) {
         // Share ImGui context with mod DLL on first call
         if (!g_imguiContextShared && g_pModSetImGuiContext) {
             void* ctx = ImGui::GetCurrentContext();
@@ -3332,12 +3342,18 @@ void RenderImGui() {
     // Render
     ImGui::EndFrame();
     ImGui::Render();
+    ImDrawData* drawData = ImGui::GetDrawData();
+    if (!drawData || drawData->CmdListsCount <= 0 || drawData->TotalVtxCount <= 0) {
+        g_imguiDrawDataReady = false;
+        return;
+    }
+
     g_imguiDrawDataReady = true;
     if (ShouldRenderImGuiViaScalingTarget()) {
         return;
     }
 
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    ImGui_ImplDX9_RenderDrawData(drawData);
     g_imguiDrawDataReady = false;
 }
 
@@ -5387,6 +5403,7 @@ bool LoadCoreModDLL() {
     g_pModOnGameExit = (ModOnGameExit_t)GetProcAddress(g_hModDLL, "ModOnGameExit");
     g_pModToggleMenu = (ModToggleMenu_t)GetProcAddress(g_hModDLL, "ModToggleMenu");
     g_pModIsMenuRequestedOpen = (ModIsMenuRequestedOpen_t)GetProcAddress(g_hModDLL, "ModIsMenuRequestedOpen");
+    g_pModShouldRenderImGui = (ModShouldRenderImGui_t)GetProcAddress(g_hModDLL, "ModShouldRenderImGui");
     g_pModGetNetplayHudText = (ModGetNetplayHudText_t)GetProcAddress(g_hModDLL, "ModGetNetplayHudText");
     g_pModGetMatchHudData = (ModGetMatchHudData_t)GetProcAddress(g_hModDLL, "ModGetMatchHudData");
     g_pModWantsExclusiveOverlay = (ModWantsExclusiveOverlay_t)GetProcAddress(g_hModDLL, "ModWantsExclusiveOverlay");
@@ -5397,8 +5414,8 @@ bool LoadCoreModDLL() {
         pModSetLogDir(g_logDir);
     }
     
-    ProxyLog("[MOD] Exports - Init:0x%p Shutdown:0x%p OnFrame:0x%p OnPresent:0x%p SetCtx:0x%p Exit:0x%p ToggleMenu:0x%p MenuState:0x%p Hud:0x%p MatchHud:0x%p Exclusive:0x%p",
-             g_pModInit, g_pModShutdown, g_pModOnFrame, g_pModOnPresent, g_pModSetImGuiContext, g_pModOnGameExit, g_pModToggleMenu, g_pModIsMenuRequestedOpen, g_pModGetNetplayHudText, g_pModGetMatchHudData, g_pModWantsExclusiveOverlay);
+    ProxyLog("[MOD] Exports - Init:0x%p Shutdown:0x%p OnFrame:0x%p OnPresent:0x%p SetCtx:0x%p Exit:0x%p ToggleMenu:0x%p MenuState:0x%p ShouldRender:0x%p Hud:0x%p MatchHud:0x%p Exclusive:0x%p",
+             g_pModInit, g_pModShutdown, g_pModOnFrame, g_pModOnPresent, g_pModSetImGuiContext, g_pModOnGameExit, g_pModToggleMenu, g_pModIsMenuRequestedOpen, g_pModShouldRenderImGui, g_pModGetNetplayHudText, g_pModGetMatchHudData, g_pModWantsExclusiveOverlay);
     
     return true;
 }

@@ -48,6 +48,13 @@ constexpr ImU32 kShadowCol      = IM_COL32(  0,   0,   0, 160);
 constexpr ImU32 kStatsBg        = IM_COL32(  0,   0,   0, 160);
 constexpr ImU32 kStatsText      = IM_COL32(255, 255, 255, 230);
 
+static uint32_t s_cachedHudFrame = UINT32_MAX;
+static uint32_t s_cachedHudMode = UINT32_MAX;
+static uint32_t s_cachedHudSubstate = UINT32_MAX;
+static uint32_t s_cachedHudGameType = UINT32_MAX;
+static bool s_cachedHudValid = false;
+static MatchHudData s_cachedHud = {};
+
 // ── UTF-8 helpers ───────────────────────────────────────────────────────
 
 static bool IsUtf8ContinuationByte(unsigned char value) {
@@ -117,15 +124,44 @@ static void DrawNickPill(ImDrawList* dl, const char* name, ImU32 bgCol,
     DrawShadowedText(dl, ImVec2(x + kNickPadW, y + kNickPadH), kNickText, clipped);
 }
 
+static bool QueryActiveHud(MatchHudData* outHud) {
+    const uint32_t frame = AS2_GetFrameNumber();
+    const uint32_t mode = GetGameMode();
+    const uint32_t substate = GetSubstate();
+    const uint32_t gameType = GetGameType();
+    if (s_cachedHudFrame != frame ||
+        s_cachedHudMode != mode ||
+        s_cachedHudSubstate != substate ||
+        s_cachedHudGameType != gameType) {
+        s_cachedHudFrame = frame;
+        s_cachedHudMode = mode;
+        s_cachedHudSubstate = substate;
+        s_cachedHudGameType = gameType;
+        s_cachedHudValid = ModGetMatchHudData(&s_cachedHud) && s_cachedHud.active;
+        if (!s_cachedHudValid) {
+            memset(&s_cachedHud, 0, sizeof(s_cachedHud));
+        }
+    }
+
+    if (outHud) {
+        *outHud = s_cachedHud;
+    }
+    return s_cachedHudValid;
+}
+
 } // namespace
 
 // ============================================================================
 // Rendering
 // ============================================================================
 
+bool NetplayHud_HasVisibleHud() {
+    return QueryActiveHud(nullptr);
+}
+
 void NetplayHud_Render() {
     MatchHudData hud{};
-    if (!ModGetMatchHudData(&hud) || !hud.active)
+    if (!QueryActiveHud(&hud))
         return;
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();

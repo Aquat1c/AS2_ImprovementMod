@@ -32,6 +32,7 @@ __declspec(dllexport) void ModOnPresent(void* pDevice);
 __declspec(dllexport) bool ModWantsExclusiveOverlay();
 __declspec(dllexport) void ModToggleMenu();
 __declspec(dllexport) bool ModIsMenuRequestedOpen();
+__declspec(dllexport) bool ModShouldRenderImGui();
 __declspec(dllexport) bool ModGetNetplayHudText(char* out, int cap);
 
 struct MatchHudData {

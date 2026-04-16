@@ -2462,6 +2462,10 @@ void ReplayRuntime_RenderHUD() {
     RenderReplayMatchHud();
 }
 
+bool ReplayRuntime_HasVisibleHud() {
+    return s_initialized && s_replayMatchActive && s_replayHudVisible;
+}
+
 bool ReplayRuntime_ShouldFreezeFrame() {
     return s_replayMatchActive && s_paused && s_seekTargetFrame < 0 && s_stepBudget == 0;
 }

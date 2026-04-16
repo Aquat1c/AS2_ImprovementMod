@@ -20,6 +20,7 @@ void ReplayRuntime_Init();
 void ReplayRuntime_Shutdown();
 void ReplayRuntime_FrameUpdate();
 void ReplayRuntime_RenderHUD();
+bool ReplayRuntime_HasVisibleHud();
 
 bool ReplayRuntime_ShouldFreezeFrame();
 bool ReplayRuntime_IsReplayMatchActive();

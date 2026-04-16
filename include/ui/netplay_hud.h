@@ -9,3 +9,4 @@
 #pragma once
 
 void NetplayHud_Render();
+bool NetplayHud_HasVisibleHud();
