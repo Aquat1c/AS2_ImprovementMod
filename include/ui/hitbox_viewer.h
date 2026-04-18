@@ -23,8 +23,21 @@
  *   - ATK:         entity+0x6C8 == 1 && entity+0x6D4 != 0
  *   - CLASH:       entity+0x77C rank, entity+0x788 continuation ID
  *   - MAX HIT:     entity+0x78C/+0x78E/+0x790 raw max-hit lanes
- *   - ARMOR:       entity+0x6CC & 0x20000 (force active)
+ *   - INVINCIBLE:  legacy defender gate at entity+0x78C (the source the older viewer used)
+ *                  plus direct defense bits from entity+0x794 (0x2000 melee, 0x4000 projectile)
+ *                  and marker-gated special states from ((entity+0x788)|(entity+0x794)) & (0x10000|0x8000)
+ *                  when entity+0x79C != 0. entity+0x79D is tracked separately in the info overlay.
+ *   - CONTACT OVERRIDE: entity+0x6CC & 0x20000 literal collision override that bypasses @40/@72
+ *                  box-size / overlap checks; kept out of the main HUD labels because no cleaner
+ *                  in-game mechanic name is verified yet.
  *   - PROJ IMMUNE: entity+0x6CC & 0x800
+ *   - BREAK:       command-20 timer at entity+0x688. The HUD label follows the
+ *                  active window itself, while `Entity_TryAction_Super1` gates stay
+ *                  in the info panel as "usable now" debug.
+ *   - LIGHT BREAK: command-21 timer at entity+0x689. `0x689` is the Orange /
+ *                  Light Break countdown window, not a mechanic ID by itself;
+ *                  `Entity_TryAction_Super2` gates are tracked separately in debug.
+ *   - CANCEL:      older action-107 / 49 / 52 / 59-62 routes, kept as debug.
  */
 
 #pragma once

@@ -376,29 +376,49 @@
 #define ENTITY_OFF_HIT_ACTIVE    0x06D4   // +1748, BYTE — hit data active flag
 
 // Attack type flag bits (entity+1740)
-#define ATTACK_FLAG_LOW_HIT      0x00001  // Low hit type (stand vs crouch)
-#define ATTACK_FLAG_PROJ_IMMUNE  0x00800  // Projectile immunity / bypasses the defender +1932 gate in melee/summon checks
-#define ATTACK_FLAG_FORCE_ACTIVE 0x20000  // Force active / super armor (bypasses box dimension checks)
+#define ATTACK_FLAG_LOW_HIT          0x00001  // Low hit type (stand vs crouch)
+#define ATTACK_FLAG_PROJ_IMMUNE      0x00800  // Projectile immunity / bypasses the defender +1932 gate in melee/summon checks
+#define ATTACK_FLAG_CONTACT_OVERRIDE 0x20000  // Bypasses box-size / overlap checks in grab, damage, hit-detection, and summon-collision paths
 
 // Verified clash / max-hit block (entity+0x77C..0x79D).
 // Entity_SetClashData writes the raw clash payload used by Entity_ResolveAttackCollision.
 // Entity_UpdateMaxHitData writes the raw max-hit lanes consulted by clash/melee/summon logic.
-// Only clash rank (+1916) and continuation ID (+1928) are fully named; the raw A-D fields
-// are used directly in overlap math but their higher-level gameplay labels remain partially unverified.
+// The first max-hit lane (+1932) is still used directly as a defender invulnerability gate in
+// Entity_UpdateGrabAlignment / Entity_UpdateHitDetection / summon-player checks, which matches
+// the old viewer's simple "entity+0x78C != 0" indicator. Move scripts also write special
+// 0x10000 / 0x8000 bits into the clash continuation ID (+1928) together with the +1948 marker,
+// while later damage-resolution helpers consult the same bit positions on the max-hit flags
+// (+1940). Only clash rank (+1916) and continuation ID (+1928) are fully named; the raw A-D
+// fields are used directly in overlap math but their higher-level gameplay labels remain
+// partially unverified.
 #define ENTITY_OFF_CLASH_RANK        0x077C  // +1916, BYTE  — clash rank / priority
 #define ENTITY_OFF_CLASH_RAW_A       0x077E  // +1918, WORD  — raw clash field A
 #define ENTITY_OFF_CLASH_RAW_B       0x0780  // +1920, WORD  — raw clash field B
 #define ENTITY_OFF_CLASH_RAW_C       0x0782  // +1922, WORD  — raw clash field C
 #define ENTITY_OFF_CLASH_RAW_D       0x0784  // +1924, WORD  — raw clash field D
-#define ENTITY_OFF_CLASH_ID          0x0788  // +1928, DWORD — clash continuation action / ID
-#define ENTITY_OFF_MAX_HIT_RAW_A     0x078C  // +1932, WORD  — max-hit raw lane A
+#define ENTITY_OFF_CLASH_ID          0x0788  // +1928, DWORD — clash continuation action / ID / scripted special flag source
+#define ENTITY_OFF_MAX_HIT_RAW_A     0x078C  // +1932, WORD  — max-hit raw lane A / legacy invulnerability gate
 #define ENTITY_OFF_MAX_HIT_RAW_B     0x078E  // +1934, WORD  — max-hit raw lane B
 #define ENTITY_OFF_MAX_HIT_RAW_C     0x0790  // +1936, WORD  — max-hit raw lane C
 #define ENTITY_OFF_MAX_HIT_RAW_D     0x0792  // +1938, WORD  — max-hit raw aux value
 #define ENTITY_OFF_MAX_HIT_ID        0x0794  // +1940, DWORD — max-hit raw aux ID
+#define ENTITY_OFF_MAX_HIT_FLAGS     ENTITY_OFF_MAX_HIT_ID  // Preferred alias when treating +1940 as bitflags
+#define ENTITY_OFF_INVINCIBILITY     ENTITY_OFF_MAX_HIT_RAW_A  // Legacy alias used by the original viewer; nonzero still blocks several defender hit checks
 #define ENTITY_OFF_MAX_HIT_ACTIVE    0x0798  // +1944, DWORD — max-hit block active flag
-#define ENTITY_OFF_HIT_MARKER_1948   0x079C  // +1948, BYTE  — special hit marker
-#define ENTITY_OFF_HIT_MARKER_1949   0x079D  // +1949, BYTE  — special hit marker
+#define ENTITY_OFF_HIT_MARKER_1948   0x079C  // +1948, BYTE  — special hit marker / timer used with 0x10000/0x8000
+#define ENTITY_OFF_HIT_MARKER_1949   0x079D  // +1949, BYTE  — reaction/clash helper marker (not treated as generic invuln)
+
+// Max-hit / collision-state flag bits (+1940).
+// This block behaves like a copied defense/frame-state mask in the collision helpers:
+//   0x2000 is checked as a direct melee-invuln gate in sub_4A5EF0.
+//   0x4000 suppresses the normal follow-through branch in sub_4A6030.
+//   0x8000 / 0x10000 are special invuln states that still require +1948.
+#define CLASH_ID_FLAG_INVINCIBLE         0x10000
+#define CLASH_ID_FLAG_SPECIAL_INVULN     0x08000
+#define MAX_HIT_FLAG_MELEE_INVULN        0x02000
+#define MAX_HIT_FLAG_PROJECTILE_INVULN   0x04000
+#define MAX_HIT_FLAG_INVINCIBLE          0x10000
+#define MAX_HIT_FLAG_SPECIAL_INVULN      0x08000
 
 // Active rect / pushbox (entity-relative single rects).
 // Managed by Input_SetNextRect / Input_ApplyNextRect.

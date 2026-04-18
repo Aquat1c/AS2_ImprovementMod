@@ -54,8 +54,8 @@ static bool  g_logPerFrame     = false;
 
 static uint32_t s_lastP1Anim = 0xFFFFFFFF;
 static uint32_t s_lastP2Anim = 0xFFFFFFFF;
-static uint32_t s_lastP1Action = 0xFFFFFFFF;
-static uint32_t s_lastP2Action = 0xFFFFFFFF;
+static uint32_t s_lastP1State = 0xFFFFFFFF;
+static uint32_t s_lastP2State = 0xFFFFFFFF;
 
 // ============================================================================
 // Colour constants
@@ -73,6 +73,7 @@ static const ImU32 COL_HITDEF_PT = IM_COL32(255, 80, 80, 255);
 static const ImU32 COL_P1_CROSS  = IM_COL32(255, 120, 120, 255);
 static const ImU32 COL_P2_CROSS  = IM_COL32(120, 120, 255, 255);
 static const ImU32 COL_CANCEL    = IM_COL32(255, 245, 120, 255);
+static const ImU32 COL_INVINCIBLE = IM_COL32(90, 175, 255, 255);
 static const ImU32 COL_ARMOR     = IM_COL32(255, 160, 0, 255);
 static const ImU32 COL_IMMUNE    = IM_COL32(180, 0, 255, 255);
 
@@ -117,7 +118,7 @@ static ImVec2 WorldToDisplay(int16_t wx, int16_t wy, const ScreenTransform& t) {
 
 static void DrawBox(ImDrawList* dl, float l, float top, float r, float bot,
                     ImU32 outline, float alpha, const ScreenTransform& t,
-                    BoxRenderPass pass) {
+                    BoxRenderPass pass, float outlinePadding = 0.0f) {
     ImVec2 p1 = GameToDisplay(l, top, t);
     ImVec2 p2 = GameToDisplay(r, bot, t);
     if (p1.x > p2.x) { float tmp = p1.x; p1.x = p2.x; p2.x = tmp; }
@@ -125,6 +126,12 @@ static void DrawBox(ImDrawList* dl, float l, float top, float r, float bot,
     if (pass == BoxRenderPass::FillOnly) {
         dl->AddRectFilled(p1, p2, ColFill(outline, alpha));
         return;
+    }
+    if (outlinePadding != 0.0f) {
+        p1.x -= outlinePadding;
+        p1.y -= outlinePadding;
+        p2.x += outlinePadding;
+        p2.y += outlinePadding;
     }
     dl->AddRect(p1, p2, outline, 0.0f, 0, 2.0f);
 }
@@ -166,7 +173,20 @@ struct CancelRouteSnapshot {
     uint8_t airborne;
     uint16_t airMoveInput;
     uint32_t gateState;
+    uint8_t command20Timer;
+    uint8_t command21Timer;
+    uint16_t super1Gate;
+    uint8_t super1Lock;
+    uint16_t super2GateA;
+    uint16_t super2GateB;
+    uint16_t super2GateC;
+    uint16_t super2GateD;
     uint16_t action107Threshold;
+    uint16_t case20Action;
+    uint16_t case21Action;
+    uint8_t case20Ready;
+    uint8_t case21Ready;
+    uint8_t case21State4Path;
     uint8_t readyActionCount;
     uint16_t readyActions[4];
 };
@@ -182,10 +202,19 @@ static constexpr uint8_t kCancelFamilyTypeByCharId[22] = {
 };
 
 static constexpr uintptr_t kEntityOffRawInputWord30 = 30;
+static constexpr uintptr_t kEntityOffStateIndex = 8;
 static constexpr uintptr_t kEntityOffAirMoveInput = 78;
 static constexpr uintptr_t kEntityOffCommandSlot16Gate = 783;
 static constexpr uintptr_t kEntityOffCommandSlot22Gate = 807;
 static constexpr uintptr_t kEntityOffCommandSlot26Gate = 823;
+static constexpr uintptr_t kEntityOffCancelWindowAux = 1672;
+static constexpr uintptr_t kEntityOffCancelWindowKind = 1673;
+static constexpr uintptr_t kEntityOffSuper1Gate = 146;
+static constexpr uintptr_t kEntityOffSuper1Lock = 434;
+static constexpr uintptr_t kEntityOffSuper2GateA = 130;
+static constexpr uintptr_t kEntityOffSuper2GateB = 76;
+static constexpr uintptr_t kEntityOffSuper2GateC = 74;
+static constexpr uintptr_t kEntityOffSuper2GateD = 132;
 static constexpr uintptr_t kEntityOffAirborneFlag = 1732;
 static constexpr uintptr_t kEntityOffCancelGateState = 1952;
 static constexpr uint16_t kAction49 = 49;
@@ -195,6 +224,10 @@ static constexpr uint16_t kAction60 = 60;
 static constexpr uint16_t kAction61 = 61;
 static constexpr uint16_t kAction62 = 62;
 static constexpr uint16_t kAction107 = 107;
+static constexpr uint16_t kAction137 = 137;
+static constexpr uint16_t kAction138 = 138;
+static constexpr uint16_t kAction139 = 139;
+static constexpr uint16_t kAction140 = 140;
 
 struct HitboxViewerFrameContext {
     ScreenTransform transform;
@@ -228,7 +261,9 @@ struct EntitySnapshot {
     int8_t facing;
     int16_t hp;
     uint32_t animIdx;
-    uint32_t actionId;
+    uint32_t stateIndex;
+    uint16_t actionPhase;
+    uint16_t actionFrame;
     uint8_t attackState;
     uint32_t attackType;
     uint8_t hitActive;
@@ -298,7 +333,8 @@ static void RenderBoxSet(ImDrawList* dl,
                          ImU32 colour,
                          const ScreenTransform& t,
                          const char* boxLabel,
-                         BoxRenderPass pass);
+                         BoxRenderPass pass,
+                         float outlinePadding = 0.0f);
 static void RenderHurtboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t, BoxRenderPass pass);
 static void RenderEntityHitboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t, BoxRenderPass pass);
 static void RenderThrowboxes(ImDrawList* dl, const EntitySnapshot& entity, const ScreenTransform& t, BoxRenderPass pass);
@@ -551,6 +587,45 @@ static CancelRouteSnapshot BuildCancelRouteSnapshot(int playerIndex,
     snapshot.airborne = ReadMemory<uint8_t>(entityBase + kEntityOffAirborneFlag);
     snapshot.airMoveInput = ReadMemory<uint16_t>(entityBase + kEntityOffAirMoveInput);
     snapshot.gateState = ReadMemory<uint32_t>(entityBase + kEntityOffCancelGateState);
+    snapshot.command20Timer = ReadMemory<uint8_t>(entityBase + kEntityOffCancelWindowAux);
+    snapshot.command21Timer = ReadMemory<uint8_t>(entityBase + kEntityOffCancelWindowKind);
+    snapshot.super1Gate = ReadMemory<uint16_t>(entityBase + kEntityOffSuper1Gate);
+    snapshot.super1Lock = ReadMemory<uint8_t>(entityBase + kEntityOffSuper1Lock);
+    snapshot.super2GateA = ReadMemory<uint16_t>(entityBase + kEntityOffSuper2GateA);
+    snapshot.super2GateB = ReadMemory<uint16_t>(entityBase + kEntityOffSuper2GateB);
+    snapshot.super2GateC = ReadMemory<uint16_t>(entityBase + kEntityOffSuper2GateC);
+    snapshot.super2GateD = ReadMemory<uint16_t>(entityBase + kEntityOffSuper2GateD);
+
+    if (snapshot.command20Timer != 0 &&
+        snapshot.super1Gate != 0 &&
+        snapshot.meter >= 0x03E8u &&
+        snapshot.super1Lock == 0) {
+        if (snapshot.airborne == 0) {
+            snapshot.case20Action = kAction137;
+            snapshot.case20Ready = 1;
+        } else if (posY < 7280) {
+            snapshot.case20Action = kAction138;
+            snapshot.case20Ready = 1;
+        }
+    }
+
+    const bool super2Window = ((snapshot.super2GateA != 0 && snapshot.super2GateB == 1) ||
+                               (snapshot.super2GateC == 1 && snapshot.super2GateD != 0));
+    if (snapshot.command21Timer != 0 && super2Window && snapshot.gateState == 4u) {
+        // Another 139/140 caller (AI_DecideAirTech in the refactored decomp) accepts
+        // gateState==4 without the normal 0x1F4 meter threshold. Keep that path visible
+        // in the overlay separately until the human-facing route is fully confirmed.
+        snapshot.case21State4Path = 1;
+    }
+    if (snapshot.command21Timer != 0 && super2Window && snapshot.meter >= 0x01F4u) {
+        if (snapshot.airborne == 0) {
+            snapshot.case21Action = kAction139;
+            snapshot.case21Ready = 1;
+        } else if (posY < 7280) {
+            snapshot.case21Action = kAction140;
+            snapshot.case21Ready = 1;
+        }
+    }
 
     const Action107RouteConfig action107 = GetAction107RouteConfig(snapshot.charId);
     snapshot.action107Threshold = action107.meterThreshold;
@@ -600,7 +675,9 @@ static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
     snapshot.facing = ReadMemory<int8_t>(entityBase + ENTITY_OFF_FACING);
     snapshot.hp = ReadMemory<int16_t>(entityBase + ENTITY_OFF_HP);
     snapshot.animIdx = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ANIM_INDEX);
-    snapshot.actionId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID);
+    snapshot.stateIndex = ReadMemory<uint32_t>(entityBase + kEntityOffStateIndex);
+    snapshot.actionPhase = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_PHASE);
+    snapshot.actionFrame = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_FRAME);
     snapshot.attackState = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_ATTACK_STATE);
     snapshot.attackType = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ATTACK_TYPE);
     snapshot.hitActive = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_ACTIVE);
@@ -618,7 +695,7 @@ static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
     snapshot.maxHit.active = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ACTIVE);
     snapshot.maxHit.marker1948 = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_MARKER_1948);
     snapshot.maxHit.marker1949 = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_MARKER_1949);
-    snapshot.cancelRoutes = BuildCancelRouteSnapshot(playerIndex, entityBase, snapshot.actionId, snapshot.posY);
+    snapshot.cancelRoutes = BuildCancelRouteSnapshot(playerIndex, entityBase, snapshot.stateIndex, snapshot.posY);
     snapshot.animFrame = GetOrLoadAnimFrameSnapshot(cache, entityBase, snapshot.animIdx, label);
     return snapshot;
 }
@@ -701,7 +778,8 @@ static void RenderBoxSet(ImDrawList* dl,
                          ImU32 colour,
                          const ScreenTransform& t,
                          const char* boxLabel,
-                         BoxRenderPass pass) {
+                         BoxRenderPass pass,
+                         float outlinePadding) {
     if (!boxes) {
         return;
     }
@@ -751,7 +829,7 @@ static void RenderBoxSet(ImDrawList* dl,
                      bot);
         }
 
-        DrawBox(dl, left, top, right, bot, colour, g_fillAlpha, t, pass);
+        DrawBox(dl, left, top, right, bot, colour, g_fillAlpha, t, pass, outlinePadding);
     }
 }
 
@@ -782,7 +860,34 @@ static void RenderThrowboxes(ImDrawList* dl,
     if (!entity.animFrame) {
         return;
     }
-    RenderBoxSet(dl, entity, entity.animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME, COL_THROWBOX, t, "ext", pass);
+    const float outlinePadding = (pass == BoxRenderPass::OutlineOnly) ? 1.5f : 0.0f;
+    RenderBoxSet(dl, entity, entity.animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME, COL_THROWBOX, t, "ext", pass, outlinePadding);
+}
+
+static uint32_t GetLegacyInvincibleGateValue(const EntitySnapshot& entity) {
+    return entity.maxHit.rawA;
+}
+
+static uint32_t GetDirectInvincibleFlagBits(const EntitySnapshot& entity) {
+    return entity.maxHit.rawId & (MAX_HIT_FLAG_MELEE_INVULN | MAX_HIT_FLAG_PROJECTILE_INVULN);
+}
+
+static uint32_t GetMarkerInvincibleStateBits(const EntitySnapshot& entity) {
+    const uint32_t invulnFlags = CLASH_ID_FLAG_INVINCIBLE | CLASH_ID_FLAG_SPECIAL_INVULN;
+    if (entity.maxHit.marker1948 == 0) {
+        return 0;
+    }
+    return (entity.clash.continuationId | entity.maxHit.rawId) & invulnFlags;
+}
+
+static bool HasInvincibleState(const EntitySnapshot& entity) {
+    return GetLegacyInvincibleGateValue(entity) != 0
+        || GetDirectInvincibleFlagBits(entity) != 0
+        || GetMarkerInvincibleStateBits(entity) != 0;
+}
+
+static const char* BoolWord(bool value) {
+    return value ? "yes" : "no";
 }
 
 static void RenderStateFlags(ImDrawList* dl,
@@ -801,15 +906,24 @@ static void RenderStateFlags(ImDrawList* dl,
         yOff -= (sz.y + 4.0f);
     };
 
-    if (entity.cancelRoutes.readyActionCount != 0) {
+    bool drewPrimaryCancel = false;
+    if (entity.cancelRoutes.command20Timer != 0) {
+        drawLabel(COL_CANCEL, "BREAK");
+        drewPrimaryCancel = true;
+    }
+    if (entity.cancelRoutes.command21Timer != 0) {
+        drawLabel(COL_CANCEL, "LIGHT BREAK");
+        drewPrimaryCancel = true;
+    }
+    if (!drewPrimaryCancel && entity.cancelRoutes.readyActionCount != 0) {
         char readyText[32];
         FormatReadyCancelActions(entity.cancelRoutes, readyText, sizeof(readyText));
         snprintf(buf, sizeof(buf), "CANCEL %s", readyText);
         drawLabel(COL_CANCEL, buf);
     }
 
-    if (entity.attackType & ATTACK_FLAG_FORCE_ACTIVE) {
-        drawLabel(COL_ARMOR, "ARMOR");
+    if (HasInvincibleState(entity)) {
+        drawLabel(COL_INVINCIBLE, "INVINCIBLE");
     }
 
     if (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE) {
@@ -957,10 +1071,209 @@ static void RenderPosition(ImDrawList* dl,
     dl->AddLine(c, ImVec2(c.x + arrowLen, c.y), colour, 2.5f);
 }
 
+static void RenderEntityInfoPanel(const EntitySnapshot& entity) {
+    const AnimFrameSnapshot* animFrame = entity.animFrame;
+    const int hurtCount = animFrame ? CountActiveBoxes(animFrame->hurtBoxes, HURTBOX_COUNT_PER_FRAME) : 0;
+    const int hitCount = animFrame ? CountActiveBoxes(animFrame->hitBoxes, HURTBOX_COUNT_PER_FRAME) : 0;
+    const int extCount = animFrame ? CountActiveBoxes(animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME) : 0;
+    const bool breakWindowActive = entity.cancelRoutes.command20Timer != 0;
+    const bool lightBreakWindowActive = entity.cancelRoutes.command21Timer != 0;
+    const ImVec4 playerCol = entity.playerIndex == 0
+        ? ImVec4(1.00f, 0.55f, 0.55f, 1.00f)
+        : ImVec4(0.55f, 0.65f, 1.00f, 1.00f);
+    const ImVec4 activeCol = ImVec4(1.00f, 0.96f, 0.47f, 1.00f);
+    const ImVec4 infoCol = ImVec4(0.75f, 0.78f, 0.85f, 1.00f);
+    char buf[256];
+    char readyText[32];
+    FormatReadyCancelActions(entity.cancelRoutes, readyText, sizeof(readyText));
+
+    auto text = [&](const char* fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        ImGui::TextUnformatted(buf);
+    };
+    auto textColored = [&](const ImVec4& col, const char* fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        ImGui::TextColored(col, "%s", buf);
+    };
+
+    ImGui::TextColored(playerCol, "%s", entity.label);
+    ImGui::Separator();
+    text("Pos %d,%d  Face %d  HP %d  Meter %u",
+         entity.posX, entity.posY, entity.facing, entity.hp, entity.cancelRoutes.meter);
+    text("State %u  Phase %u  Frame %u  Anim %u",
+         entity.stateIndex, entity.actionPhase, entity.actionFrame, entity.animIdx);
+    text("Atk state %u  Type 0x%X  Hit active %u",
+         entity.attackState, entity.attackType, entity.hitActive);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Cancel windows");
+    ImGui::Indent();
+    if (breakWindowActive) {
+        textColored(activeCol, "BREAK window: %u frames", entity.cancelRoutes.command20Timer);
+    } else {
+        text("BREAK window: 0");
+    }
+    text("  usable: %s  route: %u",
+         BoolWord(entity.cancelRoutes.case20Ready != 0),
+         entity.cancelRoutes.case20Action);
+    text("  gate146: %u  lock434: %u",
+         entity.cancelRoutes.super1Gate,
+         entity.cancelRoutes.super1Lock);
+    if (lightBreakWindowActive) {
+        textColored(activeCol, "LIGHT BREAK window: %u frames", entity.cancelRoutes.command21Timer);
+    } else {
+        text("LIGHT BREAK window: 0");
+    }
+    text("  usable: %s  route: %u",
+         BoolWord(entity.cancelRoutes.case21Ready != 0),
+         entity.cancelRoutes.case21Action);
+    text("  gate130/76: %u/%u  gate74/132: %u/%u",
+         entity.cancelRoutes.super2GateA,
+         entity.cancelRoutes.super2GateB,
+         entity.cancelRoutes.super2GateC,
+         entity.cancelRoutes.super2GateD);
+    text("  state4 path: %s", BoolWord(entity.cancelRoutes.case21State4Path != 0));
+    textColored(infoCol, "Legacy routes: %s", readyText);
+    ImGui::Unindent();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Defence");
+    ImGui::Indent();
+    text("Invincible: %s", BoolWord(HasInvincibleState(entity)));
+    text("  gate: 0x%X  flags: 0x%X  marker: 0x%X",
+         GetLegacyInvincibleGateValue(entity),
+         GetDirectInvincibleFlagBits(entity),
+         GetMarkerInvincibleStateBits(entity));
+    text("  marker1948: %u  marker1949: %u",
+         entity.maxHit.marker1948,
+         entity.maxHit.marker1949);
+    if (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE) {
+        textColored(infoCol, "Projectile immunity is active.");
+    }
+    if (entity.attackType & ATTACK_FLAG_CONTACT_OVERRIDE) {
+        ImGui::TextWrapped("Contact override is active: hit / grab checks can bypass the normal box-size and overlap tests.");
+    }
+    ImGui::Unindent();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Boxes");
+    ImGui::Indent();
+    text("Counts  coll:%u  hurt:%d  hit:%d  ext:%d",
+         (animFrame && animFrame->collisionBox.halfW > 0 && animFrame->collisionBox.halfH > 0) ? 1u : 0u,
+         hurtCount,
+         hitCount,
+         extCount);
+    if (!animFrame) {
+        textColored(infoCol, "No animation frame snapshot is loaded.");
+    } else {
+        char treeLabel[32];
+        snprintf(treeLabel, sizeof(treeLabel), "Frame boxes##%s", entity.label);
+        if (ImGui::TreeNode(treeLabel)) {
+            if (animFrame->collisionBox.halfW > 0 && animFrame->collisionBox.halfH > 0) {
+                text("coll off(%d,%d) half(%d,%d)",
+                     animFrame->collisionBox.xOff,
+                     animFrame->collisionBox.yOff,
+                     animFrame->collisionBox.halfW,
+                     animFrame->collisionBox.halfH);
+            }
+            for (int i = 0; i < HURTBOX_COUNT_PER_FRAME; i++) {
+                const BoxEntry& hurtBox = animFrame->hurtBoxes[i];
+                const BoxEntry& hitBox = animFrame->hitBoxes[i];
+                const BoxEntry& throwBox = animFrame->throwBoxes[i];
+                if (hurtBox.halfW > 0 && hurtBox.halfH > 0) {
+                    text("hurt%d off(%d,%d) half(%d,%d)",
+                         i, hurtBox.xOff, hurtBox.yOff, hurtBox.halfW, hurtBox.halfH);
+                }
+                if (hitBox.halfW > 0 && hitBox.halfH > 0) {
+                    text("hit%d off(%d,%d) half(%d,%d)",
+                         i, hitBox.xOff, hitBox.yOff, hitBox.halfW, hitBox.halfH);
+                }
+                if (throwBox.halfW > 0 && throwBox.halfH > 0) {
+                    text("ext%d off(%d,%d) half(%d,%d)",
+                         i, throwBox.xOff, throwBox.yOff, throwBox.halfW, throwBox.halfH);
+                }
+            }
+            ImGui::TreePop();
+        }
+    }
+    ImGui::Unindent();
+}
+
+static void RenderInfoPanelWindow(const HitboxViewerFrameContext& ctx,
+                                  const EntitySnapshot& p1,
+                                  const EntitySnapshot& p2) {
+    const ImVec2 defaultPos(ModUI_Scale(10.0f), ModUI_Scale(70.0f));
+    const ImVec2 defaultSize(ModUI_Scale(620.0f), ModUI_Scale(360.0f));
+    char scrollHex[128];
+
+    ImGui::SetNextWindowPos(defaultPos, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(defaultSize, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.84f);
+
+    bool windowOpen = g_showInfo;
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+    if (!ImGui::Begin("Hitbox Viewer Info", &windowOpen, flags)) {
+        ImGui::End();
+        g_showInfo = windowOpen;
+        return;
+    }
+    g_showInfo = windowOpen;
+
+    ImGui::Text("Scroll %d,%d  Display %.0fx%.0f  Scale %.2f,%.2f",
+                ctx.transform.scrollX, ctx.transform.scrollY,
+                ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y,
+                ctx.transform.scaleX, ctx.transform.scaleY);
+    ImGui::Separator();
+    ImGui::BeginChild("HBVInfoScroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+
+    if (g_showMatchState && ImGui::CollapsingHeader("Match / camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("Mode %u  Sub %u  Type %u  Sim %u  Disp %u",
+                    ctx.gameMode, ctx.subState, ctx.gameType, ctx.simFrame, ctx.dispFrame);
+        ImGui::Text("Phase timer %u  Round timer %u", ctx.phaseTimer, ctx.roundTimer);
+        ImGui::Text("P1 base 0x%08X  P2 base 0x%08X  Stride %d",
+                    (uint32_t)p1.base, (uint32_t)p2.base, ENTITY_SIZE);
+        ImGui::Text("Anim data +0x%X  stride %d  coll@%d hit@%d hurt@%d ext@%d  %dx%dB",
+                    ENTITY_OFF_ANIM_DATA, ANIM_DATA_STRIDE,
+                    ANIM_COLLISION_OFFSET, ANIM_HITBOX_OFFSET, ANIM_HURTBOX_OFFSET, ANIM_EXT_HURTBOX_OFFSET,
+                    HURTBOX_COUNT_PER_FRAME, HURTBOX_ENTRY_SIZE);
+        int pos = 0;
+        for (int i = 0; i < 8 && pos + 6 < (int)sizeof(scrollHex); i++) {
+            pos += snprintf(scrollHex + pos, sizeof(scrollHex) - pos, "%04X ",
+                            (uint16_t)ctx.scrollVicinity[i]);
+        }
+        ImGui::Text("Scroll vicinity %s", scrollHex);
+        ImGui::Separator();
+    }
+
+    if (ImGui::BeginTable("HBVPlayerColumns",
+                          2,
+                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_Resizable)) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        RenderEntityInfoPanel(p1);
+        ImGui::TableSetColumnIndex(1);
+        RenderEntityInfoPanel(p2);
+        ImGui::EndTable();
+    }
+
+    ImGui::EndChild();
+    ImGui::End();
+}
+
 static void RenderInfoOverlay(ImDrawList* dl,
                               const HitboxViewerFrameContext& ctx,
                               const EntitySnapshot& p1,
                               const EntitySnapshot& p2) {
+    (void)dl;
+    RenderInfoPanelWindow(ctx, p1, p2);
+    return;
+
     char buf[256];
     float y = 10.0f;
     const float x = 10.0f;
@@ -976,8 +1289,11 @@ static void RenderInfoOverlay(ImDrawList* dl,
 
     const EntitySnapshot* players[2] = { &p1, &p2 };
     for (int pi = 0; pi < 2; pi++) {
-        totalLines += 2;
+        totalLines += 6;
         const AnimFrameSnapshot* animFrame = players[pi]->animFrame;
+        if (players[pi]->attackType & ATTACK_FLAG_CONTACT_OVERRIDE) {
+            totalLines++;
+        }
         if (!animFrame) {
             continue;
         }
@@ -989,7 +1305,7 @@ static void RenderInfoOverlay(ImDrawList* dl,
         totalLines += CountActiveBoxes(animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME);
     }
 
-    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 680, y + lineH * totalLines + 6), bg);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 860, y + lineH * totalLines + 6), bg);
 
     auto line = [&](ImU32 col, const char* fmt, ...) {
         va_list ap;
@@ -1034,22 +1350,70 @@ static void RenderInfoOverlay(ImDrawList* dl,
         const EntitySnapshot& entity = *players[pi];
         const AnimFrameSnapshot* animFrame = entity.animFrame;
         ImU32 col = (pi == 0) ? COL_P1_CROSS : COL_P2_CROSS;
-           char readyText[32];
-           FormatReadyCancelActions(entity.cancelRoutes, readyText, sizeof(readyText));
-        line(col, "P%d Pos:%d,%d Face:%d HP:%d Act:%u Anim:%u Atk:%u Flags:0x%X",
+        char readyText[32];
+        FormatReadyCancelActions(entity.cancelRoutes, readyText, sizeof(readyText));
+        line(col, "P%d Pos:%d,%d Face:%d HP:%d State:%u Anim:%u Atk:%u Flags:0x%X",
              pi + 1, entity.posX, entity.posY, entity.facing, entity.hp,
-             entity.actionId, entity.animIdx, entity.attackState, entity.attackType);
-           line(col, "  cancel c:%u f:%u m:%u 107:%u g:%u/%u/%u air:%u mv:%u r:%s",
-               entity.cancelRoutes.charId,
-               entity.cancelRoutes.familyType,
-               entity.cancelRoutes.meter,
-               entity.cancelRoutes.action107Threshold,
-               entity.cancelRoutes.gate16,
-               entity.cancelRoutes.gate22,
-               entity.cancelRoutes.gate26,
-               entity.cancelRoutes.airborne,
-               entity.cancelRoutes.airMoveInput,
-               readyText);
+             entity.stateIndex, entity.animIdx, entity.attackState, entity.attackType);
+        line(col, "  case20 timer688:%u ready:%u act:%u gate146:%u lock434:%u meter:%u",
+             entity.cancelRoutes.command20Timer,
+             entity.cancelRoutes.case20Ready,
+             entity.cancelRoutes.case20Action,
+             entity.cancelRoutes.super1Gate,
+             entity.cancelRoutes.super1Lock,
+             entity.cancelRoutes.meter);
+        line(col, "  case21 timer689:%u ready:%u act:%u gate130/76:%u/%u gate74/132:%u/%u state4:%u",
+             entity.cancelRoutes.command21Timer,
+             entity.cancelRoutes.case21Ready,
+             entity.cancelRoutes.case21Action,
+             entity.cancelRoutes.super2GateA,
+             entity.cancelRoutes.super2GateB,
+             entity.cancelRoutes.super2GateC,
+             entity.cancelRoutes.super2GateD,
+             entity.cancelRoutes.case21State4Path);
+        line(col, "  legacy c:%u f:%u gs:%u 107:%u g:%u/%u/%u air:%u mv:%u r:%s",
+             entity.cancelRoutes.charId,
+             entity.cancelRoutes.familyType,
+             entity.cancelRoutes.gateState,
+             entity.cancelRoutes.action107Threshold,
+             entity.cancelRoutes.gate16,
+             entity.cancelRoutes.gate22,
+             entity.cancelRoutes.gate26,
+             entity.cancelRoutes.airborne,
+             entity.cancelRoutes.airMoveInput,
+             readyText);
+        line(col, "  clash r:%u raw:%d/%d/%d/%d id:0x%X",
+             entity.clash.rank,
+             entity.clash.rawA,
+             entity.clash.rawB,
+             entity.clash.rawC,
+             entity.clash.rawD,
+             entity.clash.continuationId);
+        line(col, "  max %u/%u/%u aux:%d flags:0x%X act:%u",
+             entity.maxHit.rawA,
+             entity.maxHit.rawB,
+             entity.maxHit.rawC,
+             entity.maxHit.rawD,
+             entity.maxHit.rawId,
+             entity.maxHit.active);
+        line(col, "  inv gate:0x%X flags:0x%X marker:0x%X on:%u m1948:%u m1949:%u",
+             GetLegacyInvincibleGateValue(entity),
+             GetDirectInvincibleFlagBits(entity),
+             GetMarkerInvincibleStateBits(entity),
+             HasInvincibleState(entity) ? 1u : 0u,
+             entity.maxHit.marker1948,
+             entity.maxHit.marker1949);
+        const int hurtCount = animFrame ? CountActiveBoxes(animFrame->hurtBoxes, HURTBOX_COUNT_PER_FRAME) : 0;
+        const int hitCount = animFrame ? CountActiveBoxes(animFrame->hitBoxes, HURTBOX_COUNT_PER_FRAME) : 0;
+        const int extCount = animFrame ? CountActiveBoxes(animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME) : 0;
+        line(col, "  box counts coll:%u hurt:%d hit:%d ext:%d",
+             (animFrame && animFrame->collisionBox.halfW > 0 && animFrame->collisionBox.halfH > 0) ? 1u : 0u,
+             hurtCount,
+             hitCount,
+             extCount);
+        if (entity.attackType & ATTACK_FLAG_CONTACT_OVERRIDE) {
+            line(col, "  contact-override: hit/grab checks bypass box-size and overlap tests");
+        }
 
         if (!animFrame) {
             continue;
@@ -1091,8 +1455,8 @@ void HitboxViewer_Init() {
     g_enabled = false;
     s_lastP1Anim = 0xFFFFFFFF;
     s_lastP2Anim = 0xFFFFFFFF;
-    s_lastP1Action = 0xFFFFFFFF;
-    s_lastP2Action = 0xFFFFFFFF;
+    s_lastP1State = 0xFFFFFFFF;
+    s_lastP2State = 0xFFFFFFFF;
     LOG_INFO("[HBV] Hitbox Viewer initialized");
 }
 
@@ -1110,19 +1474,19 @@ void HitboxViewer_Render() {
     EntitySnapshot p1 = BuildEntitySnapshot(&animCache, p1EntityBase, 0, "P1");
     EntitySnapshot p2 = BuildEntitySnapshot(&animCache, p2EntityBase, 1, "P2");
 
-    if (p1.actionId != s_lastP1Action) {
+    if (p1.stateIndex != s_lastP1State) {
         if (g_logPerFrame) {
-            LOG_INFO("[HBV] P1 action %u -> %u  anim %u -> %u",
-                     s_lastP1Action, p1.actionId, s_lastP1Anim, p1.animIdx);
+            LOG_INFO("[HBV] P1 state %u -> %u  anim %u -> %u",
+                     s_lastP1State, p1.stateIndex, s_lastP1Anim, p1.animIdx);
         }
-        s_lastP1Action = p1.actionId;
+        s_lastP1State = p1.stateIndex;
     }
-    if (p2.actionId != s_lastP2Action) {
+    if (p2.stateIndex != s_lastP2State) {
         if (g_logPerFrame) {
-            LOG_INFO("[HBV] P2 action %u -> %u  anim %u -> %u",
-                     s_lastP2Action, p2.actionId, s_lastP2Anim, p2.animIdx);
+            LOG_INFO("[HBV] P2 state %u -> %u  anim %u -> %u",
+                     s_lastP2State, p2.stateIndex, s_lastP2Anim, p2.animIdx);
         }
-        s_lastP2Action = p2.actionId;
+        s_lastP2State = p2.stateIndex;
     }
     s_lastP1Anim = p1.animIdx;
     s_lastP2Anim = p2.animIdx;
@@ -1143,13 +1507,21 @@ void HitboxViewer_Render() {
             RenderHurtboxes(dl, p2, frameCtx.transform, pass);
         }
         if (g_showThrowboxes) {
-            RenderThrowboxes(dl, p1, frameCtx.transform, pass);
-            RenderThrowboxes(dl, p2, frameCtx.transform, pass);
+            if (pass == BoxRenderPass::FillOnly) {
+                RenderThrowboxes(dl, p1, frameCtx.transform, pass);
+                RenderThrowboxes(dl, p2, frameCtx.transform, pass);
+            }
         }
         if (g_showHitboxes) {
             RenderEntityHitboxes(dl, p1, frameCtx.transform, pass);
             RenderEntityHitboxes(dl, p2, frameCtx.transform, pass);
             RenderHitDefs(dl, hitDefs, hitDefCount, frameCtx.transform, pass);
+        }
+        if (g_showThrowboxes) {
+            if (pass == BoxRenderPass::OutlineOnly) {
+                RenderThrowboxes(dl, p1, frameCtx.transform, pass);
+                RenderThrowboxes(dl, p2, frameCtx.transform, pass);
+            }
         }
     };
 
@@ -1182,9 +1554,9 @@ void HitboxViewer_RenderControls() {
     ImGui::Checkbox("Hitboxes / attacks (red, @8)", &g_showHitboxes);
     ImGui::Checkbox("Ext. hurtboxes (cyan, @72)", &g_showThrowboxes);
     ImGui::Checkbox("Collision / pushbox (yellow, @0)", &g_showPushboxes);
-    ImGui::Checkbox("State flags (ATK / ARMOR / IMMUNE / CANCEL)", &g_showStateFlags);
+    ImGui::Checkbox("State flags (ATK / INVINCIBLE / PROJ IMMUNE / BREAK)", &g_showStateFlags);
     ImGui::Checkbox("Position markers", &g_showPositions);
-    ImGui::Checkbox("Info overlay (boxes + clash data)", &g_showInfo);
+    ImGui::Checkbox("Info panel (scrollable debug)", &g_showInfo);
     ImGui::Checkbox("Match state debug", &g_showMatchState);
     ImGui::SliderFloat("Fill alpha", &g_fillAlpha, 0.0f, 1.0f, "%.2f");
     ImGui::Separator();
