@@ -20,7 +20,7 @@ constexpr uint32_t kInteractionTimeoutFrames = 300;
 constexpr uint32_t kTradeWindowFrames = 1;
 constexpr uint32_t kOverlayDisplayFrames = 180;
 constexpr uint32_t kGapDisplayFrames = 30;
-constexpr uint32_t kGapMaxFrames = 20;
+constexpr uint32_t kGapMaxFrames = 60;
 constexpr size_t kHistoryCapacity = 20;
 
 constexpr float kOverlayPadding = 6.0f;
@@ -265,8 +265,10 @@ void ClearVisibleOverlayState() {
 }
 
 void PublishGapDisplay(uint32_t simFrame, int attackerIndex, int defenderIndex) {
+    // Always clear a stale gap — new contact invalidates the previous one.
+    // Do NOT clear the FA result here: if the gap is too large or absent, the
+    // previous FA result should remain visible until the new interaction completes.
     ClearGapDisplay();
-    ClearResultDisplay();
 
     if (defenderIndex < 0 || defenderIndex >= 2) {
         return;
@@ -292,6 +294,9 @@ void PublishGapDisplay(uint32_t simFrame, int attackerIndex, int defenderIndex) 
         }
         return;
     }
+
+    // A real gap is about to be shown — clear the FA result so the gap takes the slot.
+    ClearResultDisplay();
 
     s_gapDisplay.active = true;
     s_gapDisplay.untilFrame = simFrame + kGapDisplayFrames;
@@ -538,6 +543,17 @@ void ProcessContactEdges(uint32_t simFrame) {
         Interaction& existing = s_active[attackerIndex];
         PendingAttack& pending = s_pending[attackerIndex];
 
+        // Seed the gap tracker from the ongoing interaction's D_recover when the
+        // defender was briefly free mid-string (e.g. ProxGuard between two hits).
+        // CompleteInteraction normally writes s_lastDefenderFreeFrame, but mid-string
+        // replacements clear the old interaction without completing it, so that
+        // recovery frame is otherwise lost and the intra-string gap goes unreported.
+        if (existing.active &&
+            existing.simFrame_D_recover != kFrameUnset &&
+            s_lastDefenderFreeFrame[defenderIndex] == kFrameUnset) {
+            s_lastDefenderFreeFrame[defenderIndex] = existing.simFrame_D_recover;
+        }
+
         PublishGapDisplay(simFrame, attackerIndex, defenderIndex);
 
         if (existing.active) {
@@ -587,7 +603,6 @@ void CompleteInteraction(Interaction* interaction) {
     }
 
     interaction->frameAdvantage = (int32_t)interaction->simFrame_D_recover - (int32_t)interaction->simFrame_A_recover;
-    s_lastDefenderFreeFrame[interaction->defender] = interaction->simFrame_D_recover;
     s_resultDisplayUntilFrame = interaction->simFrame_D_recover + kOverlayDisplayFrames;
 
     if (interaction->defenderLaunched && s_debugLogging) {

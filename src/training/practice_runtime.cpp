@@ -1046,7 +1046,20 @@ static bool IsPositionSetBlockedByMatchState(void) {
 
     // Position tools must stay locked until the engine has fully released the
     // opening input lock and must relock as soon as round-end transition starts.
-    return introLock != 0 || transitionLock != 0 || introFadeTimer != 0;
+    if (introLock != 0 || transitionLock != 0 || introFadeTimer != 0) {
+        return true;
+    }
+
+    const PlayerSnapshot p1 = ReadPlayerSnapshot(0);
+    const PlayerSnapshot p2 = ReadPlayerSnapshot(1);
+
+    // The first interactive-looking frames can still be in the engine's startup
+    // actions 0/1 before character intro state has fully settled.
+    if (!p1.valid || !p2.valid) {
+        return true;
+    }
+
+    return p1.actionId <= 1 || p2.actionId <= 1;
 }
 
 static bool CanUsePositionTools(void) {
