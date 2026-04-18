@@ -25,6 +25,9 @@ bool InstallHooks() {
     
     LOG_INFO("ADDR_KEYBOARD_STATE = 0x%08X (sub_62FD00)", ADDR_KEYBOARD_STATE);
     LOG_INFO("ADDR_JOYSTICK_STATE = 0x%08X (sub_62FF50)", ADDR_JOYSTICK_STATE);
+
+    const bool enableShellHotkeyImeWorkarounds = InputOverride_AreShellHotkeyImeWorkaroundsEnabled();
+    const bool enableSystemKeyWorkarounds = InputOverride_AreSystemKeyWorkaroundsEnabled();
     
     status = MH_CreateHook(
             reinterpret_cast<void*>(ADDR_KEYBOARD_STATE),
@@ -75,7 +78,7 @@ bool InstallHooks() {
     if (status != MH_OK) {
         LOG_WARN("Failed to hook GetKeyboardState! Status: %d (continuing anyway)", status);
     } else {
-        LOG_INFO("Hooked Win32 GetKeyboardState (prevents Alt+Shift issues)");
+        LOG_INFO("Hooked Win32 GetKeyboardState (keyboard input mediation)");
     }
 
     status = MH_CreateHook(
@@ -88,55 +91,63 @@ bool InstallHooks() {
         LOG_INFO("Hooked Win32 ClipCursor (prevents mouse trapping)");
     }
 
-    status = MH_CreateHook(
-            reinterpret_cast<void*>(&GetProcAddress),
-            reinterpret_cast<void*>(&Hook_GetProcAddress),
-            reinterpret_cast<void**>(&g_origGetProcAddress));
-    if (status != MH_OK) {
-        LOG_WARN("Failed to hook GetProcAddress! Status: %d (continuing anyway)", status);
-    } else {
-        LOG_INFO("Hooked Win32 GetProcAddress (blocks vanilla SetMSGHookDll helper hook)");
-    }
-
-    status = MH_CreateHook(
-            reinterpret_cast<void*>(&SystemParametersInfoA),
-            reinterpret_cast<void*>(&Hook_SystemParametersInfoA),
-            reinterpret_cast<void**>(&g_origSystemParametersInfoA));
-    if (status != MH_OK) {
-        LOG_WARN("Failed to hook SystemParametersInfoA! Status: %d (continuing anyway)", status);
-    } else {
-        LOG_INFO("Hooked Win32 SystemParametersInfoA (blocks legacy shell hotkey suppression)");
-    }
-
-    HMODULE user32 = GetModuleHandleA("user32.dll");
-    FARPROC winNlsEnableIme = user32 ? GetProcAddress(user32, "WINNLSEnableIME") : nullptr;
-    if (!winNlsEnableIme) {
-        LOG_WARN("Failed to resolve WINNLSEnableIME from user32.dll (continuing anyway)");
-    } else {
+    if (enableShellHotkeyImeWorkarounds) {
         status = MH_CreateHook(
-                reinterpret_cast<void*>(winNlsEnableIme),
-                reinterpret_cast<void*>(&Hook_WINNLSEnableIME),
-                reinterpret_cast<void**>(&g_origWINNLSEnableIME));
+                reinterpret_cast<void*>(&GetProcAddress),
+                reinterpret_cast<void*>(&Hook_GetProcAddress),
+                reinterpret_cast<void**>(&g_origGetProcAddress));
         if (status != MH_OK) {
-            LOG_WARN("Failed to hook WINNLSEnableIME! Status: %d (continuing anyway)", status);
+            LOG_WARN("Failed to hook GetProcAddress! Status: %d (continuing anyway)", status);
         } else {
-            LOG_INFO("Hooked Win32 WINNLSEnableIME (prevents vanilla IME disable)");
+            LOG_INFO("Hooked Win32 GetProcAddress (shell hotkey helper interception)");
         }
+
+        status = MH_CreateHook(
+                reinterpret_cast<void*>(&SystemParametersInfoA),
+                reinterpret_cast<void*>(&Hook_SystemParametersInfoA),
+                reinterpret_cast<void**>(&g_origSystemParametersInfoA));
+        if (status != MH_OK) {
+            LOG_WARN("Failed to hook SystemParametersInfoA! Status: %d (continuing anyway)", status);
+        } else {
+            LOG_INFO("Hooked Win32 SystemParametersInfoA (shell hotkey interception)");
+        }
+
+        HMODULE user32 = GetModuleHandleA("user32.dll");
+        FARPROC winNlsEnableIme = user32 ? GetProcAddress(user32, "WINNLSEnableIME") : nullptr;
+        if (!winNlsEnableIme) {
+            LOG_WARN("Failed to resolve WINNLSEnableIME from user32.dll (continuing anyway)");
+        } else {
+            status = MH_CreateHook(
+                    reinterpret_cast<void*>(winNlsEnableIme),
+                    reinterpret_cast<void*>(&Hook_WINNLSEnableIME),
+                    reinterpret_cast<void**>(&g_origWINNLSEnableIME));
+            if (status != MH_OK) {
+                LOG_WARN("Failed to hook WINNLSEnableIME! Status: %d (continuing anyway)", status);
+            } else {
+                LOG_INFO("Hooked Win32 WINNLSEnableIME (IME interception)");
+            }
+        }
+    } else {
+        LOG_INFO("Shell hotkey/IME workarounds disabled - skipping GetProcAddress/SystemParametersInfoA/WINNLSEnableIME hooks");
     }
 
-    void* dinputSetCooperativeLevelTarget = InputOverride_GetDInputKeyboardSetCooperativeLevelTarget();
-    if (!dinputSetCooperativeLevelTarget) {
-        LOG_WARN("Failed to locate DInput keyboard SetCooperativeLevel (continuing anyway)");
-    } else {
-        status = MH_CreateHook(
-                dinputSetCooperativeLevelTarget,
-                reinterpret_cast<void*>(&Hook_DInputKeyboardSetCooperativeLevel),
-                reinterpret_cast<void**>(&g_origDInputKeyboardSetCooperativeLevel));
-        if (status != MH_OK) {
-            LOG_WARN("Failed to hook DInput keyboard SetCooperativeLevel! Status: %d (continuing anyway)", status);
+    if (enableSystemKeyWorkarounds) {
+        void* dinputSetCooperativeLevelTarget = InputOverride_GetDInputKeyboardSetCooperativeLevelTarget();
+        if (!dinputSetCooperativeLevelTarget) {
+            LOG_WARN("Failed to locate DInput keyboard SetCooperativeLevel (continuing anyway)");
         } else {
-            LOG_INFO("Hooked DInput keyboard SetCooperativeLevel (clears exclusive/NOWINKEY flags)");
+            status = MH_CreateHook(
+                    dinputSetCooperativeLevelTarget,
+                    reinterpret_cast<void*>(&Hook_DInputKeyboardSetCooperativeLevel),
+                    reinterpret_cast<void**>(&g_origDInputKeyboardSetCooperativeLevel));
+            if (status != MH_OK) {
+                LOG_WARN("Failed to hook DInput keyboard SetCooperativeLevel! Status: %d (continuing anyway)", status);
+            } else {
+                LOG_INFO("Hooked DInput keyboard SetCooperativeLevel (system-key workaround)");
+            }
         }
+    } else {
+        LOG_INFO("System-key DInput workaround disabled - skipping SetCooperativeLevel hook");
     }
     
     LOG_INFO("ADDR_INPUT_PROCESS = 0x%08X (sub_562060)", ADDR_INPUT_PROCESS);

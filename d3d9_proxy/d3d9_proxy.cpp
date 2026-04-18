@@ -2545,6 +2545,9 @@ static bool IsGameWindowInputActive(HWND hWnd) {
     return GetForegroundWindow() == hWnd || GetActiveWindow() == hWnd || GetFocus() == hWnd;
 }
 
+static constexpr bool kEnableStandaloneWinKeyWorkaround = false;
+static constexpr bool kEnableAltShiftLayoutWorkaround = false;
+
 static void ClearRelayedWinKeyState() {
     g_relayedWinKeyVk = 0;
     g_relayedWinKeyMessageBudget = 0;
@@ -2773,11 +2776,13 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     }
 
     if (msg == kMsgRelayStandaloneWinKey) {
-        RelayStandaloneWinKeyToShell((UINT)wParam);
+        if (kEnableStandaloneWinKeyWorkaround) {
+            RelayStandaloneWinKeyToShell((UINT)wParam);
+        }
         return 0;
     }
 
-    if (HandleStandaloneWinKey(hWnd, msg, wParam, lParam)) {
+    if (kEnableStandaloneWinKeyWorkaround && HandleStandaloneWinKey(hWnd, msg, wParam, lParam)) {
         if (traceShellHotkey) {
             ProxyLog("[HOTKEYTRACE][HookedWndProc-standalone-win] %s result=0x00000000",
                      DescribeShellHotkeyTraceMessage(msg, wParam));
@@ -2785,7 +2790,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         return 0;
     }
 
-    if (HandleAltShiftLayoutToggle(hWnd, msg, wParam, lParam)) {
+    if (kEnableAltShiftLayoutWorkaround && HandleAltShiftLayoutToggle(hWnd, msg, wParam, lParam)) {
         if (traceShellHotkey) {
             ProxyLog("[HOTKEYTRACE][HookedWndProc-altshift] %s result=0x00000000",
                      DescribeShellHotkeyTraceMessage(msg, wParam));
@@ -3999,11 +4004,13 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
     }
 
     if (uMsg == kMsgRelayStandaloneWinKey) {
-        RelayStandaloneWinKeyToShell((UINT)wParam);
+        if (kEnableStandaloneWinKeyWorkaround) {
+            RelayStandaloneWinKeyToShell((UINT)wParam);
+        }
         return 0;
     }
 
-    if (ConsumeRelayedWinKeyMessage(uMsg, wParam, lParam)) {
+    if (kEnableStandaloneWinKeyWorkaround && ConsumeRelayedWinKeyMessage(uMsg, wParam, lParam)) {
         return 0;
     }
 
@@ -4036,7 +4043,9 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         }
     }
 
-    if ((uMsg == WM_KEYDOWN || uMsg == WM_KEYUP) && IsWinVirtualKey(wParam)) {
+    if (kEnableStandaloneWinKeyWorkaround
+            && (uMsg == WM_KEYDOWN || uMsg == WM_KEYUP)
+            && IsWinVirtualKey(wParam)) {
         if (kEnableInputMessageLogs) {
             ProxyLog("[WNDPROC] %s vk=0x%02X lParam=0x%08X - bypassing vanilla and calling DefWindowProc",
                      uMsg == WM_KEYDOWN ? "WM_KEYDOWN" : "WM_KEYUP",
@@ -4049,7 +4058,7 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         return 0;
     }
 
-    if (HandleAltShiftLayoutToggle(hWnd, uMsg, wParam, lParam)) {
+    if (kEnableAltShiftLayoutWorkaround && HandleAltShiftLayoutToggle(hWnd, uMsg, wParam, lParam)) {
         if (traceShellHotkey) {
             ProxyLog("[HOTKEYTRACE][ProxyWndProc-altshift] %s result=0x00000000",
                      DescribeShellHotkeyTraceMessage(uMsg, wParam));
@@ -4057,7 +4066,7 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         return 0;
     }
 
-    if (uMsg == WM_INPUTLANGCHANGEREQUEST) {
+    if (kEnableAltShiftLayoutWorkaround && uMsg == WM_INPUTLANGCHANGEREQUEST) {
         if (kEnableInputMessageLogs) {
             ProxyLog("[WNDPROC] WM_INPUTLANGCHANGEREQUEST flags=0x%08X hkl=0x%p - forcing DefWindowProc",
                      (unsigned int)wParam, (void*)lParam);
@@ -4107,14 +4116,14 @@ LRESULT CALLBACK ProxyWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         }
     }
 
-    if (uMsg == WM_SYSCOMMAND && ((wParam & 0xFFF0u) == SC_TASKLIST)) {
+    if (kEnableStandaloneWinKeyWorkaround && uMsg == WM_SYSCOMMAND && ((wParam & 0xFFF0u) == SC_TASKLIST)) {
         if (kEnableInputMessageLogs) {
             ProxyLog("[WNDPROC] WM_SYSCOMMAND SC_TASKLIST - forcing DefWindowProc");
         }
         return DefWindowProcW(hWnd, uMsg, wParam, lParam);
     }
 
-    if (uMsg == WM_SYSCOMMAND && ((wParam & 0xFFF0u) == SC_KEYMENU)) {
+    if (kEnableAltShiftLayoutWorkaround && uMsg == WM_SYSCOMMAND && ((wParam & 0xFFF0u) == SC_KEYMENU)) {
         if (kEnableInputMessageLogs) {
             ProxyLog("[WNDPROC] WM_SYSCOMMAND SC_KEYMENU - bypassing vanilla and forcing DefWindowProc");
         }

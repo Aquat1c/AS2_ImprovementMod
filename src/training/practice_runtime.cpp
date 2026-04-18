@@ -675,10 +675,12 @@ static uint32_t ReadEntityCharacterId(uintptr_t entityBase) {
 }
 
 static bool IsActionable(uint32_t actionId) {
-    // 2=stand, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand, 22=air neutral
+    // 2=stand, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand,
+    // 22=air neutral, 23=landing
     // 63/66/69=ProxGuard (cancellable), 106=healing stance cancel
     return actionId == 2  || actionId == 4  || actionId == 5  ||
            actionId == 6  || actionId == 7  || actionId == 8  || actionId == 22 ||
+           actionId == 23 ||
            actionId == 63 || actionId == 66 || actionId == 69 ||
            actionId == 106;
 }

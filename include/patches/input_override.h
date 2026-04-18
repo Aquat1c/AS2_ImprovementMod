@@ -67,6 +67,8 @@ void WriteMatchInput(int player, uint16_t input);
 void WritePlayerInput(int player, uint16_t input);
 uint16_t ReadPlayerInput(int player);
 void InputOverride_Shutdown();
+bool InputOverride_AreShellHotkeyImeWorkaroundsEnabled();
+bool InputOverride_AreSystemKeyWorkaroundsEnabled();
 void* InputOverride_GetDInputKeyboardSetCooperativeLevelTarget();
 void InputOverride_EnsureDInputKeyboardCooperativeLevel(const char* reason);
 

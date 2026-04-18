@@ -55,6 +55,17 @@ DInputSetCooperativeLevel_t g_origDInputKeyboardSetCooperativeLevel = nullptr;
 extern bool ModConfig_UseSDLInput();
 extern bool ModConfig_VerboseLogging();
 
+static constexpr bool kEnableShellHotkeyImeWorkarounds = false;
+static constexpr bool kEnableSystemKeyWorkarounds = false;
+
+bool InputOverride_AreShellHotkeyImeWorkaroundsEnabled() {
+    return kEnableShellHotkeyImeWorkarounds;
+}
+
+bool InputOverride_AreSystemKeyWorkaroundsEnabled() {
+    return kEnableSystemKeyWorkarounds;
+}
+
 // ============================================================================
 // Internal state
 // ============================================================================
@@ -189,6 +200,14 @@ void* InputOverride_GetDInputKeyboardSetCooperativeLevelTarget() {
 }
 
 HRESULT STDMETHODCALLTYPE Hook_DInputKeyboardSetCooperativeLevel(void* device, HWND hWnd, DWORD dwFlags) {
+    if (!g_origDInputKeyboardSetCooperativeLevel) {
+        return E_FAIL;
+    }
+
+    if (!kEnableSystemKeyWorkarounds) {
+        return g_origDInputKeyboardSetCooperativeLevel(device, hWnd, dwFlags);
+    }
+
     const DWORD sanitizedFlags = SanitizeDInputKeyboardCooperativeFlags(dwFlags);
     HWND targetWindow = hWnd ? hWnd : GetGameWindowHandle();
 
@@ -201,15 +220,14 @@ HRESULT STDMETHODCALLTYPE Hook_DInputKeyboardSetCooperativeLevel(void* device, H
                  static_cast<unsigned long>(dwFlags),
                  static_cast<unsigned long>(sanitizedFlags));
     }
-
-    if (!g_origDInputKeyboardSetCooperativeLevel) {
-        return E_FAIL;
-    }
-
     return g_origDInputKeyboardSetCooperativeLevel(device, targetWindow, sanitizedFlags);
 }
 
 void InputOverride_EnsureDInputKeyboardCooperativeLevel(const char* reason) {
+    if (!kEnableSystemKeyWorkarounds) {
+        return;
+    }
+
     void* device = GetDInputKeyboardDevice();
     DInputKeyboardDeviceVTable* vtable = GetDInputKeyboardDeviceVTable(device);
     HWND gameWindow = GetGameWindowHandle();
@@ -323,6 +341,10 @@ static void LogVanillaShellHotkeyState(const char* reason) {
 }
 
 static void EnsureVanillaShellHotkeysEnabled() {
+    if (!kEnableShellHotkeyImeWorkarounds) {
+        return;
+    }
+
     const bool changed = ClearVanillaShellHotkeySuppression();
 
     if (changed && !s_shellHotkeyPatchLogged) {
@@ -347,7 +369,7 @@ static bool IsReservedSystemScanCode(int keyCode) {
 }
 
 static void FilterReservedSystemVirtualKeys(PBYTE keyState) {
-    if (!keyState) {
+    if (!kEnableSystemKeyWorkarounds || !keyState) {
         return;
     }
 
@@ -363,7 +385,7 @@ static void FilterReservedSystemVirtualKeys(PBYTE keyState) {
 }
 
 static void FilterReservedSystemDirectInputKeys(uint8_t* keyBuffer) {
-    if (!keyBuffer) {
+    if (!kEnableSystemKeyWorkarounds || !keyBuffer) {
         return;
     }
 
@@ -381,6 +403,11 @@ static bool IsSetMSGHookDllLookup(LPCSTR procName) {
 }
 
 FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
+    if (!kEnableShellHotkeyImeWorkarounds) {
+        return g_origGetProcAddress ? g_origGetProcAddress(hModule, lpProcName)
+                                    : ::GetProcAddress(hModule, lpProcName);
+    }
+
     if (IsSetMSGHookDllLookup(lpProcName)) {
         ClearVanillaShellHotkeySuppression();
         LogVanillaShellHotkeyState("Hook_GetProcAddress blocked SetMSGHookDll");
@@ -397,6 +424,11 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
 }
 
 BOOL WINAPI Hook_SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni) {
+    if (!kEnableShellHotkeyImeWorkarounds) {
+        return g_origSystemParametersInfoA ? g_origSystemParametersInfoA(uiAction, uiParam, pvParam, fWinIni)
+                                           : ::SystemParametersInfoA(uiAction, uiParam, pvParam, fWinIni);
+    }
+
     if (uiAction == 0x61u) {
         LogVanillaShellHotkeyState("Hook_SystemParametersInfoA blocked 0x61");
 
@@ -426,6 +458,17 @@ BOOL WINAPI Hook_SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvPara
 }
 
 BOOL WINAPI Hook_WINNLSEnableIME(HWND hWnd, BOOL fEnable) {
+    if (!kEnableShellHotkeyImeWorkarounds) {
+        if (g_origWINNLSEnableIME) {
+            return g_origWINNLSEnableIME(hWnd, fEnable);
+        }
+
+        HMODULE user32 = GetModuleHandleA("user32.dll");
+        auto winNlsEnableIme = reinterpret_cast<WINNLSEnableIME_t>(
+            user32 ? ::GetProcAddress(user32, "WINNLSEnableIME") : nullptr);
+        return winNlsEnableIme ? winNlsEnableIme(hWnd, fEnable) : FALSE;
+    }
+
     if (!fEnable) {
         LogVanillaShellHotkeyState("Hook_WINNLSEnableIME blocked FALSE");
 
@@ -464,7 +507,9 @@ BOOL WINAPI Hook_ClipCursor(const RECT* lpRect) {
 // ============================================================================
 
 static void EnsureInputUpdated() {
-    EnsureVanillaShellHotkeysEnabled();
+    if (kEnableShellHotkeyImeWorkarounds) {
+        EnsureVanillaShellHotkeysEnabled();
+    }
 
     int currentFrame = ReadMemory<int>(ADDR_SIM_FRAME_COUNTER);
     if (currentFrame != g_lastInputUpdateFrame) {
@@ -474,7 +519,7 @@ static void EnsureInputUpdated() {
 }
 
 void InputOverride_Shutdown() {
-    if (ClearVanillaShellHotkeySuppression()) {
+    if (kEnableShellHotkeyImeWorkarounds && ClearVanillaShellHotkeySuppression()) {
         LOG_INFO("[Input] Exit cleanup removed vanilla shell hotkey suppression state");
     }
 

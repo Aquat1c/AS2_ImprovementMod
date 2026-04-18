@@ -2,9 +2,8 @@
  * Minimal wsock32.dll proxy — duplicate-instance bypass
  *
  * The game statically imports WSOCK32.dll, so this DLL loads at process start
- * (before DXLib_Init).  We use that timing for two startup-only patches:
- *  - duplicate-instance bypass (FindWindowA / DXLib flag)
- *  - early hotkey/IME suppression bypass before the window activation path runs
+ * (before DXLib_Init).  We use that timing for duplicate-instance bypass and
+ * retain the old early hotkey/IME workarounds behind a feature flag.
  *
  * All 16 wsock32 functions the game actually uses are forwarded to the real
  * wsock32.dll via GetProcAddress.
@@ -42,6 +41,7 @@ static constexpr uintptr_t kAddrShellHotkeyMsgHook = 0x009E5B7C;
 static constexpr uintptr_t kAddrShellHotkeyTempDllPath = 0x009E5B84;
 static constexpr uintptr_t kAddrShellHotkeyTempDllOwned = 0x009E5C88;
 static constexpr uintptr_t kAddrShellHotkeyHookModule = 0x009E5C8C;
+static constexpr bool kEnableEarlyInputWorkarounds = false;
 
 static void LogShellHotkeySuppressionState(const char* reason) {
     int* suppressFlag = reinterpret_cast<int*>(kAddrShellHotkeySuppressFlag);
@@ -703,9 +703,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*lpReserved*/) {
         // 2. Patch FindWindowA in the game's IAT
         PatchFindWindowA();
 
-        // 3. Patch the game's early hotkey/IME suppression APIs before the
-        // window activation path runs.
-        PatchEarlyHotkeyImports();
+        // 3. Optionally patch the game's early hotkey/IME suppression APIs
+        // before the window activation path runs.
+        if (kEnableEarlyInputWorkarounds) {
+            PatchEarlyHotkeyImports();
+        } else {
+            WsockLog("[EARLYPATCH] Startup input hotkey/IME workarounds disabled; leaving duplicate-instance bypass only");
+        }
 
         // 4. Load real wsock32.dll and resolve function pointers
         if (!LoadRealWsock32()) {
