@@ -43,7 +43,6 @@ static const int kJumpHoldFrames = 3;
 static const int kTriggerCount = 5;
 static const uint32_t kInvalidFrame = 0xFFFFFFFFu;
 static const int16_t kStageCenterX = 8000;
-static const int16_t kMidScreenHalfSpacing = 1500;
 
 enum PracticeTabId {
     PRACTICE_TAB_OVERVIEW = 0,
@@ -218,33 +217,35 @@ struct PositionPreset {
     uint8_t facing[kPracticePlayerCount];
 };
 
+// Facing convention: int8_t stored as uint8_t in entity memory.
+// 1   = facing right (positive X direction).
+// 0xFF = facing left  (-1 as int8_t; used by hitbox viewer as multiplier).
 static const PositionPreset kMidScreenPositionPreset = {
     "Mid Screen",
-    { (int16_t)(kStageCenterX - kMidScreenHalfSpacing),
-      (int16_t)(kStageCenterX + kMidScreenHalfSpacing) },
+    { kStageCenterX, kStageCenterX },
     { 7599, 7599 },
-    { 0, 1 },
+    { 1, 0xFF },  // P1 faces right, P2 faces left
 };
 
 static const PositionPreset kRoundStartPositionPreset = {
-        "Round Start",
-        { 6600, 9600 },
-        { 7599, 7599 },
-        { 0, 1 },
+    "Round Start",
+    { 6600, 9600 },
+    { 7599, 7599 },
+    { 1, 0xFF },  // P1 faces right, P2 faces left
 };
 
 static const PositionPreset kRightCornerPositionPreset = {
     "Right Corner",
     { 15019, 15499 },
     { 7599, 7599 },
-    { 0, 1 },
+    { 1, 0xFF },  // P2 is cornered right; P1 faces right, P2 faces left
 };
 
 static const PositionPreset kLeftCornerPositionPreset = {
     "Left Corner",
     { 980, 500 },
     { 7599, 7599 },
-    { 1, 0 },
+    { 0xFF, 1 },  // P2 is cornered left; P1 faces left, P2 faces right
 };
 
 struct PlayerSnapshot {
@@ -813,7 +814,7 @@ static PlayerSnapshot ReadPlayerSnapshot(int player) {
     snapshot.xAccel = ReadMemory<int16_t>(snapshot.base + ENTITY_OFF_X_ACCEL);
     snapshot.yAccel = ReadMemory<int16_t>(snapshot.base + ENTITY_OFF_Y_ACCEL);
     snapshot.facingRaw = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_FACING);
-    snapshot.facingRight = snapshot.facingRaw == 0;
+    snapshot.facingRight = (int8_t)snapshot.facingRaw > 0;  // 1=right, -1/0xFF=left
     snapshot.actionId = ReadMemory<uint32_t>(snapshot.base + ENTITY_OFF_ACTION_ID);
     snapshot.attackState = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_ATTACK_STATE);
     snapshot.attackFlags = ReadMemory<uint32_t>(snapshot.base + ENTITY_OFF_ATTACK_TYPE);
@@ -913,6 +914,39 @@ static void ZeroPlayerMotion(uintptr_t entityBase) {
     WriteMemory<int16_t>(entityBase + ENTITY_OFF_Y_ACCEL, 0);
 }
 
+static void ResetPlayerActionForPositionSet(uintptr_t entityBase) {
+    if (!entityBase) {
+        return;
+    }
+
+    // Action state — force to standing idle (2), reset phase/frame counters.
+    // Offsets are the same ones the hitbox viewer reads for live display.
+    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID,    2);
+    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_PHASE, 0);
+    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_FRAME, 0);
+
+    // Attack markers
+    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_ATTACK_STATE, 0);
+    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_ATTACK_TYPE,  0);
+
+    // Hit / clash / max-hit blocks
+    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_HIT_ACTIVE,       0);
+    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_CLASH_RANK,       0);
+    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_A,      0);
+    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_B,      0);
+    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_C,      0);
+    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_D,      0);
+    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_CLASH_ID,         0);
+    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_A,    0);
+    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_B,    0);
+    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_C,    0);
+    WriteMemory<int16_t> (entityBase + ENTITY_OFF_MAX_HIT_RAW_D,    0);
+    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ID,       0);
+    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ACTIVE,   0);
+    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_HIT_MARKER_1948,  0);
+    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_HIT_MARKER_1949,  0);
+}
+
 static void WritePlayerHpFields(uintptr_t entityBase, int hp) {
     if (!entityBase) {
         return;
@@ -936,6 +970,8 @@ static void WritePlayerValues(int player, const PlayerValueEditor& editor, const
     const bool canApplyPosition = CanUsePositionTools();
     const int16_t appliedX = canApplyPosition ? ClampS16(editor.x) : before.x;
     const int16_t appliedY = canApplyPosition ? ClampS16(editor.y) : before.y;
+    const bool positionChanged = canApplyPosition &&
+        (appliedX != before.x || appliedY != before.y);
 
     WritePlayerHpFields(before.base, ClampInt(editor.hp, 0, hpCap));
     WriteMemory<uint16_t>(before.base + ENTITY_OFF_METER, ClampU16(editor.meter, kMeterMax));
@@ -943,6 +979,10 @@ static void WritePlayerValues(int player, const PlayerValueEditor& editor, const
     if (canApplyPosition) {
         WriteMemory<int16_t>(before.base + ENTITY_OFF_X_POS, appliedX);
         WriteMemory<int16_t>(before.base + ENTITY_OFF_Y_POS, appliedY);
+        ZeroPlayerMotion(before.base);
+        if (positionChanged) {
+            ResetPlayerActionForPositionSet(before.base);
+        }
     }
 
     LOG_INFO("[Practice] %s value apply (%s): HP %u->%u Meter %u->%u Guard %u->%u Pos (%d,%d)->(%d,%d)",
@@ -982,8 +1022,26 @@ static void RefreshValueEditorsFromLiveState(void) {
     }
 }
 
+static bool IsPositionSetBlockedByMatchState(void) {
+    if (!PracticeTools_IsPracticeModeActive()) {
+        return true;
+    }
+
+    if (GetGameMode() != MODE_MATCH || GetSubstate() != MATCH_SUB_GAMEPLAY) {
+        return true;
+    }
+
+    const uint8_t introLock = GetMatchHeaderByte(MATCH_HEADER_INTRO_LOCK_OFFSET);
+    const uint8_t transitionLock = GetMatchHeaderByte(MATCH_HEADER_TRANSITION_OFFSET);
+    const uint32_t introFadeTimer = ReadMemory<uint32_t>(ADDR_MATCH_INTRO_FADE_TIMER);
+
+    // Position tools must stay locked until the engine has fully released the
+    // opening input lock and must relock as soon as round-end transition starts.
+    return introLock != 0 || transitionLock != 0 || introFadeTimer != 0;
+}
+
 static bool CanUsePositionTools(void) {
-    return PracticeTools_IsPracticeModeActive() && IsInPlayableMatchGameplay();
+    return !IsPositionSetBlockedByMatchState();
 }
 
 static void SeedValueEditorIfNeeded(int player, const PlayerSnapshot& snapshot) {
@@ -1035,6 +1093,17 @@ static bool SavePositionSnapshot(const PlayerSnapshot snapshots[kPracticePlayerC
     return true;
 }
 
+// Center the camera scroll on the midpoint between two world-space X coordinates.
+// scrollX is clamped [0, 959] per Weather_UpdateScroll (sub_4C4230).
+// World-to-screen: screenX = worldX/10 - scrollX.
+static void UpdateScrollForPositions(int16_t p1x, int16_t p2x) {
+    const int32_t midWorldX = ((int32_t)p1x + (int32_t)p2x) / 2;
+    int32_t scrollX = midWorldX / 10 - 320;  // center 640-pixel viewport
+    if (scrollX < 0)   scrollX = 0;
+    if (scrollX > 959) scrollX = 959;
+    WriteMemory<int16_t>(ADDR_SCROLL_X, (int16_t)scrollX);
+}
+
 static bool ApplyPositionData(const int16_t x[kPracticePlayerCount],
                               const int16_t y[kPracticePlayerCount],
                               const uint8_t facing[kPracticePlayerCount]) {
@@ -1053,7 +1122,10 @@ static bool ApplyPositionData(const int16_t x[kPracticePlayerCount],
         WriteMemory<int16_t>(entityBase + ENTITY_OFF_Y_POS, y[player]);
         WriteMemory<uint8_t>(entityBase + ENTITY_OFF_FACING, facing[player]);
         ZeroPlayerMotion(entityBase);
+        ResetPlayerActionForPositionSet(entityBase);
     }
+
+    UpdateScrollForPositions(x[0], x[1]);
 
     FrameAdvantage_CancelCalculation();
     FrameAdvantage_ClearDisplay();
@@ -1082,6 +1154,10 @@ static bool ApplyPositionPreset(const PositionPreset& preset) {
 }
 
 static const PositionPreset* GetLoadPositionPresetFromHotkey(void) {
+    if (!CanUsePositionTools()) {
+        return nullptr;
+    }
+
     const KeyBinding_t* loadBinding = HotkeyConfig_GetBinding(HOTKEY_POSITION_LOAD);
     if (IsFilteredBindingDown(GetP1DirectionBinding(P1_DIRECTION_BIND_UP), loadBinding)) {
         return &kRoundStartPositionPreset;
@@ -1120,6 +1196,10 @@ static void SwapPlayerPositions(const PlayerSnapshot snapshots[kPracticePlayerCo
     WriteMemory<int16_t>(snapshots[1].base + ENTITY_OFF_Y_POS, snapshots[1].y);
     ZeroPlayerMotion(snapshots[0].base);
     ZeroPlayerMotion(snapshots[1].base);
+    ResetPlayerActionForPositionSet(snapshots[0].base);
+    ResetPlayerActionForPositionSet(snapshots[1].base);
+    // Swap preserves the midpoint, so the same scroll center is still correct.
+    UpdateScrollForPositions(snapshots[0].x, snapshots[1].x);
     RefreshValueEditorsFromLiveState();
 }
 
