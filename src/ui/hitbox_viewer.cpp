@@ -54,8 +54,8 @@ static bool  g_logPerFrame     = false;
 
 static uint32_t s_lastP1Anim = 0xFFFFFFFF;
 static uint32_t s_lastP2Anim = 0xFFFFFFFF;
-static uint32_t s_lastP1State = 0xFFFFFFFF;
-static uint32_t s_lastP2State = 0xFFFFFFFF;
+static uint32_t s_lastP1Action = 0xFFFFFFFF;
+static uint32_t s_lastP2Action = 0xFFFFFFFF;
 
 // ============================================================================
 // Colour constants
@@ -202,7 +202,6 @@ static constexpr uint8_t kCancelFamilyTypeByCharId[22] = {
 };
 
 static constexpr uintptr_t kEntityOffRawInputWord30 = 30;
-static constexpr uintptr_t kEntityOffStateIndex = 8;
 static constexpr uintptr_t kEntityOffAirMoveInput = 78;
 static constexpr uintptr_t kEntityOffCommandSlot16Gate = 783;
 static constexpr uintptr_t kEntityOffCommandSlot22Gate = 807;
@@ -228,6 +227,40 @@ static constexpr uint16_t kAction137 = 137;
 static constexpr uint16_t kAction138 = 138;
 static constexpr uint16_t kAction139 = 139;
 static constexpr uint16_t kAction140 = 140;
+
+// Action-ID labels verified against decomp shared handlers and AI-reference
+// patterns. See mod/docs/frame_advantage_design.md for the full table.
+static const char* ActionLabel(uint32_t actionId) {
+    switch (actionId) {
+        case 2:  return "NeutralStand";
+        case 4:  return "WalkFwd";
+        case 5:  return "WalkBack";
+        case 7:  return "NeutralCrouch";
+        case 10: return "PrejumpN";
+        case 11: return "PrejumpFwd";
+        case 12: return "PrejumpBack";
+        case 13: return "DoubleJump";
+        case 22: return "JumpAir";
+        case 23: return "Landing";
+        case 63: return "StandProxGuard";
+        case 64: return "StandBlockHold";
+        case 65: return "StandBlockHit";
+        case 66: return "CrouchProxGuard";
+        case 67: return "CrouchBlockHold";
+        case 68: return "CrouchBlockHit";
+        case 69: return "AirProxGuard";
+        case 70: return "AirBlockHold";
+        case 71: return "AirBlockHit";
+        case 72: return "Hitstun";
+        case 73: return "Launched";
+        case 74: return "WakeupNoTech";
+        case 78: return "AirTech";
+        case 79: return "GroundTechFwd";
+        case 80: return "GroundTechNeutral";
+        case 81: return "GroundTechBack";
+        default: return nullptr;
+    }
+}
 
 struct HitboxViewerFrameContext {
     ScreenTransform transform;
@@ -261,7 +294,7 @@ struct EntitySnapshot {
     int8_t facing;
     int16_t hp;
     uint32_t animIdx;
-    uint32_t stateIndex;
+    uint32_t actionId;
     uint16_t actionPhase;
     uint16_t actionFrame;
     uint8_t attackState;
@@ -675,7 +708,7 @@ static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
     snapshot.facing = ReadMemory<int8_t>(entityBase + ENTITY_OFF_FACING);
     snapshot.hp = ReadMemory<int16_t>(entityBase + ENTITY_OFF_HP);
     snapshot.animIdx = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ANIM_INDEX);
-    snapshot.stateIndex = ReadMemory<uint32_t>(entityBase + kEntityOffStateIndex);
+    snapshot.actionId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID);
     snapshot.actionPhase = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_PHASE);
     snapshot.actionFrame = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_FRAME);
     snapshot.attackState = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_ATTACK_STATE);
@@ -695,7 +728,7 @@ static EntitySnapshot BuildEntitySnapshot(AnimFrameCache* cache,
     snapshot.maxHit.active = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ACTIVE);
     snapshot.maxHit.marker1948 = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_MARKER_1948);
     snapshot.maxHit.marker1949 = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_MARKER_1949);
-    snapshot.cancelRoutes = BuildCancelRouteSnapshot(playerIndex, entityBase, snapshot.stateIndex, snapshot.posY);
+    snapshot.cancelRoutes = BuildCancelRouteSnapshot(playerIndex, entityBase, snapshot.actionId, snapshot.posY);
     snapshot.animFrame = GetOrLoadAnimFrameSnapshot(cache, entityBase, snapshot.animIdx, label);
     return snapshot;
 }
@@ -1106,8 +1139,8 @@ static void RenderEntityInfoPanel(const EntitySnapshot& entity) {
     ImGui::Separator();
     text("Pos %d,%d  Face %d  HP %d  Meter %u",
          entity.posX, entity.posY, entity.facing, entity.hp, entity.cancelRoutes.meter);
-    text("State %u  Phase %u  Frame %u  Anim %u",
-         entity.stateIndex, entity.actionPhase, entity.actionFrame, entity.animIdx);
+    text("Action %u  Phase %u  Frame %u  Anim %u",
+         entity.actionId, entity.actionPhase, entity.actionFrame, entity.animIdx);
     text("Atk state %u  Type 0x%X  Hit active %u",
          entity.attackState, entity.attackType, entity.hitActive);
 
@@ -1352,9 +1385,9 @@ static void RenderInfoOverlay(ImDrawList* dl,
         ImU32 col = (pi == 0) ? COL_P1_CROSS : COL_P2_CROSS;
         char readyText[32];
         FormatReadyCancelActions(entity.cancelRoutes, readyText, sizeof(readyText));
-        line(col, "P%d Pos:%d,%d Face:%d HP:%d State:%u Anim:%u Atk:%u Flags:0x%X",
+        line(col, "P%d Pos:%d,%d Face:%d HP:%d Action:%u Anim:%u Atk:%u Flags:0x%X",
              pi + 1, entity.posX, entity.posY, entity.facing, entity.hp,
-             entity.stateIndex, entity.animIdx, entity.attackState, entity.attackType);
+             entity.actionId, entity.animIdx, entity.attackState, entity.attackType);
         line(col, "  case20 timer688:%u ready:%u act:%u gate146:%u lock434:%u meter:%u",
              entity.cancelRoutes.command20Timer,
              entity.cancelRoutes.case20Ready,
@@ -1455,8 +1488,8 @@ void HitboxViewer_Init() {
     g_enabled = false;
     s_lastP1Anim = 0xFFFFFFFF;
     s_lastP2Anim = 0xFFFFFFFF;
-    s_lastP1State = 0xFFFFFFFF;
-    s_lastP2State = 0xFFFFFFFF;
+    s_lastP1Action = 0xFFFFFFFF;
+    s_lastP2Action = 0xFFFFFFFF;
     LOG_INFO("[HBV] Hitbox Viewer initialized");
 }
 
@@ -1474,19 +1507,27 @@ void HitboxViewer_Render() {
     EntitySnapshot p1 = BuildEntitySnapshot(&animCache, p1EntityBase, 0, "P1");
     EntitySnapshot p2 = BuildEntitySnapshot(&animCache, p2EntityBase, 1, "P2");
 
-    if (p1.stateIndex != s_lastP1State) {
+    auto labelOr = [](uint32_t id) -> const char* {
+        const char* l = ActionLabel(id);
+        return l ? l : "?";
+    };
+    if (p1.actionId != s_lastP1Action) {
         if (g_logPerFrame) {
-            LOG_INFO("[HBV] P1 state %u -> %u  anim %u -> %u",
-                     s_lastP1State, p1.stateIndex, s_lastP1Anim, p1.animIdx);
+            LOG_INFO("[HBV] P1 action %u(%s) -> %u(%s)  anim %u -> %u",
+                     s_lastP1Action, labelOr(s_lastP1Action),
+                     p1.actionId, labelOr(p1.actionId),
+                     s_lastP1Anim, p1.animIdx);
         }
-        s_lastP1State = p1.stateIndex;
+        s_lastP1Action = p1.actionId;
     }
-    if (p2.stateIndex != s_lastP2State) {
+    if (p2.actionId != s_lastP2Action) {
         if (g_logPerFrame) {
-            LOG_INFO("[HBV] P2 state %u -> %u  anim %u -> %u",
-                     s_lastP2State, p2.stateIndex, s_lastP2Anim, p2.animIdx);
+            LOG_INFO("[HBV] P2 action %u(%s) -> %u(%s)  anim %u -> %u",
+                     s_lastP2Action, labelOr(s_lastP2Action),
+                     p2.actionId, labelOr(p2.actionId),
+                     s_lastP2Anim, p2.animIdx);
         }
-        s_lastP2State = p2.stateIndex;
+        s_lastP2Action = p2.actionId;
     }
     s_lastP1Anim = p1.animIdx;
     s_lastP2Anim = p2.animIdx;

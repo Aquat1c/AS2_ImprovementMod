@@ -76,7 +76,6 @@ static const uintptr_t ADDR_CAMERA_X = 0x76CD4C;
 static const uintptr_t ADDR_CAMERA_Y = 0x76CD4E;
 
 // Known offsets
-static const uint32_t OFF_ACTION_ID = 0x44C;   // Current action ID
 static const uint32_t OFF_POS_X = 184;         // +0xB8
 static const uint32_t OFF_POS_Y = 186;         // +0xBA
 static const uint32_t OFF_FACING = 189;        // +0xBD
@@ -228,8 +227,8 @@ void HitboxDisplay_Render() {
     }
     
     // Read current action IDs
-    uint32_t p1Action = ReadMemory<uint32_t>(p1Base + OFF_ACTION_ID);
-    uint32_t p2Action = ReadMemory<uint32_t>(p2Base + OFF_ACTION_ID);
+    uint32_t p1Action = ReadMemory<uint32_t>(p1Base + ENTITY_OFF_ACTION_ID);
+    uint32_t p2Action = ReadMemory<uint32_t>(p2Base + ENTITY_OFF_ACTION_ID);
     
     // Check for action changes and log
     if (g_logOnActionChange) {
@@ -514,7 +513,7 @@ void HitboxDisplay_RenderControls() {
         if (AS2_IsInMatch()) {
             uintptr_t base = ReadMemory<uint32_t>(ADDR_ENTITY_ARRAY_ALT);
             if (base) {
-                ScanForHitboxPatterns("P1 (forced)", base, ReadMemory<uint32_t>(base + OFF_ACTION_ID));
+                ScanForHitboxPatterns("P1 (forced)", base, ReadMemory<uint32_t>(base + ENTITY_OFF_ACTION_ID));
             }
         }
     }

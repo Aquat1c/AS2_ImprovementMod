@@ -471,7 +471,7 @@
 #define ENTITY_OFF_PUSH_DIR     0x00BC  // +188, 1 byte (collision push direction)
 #define ENTITY_OFF_FACING       0x00BD  // +189, 1 byte
 #define ENTITY_OFF_CHAR_ID      0x00B0  // +176, character ID (from word_776718 indexing)
-#define ENTITY_OFF_ACTION_ID    0x046C  // +1132, 4 bytes (unverified)
+#define ENTITY_OFF_ACTION_ID    0x044C  // +1100, DWORD — action handler dispatch ID (changes on walk/crouch/jump/attack/hitstun; see ENTITY_INPUT_START note)
 #define ENTITY_OFF_ANIMATION    0x0470  // +1136, 2 bytes
 #define ENTITY_OFF_OPPONENT     0x0004  // +4, pointer to opponent entity
 
