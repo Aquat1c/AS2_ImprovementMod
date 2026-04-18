@@ -1,22 +1,40 @@
 #include "training/hotkey_config.h"
+
+#include "training/practice_tools.h"
 #include "imgui.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
+
+#include <SDL3/SDL.h>
 #include <stdio.h>
 #include <string.h>
 
 // ============================================================================
-// Defaults
+// Defaults / Config
 // ============================================================================
 
-static const int kDefaultKeys[HOTKEY_COUNT] = {
-    VK_F4,          // HOTKEY_HITBOX_TOGGLE
-    VK_F7,          // HOTKEY_PAUSE_TOGGLE
-    VK_F8,          // HOTKEY_FRAME_STEP
-    VK_F9,          // HOTKEY_CONTROL_SWAP
-    VK_F10,         // HOTKEY_MACRO_RECORD
-    VK_DELETE,      // HOTKEY_MACRO_PLAY
-    VK_F12,         // HOTKEY_MACRO_SLOT_NEXT
+static const char* kHotkeyConfigFilename = "as2_practice_hotkeys.cfg";
+static const uint32_t kHotkeyConfigMagic = 0x48325341u;   // "AS2H"
+static const uint32_t kHotkeyConfigVersion = 1u;
+
+struct HotkeyConfigHeader {
+    uint32_t magic;
+    uint32_t version;
+};
+
+static const KeyBinding_t kDefaultBindings[HOTKEY_COUNT] = {
+    { SDL_SCANCODE_F4,  -1, -1, 0 },  // HOTKEY_HITBOX_TOGGLE
+    { SDL_SCANCODE_F7,  -1, -1, 0 },  // HOTKEY_PAUSE_TOGGLE
+    { SDL_SCANCODE_F8,  -1, -1, 0 },  // HOTKEY_FRAME_STEP
+    { SDL_SCANCODE_F9,  -1, -1, 0 },  // HOTKEY_CONTROL_SWAP
+    { SDL_SCANCODE_1,   -1, -1, 0 },  // HOTKEY_POSITION_LOAD
+    { SDL_SCANCODE_2,   -1, -1, 0 },  // HOTKEY_POSITION_SAVE
+    { SDL_SCANCODE_F10, -1, -1, 0 },  // HOTKEY_MACRO_RECORD
+    { SDL_SCANCODE_DELETE, -1, -1, 0 },  // HOTKEY_MACRO_PLAY
+    { SDL_SCANCODE_F12, -1, -1, 0 },  // HOTKEY_MACRO_SLOT_NEXT
 };
 
 static const char* kActionNames[HOTKEY_COUNT] = {
@@ -24,25 +42,277 @@ static const char* kActionNames[HOTKEY_COUNT] = {
     "Pause Toggle",
     "Frame Step",
     "Control Swap",
+    "Position Load",
+    "Position Save",
     "Macro Record",
     "Macro Play/Stop",
     "Macro Slot Next",
+};
+
+static const char* kControlActionNames[INPUT_ACTION_COUNT] = {
+    "Up",
+    "Down",
+    "Left",
+    "Right",
+    "A (Light)",
+    "B (Medium)",
+    "C (Heavy)",
+    "D (Special)",
+    "Start",
+    "Select",
+    "L1",
+    "R1",
+    "L2",
+    "R2",
 };
 
 // ============================================================================
 // State
 // ============================================================================
 
-static int  s_keys[HOTKEY_COUNT] = {};
+static KeyBinding_t s_bindings[HOTKEY_COUNT] = {};
 static bool s_prevDown[HOTKEY_COUNT] = {};
 static bool s_currDown[HOTKEY_COUNT] = {};
 static bool s_initialized = false;
-
-// Rebind state: which action is currently listening for a new key (-1 = none)
-static int  s_rebindAction = -1;
+static int s_rebindAction = -1;
 
 // ============================================================================
-// Key name lookup
+// Internal Helpers
+// ============================================================================
+
+static bool IsGameWindowFocused() {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground) {
+        return false;
+    }
+
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(foreground, &foregroundPid);
+    return foregroundPid == GetCurrentProcessId();
+}
+
+static bool IsImGuiKeyboardEntryActive() {
+    if (!ImGui::GetCurrentContext()) {
+        return false;
+    }
+
+    const ImGuiIO& io = ImGui::GetIO();
+    return io.WantTextInput || ImGui::IsAnyItemActive();
+}
+
+static bool BindingHasAnyComponent(const KeyBinding_t* binding) {
+    return binding &&
+           (binding->keyboard_key > 0 ||
+            binding->gamepad_button >= 0 ||
+            binding->gamepad_axis >= 0);
+}
+
+static void ResetBinding(KeyBinding_t* binding) {
+    if (!binding) {
+        return;
+    }
+
+    binding->keyboard_key = 0;
+    binding->gamepad_button = -1;
+    binding->gamepad_axis = -1;
+    binding->axis_direction = 0;
+}
+
+static void ResetToDefaults() {
+    memcpy(s_bindings, kDefaultBindings, sizeof(s_bindings));
+    memset(s_prevDown, 0, sizeof(s_prevDown));
+    memset(s_currDown, 0, sizeof(s_currDown));
+}
+
+static void RemoveOverlappingBindingComponents(KeyBinding_t* target,
+                                               const KeyBinding_t* blocker) {
+    if (!target || !blocker) {
+        return;
+    }
+
+    if (target->keyboard_key > 0 && target->keyboard_key == blocker->keyboard_key) {
+        target->keyboard_key = 0;
+    }
+    if (target->gamepad_button >= 0 && target->gamepad_button == blocker->gamepad_button) {
+        target->gamepad_button = -1;
+    }
+    if (target->gamepad_axis >= 0 &&
+        target->gamepad_axis == blocker->gamepad_axis &&
+        target->axis_direction == blocker->axis_direction) {
+        target->gamepad_axis = -1;
+        target->axis_direction = 0;
+    }
+}
+
+static bool BindingHasIndependentComponent(const KeyBinding_t* binding,
+                                           const KeyBinding_t* blocker) {
+    if (!BindingHasAnyComponent(binding)) {
+        return false;
+    }
+
+    KeyBinding_t filtered = *binding;
+    RemoveOverlappingBindingComponents(&filtered, blocker);
+    return BindingHasAnyComponent(&filtered);
+}
+
+static bool LoadConfig(const char* filename) {
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        return false;
+    }
+
+    HotkeyConfigHeader header = {};
+    const size_t headerRead = fread(&header, sizeof(header), 1, file);
+    if (headerRead != 1 ||
+        header.magic != kHotkeyConfigMagic ||
+        header.version != kHotkeyConfigVersion) {
+        fclose(file);
+        remove(filename);
+        return false;
+    }
+
+    const size_t bindingRead = fread(s_bindings, sizeof(s_bindings), 1, file);
+    fclose(file);
+    return bindingRead == 1;
+}
+
+static void SaveConfig(const char* filename) {
+    FILE* file = fopen(filename, "wb");
+    if (!file) {
+        return;
+    }
+
+    const HotkeyConfigHeader header = { kHotkeyConfigMagic, kHotkeyConfigVersion };
+    fwrite(&header, sizeof(header), 1, file);
+    fwrite(s_bindings, sizeof(s_bindings), 1, file);
+    fclose(file);
+}
+
+static bool BuildControlConflictText(const KeyBinding_t* binding, char* out, size_t outSize) {
+    if (!out || outSize == 0) {
+        return false;
+    }
+
+    out[0] = '\0';
+    if (!BindingHasAnyComponent(binding)) {
+        return false;
+    }
+
+    size_t used = 0;
+    int conflictCount = 0;
+    for (int player = 0; player < 2; ++player) {
+        const PlayerBindings_t* bindings = InputSystem_GetBindings(player);
+        if (!bindings) {
+            continue;
+        }
+
+        for (int actionIndex = 0; actionIndex < INPUT_ACTION_COUNT; ++actionIndex) {
+            const KeyBinding_t* controlBinding = InputSystem_GetBindingByIndexConst(bindings, actionIndex);
+            if (!controlBinding || !InputSystem_DoBindingsOverlap(binding, controlBinding)) {
+                continue;
+            }
+
+            const size_t remaining = outSize - used;
+            if (remaining <= 1) {
+                return conflictCount > 0;
+            }
+
+            const int written = snprintf(out + used,
+                                         remaining,
+                                         "%sP%d %s",
+                                         conflictCount > 0 ? ", " : "",
+                                         player + 1,
+                                         kControlActionNames[actionIndex]);
+            if (written < 0) {
+                out[outSize - 1] = '\0';
+                return conflictCount > 0;
+            }
+
+            const size_t advanced = (size_t)written;
+            used = (advanced < remaining) ? (used + advanced) : (outSize - 1);
+            conflictCount++;
+        }
+    }
+
+    return conflictCount > 0;
+}
+
+static bool BuildUnavailablePresetText(char* out, size_t outSize) {
+    if (!out || outSize == 0) {
+        return false;
+    }
+
+    out[0] = '\0';
+
+    const KeyBinding_t* loadBinding = HotkeyConfig_GetBinding(HOTKEY_POSITION_LOAD);
+    const PlayerBindings_t* p1Bindings = InputSystem_GetBindings(0);
+    if (!BindingHasAnyComponent(loadBinding) || !p1Bindings) {
+        return false;
+    }
+
+    struct UnavailablePreset {
+        const KeyBinding_t* binding;
+        const char* label;
+    } presets[] = {
+        { &p1Bindings->up, "Round Start" },
+        { &p1Bindings->down, "Mid Screen" },
+        { &p1Bindings->right, "Right Corner" },
+        { &p1Bindings->left, "Left Corner" },
+    };
+
+    size_t used = 0;
+    int count = 0;
+    for (const UnavailablePreset& preset : presets) {
+        if (!InputSystem_DoBindingsOverlap(loadBinding, preset.binding) ||
+            BindingHasIndependentComponent(preset.binding, loadBinding)) {
+            continue;
+        }
+
+        const size_t remaining = outSize - used;
+        if (remaining <= 1) {
+            return count > 0;
+        }
+
+        const int written = snprintf(out + used,
+                                     remaining,
+                                     "%s%s",
+                                     count > 0 ? ", " : "",
+                                     preset.label);
+        if (written < 0) {
+            out[outSize - 1] = '\0';
+            return count > 0;
+        }
+
+        const size_t advanced = (size_t)written;
+        used = (advanced < remaining) ? (used + advanced) : (outSize - 1);
+        count++;
+    }
+
+    return count > 0;
+}
+
+static void RenderHotkeyWarnings(HotkeyAction action) {
+    const KeyBinding_t* binding = HotkeyConfig_GetBinding(action);
+
+    if (action == HOTKEY_POSITION_LOAD) {
+        char unavailableText[128] = {};
+        if (BuildUnavailablePresetText(unavailableText, sizeof(unavailableText))) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                               "    Shares the same input as: %s. Those preset chords are unavailable.",
+                               unavailableText);
+        }
+    }
+
+    char conflictText[256] = {};
+    if (BuildControlConflictText(binding, conflictText, sizeof(conflictText))) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                           "    Conflicts with controls: %s",
+                           conflictText);
+    }
+}
+
+// ============================================================================
+// Key Name Lookup
 // ============================================================================
 
 const char* HotkeyConfig_KeyName(int vk) {
@@ -67,7 +337,7 @@ const char* HotkeyConfig_KeyName(int vk) {
     case VK_SPACE:    return "Space";
     case VK_RETURN:   return "Enter";
     case VK_BACK:     return "Backspace";
-    case VK_DELETE:    return "Delete";
+    case VK_DELETE:   return "Delete";
     case VK_INSERT:   return "Insert";
     case VK_HOME:     return "Home";
     case VK_END:      return "End";
@@ -93,12 +363,10 @@ const char* HotkeyConfig_KeyName(int vk) {
     case VK_DECIMAL:  return "Num.";
     case VK_DIVIDE:   return "Num/";
     default:
-        // A-Z keys
         if (vk >= 'A' && vk <= 'Z') {
             snprintf(buf, sizeof(buf), "%c", (char)vk);
             return buf;
         }
-        // 0-9 keys
         if (vk >= '0' && vk <= '9') {
             snprintf(buf, sizeof(buf), "%c", (char)vk);
             return buf;
@@ -113,11 +381,8 @@ const char* HotkeyConfig_KeyName(int vk) {
 // ============================================================================
 
 void HotkeyConfig_Init(void) {
-    for (int i = 0; i < HOTKEY_COUNT; i++) {
-        s_keys[i] = kDefaultKeys[i];
-        s_prevDown[i] = false;
-        s_currDown[i] = false;
-    }
+    ResetToDefaults();
+    LoadConfig(kHotkeyConfigFilename);
     s_rebindAction = -1;
     s_initialized = true;
 }
@@ -126,14 +391,37 @@ void HotkeyConfig_Init(void) {
 // API
 // ============================================================================
 
-int HotkeyConfig_GetKey(HotkeyAction action) {
-    if (action < 0 || action >= HOTKEY_COUNT) return 0;
-    return s_keys[action];
+const KeyBinding_t* HotkeyConfig_GetBinding(HotkeyAction action) {
+    if (action < 0 || action >= HOTKEY_COUNT) {
+        return nullptr;
+    }
+    return &s_bindings[action];
 }
 
-void HotkeyConfig_SetKey(HotkeyAction action, int vk) {
-    if (action < 0 || action >= HOTKEY_COUNT) return;
-    s_keys[action] = vk;
+void HotkeyConfig_SetBinding(HotkeyAction action, const KeyBinding_t* binding) {
+    if (action < 0 || action >= HOTKEY_COUNT) {
+        return;
+    }
+
+    if (binding) {
+        s_bindings[action] = *binding;
+    } else {
+        ResetBinding(&s_bindings[action]);
+    }
+    SaveConfig(kHotkeyConfigFilename);
+}
+
+void HotkeyConfig_GetBindingDisplayName(HotkeyAction action, char* out, int outSize) {
+    if (!out || outSize <= 0) {
+        return;
+    }
+
+    if (action < 0 || action >= HOTKEY_COUNT) {
+        snprintf(out, outSize, "None");
+        return;
+    }
+
+    InputSystem_GetBindingDisplayName(&s_bindings[action], out, outSize);
 }
 
 const char* HotkeyConfig_ActionName(HotkeyAction action) {
@@ -141,52 +429,37 @@ const char* HotkeyConfig_ActionName(HotkeyAction action) {
     return kActionNames[action];
 }
 
+bool HotkeyConfig_IsSuppressed(void) {
+    return !PracticeTools_IsPracticeModeActive() ||
+           !IsGameWindowFocused() ||
+           InputSystem_IsBindingActive() ||
+           IsImGuiKeyboardEntryActive();
+}
+
 void HotkeyConfig_Update(void) {
     if (!s_initialized) return;
 
+    const bool suppressed = HotkeyConfig_IsSuppressed();
+
     for (int i = 0; i < HOTKEY_COUNT; i++) {
+        const bool down = BindingHasAnyComponent(&s_bindings[i]) &&
+                          InputSystem_IsBindingDown(0, &s_bindings[i]);
+        if (suppressed) {
+            s_prevDown[i] = down;
+            s_currDown[i] = down;
+            continue;
+        }
+
         s_prevDown[i] = s_currDown[i];
-        s_currDown[i] = (s_keys[i] != 0) && ((GetAsyncKeyState(s_keys[i]) & 0x8000) != 0);
+        s_currDown[i] = down;
     }
 }
 
 bool HotkeyConfig_JustPressed(HotkeyAction action) {
     if (action < 0 || action >= HOTKEY_COUNT) return false;
-    // Suppress hotkeys while rebinding
     if (s_rebindAction >= 0) return false;
+    if (HotkeyConfig_IsSuppressed()) return false;
     return s_currDown[action] && !s_prevDown[action];
-}
-
-// ============================================================================
-// Scan for a newly-pressed key during rebind
-// ============================================================================
-
-static int ScanForKeyPress(void) {
-    // Check F-keys first (most common rebind targets)
-    for (int vk = VK_F1; vk <= VK_F12; vk++) {
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    }
-    // A-Z
-    for (int vk = 'A'; vk <= 'Z'; vk++) {
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    }
-    // 0-9
-    for (int vk = '0'; vk <= '9'; vk++) {
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    }
-    // Numpad
-    for (int vk = VK_NUMPAD0; vk <= VK_DIVIDE; vk++) {
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    }
-    // Common special keys
-    static const int specials[] = {
-        VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT,
-        VK_TAB, VK_SPACE, VK_BACK,
-    };
-    for (int vk : specials) {
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    }
-    return 0;
 }
 
 // ============================================================================
@@ -196,47 +469,70 @@ static int ScanForKeyPress(void) {
 void HotkeyConfig_RenderImGui(void) {
     if (!s_initialized) return;
 
+    ImGui::TextDisabled("Practice hotkeys read the P1 device set.");
+    ImGui::TextDisabled("Click a row, then press a keyboard key or P1 controller input.");
+    ImGui::Spacing();
+
     for (int i = 0; i < HOTKEY_COUNT; i++) {
+        const HotkeyAction action = (HotkeyAction)i;
         ImGui::PushID(i);
 
         if (s_rebindAction == i) {
-            // Currently listening for a new key
             ImGui::Text("%-18s", kActionNames[i]);
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Press a key...");
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f),
+                               "Press a key or controller input...");
             ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel")) {
+            if (ImGui::SmallButton("Cancel") || (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
+                InputSystem_CancelBinding();
                 s_rebindAction = -1;
-            }
-
-            int pressed = ScanForKeyPress();
-            if (pressed != 0) {
-                // Escape cancels without changing
-                if (pressed == VK_ESCAPE) {
-                    s_rebindAction = -1;
-                } else {
-                    s_keys[i] = pressed;
+            } else {
+                KeyBinding_t captured = {};
+                int source = -1;
+                if (InputSystem_FinishBinding(&captured, &source)) {
+                    if (source == 0) {
+                        s_bindings[i].keyboard_key = captured.keyboard_key;
+                    } else {
+                        s_bindings[i].gamepad_button = captured.gamepad_button;
+                        s_bindings[i].gamepad_axis = captured.gamepad_axis;
+                        s_bindings[i].axis_direction = captured.axis_direction;
+                    }
+                    SaveConfig(kHotkeyConfigFilename);
                     s_rebindAction = -1;
                 }
             }
         } else {
+            char bindingLabel[128] = {};
+            HotkeyConfig_GetBindingDisplayName(action, bindingLabel, (int)sizeof(bindingLabel));
+
             ImGui::Text("%-18s", kActionNames[i]);
             ImGui::SameLine();
-            char label[64];
-            snprintf(label, sizeof(label), "[%s]##btn", HotkeyConfig_KeyName(s_keys[i]));
-            if (ImGui::SmallButton(label)) {
+
+            char label[160] = {};
+            snprintf(label, sizeof(label), "[%s]##bind", bindingLabel);
+            if (ImGui::SmallButton(label) && !InputSystem_IsBindingActive()) {
+                InputSystem_StartBinding(0, 0);
                 s_rebindAction = i;
+            }
+
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear")) {
+                ResetBinding(&s_bindings[i]);
+                SaveConfig(kHotkeyConfigFilename);
             }
         }
 
         ImGui::PopID();
+        RenderHotkeyWarnings(action);
     }
 
     ImGui::Spacing();
     if (ImGui::Button("Reset to Defaults")) {
-        for (int i = 0; i < HOTKEY_COUNT; i++) {
-            s_keys[i] = kDefaultKeys[i];
+        if (s_rebindAction >= 0) {
+            InputSystem_CancelBinding();
+            s_rebindAction = -1;
         }
-        s_rebindAction = -1;
+        ResetToDefaults();
+        SaveConfig(kHotkeyConfigFilename);
     }
 }

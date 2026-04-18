@@ -451,9 +451,10 @@
 
 #define ENTITY_OFF_COMBO_P1     41254     // 0xA126 - P1 combo counter (byte)
 #define ENTITY_OFF_COMBO_P2     150066    // 0x249F2 - P2 combo counter (byte)
-#define ENTITY_OFF_GUARD_GAUGE  41248     // 0xA120 - Guard gauge (word)
+#define ENTITY_OFF_GUARD_GAUGE  0x00B2    // +178, word - guard gauge fill (reset=10000; decremented on guard damage)
 #define ENTITY_OFF_ROUND_WINS   41254     // 0xA126 - Round wins (shared offset with combo)
-#define ENTITY_OFF_HP_DISPLAY   41284     // 0xA144 - HP display value (word)
+#define ENTITY_OFF_HP_DISPLAY_PREVIOUS 0x00D2 // +210, word - HP bar trailing value
+#define ENTITY_OFF_HP_DISPLAY   0x00D4    // +212, word - HP bar visible value
 #define ENTITY_OFF_GAME_STATE   42952     // 0xA7D8 - Game state (11 = active match)
 
 // Character structure size (P1 base to P2 base offset)
@@ -654,13 +655,24 @@
 // In-Match Settings (vanilla pause menu)
 // ============================================================================
 
-// BYTE2(dword_8E93B8) — Training dummy behavior master toggle.
-// In training pause settings, this is the 3rd menu option the user toggles to
-// enable or disable the dummy action group. When 0, the related dummy-action
-// options are grayed out and the training dummy stays passive.
-// This is persisted in the game's config and must not be reused as a generic
-// char-select or netplay flag.
+// dword_8E93B8 / dword_8E93BC / byte_8E93C0 — native training pause-menu state.
+// LOBYTE(dword_8E93B8): Health regeneration percent (0=off, 1..10 = 10%..100%)
+#define ADDR_TRAINING_HEALTH_REGEN_SETTING  0x8E93B8
+// BYTE1(dword_8E93B8): Meter level (0=off, 1..9 = 1..9 bars)
+#define ADDR_TRAINING_METER_LEVEL_SETTING   0x8E93B9
+// BYTE2(dword_8E93B8): Opponent control mode (0=native training dummy, 1=full CPU AI)
+// When set to 1, the native dummy option rows are disabled.
 #define ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE 0x8E93BA
+// HIBYTE(dword_8E93B8): Native air-tech option (0=off, 1=up, 2=forward, 3=neutral, 4=back)
+#define ADDR_TRAINING_AIR_TECH_SETTING      0x8E93BB
+// LOBYTE(dword_8E93BC): Native ground-tech option (0=off, 1=forward, 2=neutral, 3=back)
+#define ADDR_TRAINING_GROUND_TECH_SETTING   0x8E93BC
+// BYTE1(dword_8E93BC): Native block type (0=off, 1=normal, 2=1 hit)
+#define ADDR_TRAINING_BLOCK_TYPE_SETTING    0x8E93BD
+// BYTE2(dword_8E93BC): Native dummy state (0=off, 1=stand, 2=crouch, 3=jump)
+#define ADDR_TRAINING_DUMMY_STATE_SETTING   0x8E93BE
+// HIBYTE(dword_8E93BC): Native damage display toggle (0=off, 1=on)
+#define ADDR_TRAINING_DAMAGE_DISPLAY        0x8E93BF
 
 // BYTE2(dword_8E93EC) — Stage Select enable/disable toggle (0 or 1)
 // When 0, stage is auto-picked from character's home stage lookup table.

@@ -66,6 +66,7 @@ struct SavestateSlot {
 };
 
 static SavestateSlot g_manualSlot;
+static SavestateSlot g_roundStartSlot;
 static SavestateSlot g_rollbackBaselineSlot;
 static bool g_offlineMatchContextActive = false;
 static bool g_roundStartAutosaveArmed = false;
@@ -179,8 +180,117 @@ static void ClearManualSavestateSlot(const char* reason) {
     ClearSavestateSlot(&g_manualSlot, "manual", reason);
 }
 
+static void ClearRoundStartSavestateSlot(const char* reason) {
+    ClearSavestateSlot(&g_roundStartSlot, "round_start", reason);
+}
+
 static void ClearRollbackBaselineSlot(const char* reason) {
     ClearSavestateSlot(&g_rollbackBaselineSlot, "rollback_baseline", reason);
+}
+
+static bool CapturePracticeSavestateSlot(SavestateSlot* slot,
+                                         const char* slotLabel) {
+    if (!slot) {
+        return false;
+    }
+
+    if (!Rollback::GameSnapshot_Capture(
+            &slot->snapshot,
+            (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER))) {
+        LOG_ERROR("[Savestate] %s capture FAILED — snapshot capture rejected",
+                  slotLabel ? slotLabel : "savestate");
+        return false;
+    }
+
+    slot->fpu_cw = CaptureX87CW();
+    slot->fpu_mxcsr = CaptureMXCSR();
+
+    slot->info.valid = true;
+    slot->info.frame = slot->snapshot.sim_frame;
+    slot->info.checksum = slot->snapshot.checksum;
+    slot->info.rng_seed = slot->snapshot.rng_seed;
+    slot->info.game_mode = slot->snapshot.game_mode;
+    slot->info.substate = slot->snapshot.substate;
+    slot->practice_control_swap = PracticeTools_IsControlSwapped();
+    PracticeTools_CaptureRuntimeState(&slot->practice_runtime);
+    return true;
+}
+
+static bool RestorePracticeSavestateSlot(const SavestateSlot* slot,
+                                         const char* slotLabel) {
+    if (!slot || !slot->info.valid) {
+        LOG_WARN("[Savestate] Cannot load %s — no savestate exists.",
+                 slotLabel ? slotLabel : "savestate");
+        return false;
+    }
+
+    if (!Savestate_CanSaveLoad()) {
+        LOG_WARN("[Savestate] Cannot load %s — offline playable match required (mode=%d sub=%d type=%d net=%d rb=%d)",
+                 slotLabel ? slotLabel : "savestate",
+                 ReadMemory<uint32_t>(ADDR_GAME_MODE),
+                 ReadMemory<uint32_t>(ADDR_SUB_STATE),
+                 ReadMemory<uint32_t>(ADDR_GAME_TYPE),
+                 Net::Session_IsConnected() ? 1 : 0,
+                 Rollback::RollbackSession_IsActive() ? 1 : 0);
+        return false;
+    }
+
+    uint32_t preFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    uint32_t preRng = DetVer_GetRngSeed();
+    uint32_t preChecksum = ComputeMainChecksum();
+
+    LOG_INFO("[Savestate] LOADING %s — restoring frame %d (current frame %d, swap=%d)",
+             slotLabel ? slotLabel : "savestate",
+             slot->info.frame,
+             preFrame,
+             slot->practice_control_swap ? 1 : 0);
+
+    if (!Rollback::GameSnapshot_Restore(&slot->snapshot)) {
+        LOG_ERROR("[Savestate] %s restore FAILED — snapshot restore rejected",
+                  slotLabel ? slotLabel : "savestate");
+        return false;
+    }
+
+    FrameAdvantage_CancelCalculation();
+    InputMacro_OnSavestateLoad();
+    PracticeTools_ApplyControlSwapState(slot->practice_control_swap);
+    PracticeTools_RestoreRuntimeState(&slot->practice_runtime);
+    PracticeTools_SyncControlSwapState();
+
+    uint32_t postChecksum = ComputeMainChecksum();
+    uint32_t postRng = DetVer_GetRngSeed();
+    uint32_t postFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+
+    const bool checksumMatch = (postChecksum == slot->info.checksum);
+
+    if (checksumMatch) {
+        LOG_INFO("[Savestate] LOADED %s OK — frame %d->%d checksum=0x%08X (match) rng=0x%08X paused=%d step=%u",
+                 slotLabel ? slotLabel : "savestate",
+                 preFrame,
+                 postFrame,
+                 postChecksum,
+                 postRng,
+                 slot->practice_runtime.paused ? 1 : 0,
+                 slot->practice_runtime.stepCounter);
+    } else {
+        LOG_ERROR("[Savestate] LOADED %s with CHECKSUM MISMATCH! expected=0x%08X got=0x%08X",
+                  slotLabel ? slotLabel : "savestate",
+                  slot->info.checksum,
+                  postChecksum);
+    }
+
+    LogToFile("LOAD slot=%s pre_frame=%d pre_checksum=0x%08X pre_rng=0x%08X\n",
+              slotLabel ? slotLabel : "savestate",
+              preFrame,
+              preChecksum,
+              preRng);
+    LogToFile("     restored_frame=%d post_checksum=0x%08X rng=0x%08X match=%s\n",
+              postFrame,
+              postChecksum,
+              postRng,
+              checksumMatch ? "YES" : "NO");
+
+    return true;
 }
 
 static bool IsOfflineSavestateGameType(uint32_t gameType) {
@@ -236,6 +346,7 @@ static void UpdateSavestateContext() {
 
     if (g_offlineMatchContextActive && !offlineMatchActive) {
         ClearManualSavestateSlot("left offline match context");
+        ClearRoundStartSavestateSlot("left offline match context");
         g_roundStartAutosaveArmed = false;
     }
 
@@ -256,10 +367,11 @@ static void UpdateSavestateContext() {
     }
 
     if (g_roundStartAutosaveArmed && IsOfflinePlayableSavestateContext()) {
-        if (Savestate_Save()) {
+        if (CapturePracticeSavestateSlot(&g_roundStartSlot, "round_start autosave")) {
             LOG_INFO("[Savestate] Auto-saved first interactable offline frame");
             LogToFile("AUTO_SAVE frame=%u reason=first_interactable_offline_frame\n",
-                      g_manualSlot.info.frame);
+                      g_roundStartSlot.info.frame);
+            CapturePracticeSavestateSlot(&g_manualSlot, "manual autosave mirror");
         } else {
             LOG_WARN("[Savestate] Round-start auto-save failed");
         }
@@ -273,6 +385,7 @@ static void UpdateSavestateContext() {
 
 void Savestate_Init() {
     ClearManualSavestateSlot("init");
+    ClearRoundStartSavestateSlot("init");
     ClearRollbackBaselineSlot("init");
     g_offlineMatchContextActive = false;
     g_roundStartAutosaveArmed = false;
@@ -315,26 +428,9 @@ bool Savestate_Save() {
         return false;
     }
 
-    if (!Rollback::GameSnapshot_Capture(
-            &g_manualSlot.snapshot,
-            (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER))) {
-        LOG_ERROR("[Savestate] FAILED — snapshot capture rejected");
+    if (!CapturePracticeSavestateSlot(&g_manualSlot, "manual")) {
         return false;
     }
-
-    // Capture FPU state (diagnostic only — NOT restored on load)
-    g_manualSlot.fpu_cw    = CaptureX87CW();
-    g_manualSlot.fpu_mxcsr = CaptureMXCSR();
-
-    // Fill info
-    g_manualSlot.info.valid     = true;
-    g_manualSlot.info.frame     = g_manualSlot.snapshot.sim_frame;
-    g_manualSlot.info.checksum  = g_manualSlot.snapshot.checksum;
-    g_manualSlot.info.rng_seed  = g_manualSlot.snapshot.rng_seed;
-    g_manualSlot.info.game_mode = g_manualSlot.snapshot.game_mode;
-    g_manualSlot.info.substate  = g_manualSlot.snapshot.substate;
-    g_manualSlot.practice_control_swap = PracticeTools_IsControlSwapped();
-    PracticeTools_CaptureRuntimeState(&g_manualSlot.practice_runtime);
 
     LOG_INFO("[Savestate] SAVED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d swap=%d paused=%d step=%u",
              g_manualSlot.info.frame, g_manualSlot.info.checksum, g_manualSlot.info.rng_seed,
@@ -410,72 +506,11 @@ bool Savestate_CaptureRollbackBaseline() {
 // ============================================================================
 
 bool Savestate_Load() {
-    if (!g_manualSlot.info.valid) {
-        LOG_WARN("[Savestate] Cannot load — no savestate exists. Press F5 first.");
-        return false;
-    }
+    return RestorePracticeSavestateSlot(&g_manualSlot, "manual");
+}
 
-    if (!Savestate_CanSaveLoad()) {
-        LOG_WARN("[Savestate] Cannot load — offline playable match required (mode=%d sub=%d type=%d net=%d rb=%d)",
-                 ReadMemory<uint32_t>(ADDR_GAME_MODE),
-                 ReadMemory<uint32_t>(ADDR_SUB_STATE),
-                 ReadMemory<uint32_t>(ADDR_GAME_TYPE),
-                 Net::Session_IsConnected() ? 1 : 0,
-                 Rollback::RollbackSession_IsActive() ? 1 : 0);
-        return false;
-    }
-
-    // Log pre-load state
-    uint32_t preFrame    = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-    uint32_t preRng      = DetVer_GetRngSeed();
-    uint32_t preChecksum = ComputeMainChecksum();
-
-    LOG_INFO("[Savestate] LOADING — restoring frame %d (current frame %d, swap=%d)",
-             g_manualSlot.info.frame, preFrame, g_manualSlot.practice_control_swap ? 1 : 0);
-
-    if (!Rollback::GameSnapshot_Restore(&g_manualSlot.snapshot)) {
-        LOG_ERROR("[Savestate] FAILED — snapshot restore rejected");
-        return false;
-    }
-
-    FrameAdvantage_CancelCalculation();
-    InputMacro_OnSavestateLoad();
-    PracticeTools_ApplyControlSwapState(g_manualSlot.practice_control_swap);
-    PracticeTools_RestoreRuntimeState(&g_manualSlot.practice_runtime);
-    PracticeTools_SyncControlSwapState();
-
-    // FPU state: NOT restored by default. If desync investigation reveals
-    // that FPU drift is causing issues, uncomment these lines:
-    // {
-    //     uint16_t cw = g_manualSlot.fpu_cw;
-    //     __asm { fldcw word ptr [cw] }
-    //     _mm_setcsr(g_manualSlot.fpu_mxcsr);
-    // }
-
-    // Verify restoration
-    uint32_t postChecksum = ComputeMainChecksum();
-    uint32_t postRng      = DetVer_GetRngSeed();
-    uint32_t postFrame    = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-
-    bool checksumMatch = (postChecksum == g_manualSlot.info.checksum);
-
-    if (checksumMatch) {
-        LOG_INFO("[Savestate] LOADED OK — frame %d->%d checksum=0x%08X (match) rng=0x%08X paused=%d step=%u",
-                 preFrame, postFrame, postChecksum, postRng,
-                 g_manualSlot.practice_runtime.paused ? 1 : 0,
-                 g_manualSlot.practice_runtime.stepCounter);
-    } else {
-        LOG_ERROR("[Savestate] LOADED with CHECKSUM MISMATCH! expected=0x%08X got=0x%08X",
-                  g_manualSlot.info.checksum, postChecksum);
-    }
-
-    // Log to file
-    LogToFile("LOAD pre_frame=%d pre_checksum=0x%08X pre_rng=0x%08X\n",
-              preFrame, preChecksum, preRng);
-    LogToFile("     restored_frame=%d post_checksum=0x%08X rng=0x%08X match=%s\n",
-              postFrame, postChecksum, postRng, checksumMatch ? "YES" : "NO");
-
-    return true;
+bool Savestate_LoadRoundStart() {
+    return RestorePracticeSavestateSlot(&g_roundStartSlot, "round_start");
 }
 
 bool Savestate_RestoreRollbackBaseline() {
@@ -550,6 +585,10 @@ const SavestateInfo* Savestate_GetRollbackBaselineInfo() {
     return &g_rollbackBaselineSlot.info;
 }
 
+const SavestateInfo* Savestate_GetRoundStartInfo() {
+    return &g_roundStartSlot.info;
+}
+
 void Savestate_ClearRollbackBaseline(const char* reason) {
     ClearRollbackBaselineSlot(reason);
 }
@@ -602,6 +641,7 @@ void Savestate_ProcessHotkeys() {
 
 void Savestate_RenderImGui() {
     const SavestateInfo* info = &g_manualSlot.info;
+    const SavestateInfo* roundStartInfo = &g_roundStartSlot.info;
 
     ImGui::Text("Offline Savestate (Auto-save + F5/F6)");
     ImGui::Separator();
@@ -615,6 +655,12 @@ void Savestate_RenderImGui() {
     } else {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Slot: EMPTY");
         ImGui::TextDisabled("Auto-saves on the first playable offline frame of each round");
+    }
+
+    if (roundStartInfo->valid) {
+        ImGui::Text("Round Start Slot: frame %d", roundStartInfo->frame);
+    } else {
+        ImGui::TextDisabled("Round Start Slot: empty");
     }
 
     ImGui::Separator();
@@ -651,6 +697,16 @@ void Savestate_RenderImGui() {
         } else {
             ImGui::BeginDisabled();
             ImGui::Button("Load State (F6)");
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (roundStartInfo->valid) {
+            if (ImGui::Button("Load Round Start")) {
+                Savestate_LoadRoundStart();
+            }
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::Button("Load Round Start");
             ImGui::EndDisabled();
         }
     } else {

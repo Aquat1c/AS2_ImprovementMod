@@ -62,6 +62,9 @@ bool Savestate_Save(void);
 // Returns true if load succeeded.
 // Only valid if a savestate exists and game is in a safe state to restore.
 bool Savestate_Load(void);
+// Load the dedicated round-start autosave slot.
+// Returns true if restore succeeded.
+bool Savestate_LoadRoundStart(void);
 
 // Capture the rollback bootstrap baseline into a dedicated netplay slot.
 // Returns true if the baseline capture succeeded.
@@ -85,6 +88,8 @@ const SavestateInfo* Savestate_GetInfo(void);
 
 // Get info about the current rollback bootstrap baseline slot.
 const SavestateInfo* Savestate_GetRollbackBaselineInfo(void);
+// Get info about the auto-captured first-interactable offline frame slot.
+const SavestateInfo* Savestate_GetRoundStartInfo(void);
 
 // Returns true if we are in a state where save/load is allowed.
 bool Savestate_CanSaveLoad(void);

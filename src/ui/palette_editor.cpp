@@ -22,6 +22,7 @@ constexpr int kMaxPresetCount = 128;
 
 struct PaletteHistoryEntry {
     bool               valid;
+    char               action[40];
     NetplayPaletteBank bank;
     uint8_t            selected_index;
     uint8_t            range_start;
@@ -473,12 +474,13 @@ static void ResetHistory() {
     s_redoCount = 0;
 }
 
-static void CaptureHistoryEntry(PaletteHistoryEntry* out) {
+static void CaptureHistoryEntry(PaletteHistoryEntry* out, const char* action = nullptr) {
     if (!out) {
         return;
     }
     memset(out, 0, sizeof(*out));
     out->valid = s_hasWorkingBank;
+    CopyText(out->action, sizeof(out->action), action ? action : "Edit");
     if (s_hasWorkingBank) {
         out->bank = s_workingBank;
         out->selected_index = s_selectedIndex;
@@ -639,9 +641,9 @@ static void ApplyWorkingBankLive() {
     }
 }
 
-static void PushUndoSnapshot() {
+static void PushUndoSnapshot(const char* action = nullptr) {
     PaletteHistoryEntry entry{};
-    CaptureHistoryEntry(&entry);
+    CaptureHistoryEntry(&entry, action);
     PushHistoryEntry(s_undoHistory, &s_undoCount, entry);
     memset(s_redoHistory, 0, sizeof(s_redoHistory));
     s_redoCount = 0;
@@ -661,13 +663,13 @@ static int FindPresetIndexByName(const char* presetName) {
     return -1;
 }
 
-static bool ReplaceWorkingBank(const NetplayPaletteBank& bank, bool keepSelection, bool pushUndo) {
+static bool ReplaceWorkingBank(const NetplayPaletteBank& bank, bool keepSelection, bool pushUndo, const char* action = nullptr) {
     if (!bank.valid) {
         return false;
     }
 
     if (pushUndo && s_hasWorkingBank) {
-        PushUndoSnapshot();
+        PushUndoSnapshot(action);
     }
 
     s_workingBank = bank;
@@ -693,7 +695,7 @@ static bool LoadPresetIntoWorkingBank(int presetIndex, bool applyLive) {
         return false;
     }
 
-    if (!ReplaceWorkingBank(bank, true, true)) {
+    if (!ReplaceWorkingBank(bank, true, true, "Load preset")) {
         SetStatusText(s_presetStatus,
             sizeof(s_presetStatus),
             "Failed to replace the working bank with '%s'.",
@@ -807,11 +809,11 @@ static void FinishBankEdit(const NetplayPaletteLocalContext& context) {
     }
 }
 
-static bool BeginBankEdit() {
+static bool BeginBankEdit(const char* action = nullptr) {
     if (!s_hasWorkingBank) {
         return false;
     }
-    PushUndoSnapshot();
+    PushUndoSnapshot(action);
     return true;
 }
 
@@ -820,13 +822,13 @@ static bool UndoWorkingBank(const NetplayPaletteLocalContext& context) {
         return false;
     }
 
-    PaletteHistoryEntry current{};
-    CaptureHistoryEntry(&current);
-    PushHistoryEntry(s_redoHistory, &s_redoCount, current);
-
     const PaletteHistoryEntry entry = s_undoHistory[s_undoCount - 1];
     memset(&s_undoHistory[s_undoCount - 1], 0, sizeof(s_undoHistory[0]));
     --s_undoCount;
+
+    PaletteHistoryEntry current{};
+    CaptureHistoryEntry(&current, entry.action);
+    PushHistoryEntry(s_redoHistory, &s_redoCount, current);
 
     s_workingBank = entry.bank;
     s_selectedIndex = entry.selected_index;
@@ -842,13 +844,13 @@ static bool RedoWorkingBank(const NetplayPaletteLocalContext& context) {
         return false;
     }
 
-    PaletteHistoryEntry current{};
-    CaptureHistoryEntry(&current);
-    PushHistoryEntry(s_undoHistory, &s_undoCount, current);
-
     const PaletteHistoryEntry entry = s_redoHistory[s_redoCount - 1];
     memset(&s_redoHistory[s_redoCount - 1], 0, sizeof(s_redoHistory[0]));
     --s_redoCount;
+
+    PaletteHistoryEntry current{};
+    CaptureHistoryEntry(&current, entry.action);
+    PushHistoryEntry(s_undoHistory, &s_undoCount, current);
 
     s_workingBank = entry.bank;
     s_selectedIndex = entry.selected_index;
@@ -954,8 +956,9 @@ static void RenderOfflineSlotSelector(const NetplayPaletteRuntimeSnapshot& snaps
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.36f, 0.54f, 0.29f, 1.0f));
             }
 
-            char label[32] = {};
-            _snprintf_s(label, sizeof(label), _TRUNCATE, "P%d", slot + 1);
+            char label[64] = {};
+            _snprintf_s(label, sizeof(label), _TRUNCATE, "P%d  -  Char %u, Pal %u",
+                slot + 1, player.character_id, player.base_palette);
             if (ImGui::Button(label, ImVec2(-FLT_MIN, 0.0f)) &&
                 NetplayPaletteRuntime_SetOfflineEditorGameSlot((uint8_t)slot)) {
                 ReloadWorkingBank(GetDefaultSource(context));
@@ -964,157 +967,143 @@ static void RenderOfflineSlotSelector(const NetplayPaletteRuntimeSnapshot& snaps
             if (context.game_slot == slot) {
                 ImGui::PopStyleColor(2);
             }
-
-            ImGui::Text("Char %u  Base %u", player.character_id, player.base_palette);
-            ImGui::TextDisabled("Live:%s  Src:%s  Saved:%s",
-                player.live_bank_ready ? "yes" : "no",
-                player.vanilla_bank_ready ? "yes" : "no",
-                player.custom_bank_ready ? "yes" : "no");
         }
         ImGui::EndTable();
     }
 }
 
 static void RenderPaletteSummary(const NetplayPaletteLocalContext& context) {
-    int rangeStart = 0;
-    int rangeEnd = 0;
-    GetRangeBounds(&rangeStart, &rangeEnd);
-    const int visibleCount = GetVisibleEntryCount();
-
-    ImGui::Text("Editing Slot: P%d", context.game_slot + 1);
-    ImGui::SameLine();
-    ImGui::Text("Character: %u", context.character_id);
-    ImGui::SameLine();
-    ImGui::Text("Base: %u", context.base_palette);
-    ImGui::SameLine();
-    ImGui::TextDisabled("Loaded: %s", BankSourceLabel(s_loadedSource));
-
-    ImGui::TextDisabled("Selected %u (0x%02X)  Range %u..%u (%d)  Visible:%d/%d  Undo:%d  Redo:%d",
-        s_selectedIndex,
-        s_selectedIndex,
-        rangeStart,
-        rangeEnd,
-        rangeEnd - rangeStart + 1,
-        visibleCount,
-        kPaletteEntryCount,
-        s_undoCount,
-        s_redoCount);
-    if (s_hoveredIndex < kPaletteEntryCount) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Hover %u (0x%02X)", s_hoveredIndex, s_hoveredIndex);
-    }
-
+    ImGui::Text("P%d  |  Character %u, Palette %u", context.game_slot + 1, context.character_id, context.base_palette);
     if (s_loadedPresetName[0]) {
-        ImGui::TextDisabled("Editor preset: %s", s_loadedPresetName);
+        ImGui::SameLine();
+        ImGui::TextDisabled("  Preset: %s", s_loadedPresetName);
     }
-
-    ImGui::TextDisabled("Live:%s  Applied:%s  Saved:%s  Asset:%s",
-        context.has_live_bank ? "yes" : "no",
-        context.has_applied_custom_bank ? "yes" : "no",
-        context.has_saved_custom_bank ? "yes" : "no",
-        context.asset_loaded ? "yes" : "no");
 }
 
 static void RenderPaletteToolbar(const NetplayPaletteLocalContext& context) {
-    ImGui::Checkbox("Auto Apply Live", &s_autoApplyLive);
+    // Primary action bar
+    ImGui::BeginDisabled(s_undoCount <= 0);
+    char undoLabel[24] = {};
+    _snprintf_s(undoLabel, sizeof(undoLabel), _TRUNCATE, "Undo (%d)", s_undoCount);
+    if (ImGui::Button(undoLabel)) {
+        UndoWorkingBank(context);
+    }
+    if (s_undoCount > 0 && ImGui::BeginItemTooltip()) {
+        ImGui::Text("Undo: %s  (Ctrl+Z)", s_undoHistory[s_undoCount - 1].action);
+        ImGui::EndTooltip();
+    }
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::Checkbox("Show Transparency", &s_showAlpha);
+    ImGui::BeginDisabled(s_redoCount <= 0);
+    char redoLabel[24] = {};
+    _snprintf_s(redoLabel, sizeof(redoLabel), _TRUNCATE, "Redo (%d)", s_redoCount);
+    if (ImGui::Button(redoLabel)) {
+        RedoWorkingBank(context);
+    }
+    if (s_redoCount > 0 && ImGui::BeginItemTooltip()) {
+        ImGui::Text("Redo: %s  (Ctrl+Y)", s_redoHistory[s_redoCount - 1].action);
+        ImGui::EndTooltip();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0.0f, ModUI_Scale(12.0f));
+
+    if (ImGui::Button("Apply") && s_hasWorkingBank) {
+        ApplyWorkingBankLive();
+    }
+    if (ImGui::BeginItemTooltip()) {
+        ImGui::TextUnformatted("Write current edits into live game memory.");
+        ImGui::EndTooltip();
+    }
     ImGui::SameLine();
-    ImGui::Checkbox("Show Row Labels", &s_showGridLabels);
+    if (ImGui::Button("Save to Disk") && s_hasWorkingBank) {
+        NetplayPaletteRuntime_SetLocalCustomBank(&s_workingBank, true);
+    }
+    if (ImGui::BeginItemTooltip()) {
+        ImGui::TextUnformatted("Save as the permanent custom palette for this character.");
+        ImGui::EndTooltip();
+    }
     ImGui::SameLine();
-    ImGui::Checkbox("Show Box Indices", &s_showGridIndices);
+    if (ImGui::Button("Revert")) {
+        ReloadWorkingBank(s_loadedSource);
+    }
+    if (ImGui::BeginItemTooltip()) {
+        ImGui::TextUnformatted("Discard all edits and reload from the current source.");
+        ImGui::EndTooltip();
+    }
     ImGui::SameLine();
-    ImGui::Checkbox("Highlight Grid", &s_highlightGrid);
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Hide Empty Tail", &s_hideEmptyTail)) {
-        ClampSelectionToVisibleEntries();
-        SyncGradientEndpointsFromRange();
-        SyncHexInputFromSelection();
+    if (ImGui::Button("Clear Custom")) {
+        NetplayPaletteRuntime_ClearLocalCustomBank(true);
+        ReloadWorkingBank(GetDefaultSource(context));
+    }
+    if (ImGui::BeginItemTooltip()) {
+        ImGui::TextUnformatted("Delete the saved custom palette and revert to vanilla.");
+        ImGui::EndTooltip();
+    }
+
+    // Second row: Auto-apply, Freeze, Source combo, Display settings
+    ImGui::Checkbox("Auto-Apply", &s_autoApplyLive);
+    if (ImGui::BeginItemTooltip()) {
+        ImGui::TextUnformatted("Automatically push every edit to live memory.");
+        ImGui::EndTooltip();
     }
 
     if (!context.match_active && PracticeTools_IsPracticeModeActive()) {
         ImGui::SameLine();
         bool paused = PracticeTools_IsPaused();
-        if (ImGui::Checkbox("Freeze Frame", &paused)) {
+        if (ImGui::Checkbox("Freeze", &paused)) {
             PracticeTools_SetPaused(paused);
         }
-    }
-
-    ImGui::SetNextItemWidth(ModUI_Scale(180.0f));
-    if (ImGui::SliderFloat("Box Size", &s_gridCellSize, 18.0f, 32.0f, "%.0f px")) {
-        if (s_gridCellSize < 18.0f) {
-            s_gridCellSize = 18.0f;
-        }
-        if (s_gridCellSize > 32.0f) {
-            s_gridCellSize = 32.0f;
+        if (ImGui::BeginItemTooltip()) {
+            ImGui::TextUnformatted("Pause the game to inspect palette changes.");
+            ImGui::EndTooltip();
         }
     }
 
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(ModUI_Scale(180.0f));
-    if (ImGui::SliderFloat("Picker Scale", &s_pickerScale, 0.75f, 1.75f, "%.2fx")) {
-        s_pickerScale = ClampFloat(s_pickerScale, 0.75f, 1.75f);
+    ImGui::SetNextItemWidth(ModUI_Scale(160.0f));
+    if (ImGui::BeginCombo("Source", BankSourceLabel(s_loadedSource))) {
+        for (int i = 0; i < 4; ++i) {
+            const NetplayPaletteBankSource source = (NetplayPaletteBankSource)i;
+            if (!IsSourceAvailable(context, source)) {
+                continue;
+            }
+            const bool selected = (source == s_loadedSource);
+            if (ImGui::Selectable(BankSourceLabel(source), selected)) {
+                ReloadWorkingBank(source);
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
     }
 
-    if (ImGui::BeginTable("PaletteCommandBar", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("Sources");
-        ImGui::BeginDisabled(!context.has_live_bank);
-        if (ImGui::Button("Load Live")) {
-            ReloadWorkingBank(NetplayPaletteBankSource::LiveMemory);
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!context.has_vanilla_bank);
-        if (ImGui::Button("Load Vanilla")) {
-            ReloadWorkingBank(NetplayPaletteBankSource::VanillaSource);
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!context.has_applied_custom_bank);
-        if (ImGui::Button("Load Applied")) {
-            ReloadWorkingBank(NetplayPaletteBankSource::AppliedCustom);
-        }
-        ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Display...")) {
+        ImGui::OpenPopup("PaletteDisplaySettings");
+    }
 
-        ImGui::BeginDisabled(!context.has_saved_custom_bank);
-        if (ImGui::Button("Load Saved")) {
-            ReloadWorkingBank(NetplayPaletteBankSource::SavedCustom);
+    if (ImGui::BeginPopup("PaletteDisplaySettings")) {
+        ImGui::SeparatorText("Grid");
+        ImGui::Checkbox("Show Row Labels", &s_showGridLabels);
+        ImGui::Checkbox("Show Cell Indices", &s_showGridIndices);
+        ImGui::Checkbox("Highlight Range", &s_highlightGrid);
+        ImGui::Checkbox("Show Transparency", &s_showAlpha);
+        if (ImGui::Checkbox("Hide Empty Tail", &s_hideEmptyTail)) {
+            ClampSelectionToVisibleEntries();
+            SyncGradientEndpointsFromRange();
+            SyncHexInputFromSelection();
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button("Reload Working")) {
-            ReloadWorkingBank(s_loadedSource);
+        ImGui::SeparatorText("Sizing");
+        ImGui::SetNextItemWidth(ModUI_Scale(140.0f));
+        if (ImGui::SliderFloat("Cell Size", &s_gridCellSize, 18.0f, 32.0f, "%.0f px")) {
+            s_gridCellSize = ClampFloat(s_gridCellSize, 18.0f, 32.0f);
         }
-
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("Working Bank");
-        if (ImGui::Button("Apply Live") && s_hasWorkingBank) {
-            ApplyWorkingBankLive();
+        ImGui::SetNextItemWidth(ModUI_Scale(140.0f));
+        if (ImGui::SliderFloat("Picker Scale", &s_pickerScale, 0.75f, 1.75f, "%.2fx")) {
+            s_pickerScale = ClampFloat(s_pickerScale, 0.75f, 1.75f);
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Save Custom") && s_hasWorkingBank) {
-            NetplayPaletteRuntime_SetLocalCustomBank(&s_workingBank, true);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear Custom")) {
-            NetplayPaletteRuntime_ClearLocalCustomBank(true);
-            ReloadWorkingBank(GetDefaultSource(context));
-        }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(s_undoCount <= 0);
-        if (ImGui::Button("Undo")) {
-            UndoWorkingBank(context);
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(s_redoCount <= 0);
-        if (ImGui::Button("Redo")) {
-            RedoWorkingBank(context);
-        }
-        ImGui::EndDisabled();
-
-        ImGui::EndTable();
+        ImGui::EndPopup();
     }
 }
 
@@ -1125,7 +1114,7 @@ static void RenderPaletteGrid(const NetplayPaletteLocalContext& context) {
     const int visibleCount = GetVisibleEntryCount();
     const int rowCount = (visibleCount + 15) / 16;
     s_hoveredIndex = 0xFF;
-    ImGui::TextDisabled("Click select  Ctrl start range  Shift end range  Drag a box to swap  Right-click for quick tools");
+    ImGui::TextDisabled("Click: select | Ctrl+Click: range start | Shift+Click: range end | Drag: swap | Right-click: tools");
     float gridHeight = ImGui::GetContentRegionAvail().y;
     if (gridHeight < ModUI_Scale(280.0f)) {
         gridHeight = ModUI_Scale(280.0f);
@@ -1205,7 +1194,7 @@ static void RenderPaletteGrid(const NetplayPaletteLocalContext& context) {
                 if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("PaletteEntryIndex")) {
                     if (payload->DataSize == sizeof(uint8_t)) {
                         const uint8_t sourceIndex = *(const uint8_t*)payload->Data;
-                        if (sourceIndex != index && BeginBankEdit()) {
+                        if (sourceIndex != index && BeginBankEdit("Swap entries")) {
                             SwapEntries(sourceIndex, index);
                             s_selectedIndex = index;
                             FinishBankEdit(context);
@@ -1248,13 +1237,13 @@ static void RenderPaletteGrid(const NetplayPaletteLocalContext& context) {
                     SyncHexInputFromSelection();
                 }
                 ImGui::BeginDisabled(!s_hasClipboardColor);
-                if (ImGui::MenuItem("Paste Clipboard To Entry") && BeginBankEdit()) {
+                if (ImGui::MenuItem("Paste Clipboard To Entry") && BeginBankEdit("Paste to entry")) {
                     s_selectedIndex = index;
                     SetEntryColor(index, s_clipboardColor);
                     FinishBankEdit(context);
                 }
                 ImGui::EndDisabled();
-                if (ImGui::MenuItem("Swap With Selected", nullptr, false, index != s_selectedIndex) && BeginBankEdit()) {
+                if (ImGui::MenuItem("Swap With Selected", nullptr, false, index != s_selectedIndex) && BeginBankEdit("Swap entries")) {
                     SwapEntries(index, s_selectedIndex);
                     s_selectedIndex = index;
                     FinishBankEdit(context);
@@ -1284,12 +1273,41 @@ static void RenderPaletteGrid(const NetplayPaletteLocalContext& context) {
 static void RenderSelectedTools(const NetplayPaletteLocalContext& context) {
     const int visibleMaxIndex = GetVisibleMaxIndex();
 
-    ImGui::TextDisabled("Selected entry %u (0x%02X)", s_selectedIndex, s_selectedIndex);
-    if (s_hoveredIndex < kPaletteEntryCount) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Hover %u (0x%02X)", s_hoveredIndex, s_hoveredIndex);
+    // Compact entry navigation
+    ImGui::BeginDisabled(s_selectedIndex <= 0);
+    if (ImGui::ArrowButton("##PrevEntry", ImGuiDir_Left)) {
+        --s_selectedIndex;
+        SyncHexInputFromSelection();
     }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    int selectedIndex = (int)s_selectedIndex;
+    ImGui::SetNextItemWidth(ModUI_Scale(100.0f));
+    if (ImGui::SliderInt("##EntryNav", &selectedIndex, 0, visibleMaxIndex)) {
+        s_selectedIndex = (uint8_t)selectedIndex;
+        SyncHexInputFromSelection();
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(s_selectedIndex >= visibleMaxIndex);
+    if (ImGui::ArrowButton("##NextEntry", ImGuiDir_Right)) {
+        ++s_selectedIndex;
+        SyncHexInputFromSelection();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("/ %d", visibleMaxIndex);
 
+    if (ImGui::SmallButton("Range Start")) {
+        s_rangeStart = s_selectedIndex;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Range End")) {
+        s_rangeEnd = s_selectedIndex;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("Entry %u (0x%02X)", s_selectedIndex, s_selectedIndex);
+
+    // Color picker
     float selectedColor[4] = {};
     LoadEntryColor(s_selectedIndex, selectedColor);
 
@@ -1297,159 +1315,128 @@ static void RenderSelectedTools(const NetplayPaletteLocalContext& context) {
         SyncHexInputFromSelection();
     }
 
-    if (ImGui::BeginTable("SelectedTools", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableNextColumn();
-        ImGuiColorEditFlags pickerFlags = ImGuiColorEditFlags_DisplayHSV |
-            ImGuiColorEditFlags_PickerHueBar |
-            ImGuiColorEditFlags_AlphaBar;
-        if (!s_showAlpha) {
-            pickerFlags |= ImGuiColorEditFlags_NoAlpha;
+    ImGuiColorEditFlags pickerFlags = ImGuiColorEditFlags_DisplayHSV |
+        ImGuiColorEditFlags_PickerHueBar |
+        ImGuiColorEditFlags_AlphaBar;
+    if (!s_showAlpha) {
+        pickerFlags |= ImGuiColorEditFlags_NoAlpha;
+    }
+    const float pickerWidth = ClampFloat(
+        ImGui::GetContentRegionAvail().x * s_pickerScale,
+        ModUI_Scale(180.0f),
+        ModUI_Scale(420.0f));
+    ImGui::PushItemWidth(pickerWidth);
+    if (ImGui::ColorPicker4("##SelectedPicker",
+            selectedColor,
+            pickerFlags,
+            s_hasClipboardColor ? s_clipboardColor : nullptr) &&
+        BeginBankEdit("Color edit")) {
+        SetEntryColor(s_selectedIndex, selectedColor);
+        FinishBankEdit(context);
+    }
+    ImGui::PopItemWidth();
+
+    // HSV fine-tune sliders
+    float hue = 0.0f;
+    float saturation = 0.0f;
+    float brightness = 0.0f;
+    ImGui::ColorConvertRGBtoHSV(selectedColor[0], selectedColor[1], selectedColor[2], hue, saturation, brightness);
+    float hueDegrees = hue * 360.0f;
+    float saturationPct = saturation * 100.0f;
+    float brightnessPct = brightness * 100.0f;
+    float alphaPct = selectedColor[3] * 100.0f;
+
+    bool hsbaChanged = false;
+    hsbaChanged |= ImGui::SliderFloat("Hue", &hueDegrees, 0.0f, 360.0f, "%.1f deg");
+    hsbaChanged |= ImGui::SliderFloat("Saturation", &saturationPct, 0.0f, 100.0f, "%.1f%%");
+    hsbaChanged |= ImGui::SliderFloat("Brightness", &brightnessPct, 0.0f, 100.0f, "%.1f%%");
+    if (s_showAlpha) {
+        hsbaChanged |= ImGui::SliderFloat("Alpha", &alphaPct, 0.0f, 100.0f, "%.1f%%");
+    }
+    if (hsbaChanged && BeginBankEdit("Color edit")) {
+        while (hueDegrees < 0.0f) {
+            hueDegrees += 360.0f;
         }
-        const float pickerWidth = ClampFloat(
-            ImGui::GetContentRegionAvail().x * s_pickerScale,
-            ModUI_Scale(180.0f),
-            ModUI_Scale(420.0f));
-        ImGui::PushItemWidth(pickerWidth);
-        if (ImGui::ColorPicker4("##SelectedPicker",
-                selectedColor,
-                pickerFlags,
-                s_hasClipboardColor ? s_clipboardColor : nullptr) &&
-            BeginBankEdit()) {
-            SetEntryColor(s_selectedIndex, selectedColor);
+        while (hueDegrees >= 360.0f) {
+            hueDegrees -= 360.0f;
+        }
+        ImGui::ColorConvertHSVtoRGB(hueDegrees / 360.0f,
+            Clamp01(saturationPct / 100.0f),
+            Clamp01(brightnessPct / 100.0f),
+            selectedColor[0],
+            selectedColor[1],
+            selectedColor[2]);
+        selectedColor[3] = Clamp01(alphaPct / 100.0f);
+        SetEntryColor(s_selectedIndex, selectedColor);
+        FinishBankEdit(context);
+    }
+
+    // Hex input
+    ImGui::SeparatorText("Hex Input");
+    ImGui::SetNextItemWidth(ModUI_Scale(120.0f));
+    bool applyHex = ImGui::InputText("##HexRGBA",
+        s_hexInput,
+        sizeof(s_hexInput),
+        ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Apply##Hex")) {
+        applyHex = true;
+    }
+    if (applyHex) {
+        float parsedColor[4] = {};
+        if (ParseHexColor(s_hexInput, selectedColor[3], parsedColor) && BeginBankEdit("Hex edit")) {
+            SetEntryColor(s_selectedIndex, parsedColor);
             FinishBankEdit(context);
-        }
-        ImGui::PopItemWidth();
-
-        ImGui::TableNextColumn();
-
-        int selectedIndex = (int)s_selectedIndex;
-        if (ImGui::SliderInt("Entry Index", &selectedIndex, 0, visibleMaxIndex)) {
-            s_selectedIndex = (uint8_t)selectedIndex;
-            SyncHexInputFromSelection();
-        }
-
-        if (ImGui::Button("Prev") && s_selectedIndex > 0) {
-            --s_selectedIndex;
-            SyncHexInputFromSelection();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Next") && s_selectedIndex < visibleMaxIndex) {
-            ++s_selectedIndex;
-            SyncHexInputFromSelection();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Start <- Selected")) {
-            s_rangeStart = s_selectedIndex;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("End <- Selected")) {
-            s_rangeEnd = s_selectedIndex;
-        }
-
-        float hue = 0.0f;
-        float saturation = 0.0f;
-        float brightness = 0.0f;
-        ImGui::ColorConvertRGBtoHSV(selectedColor[0], selectedColor[1], selectedColor[2], hue, saturation, brightness);
-        float hueDegrees = hue * 360.0f;
-        float saturationPct = saturation * 100.0f;
-        float brightnessPct = brightness * 100.0f;
-        float alphaPct = selectedColor[3] * 100.0f;
-
-        bool hsbaChanged = false;
-        hsbaChanged |= ImGui::SliderFloat("Hue", &hueDegrees, 0.0f, 360.0f, "%.1f deg");
-        hsbaChanged |= ImGui::SliderFloat("Saturation", &saturationPct, 0.0f, 100.0f, "%.1f%%");
-        hsbaChanged |= ImGui::SliderFloat("Brightness", &brightnessPct, 0.0f, 100.0f, "%.1f%%");
-        if (s_showAlpha) {
-            hsbaChanged |= ImGui::SliderFloat("Alpha", &alphaPct, 0.0f, 100.0f, "%.1f%%");
-        }
-        if (hsbaChanged && BeginBankEdit()) {
-            while (hueDegrees < 0.0f) {
-                hueDegrees += 360.0f;
-            }
-            while (hueDegrees >= 360.0f) {
-                hueDegrees -= 360.0f;
-            }
-            ImGui::ColorConvertHSVtoRGB(hueDegrees / 360.0f,
-                Clamp01(saturationPct / 100.0f),
-                Clamp01(brightnessPct / 100.0f),
-                selectedColor[0],
-                selectedColor[1],
-                selectedColor[2]);
-            selectedColor[3] = Clamp01(alphaPct / 100.0f);
-            SetEntryColor(s_selectedIndex, selectedColor);
-            FinishBankEdit(context);
-        }
-
-        bool applyHex = ImGui::InputText("Hex RGBA",
-            s_hexInput,
-            sizeof(s_hexInput),
-            ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        if (ImGui::Button("Apply Hex")) {
-            applyHex = true;
-        }
-        if (applyHex) {
-            float parsedColor[4] = {};
-            if (ParseHexColor(s_hexInput, selectedColor[3], parsedColor) && BeginBankEdit()) {
-                SetEntryColor(s_selectedIndex, parsedColor);
-                FinishBankEdit(context);
-            } else {
-                SyncHexInputFromSelection();
-            }
-        }
-        ImGui::TextDisabled("Format: RRGGBB or RRGGBBAA");
-
-        if (ImGui::Button("Copy Selected")) {
-            CopySelectedToClipboard();
-        }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!s_hasClipboardColor);
-        if (ImGui::Button("Paste To Selected") && BeginBankEdit()) {
-            SetEntryColor(s_selectedIndex, s_clipboardColor);
-            FinishBankEdit(context);
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button("Fill Range With Selected") && BeginBankEdit()) {
-            int rangeStart = 0;
-            int rangeEnd = 0;
-            GetRangeBounds(&rangeStart, &rangeEnd);
-            FillRangeWithColor(rangeStart, rangeEnd, selectedColor);
-            FinishBankEdit(context);
-        }
-
-        if (s_hasClipboardColor) {
-            ImGui::ColorButton("Clipboard Preview",
-                ImVec4(s_clipboardColor[0], s_clipboardColor[1], s_clipboardColor[2], s_clipboardColor[3]),
-                s_showAlpha ? ImGuiColorEditFlags_AlphaPreviewHalf : ImGuiColorEditFlags_NoAlpha,
-                ImVec2(ModUI_Scale(40.0f), ModUI_Scale(40.0f)));
-            ImGui::SameLine();
-            ImGui::Text("Clipboard");
-            ImGui::TextDisabled("RGBA %.0f %.0f %.0f %.0f",
-                s_clipboardColor[0] * 255.0f,
-                s_clipboardColor[1] * 255.0f,
-                s_clipboardColor[2] * 255.0f,
-                s_clipboardColor[3] * 255.0f);
         } else {
-            ImGui::TextDisabled("Clipboard empty");
+            SyncHexInputFromSelection();
         }
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("RRGGBB / RRGGBBAA");
 
-        ImGui::Text("BGRA %02X %02X %02X %02X",
-            s_workingBank.data[s_selectedIndex * 4 + 0],
-            s_workingBank.data[s_selectedIndex * 4 + 1],
-            s_workingBank.data[s_selectedIndex * 4 + 2],
-            s_workingBank.data[s_selectedIndex * 4 + 3]);
-        ImGui::EndTable();
+    // Clipboard tools
+    ImGui::SeparatorText("Clipboard");
+    if (ImGui::Button("Copy")) {
+        CopySelectedToClipboard();
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!s_hasClipboardColor);
+    if (ImGui::Button("Paste") && BeginBankEdit("Paste to entry")) {
+        SetEntryColor(s_selectedIndex, s_clipboardColor);
+        FinishBankEdit(context);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Fill Range") && BeginBankEdit("Fill range")) {
+        int rangeStart = 0;
+        int rangeEnd = 0;
+        GetRangeBounds(&rangeStart, &rangeEnd);
+        FillRangeWithColor(rangeStart, rangeEnd, selectedColor);
+        FinishBankEdit(context);
+    }
+    ImGui::EndDisabled();
+
+    if (s_hasClipboardColor) {
+        ImGui::ColorButton("##ClipPreview",
+            ImVec4(s_clipboardColor[0], s_clipboardColor[1], s_clipboardColor[2], s_clipboardColor[3]),
+            s_showAlpha ? ImGuiColorEditFlags_AlphaPreviewHalf : ImGuiColorEditFlags_NoAlpha,
+            ImVec2(ModUI_Scale(20.0f), ModUI_Scale(20.0f)));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%.0f, %.0f, %.0f, %.0f",
+            s_clipboardColor[0] * 255.0f,
+            s_clipboardColor[1] * 255.0f,
+            s_clipboardColor[2] * 255.0f,
+            s_clipboardColor[3] * 255.0f);
     }
 }
 
 static void RenderRangeTools(const NetplayPaletteLocalContext& context) {
-    ImGui::TextDisabled("Range operations apply to the selected span. Use Ctrl+Click and Shift+Click in the grid to set endpoints quickly.");
     const int visibleMaxIndex = GetVisibleMaxIndex();
 
+    // Range selection
+    ImGui::SeparatorText("Range");
     int rangeStart = (int)s_rangeStart;
     int rangeEnd = (int)s_rangeEnd;
-    if (ImGui::DragIntRange2("Entry Range",
+    if (ImGui::DragIntRange2("##Range",
             &rangeStart,
             &rangeEnd,
             1.0f,
@@ -1464,86 +1451,86 @@ static void RenderRangeTools(const NetplayPaletteLocalContext& context) {
     int normalizedStart = 0;
     int normalizedEnd = 0;
     GetRangeBounds(&normalizedStart, &normalizedEnd);
-    ImGui::Text("Range Size: %d entries", normalizedEnd - normalizedStart + 1);
+    ImGui::TextDisabled("%d entries selected", normalizedEnd - normalizedStart + 1);
 
-    if (ImGui::Button("Use Range Endpoints")) {
+    if (ImGui::SmallButton("Select All")) {
+        s_rangeStart = 0;
+        s_rangeEnd = (uint8_t)visibleMaxIndex;
         SyncGradientEndpointsFromRange();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Range = Selected Only")) {
+    if (ImGui::SmallButton("Single Entry")) {
         s_rangeStart = s_selectedIndex;
         s_rangeEnd = s_selectedIndex;
         SyncGradientEndpointsFromRange();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Reverse Range") && BeginBankEdit()) {
+    if (ImGui::SmallButton("Reverse") && BeginBankEdit("Reverse range")) {
         ReverseRange(normalizedStart, normalizedEnd);
         FinishBankEdit(context);
         SyncGradientEndpointsFromRange();
     }
+    ImGui::TextDisabled("Ctrl+Click grid = range start, Shift+Click = range end");
 
-    ImGui::Separator();
-    ImGui::Text("Gradient");
+    // Gradient
+    ImGui::SeparatorText("Gradient");
     ImGuiColorEditFlags gradientFlags = ImGuiColorEditFlags_DisplayHSV;
     if (!s_showAlpha) {
         gradientFlags |= ImGuiColorEditFlags_NoAlpha;
     }
-    ImGui::ColorEdit4("Start Color", s_gradientStart, gradientFlags);
-    ImGui::ColorEdit4("End Color", s_gradientEnd, gradientFlags);
+    ImGui::ColorEdit4("Start##Grad", s_gradientStart, gradientFlags);
+    ImGui::ColorEdit4("End##Grad", s_gradientEnd, gradientFlags);
 
-    if (ImGui::Button("Selected -> Start")) {
+    if (ImGui::SmallButton("From Selected##GradS")) {
         LoadEntryColor(s_selectedIndex, s_gradientStart);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Selected -> End")) {
+    if (ImGui::SmallButton("From Selected##GradE")) {
         LoadEntryColor(s_selectedIndex, s_gradientEnd);
     }
     ImGui::SameLine();
+    if (ImGui::SmallButton("From Range Ends")) {
+        SyncGradientEndpointsFromRange();
+    }
+    ImGui::SameLine();
     ImGui::BeginDisabled(!s_hasClipboardColor);
-    if (ImGui::Button("Clipboard -> End")) {
+    if (ImGui::SmallButton("Clipboard##GradE")) {
         memcpy(s_gradientEnd, s_clipboardColor, sizeof(s_gradientEnd));
     }
     ImGui::EndDisabled();
 
-    if (ImGui::Button("Apply Gradient") && BeginBankEdit()) {
+    if (ImGui::Button("Apply Gradient", ImVec2(-FLT_MIN, 0.0f)) && BeginBankEdit("Apply gradient")) {
         ApplyGradientToRange(normalizedStart, normalizedEnd, s_gradientStart, s_gradientEnd);
         FinishBankEdit(context);
     }
 
-    ImGui::Separator();
-    ImGui::Text("HSV Transform");
+    // HSV Transform
+    ImGui::SeparatorText("HSV Transform");
     ImGui::SliderFloat("Hue Shift", &s_hueShiftDegrees, -180.0f, 180.0f, "%.1f deg");
-    ImGui::SliderFloat("Saturation", &s_saturationScale, 0.0f, 2.0f, "%.2fx");
-    ImGui::SliderFloat("Value", &s_valueScale, 0.0f, 2.0f, "%.2fx");
+    ImGui::SliderFloat("Sat Scale", &s_saturationScale, 0.0f, 2.0f, "%.2fx");
+    ImGui::SliderFloat("Val Scale", &s_valueScale, 0.0f, 2.0f, "%.2fx");
     if (s_showAlpha) {
-        ImGui::SliderFloat("Alpha", &s_alphaScale, 0.0f, 2.0f, "%.2fx");
+        ImGui::SliderFloat("Alpha Scale", &s_alphaScale, 0.0f, 2.0f, "%.2fx");
     }
 
-    if (ImGui::Button("Apply Transform") && BeginBankEdit()) {
+    if (ImGui::Button("Apply Transform", ImVec2(ModUI_Scale(160.0f), 0.0f)) && BeginBankEdit("Apply transform")) {
         ApplyTransformToRange(normalizedStart, normalizedEnd);
         FinishBankEdit(context);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Reset Transform")) {
+    if (ImGui::Button("Reset", ImVec2(ModUI_Scale(80.0f), 0.0f))) {
         ResetTransformState();
     }
-
-    ImGui::Separator();
-    ImGui::Text("Clipboard");
-    ImGui::BeginDisabled(!s_hasClipboardColor);
-    if (ImGui::Button("Paste Clipboard To Range") && BeginBankEdit()) {
-        FillRangeWithColor(normalizedStart, normalizedEnd, s_clipboardColor);
-        FinishBankEdit(context);
-    }
-    ImGui::EndDisabled();
 }
 
 static void RenderSourceCompare(const NetplayPaletteLocalContext& context) {
+    ImGui::TextDisabled("Compare entry %u across all available source banks.", s_selectedIndex);
+
     if (ImGui::BeginTable("SourceCompare", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Source");
-        ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthFixed, ModUI_Scale(72.0f));
-        ImGui::TableSetupColumn("Selected Entry");
-        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, ModUI_Scale(120.0f));
+        ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthFixed, ModUI_Scale(56.0f));
+        ImGui::TableSetupColumn("Color");
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ModUI_Scale(60.0f));
         ImGui::TableHeadersRow();
 
         for (int sourceIndex = 0; sourceIndex < 4; ++sourceIndex) {
@@ -1562,7 +1549,8 @@ static void RenderSourceCompare(const NetplayPaletteLocalContext& context) {
             ImGui::TableNextColumn();
             ImGui::Text("%s", BankSourceLabel(source));
             if (source == s_loadedSource) {
-                ImGui::TextDisabled("Loaded");
+                ImGui::SameLine();
+                ImGui::TextDisabled("(active)");
             }
 
             ImGui::TableNextColumn();
@@ -1572,11 +1560,10 @@ static void RenderSourceCompare(const NetplayPaletteLocalContext& context) {
                 ImVec2(ModUI_Scale(40.0f), ModUI_Scale(20.0f)));
 
             ImGui::TableNextColumn();
-            ImGui::Text("RGBA %02X %02X %02X %02X", entry[2], entry[1], entry[0], entry[3]);
-            ImGui::TextDisabled("CRC 0x%08X  Visible:%d", bank.crc32, GetVisibleEntryCountForBank(bank));
+            ImGui::Text("#%02X%02X%02X%02X", entry[2], entry[1], entry[0], entry[3]);
 
             ImGui::TableNextColumn();
-            if (ImGui::Button(BankSourceLabel(source))) {
+            if (ImGui::SmallButton("Load")) {
                 ReloadWorkingBank(source);
             }
 
@@ -1585,104 +1572,80 @@ static void RenderSourceCompare(const NetplayPaletteLocalContext& context) {
 
         ImGui::EndTable();
     }
-
-    ImGui::TextDisabled("Current source: %s  |  Live:%s  Applied:%s  Saved:%s",
-        BankSourceLabel(s_loadedSource),
-        context.has_live_bank ? "yes" : "no",
-        context.has_applied_custom_bank ? "yes" : "no",
-        context.has_saved_custom_bank ? "yes" : "no");
 }
 
 static void RenderPresetTools() {
     EnsurePresetListCurrent();
 
-    ImGui::TextDisabled("Named presets are scoped to the current character and base palette. Loading a preset only changes the editor until you apply it live or save it as the active custom bank.");
-    ImGui::TextDisabled("Preset scope: Char %u  Base %u", s_workingBank.character_id, s_workingBank.base_palette);
+    ImGui::TextDisabled("Presets for Character %u, Palette %u", s_workingBank.character_id, s_workingBank.base_palette);
 
-    if (ImGui::BeginTable("PresetToolsLayout", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("PresetList", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableSetupColumn("PresetActions", ImGuiTableColumnFlags_WidthStretch, 0.9f);
-
-        ImGui::TableNextColumn();
-        ImGui::Text("Saved Presets (%d)", s_presetCount);
-        ImGui::BeginChild("PresetList", ImVec2(0.0f, ModUI_Scale(200.0f)), true);
-        for (int presetIndex = 0; presetIndex < s_presetCount; ++presetIndex) {
-            const bool isSelected = presetIndex == s_selectedPreset;
-            if (ImGui::Selectable(s_presets[presetIndex].name, isSelected, ImGuiSelectableFlags_AllowDoubleClick)) {
-                s_selectedPreset = presetIndex;
-                CopyText(s_presetName, sizeof(s_presetName), s_presets[presetIndex].name);
-                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    LoadPresetIntoWorkingBank(presetIndex, false);
-                }
-            }
-            if (ImGui::IsItemHovered()) {
-                RenderPresetTooltip(presetIndex);
+    // Preset list
+    ImGui::Text("Saved Presets (%d)", s_presetCount);
+    ImGui::BeginChild("PresetList", ImVec2(0.0f, ModUI_Scale(160.0f)), true);
+    for (int presetIndex = 0; presetIndex < s_presetCount; ++presetIndex) {
+        const bool isSelected = presetIndex == s_selectedPreset;
+        if (ImGui::Selectable(s_presets[presetIndex].name, isSelected, ImGuiSelectableFlags_AllowDoubleClick)) {
+            s_selectedPreset = presetIndex;
+            CopyText(s_presetName, sizeof(s_presetName), s_presets[presetIndex].name);
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                LoadPresetIntoWorkingBank(presetIndex, s_autoApplyLive);
             }
         }
-        if (s_presetCount <= 0) {
-            ImGui::TextDisabled("No named presets saved for this bank yet.");
+        if (ImGui::IsItemHovered()) {
+            RenderPresetTooltip(presetIndex);
         }
-        ImGui::EndChild();
+    }
+    if (s_presetCount <= 0) {
+        ImGui::TextDisabled("No presets saved yet.");
+    }
+    ImGui::EndChild();
 
-        ImGui::TableNextColumn();
-        ImGui::Text("Actions");
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::InputText("Preset Name", s_presetName, sizeof(s_presetName));
-        ImGui::TextDisabled("Invalid filename characters are replaced with underscores.");
+    // Preview of selected preset
+    const bool hasSelectedPreset = s_selectedPreset >= 0 && s_selectedPreset < s_presetCount;
+    if (hasSelectedPreset) {
+        NetplayPaletteBank previewBank{};
+        if (LoadPresetByIndex(s_selectedPreset, &previewBank)) {
+            RenderBankPreviewRow(previewBank, 16);
+        }
+    }
 
-        const bool hasSelectedPreset = s_selectedPreset >= 0 && s_selectedPreset < s_presetCount;
+    // Actions
+    ImGui::SeparatorText("Actions");
+    ImGui::BeginDisabled(!hasSelectedPreset);
+    if (ImGui::Button("Load")) {
+        LoadPresetIntoWorkingBank(s_selectedPreset, false);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load & Apply")) {
+        LoadPresetIntoWorkingBank(s_selectedPreset, true);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Delete")) {
+        DeleteSelectedPreset();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Random")) {
+        const int randomIndex = PickRandomPresetIndex();
+        if (randomIndex >= 0) {
+            LoadPresetIntoWorkingBank(randomIndex, s_autoApplyLive);
+        } else {
+            SetStatusText(s_presetStatus, sizeof(s_presetStatus), "No other presets available.");
+        }
+    }
+    ImGui::EndDisabled();
 
-        ImGui::BeginDisabled(!hasSelectedPreset);
-        if (ImGui::Button("Load To Editor", ImVec2(-FLT_MIN, 0.0f))) {
-            LoadPresetIntoWorkingBank(s_selectedPreset, false);
-        }
-        if (ImGui::Button("Apply Selected Live", ImVec2(-FLT_MIN, 0.0f))) {
-            LoadPresetIntoWorkingBank(s_selectedPreset, true);
-        }
-        if (ImGui::Button("Delete Selected", ImVec2(-FLT_MIN, 0.0f))) {
-            DeleteSelectedPreset();
-        }
-        ImGui::EndDisabled();
-
-        if (ImGui::Button("Save Current As Preset", ImVec2(-FLT_MIN, 0.0f))) {
-            SaveWorkingBankAsPreset(s_presetName, false);
-        }
-        if (ImGui::Button("Refresh Presets", ImVec2(-FLT_MIN, 0.0f))) {
-            RefreshPresetList();
-            SetStatusText(s_presetStatus, sizeof(s_presetStatus), "Refreshed preset list.");
-        }
-
-        if (ImGui::Button("Random Load", ImVec2(-FLT_MIN, 0.0f))) {
-            const int randomIndex = PickRandomPresetIndex();
-            if (randomIndex >= 0) {
-                LoadPresetIntoWorkingBank(randomIndex, false);
-            } else {
-                SetStatusText(s_presetStatus, sizeof(s_presetStatus), "No presets available to randomize.");
-            }
-        }
-        if (ImGui::Button("Random Apply Live", ImVec2(-FLT_MIN, 0.0f))) {
-            const int randomIndex = PickRandomPresetIndex();
-            if (randomIndex >= 0) {
-                LoadPresetIntoWorkingBank(randomIndex, true);
-            } else {
-                SetStatusText(s_presetStatus, sizeof(s_presetStatus), "No presets available to randomize.");
-            }
-        }
-
-        if (hasSelectedPreset) {
-            NetplayPaletteBank previewBank{};
-            if (LoadPresetByIndex(s_selectedPreset, &previewBank)) {
-                ImGui::Separator();
-                ImGui::TextDisabled("Preview: %s", s_presets[s_selectedPreset].name);
-                RenderBankPreviewRow(previewBank, 16);
-                ImGui::TextDisabled("Visible:%d/%d  CRC:0x%08X",
-                    GetVisibleEntryCountForBank(previewBank),
-                    kPaletteEntryCount,
-                    previewBank.crc32);
-            }
-        }
-
-        ImGui::EndTable();
+    // Save
+    ImGui::SeparatorText("Save");
+    ImGui::SetNextItemWidth(ModUI_Scale(200.0f));
+    ImGui::InputText("Name", s_presetName, sizeof(s_presetName));
+    ImGui::SameLine();
+    if (ImGui::Button("Save")) {
+        SaveWorkingBankAsPreset(s_presetName, false);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh")) {
+        RefreshPresetList();
+        SetStatusText(s_presetStatus, sizeof(s_presetStatus), "Refreshed.");
     }
 
     if (s_presetStatus[0]) {
@@ -1779,6 +1742,34 @@ void PaletteEditor_Render() {
     }
 
     RenderPaletteSummary(context);
+
+    // Keyboard shortcuts
+    if (s_hasWorkingBank && !ImGui::GetIO().WantTextInput) {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            if (io.KeyShift) {
+                RedoWorkingBank(context);
+            } else {
+                UndoWorkingBank(context);
+            }
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+            RedoWorkingBank(context);
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            CopySelectedToClipboard();
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            if (s_hasClipboardColor && BeginBankEdit("Paste to entry")) {
+                SetEntryColor(s_selectedIndex, s_clipboardColor);
+                FinishBankEdit(context);
+            }
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+            if (BeginBankEdit("Clear entry")) {
+                const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                SetEntryColor(s_selectedIndex, zero);
+                FinishBankEdit(context);
+            }
+        }
+    }
+
     RenderPaletteToolbar(context);
 
     if (!s_hasWorkingBank) {
@@ -1796,17 +1787,24 @@ void PaletteEditor_Render() {
         RenderPaletteGrid(context);
 
         ImGui::TableNextColumn();
-        if (ImGui::CollapsingHeader("Selected Color", ImGuiTreeNodeFlags_DefaultOpen)) {
-            RenderSelectedTools(context);
-        }
-        if (ImGui::CollapsingHeader("Range, Gradient, Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-            RenderRangeTools(context);
-        }
-        if (ImGui::CollapsingHeader("Source Banks", ImGuiTreeNodeFlags_DefaultOpen)) {
-            RenderSourceCompare(context);
-        }
-        if (ImGui::CollapsingHeader("Saved Presets", ImGuiTreeNodeFlags_DefaultOpen)) {
-            RenderPresetTools();
+        if (ImGui::BeginTabBar("PaletteToolTabs")) {
+            if (ImGui::BeginTabItem("Color")) {
+                RenderSelectedTools(context);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Effects")) {
+                RenderRangeTools(context);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Presets")) {
+                RenderPresetTools();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Banks")) {
+                RenderSourceCompare(context);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
         }
 
         ImGui::EndTable();

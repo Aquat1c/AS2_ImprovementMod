@@ -190,10 +190,16 @@ void InputSystem_CancelBinding(void);
 KeyBinding_t* InputSystem_GetBindingByIndex(PlayerBindings_t* bindings, int index);
 const KeyBinding_t* InputSystem_GetBindingByIndexConst(const PlayerBindings_t* bindings, int index);
 
+// Query helpers for arbitrary bindings (used by UI/config systems)
+bool InputSystem_IsBindingDown(int player, const KeyBinding_t* binding);
+bool InputSystem_DoBindingsOverlap(const KeyBinding_t* lhs, const KeyBinding_t* rhs);
+void InputSystem_GetBindingDisplayName(const KeyBinding_t* binding, char* out, int outSize);
+
 // ============================================================================
 // Display Name Helpers
 // ============================================================================
 
+int InputSystem_ScancodeToVirtualKey(int sdlScancode);
 const char* InputSystem_GetKeyName(int sdlScancode);
 const char* InputSystem_GetGamepadButtonName(int sdlGamepadButton);
 const char* InputSystem_GetGamepadAxisName(int sdlGamepadAxis, int direction);

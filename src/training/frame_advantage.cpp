@@ -18,15 +18,21 @@ constexpr uint32_t kFrameUnset = UINT32_MAX;
 constexpr uint32_t kPendingTimeoutFrames = 180;
 constexpr uint32_t kInteractionTimeoutFrames = 300;
 constexpr uint32_t kTradeWindowFrames = 1;
+constexpr uint32_t kOverlayDisplayFrames = 180;
+constexpr uint32_t kGapDisplayFrames = 30;
+constexpr uint32_t kGapMaxFrames = 20;
 constexpr size_t kHistoryCapacity = 20;
 
 constexpr float kOverlayPadding = 6.0f;
-constexpr float kOverlayY = 54.0f; // Below pause indicator
+// Overlay anchor offset from bottom of screen (above meter bars).
+// Slot 0 = bottom-most (PAUSED), slot 1 = FA, slot 2 = macro.
+constexpr float kOverlayBottomOffset = 62.0f;
 
 constexpr ImU32 kOverlayBg = IM_COL32(0, 0, 0, 180);
 constexpr ImU32 kNeutralColor = IM_COL32(230, 230, 230, 255);
 constexpr ImU32 kPlusColor = IM_COL32(120, 255, 140, 255);
 constexpr ImU32 kMinusColor = IM_COL32(255, 150, 120, 255);
+constexpr ImU32 kGapColor = IM_COL32(255, 225, 110, 255);
 
 enum class InteractionResult : uint8_t {
     Blocked,
@@ -83,6 +89,14 @@ struct HistoryEntry {
     int32_t frameAdvantage = 0;
 };
 
+struct GapDisplay {
+    bool active = false;
+    uint32_t untilFrame = kFrameUnset;
+    uint32_t gapFrames = 0;
+    uint8_t attacker = 0;
+    uint8_t defender = 1;
+};
+
 bool s_initialized = false;
 bool s_enabled = true;
 bool s_roundResetApplied = false;
@@ -95,6 +109,10 @@ uint8_t  s_lastLoggedHitActive[2] = {};
 PlayerState s_players[2]{};
 PendingAttack s_pending[2]{};
 Interaction s_active[2]{};
+GapDisplay s_gapDisplay{};
+uint32_t s_resultDisplayUntilFrame = kFrameUnset;
+uint32_t s_lastSimFrame = kFrameUnset;
+uint32_t s_lastDefenderFreeFrame[2] = {kFrameUnset, kFrameUnset};
 std::array<HistoryEntry, kHistoryCapacity> s_history{};
 size_t s_historyHead = 0;
 size_t s_historyCount = 0;
@@ -113,7 +131,11 @@ bool IsBlockstun(uint32_t actionId) {
 }
 
 bool IsHitstun(uint32_t actionId) {
-    return actionId == 72 || actionId == 73 || actionId == 74;
+    return actionId == 72 || actionId == 73;
+}
+
+bool IsWakeupNoTech(uint32_t actionId) {
+    return actionId == 74;
 }
 
 bool IsTech(uint32_t actionId) {
@@ -121,17 +143,20 @@ bool IsTech(uint32_t actionId) {
 }
 
 bool IsStunned(uint32_t actionId) {
-    return IsBlockstun(actionId) || IsHitstun(actionId);
+    return IsBlockstun(actionId) || IsHitstun(actionId) || IsWakeupNoTech(actionId);
 }
 
 bool IsDefenderLocked(uint32_t actionId) {
-    return IsStunned(actionId) || IsTech(actionId) || actionId == 23;
+    return IsBlockstun(actionId) ||
+           IsHitstun(actionId) ||
+           (actionId >= 74 && actionId <= 82) ||
+           actionId == 23;
 }
 
-// Knockdown/launch states: tech recovery (78-82) or action IDs between
-// hitstun and tech that represent knockdown/falling (75-77).
+// Knockdown/launch states: untechable wakeup (74), airborne knockdown/fall
+// (75-77), or tech/post-tech recovery (78-82).
 bool IsKnockdownOrLaunch(uint32_t actionId) {
-    return (actionId >= 75 && actionId <= 82);
+    return actionId == 74 || (actionId >= 75 && actionId <= 82);
 }
 
 bool HasAttackPayload(const EntitySample& sample) {
@@ -159,6 +184,7 @@ const char* ActionCategory(uint32_t actionId) {
     if (IsActionable(actionId)) return "Actionable";
     if (IsBlockstun(actionId)) return "Blockstun";
     if (IsHitstun(actionId)) return "Hitstun";
+    if (IsWakeupNoTech(actionId)) return "WakeupNoTech";
     if (IsTech(actionId)) return "Tech";
     if (IsKnockdownOrLaunch(actionId)) return "Knockdown";
     return "Other";
@@ -208,6 +234,62 @@ void ClearInteraction(Interaction* interaction) {
     *interaction = Interaction{};
 }
 
+void ClearGapDisplay() {
+    s_gapDisplay = GapDisplay{};
+}
+
+void ClearResultDisplay() {
+    s_resultDisplayUntilFrame = kFrameUnset;
+}
+
+void ClearVisibleOverlayState() {
+    ClearGapDisplay();
+    ClearResultDisplay();
+}
+
+void PublishGapDisplay(uint32_t simFrame, int attackerIndex, int defenderIndex) {
+    ClearGapDisplay();
+    ClearResultDisplay();
+
+    if (defenderIndex < 0 || defenderIndex >= 2) {
+        return;
+    }
+
+    const uint32_t defenderFreeFrame = s_lastDefenderFreeFrame[defenderIndex];
+    s_lastDefenderFreeFrame[defenderIndex] = kFrameUnset;
+
+    if (defenderFreeFrame == kFrameUnset || simFrame <= defenderFreeFrame) {
+        return;
+    }
+
+    const uint32_t gapFrames = simFrame - defenderFreeFrame;
+    if (gapFrames == 0 || gapFrames > kGapMaxFrames) {
+        if (s_debugLogging && gapFrames > 0) {
+            LOG_INFO("[FA] GAP ignored: %s->%s gap=%u (max=%u free=%u contact=%u)",
+                     SideLabel((uint8_t)attackerIndex),
+                     SideLabel((uint8_t)defenderIndex),
+                     gapFrames,
+                     kGapMaxFrames,
+                     defenderFreeFrame,
+                     simFrame);
+        }
+        return;
+    }
+
+    s_gapDisplay.active = true;
+    s_gapDisplay.untilFrame = simFrame + kGapDisplayFrames;
+    s_gapDisplay.gapFrames = gapFrames;
+    s_gapDisplay.attacker = (uint8_t)attackerIndex;
+    s_gapDisplay.defender = (uint8_t)defenderIndex;
+
+    LOG_INFO("[FA] GAP: %s->%s gap=%u (free=%u contact=%u)",
+             SideLabel((uint8_t)attackerIndex),
+             SideLabel((uint8_t)defenderIndex),
+             gapFrames,
+             defenderFreeFrame,
+             simFrame);
+}
+
 void ClearTrackingRuntime(bool clearHistory) {
     for (PlayerState& player : s_players) {
         player = PlayerState{};
@@ -218,6 +300,10 @@ void ClearTrackingRuntime(bool clearHistory) {
     for (Interaction& interaction : s_active) {
         interaction = Interaction{};
     }
+    ClearVisibleOverlayState();
+    s_lastSimFrame = kFrameUnset;
+    s_lastDefenderFreeFrame[0] = kFrameUnset;
+    s_lastDefenderFreeFrame[1] = kFrameUnset;
     if (clearHistory) {
         s_historyHead = 0;
         s_historyCount = 0;
@@ -304,17 +390,20 @@ void FinalizeFrameSamples() {
 void RefreshPendingAttack(uint32_t simFrame, int attackerIndex) {
     const PlayerState& attacker = s_players[attackerIndex];
     PendingAttack& pending = s_pending[attackerIndex];
+    const Interaction& active = s_active[attackerIndex];
 
     const bool attackStateEdge = attacker.prev.attackState == 0 && attacker.curr.attackState == 1;
     const bool attackActionEntered = attacker.curr.actionId != attacker.prev.actionId &&
         IsAttackActionCandidate(attacker.curr);
     const bool attackPayloadAppeared = !HasAttackPayload(attacker.prev) &&
         IsAttackActionCandidate(attacker.curr);
-    const bool shouldStartPending = !s_active[attackerIndex].active &&
+    const bool canQueuePending = !active.active || active.attacker_actionId != attacker.curr.actionId;
+    const bool shouldStartPending = canQueuePending &&
         (attackStateEdge || attackActionEntered || attackPayloadAppeared) &&
         (!pending.active || pending.attacker_actionId != attacker.curr.actionId);
 
     if (shouldStartPending) {
+        ClearVisibleOverlayState();
         pending = PendingAttack{};
         pending.active = true;
         pending.simFrame_attackStart = simFrame;
@@ -416,7 +505,7 @@ void PromotePendingAttackToInteraction(uint32_t simFrame, int attackerIndex, int
 void ProcessContactEdges(uint32_t simFrame) {
     for (int defenderIndex = 0; defenderIndex < 2; ++defenderIndex) {
         const PlayerState& defender = s_players[defenderIndex];
-        const bool enteredStun = !IsStunned(defender.prev.actionId) && IsStunned(defender.curr.actionId);
+        const bool enteredStun = !IsDefenderLocked(defender.prev.actionId) && IsStunned(defender.curr.actionId);
         if (!enteredStun) {
             continue;
         }
@@ -430,12 +519,35 @@ void ProcessContactEdges(uint32_t simFrame) {
 
         const int attackerIndex = 1 - defenderIndex;
         Interaction& existing = s_active[attackerIndex];
+        PendingAttack& pending = s_pending[attackerIndex];
+
+        PublishGapDisplay(simFrame, attackerIndex, defenderIndex);
+
         if (existing.active) {
-            if (s_debugLogging) {
-                LOG_INFO("[FA] %s re-stunned during active interaction (multi-hit), resetting D_recover",
-                         SideLabel((uint8_t)defenderIndex));
+            if (pending.active && pending.attacker_actionId != existing.attacker_actionId) {
+                if (s_debugLogging) {
+                    LOG_INFO("[FA] %s->%s new move contact: replacing actionId=%u with actionId=%u at frame %u",
+                             SideLabel((uint8_t)attackerIndex),
+                             SideLabel((uint8_t)defenderIndex),
+                             existing.attacker_actionId,
+                             pending.attacker_actionId,
+                             simFrame);
+                }
+                ClearInteraction(&existing);
+                PromotePendingAttackToInteraction(simFrame, attackerIndex, defenderIndex);
+                continue;
             }
+
+            if (s_debugLogging) {
+                LOG_INFO("[FA] %s re-contact during active interaction, refreshing contact frame to %u",
+                         SideLabel((uint8_t)defenderIndex),
+                         simFrame);
+            }
+            existing.simFrame_contact = simFrame;
             existing.simFrame_D_recover = kFrameUnset;
+            existing.defender_actionAtContact = defender.curr.actionId;
+            existing.result = IsBlockstun(defender.curr.actionId) ? InteractionResult::Blocked : InteractionResult::Hit;
+            existing.defenderLaunched = false;
             existing.lastProgressFrame = simFrame;
             continue;
         }
@@ -457,17 +569,15 @@ void CompleteInteraction(Interaction* interaction) {
         return;
     }
 
-    // Skip launches/knockdowns — frame advantage is meaningless.
-    if (interaction->defenderLaunched) {
-        if (s_debugLogging) {
-            LOG_INFO("[FA] %s->%s LAUNCHED — discarding (no frame advantage for knockdown)",
-                     SideLabel(interaction->attacker), SideLabel(interaction->defender));
-        }
-        ClearInteraction(interaction);
-        return;
-    }
-
     interaction->frameAdvantage = (int32_t)interaction->simFrame_D_recover - (int32_t)interaction->simFrame_A_recover;
+    s_lastDefenderFreeFrame[interaction->defender] = interaction->simFrame_D_recover;
+    s_resultDisplayUntilFrame = interaction->simFrame_D_recover + kOverlayDisplayFrames;
+
+    if (interaction->defenderLaunched && s_debugLogging) {
+        LOG_INFO("[FA] %s->%s completed after launch/knockdown recovery",
+                 SideLabel(interaction->attacker),
+                 SideLabel(interaction->defender));
+    }
 
     LOG_INFO("[FA] COMPLETE: %s->%s %s adv=%+d (A_recover=%u D_recover=%u contact=%u actionId=%u)",
              SideLabel(interaction->attacker), SideLabel(interaction->defender),
@@ -501,15 +611,16 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
         }
     }
 
-    // Detect launches: if the defender enters a knockdown/tech state after
-    // being hit (not blocked), this is a launch — no meaningful frame advantage.
+    // Track whether the exchange flowed through launch/knockdown recovery.
+    // Unlike the old implementation, this no longer discards the result.
     if (interaction.result == InteractionResult::Hit &&
         !interaction.defenderLaunched &&
         IsKnockdownOrLaunch(defender.curr.actionId)) {
         interaction.defenderLaunched = true;
         if (s_debugLogging) {
-            LOG_INFO("[FA] %s DEFENDER LAUNCHED: frame=%u def_act=%u",
-                     SideLabel(interaction.defender), simFrame, defender.curr.actionId);
+            LOG_INFO("[FA] %s DEFENDER ENTERED KNOCKDOWN/WAKEUP: frame=%u def_act=%u(%s) - waiting for true recovery",
+                     SideLabel(interaction.defender), simFrame,
+                     defender.curr.actionId, ActionCategory(defender.curr.actionId));
         }
     }
 
@@ -571,6 +682,7 @@ void FrameAdvantage_ResetState(void) {
 }
 
 void FrameAdvantage_ClearDisplay(void) {
+    ClearVisibleOverlayState();
     s_historyHead = 0;
     s_historyCount = 0;
     s_history.fill(HistoryEntry{});
@@ -586,6 +698,9 @@ void FrameAdvantage_CancelCalculation(void) {
     for (Interaction& interaction : s_active) {
         interaction = Interaction{};
     }
+    ClearGapDisplay();
+    s_lastDefenderFreeFrame[0] = kFrameUnset;
+    s_lastDefenderFreeFrame[1] = kFrameUnset;
 }
 
 void FrameAdvantage_SetEnabled(bool enabled) {
@@ -601,12 +716,35 @@ bool FrameAdvantage_IsEnabled(void) {
 }
 
 bool FrameAdvantage_HasVisibleOverlay(void) {
-    return s_initialized && s_enabled && s_historyCount > 0;
+    if (!s_initialized || !s_enabled) {
+        return false;
+    }
+
+    if (s_gapDisplay.active) {
+        return true;
+    }
+
+    return s_historyCount > 0 &&
+           s_resultDisplayUntilFrame != kFrameUnset &&
+           s_lastSimFrame != kFrameUnset &&
+           s_lastSimFrame < s_resultDisplayUntilFrame;
 }
 
 void FrameAdvantage_OnFrameAdvanced(uint32_t simFrame) {
     if (!s_initialized || !s_enabled) {
         return;
+    }
+
+    s_lastSimFrame = simFrame;
+
+    if (s_resultDisplayUntilFrame != kFrameUnset && simFrame >= s_resultDisplayUntilFrame) {
+        ClearResultDisplay();
+    }
+
+    if (s_gapDisplay.active &&
+        s_gapDisplay.untilFrame != kFrameUnset &&
+        simFrame >= s_gapDisplay.untilFrame) {
+        ClearGapDisplay();
     }
 
     if (!PracticeTools_IsPracticeModeActive()) {
@@ -649,12 +787,34 @@ void FrameAdvantage_RenderOverlay(void) {
         return;
     }
 
-    if (s_historyCount == 0) {
+    if (!s_gapDisplay.active &&
+        (s_historyCount == 0 ||
+         s_resultDisplayUntilFrame == kFrameUnset ||
+         s_lastSimFrame == kFrameUnset ||
+         s_lastSimFrame >= s_resultDisplayUntilFrame)) {
         return;
     }
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     if (!dl) {
+        return;
+    }
+
+    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+
+    if (s_gapDisplay.active) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "Gap %u", s_gapDisplay.gapFrames);
+
+        const ImVec2 textSize = ImGui::CalcTextSize(buf);
+        const float x = (displaySize.x - textSize.x) * 0.5f;
+        const float y = displaySize.y - kOverlayBottomOffset;
+
+        dl->AddRectFilled(
+            ImVec2(x - kOverlayPadding, y - 2.0f),
+            ImVec2(x + textSize.x + kOverlayPadding, y + textSize.y + 2.0f),
+            kOverlayBg, 4.0f);
+        dl->AddText(ImVec2(x, y), kGapColor, buf);
         return;
     }
 
@@ -669,11 +829,10 @@ void FrameAdvantage_RenderOverlay(void) {
 
     const ImU32 textColor = AdvantageColor(entry->frameAdvantage);
     const ImVec2 textSize = ImGui::CalcTextSize(buf);
-    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
 
-    // Center horizontally, below the pause indicator
+    // Center horizontally, above the meter bars at bottom of screen
     const float x = (displaySize.x - textSize.x) * 0.5f;
-    const float y = kOverlayY;
+    const float y = displaySize.y - kOverlayBottomOffset;
 
     dl->AddRectFilled(
         ImVec2(x - kOverlayPadding, y - 2.0f),
@@ -704,6 +863,13 @@ void FrameAdvantage_RenderImGui(void) {
             ImGui::Text("Last: %s %+d (%s)", SideLabel(entry->attacker),
                         entry->frameAdvantage, ResultLabel(entry->result));
         }
+    }
+
+    if (s_enabled && s_gapDisplay.active) {
+        ImGui::Text("Gap: %u (%s->%s)",
+                    s_gapDisplay.gapFrames,
+                    SideLabel(s_gapDisplay.attacker),
+                    SideLabel(s_gapDisplay.defender));
     }
 
     // Live tracking state display
@@ -742,6 +908,20 @@ void FrameAdvantage_RenderImGui(void) {
                             (ia.simFrame_D_recover == kFrameUnset) ? "unset" : "set",
                             ia.defenderLaunched ? 1 : 0);
             }
+        }
+
+        for (int i = 0; i < 2; i++) {
+            if (s_lastDefenderFreeFrame[i] != kFrameUnset) {
+                ImGui::Text("  %s LastFree=%u", SideLabel((uint8_t)i), s_lastDefenderFreeFrame[i]);
+            }
+        }
+
+        if (s_gapDisplay.active) {
+            ImGui::Text("  ActiveGap: %s->%s gap=%u until=%u",
+                        SideLabel(s_gapDisplay.attacker),
+                        SideLabel(s_gapDisplay.defender),
+                        s_gapDisplay.gapFrames,
+                        s_gapDisplay.untilFrame);
         }
     }
 }

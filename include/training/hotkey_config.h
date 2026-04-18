@@ -1,5 +1,7 @@
 #pragma once
 
+#include "input_system.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -12,6 +14,8 @@ enum HotkeyAction : int {
     HOTKEY_PAUSE_TOGGLE,
     HOTKEY_FRAME_STEP,
     HOTKEY_CONTROL_SWAP,
+    HOTKEY_POSITION_LOAD,
+    HOTKEY_POSITION_SAVE,
     HOTKEY_MACRO_RECORD,
     HOTKEY_MACRO_PLAY,
     HOTKEY_MACRO_SLOT_NEXT,
@@ -28,17 +32,23 @@ extern "C" {
 
 void HotkeyConfig_Init(void);
 
-// Returns the Windows virtual key code for an action.
-int  HotkeyConfig_GetKey(HotkeyAction action);
+// Returns the binding for an action.
+const KeyBinding_t* HotkeyConfig_GetBinding(HotkeyAction action);
 
-// Sets the Windows virtual key code for an action.
-void HotkeyConfig_SetKey(HotkeyAction action, int vk);
+// Sets the full keyboard/controller binding for an action.
+void HotkeyConfig_SetBinding(HotkeyAction action, const KeyBinding_t* binding);
+
+// Formats a display name for an action's current binding.
+void HotkeyConfig_GetBindingDisplayName(HotkeyAction action, char* out, int outSize);
 
 // Returns a display name for a virtual key code (e.g. "F4", "A", "Numpad0").
 const char* HotkeyConfig_KeyName(int vk);
 
 // Returns the display label for an action (e.g. "Hitbox Toggle").
 const char* HotkeyConfig_ActionName(HotkeyAction action);
+
+// Returns true if training hotkeys should be ignored this frame.
+bool HotkeyConfig_IsSuppressed(void);
 
 // Edge-detected key press query. Call once per frame for each action.
 // Returns true on the frame a key transitions from up to down.

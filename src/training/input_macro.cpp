@@ -484,7 +484,7 @@ void InputMacro_RenderOverlay(void) {
     const ImVec2 textSize = ImGui::CalcTextSize(buf);
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
     const float x = (displaySize.x - textSize.x) * 0.5f;
-    const float y = 76.0f;  // Below frame advantage overlay
+    const float y = displaySize.y - 84.0f;  // Slot 2: above FA overlay
 
     dl->AddRectFilled(
         ImVec2(x - 6.0f, y - 2.0f),

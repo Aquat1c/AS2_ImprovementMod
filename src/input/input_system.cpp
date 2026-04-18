@@ -274,7 +274,7 @@ static uint16_t ReadGamepadPlayer(int player) {
 // Keyboard Reading — Win32 GetAsyncKeyState (reliable without own window)
 // ============================================================================
 
-static int SDLScancodeToVirtualKey(int sc) {
+int InputSystem_ScancodeToVirtualKey(int sc) {
     // SDL_SCANCODE values → Win32 Virtual Key codes
     // Covers ALL standard SDL3 scancodes for complete keyboard binding support.
     switch (sc) {
@@ -445,7 +445,7 @@ static uint16_t ReadKeyboardPlayer(int player) {
 
     auto checkKey = [&](const KeyBinding_t& bind, uint16_t flag) {
         if (bind.keyboard_key > 0) {
-            int vk = SDLScancodeToVirtualKey(bind.keyboard_key);
+            int vk = InputSystem_ScancodeToVirtualKey(bind.keyboard_key);
             if (vk > 0 && (GetAsyncKeyState(vk) & 0x8000))
                 input |= flag;
         }
@@ -868,6 +868,107 @@ KeyBinding_t* InputSystem_GetBindingByIndex(PlayerBindings_t* bindings, int inde
 const KeyBinding_t* InputSystem_GetBindingByIndexConst(const PlayerBindings_t* bindings, int index) {
     if (!bindings || index < 0 || index >= INPUT_ACTION_COUNT) return nullptr;
     return &(reinterpret_cast<const KeyBinding_t*>(bindings))[index];
+}
+
+bool InputSystem_IsBindingDown(int player, const KeyBinding_t* binding) {
+    if (!binding || !IsGameWindowActive()) {
+        return false;
+    }
+
+    if (binding->keyboard_key > 0) {
+        const int vk = InputSystem_ScancodeToVirtualKey(binding->keyboard_key);
+        if (vk > 0 && (GetAsyncKeyState(vk) & 0x8000)) {
+            return true;
+        }
+    }
+
+    if (player >= 0 && player < g_gamepadCount) {
+        SDL_Gamepad* gp = g_gamepads[player];
+        if (gp) {
+            if (binding->gamepad_button >= 0 &&
+                SDL_GetGamepadButton(gp, (SDL_GamepadButton)binding->gamepad_button)) {
+                return true;
+            }
+
+            if (binding->gamepad_axis >= 0) {
+                const int16_t value = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)binding->gamepad_axis);
+                if ((binding->axis_direction > 0 && value > STICK_DEADZONE) ||
+                    (binding->axis_direction < 0 && value < -STICK_DEADZONE)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+bool InputSystem_DoBindingsOverlap(const KeyBinding_t* lhs, const KeyBinding_t* rhs) {
+    if (!lhs || !rhs) {
+        return false;
+    }
+
+    if (lhs->keyboard_key > 0 && lhs->keyboard_key == rhs->keyboard_key) {
+        return true;
+    }
+
+    if (lhs->gamepad_button >= 0 && lhs->gamepad_button == rhs->gamepad_button) {
+        return true;
+    }
+
+    if (lhs->gamepad_axis >= 0 &&
+        lhs->gamepad_axis == rhs->gamepad_axis &&
+        lhs->axis_direction == rhs->axis_direction) {
+        return true;
+    }
+
+    return false;
+}
+
+void InputSystem_GetBindingDisplayName(const KeyBinding_t* binding, char* out, int outSize) {
+    if (!out || outSize <= 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (!binding) {
+        snprintf(out, outSize, "None");
+        return;
+    }
+
+    int written = 0;
+    auto appendPart = [&](const char* text) {
+        if (!text || !text[0] || written >= outSize - 1) {
+            return;
+        }
+
+        if (written > 0) {
+            written += snprintf(out + written, outSize - written, " / ");
+            if (written >= outSize - 1) {
+                out[outSize - 1] = '\0';
+                return;
+            }
+        }
+
+        written += snprintf(out + written, outSize - written, "%s", text);
+        if (written >= outSize - 1) {
+            out[outSize - 1] = '\0';
+        }
+    };
+
+    if (binding->keyboard_key > 0) {
+        appendPart(InputSystem_GetKeyName(binding->keyboard_key));
+    }
+    if (binding->gamepad_button >= 0) {
+        appendPart(InputSystem_GetGamepadButtonName(binding->gamepad_button));
+    }
+    if (binding->gamepad_axis >= 0) {
+        appendPart(InputSystem_GetGamepadAxisName(binding->gamepad_axis, binding->axis_direction));
+    }
+
+    if (!out[0]) {
+        snprintf(out, outSize, "None");
+    }
 }
 
 // ============================================================================
