@@ -2,18 +2,17 @@
  * Alice Senki 2 - Practice Mode Tools
  *
  * Pause/unpause, single-frame advance, controller swap with CPU flag
- * management, hitbox toggle, in-game HUD overlay.
+ * management, hitbox toggle, macro recording, in-game HUD overlay.
  * All features are gated to training mode only
  * (GAMETYPE_TRAINING in MODE_MATCH).
  *
- * Hotkeys:
- *   F4  = Toggle hitbox viewer
- *   F7  = Toggle pause / unpause
- *   F8  = Single-frame advance (while paused; each press = 1 frame)
- *   F9  = Toggle controller swap (P1 <-> P2)
+ * Hotkeys are configurable via HotkeyConfig.
  */
 
 #include "training/practice_tools.h"
+#include "training/frame_advantage.h"
+#include "training/hotkey_config.h"
+#include "training/input_macro.h"
 #include "core/game_state.h"
 #include "patches/memory_utils.h"
 #include "ui/hitbox_viewer.h"
@@ -36,12 +35,6 @@ static bool s_paused = false;
 static bool s_stepRequested = false;   // One-shot flag: let exactly one game frame advance then re-freeze
 static int  s_stepCounter = 0;         // Cumulative frames stepped (increments per F8, always displayed)
 static bool s_wasActive = false;       // Previous frame's practice-mode status
-
-// Edge detection for hotkeys (GetAsyncKeyState)
-static bool s_f4WasDown = false;
-static bool s_f7WasDown = false;
-static bool s_f8WasDown = false;
-static bool s_f9WasDown = false;
 
 // ============================================================================
 // Toast notification system
@@ -126,6 +119,8 @@ static void ResetPracticeState() {
         LOG_INFO("[Practice] Cleaning up practice state");
     }
 
+    InputMacro_Stop();
+    FrameAdvantage_ResetState();
     s_paused = false;
     s_stepRequested = false;
     s_stepCounter = 0;
@@ -152,26 +147,47 @@ void PracticeTools_SetPaused(bool paused) {
     }
 }
 
+void PracticeTools_CaptureRuntimeState(PracticeToolsRuntimeState* out) {
+    if (!out) {
+        return;
+    }
+
+    out->paused = s_paused;
+    out->stepRequested = s_stepRequested;
+    out->stepCounter = (uint32_t)s_stepCounter;
+}
+
+void PracticeTools_RestoreRuntimeState(const PracticeToolsRuntimeState* state) {
+    if (!state) {
+        return;
+    }
+
+    s_paused = state->paused;
+    s_stepRequested = state->stepRequested;
+    s_stepCounter = (int)state->stepCounter;
+}
+
 // ============================================================================
 // Lifecycle
 // ============================================================================
 
 void PracticeTools_Init() {
     s_initialized = true;
+    HotkeyConfig_Init();
+    FrameAdvantage_Init();
+    InputMacro_Init();
     s_paused = false;
     s_stepRequested = false;
     s_stepCounter = 0;
     s_wasActive = false;
-    s_f4WasDown = false;
-    s_f7WasDown = false;
-    s_f8WasDown = false;
-    s_f9WasDown = false;
     s_toastCount = 0;
     LOG_INFO("[Practice] Practice tools initialized");
 }
 
 void PracticeTools_Shutdown() {
     ResetPracticeState();
+    InputMacro_Shutdown();
+    FrameAdvantage_Shutdown();
     s_initialized = false;
 }
 
@@ -201,39 +217,41 @@ void PracticeTools_FrameUpdate() {
 
     PracticeTools_SyncControlSwapState();
 
+    // During macro replay, ensure CPU flags are set BEFORE the frame so
+    // the game sees P2 as human during simulation (AI won't overwrite input).
+    if (InputMacro_GetState() == MACRO_REPLAYING) {
+        WriteMemory<uint8_t>(ADDR_P1_CPU_FLAG, 0);
+        WriteMemory<uint8_t>(ADDR_P2_CPU_FLAG, 0);
+    }
+
     // --- Advance toast timers ---
     // Use a fixed dt since game runs at 60fps
     UpdateToasts(1.0f / 60.0f);
 
-    // --- Hotkey edge detection ---
-    bool f4Down = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
-    bool f7Down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    bool f9Down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    // --- Hotkey edge detection (via configurable HotkeyConfig) ---
+    HotkeyConfig_Update();
 
-    // F4: Toggle hitbox viewer (disabled during netplay)
-    if (f4Down && !s_f4WasDown && !Rollback::RollbackSession_IsActive()) {
+    // Hitbox toggle (disabled during netplay)
+    if (HotkeyConfig_JustPressed(HOTKEY_HITBOX_TOGGLE) && !Rollback::RollbackSession_IsActive()) {
         HitboxViewer_ToggleEnabled();
         PushToast(HitboxViewer_IsEnabled() ? "Hitboxes ON" : "Hitboxes OFF",
                   HitboxViewer_IsEnabled() ? IM_COL32(100, 255, 100, 255) : IM_COL32(255, 100, 100, 255));
         LOG_INFO("[Practice] Hitbox viewer %s", HitboxViewer_IsEnabled() ? "ON" : "OFF");
     }
 
-    // F7: Toggle pause
-    if (f7Down && !s_f7WasDown) {
+    // Pause toggle
+    if (HotkeyConfig_JustPressed(HOTKEY_PAUSE_TOGGLE)) {
         PracticeTools_SetPaused(!s_paused);
     }
 
-    // F8: Frame step (each key-down edge = request exactly 1 game frame advance)
-    // s_stepRequested is a one-shot flag consumed by Hook_AdvanceFrame after the
-    // game frame completes (via PracticeTools_OnFrameAdvanced).
-    if (f8Down && !s_f8WasDown && s_paused && !s_stepRequested) {
+    // Frame step (each key-down edge = request exactly 1 game frame advance)
+    if (HotkeyConfig_JustPressed(HOTKEY_FRAME_STEP) && s_paused && !s_stepRequested) {
         s_stepRequested = true;
         s_stepCounter++;
     }
 
-    // F9: Toggle controller swap
-    if (f9Down && !s_f9WasDown) {
+    // Controller swap
+    if (HotkeyConfig_JustPressed(HOTKEY_CONTROL_SWAP)) {
         bool newSwap = !InputSystem_GetControlSwap();
         ApplyControlSwap(newSwap);
         PushToast(newSwap ? "Controls Swapped (P2)" : "Controls Normal (P1)",
@@ -243,10 +261,20 @@ void PracticeTools_FrameUpdate() {
                  newSwap ? "P2" : "P1");
     }
 
-    s_f4WasDown = f4Down;
-    s_f7WasDown = f7Down;
-    s_f8WasDown = f8Down;
-    s_f9WasDown = f9Down;
+    // Macro recording
+    if (HotkeyConfig_JustPressed(HOTKEY_MACRO_RECORD)) {
+        InputMacro_ToggleRecord();
+    }
+
+    // Macro playback
+    if (HotkeyConfig_JustPressed(HOTKEY_MACRO_PLAY)) {
+        InputMacro_TogglePlay();
+    }
+
+    // Macro slot cycle
+    if (HotkeyConfig_JustPressed(HOTKEY_MACRO_SLOT_NEXT)) {
+        InputMacro_NextSlot();
+    }
 }
 
 // ============================================================================
@@ -268,6 +296,9 @@ bool PracticeTools_ShouldFreezeFrame() {
 }
 
 void PracticeTools_OnFrameAdvanced() {
+    FrameAdvantage_OnFrameAdvanced(ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER));
+    InputMacro_Tick();
+
     // Called from Hook_AdvanceFrame after the game frame actually ran.
     // Clears the one-shot step flag so the next frame re-freezes.
     s_stepRequested = false;
@@ -346,6 +377,32 @@ void PracticeTools_RenderImGui() {
 
     ImGui::Separator();
 
+    // --- Display Options ---
+    ImGui::Text("Display Options");
+
+    bool hitbox = HitboxViewer_IsEnabled();
+    if (ImGui::Checkbox("Hitbox Viewer (F4)", &hitbox)) {
+        HitboxViewer_SetEnabled(hitbox);
+    }
+
+    FrameAdvantage_RenderImGui();
+
+    ImGui::Separator();
+
+    // --- Macro Recording ---
+    if (ImGui::CollapsingHeader("Macro Recording", ImGuiTreeNodeFlags_DefaultOpen)) {
+        InputMacro_RenderImGui();
+    }
+
+    ImGui::Separator();
+
+    // --- Hotkey Config ---
+    if (ImGui::CollapsingHeader("Hotkey Config")) {
+        HotkeyConfig_RenderImGui();
+    }
+
+    ImGui::Separator();
+
     // --- Status ---
     ImGui::Text("Status");
     uint8_t p1Cpu = ReadMemory<uint8_t>(ADDR_P1_CPU_FLAG);
@@ -388,6 +445,9 @@ void PracticeTools_RenderHUD() {
             IM_COL32(0, 0, 0, 180));
         dl->AddText(ImVec2(x, y), IM_COL32(255, 255, 100, 255), buf);
     }
+
+    FrameAdvantage_RenderOverlay();
+    InputMacro_RenderOverlay();
 
     // --- Toast notifications (bottom-center, stacked upward) ---
     if (s_toastCount > 0) {
@@ -435,6 +495,13 @@ void PracticeTools_SyncControlSwapState() {
         return;
     }
 
+    // During macro replay, the macro system owns CPU flags.
+    // Don't fight it — the macro sets P2 to human so our override input
+    // reaches the game instead of the AI overwriting it.
+    if (InputMacro_GetState() == MACRO_REPLAYING) {
+        return;
+    }
+
     const bool swapped = InputSystem_GetControlSwap();
     const uint8_t expectedP1Cpu = swapped ? 1 : 0;
     const uint8_t expectedP2Cpu = swapped ? 0 : 1;
@@ -457,7 +524,7 @@ void PracticeTools_SyncControlSwapState() {
 bool PracticeTools_HasVisibleHud() {
     return s_initialized &&
            IsPracticeModeNow() &&
-           (s_paused || s_toastCount > 0);
+           (s_paused || s_toastCount > 0 || FrameAdvantage_HasVisibleOverlay());
 }
 
 // ============================================================================

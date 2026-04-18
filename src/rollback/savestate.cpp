@@ -28,6 +28,8 @@
 #include "rollback/determinism_verify.h"
 #include "rollback/game_snapshot.h"
 #include "rollback/rollback_session.h"
+#include "training/frame_advantage.h"
+#include "training/input_macro.h"
 #include "training/practice_tools.h"
 #include "net/gameplay_bridge.h"
 #include "net/session_manager.h"
@@ -54,6 +56,7 @@ struct SavestateSlot {
     Rollback::GameSnapshot snapshot;
 
     bool practice_control_swap;
+    PracticeToolsRuntimeState practice_runtime;
 
     // FPU state — captured for diagnostics but NOT restored by default.
     // Uncomment the restore lines in Savestate_Load if desync evidence
@@ -331,17 +334,23 @@ bool Savestate_Save() {
     g_manualSlot.info.game_mode = g_manualSlot.snapshot.game_mode;
     g_manualSlot.info.substate  = g_manualSlot.snapshot.substate;
     g_manualSlot.practice_control_swap = PracticeTools_IsControlSwapped();
+    PracticeTools_CaptureRuntimeState(&g_manualSlot.practice_runtime);
 
-    LOG_INFO("[Savestate] SAVED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d swap=%d",
+    LOG_INFO("[Savestate] SAVED at frame %d — checksum=0x%08X rng=0x%08X mode=%d sub=%d swap=%d paused=%d step=%u",
              g_manualSlot.info.frame, g_manualSlot.info.checksum, g_manualSlot.info.rng_seed,
              g_manualSlot.info.game_mode, g_manualSlot.info.substate,
-             g_manualSlot.practice_control_swap ? 1 : 0);
+             g_manualSlot.practice_control_swap ? 1 : 0,
+             g_manualSlot.practice_runtime.paused ? 1 : 0,
+             g_manualSlot.practice_runtime.stepCounter);
 
     // Log to file for determinism analysis
-    LogToFile("SAVE frame=%d checksum=0x%08X rng=0x%08X mode=%d sub=%d timer=%d swap=%d fpu_cw=0x%04X mxcsr=0x%08X\n",
+    LogToFile("SAVE frame=%d checksum=0x%08X rng=0x%08X mode=%d sub=%d timer=%d swap=%d paused=%d step=%u step_req=%d fpu_cw=0x%04X mxcsr=0x%08X\n",
               g_manualSlot.info.frame, g_manualSlot.info.checksum, g_manualSlot.info.rng_seed,
               g_manualSlot.info.game_mode, g_manualSlot.info.substate, g_manualSlot.snapshot.match_phase_timer,
               g_manualSlot.practice_control_swap ? 1 : 0,
+              g_manualSlot.practice_runtime.paused ? 1 : 0,
+              g_manualSlot.practice_runtime.stepCounter,
+              g_manualSlot.practice_runtime.stepRequested ? 1 : 0,
               g_manualSlot.fpu_cw, g_manualSlot.fpu_mxcsr);
 
     return true;
@@ -429,7 +438,10 @@ bool Savestate_Load() {
         return false;
     }
 
+    FrameAdvantage_CancelCalculation();
+    InputMacro_OnSavestateLoad();
     PracticeTools_ApplyControlSwapState(g_manualSlot.practice_control_swap);
+    PracticeTools_RestoreRuntimeState(&g_manualSlot.practice_runtime);
     PracticeTools_SyncControlSwapState();
 
     // FPU state: NOT restored by default. If desync investigation reveals
@@ -448,8 +460,10 @@ bool Savestate_Load() {
     bool checksumMatch = (postChecksum == g_manualSlot.info.checksum);
 
     if (checksumMatch) {
-        LOG_INFO("[Savestate] LOADED OK — frame %d->%d checksum=0x%08X (match) rng=0x%08X",
-                 preFrame, postFrame, postChecksum, postRng);
+        LOG_INFO("[Savestate] LOADED OK — frame %d->%d checksum=0x%08X (match) rng=0x%08X paused=%d step=%u",
+                 preFrame, postFrame, postChecksum, postRng,
+                 g_manualSlot.practice_runtime.paused ? 1 : 0,
+                 g_manualSlot.practice_runtime.stepCounter);
     } else {
         LOG_ERROR("[Savestate] LOADED with CHECKSUM MISMATCH! expected=0x%08X got=0x%08X",
                   g_manualSlot.info.checksum, postChecksum);

@@ -18,6 +18,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+struct PracticeToolsRuntimeState {
+	bool paused;
+	bool stepRequested;
+	uint32_t stepCounter;
+};
+
 // Lifecycle
 void PracticeTools_Init();
 void PracticeTools_Shutdown();
@@ -49,6 +55,8 @@ bool PracticeTools_IsControlSwapped();
 void PracticeTools_ApplyControlSwapState(bool swapped);
 void PracticeTools_SyncControlSwapState();
 void PracticeTools_SetPaused(bool paused);
+void PracticeTools_CaptureRuntimeState(PracticeToolsRuntimeState* out);
+void PracticeTools_RestoreRuntimeState(const PracticeToolsRuntimeState* state);
 
 // Push a toast notification to the in-game HUD.
 // Only visible in practice mode. Short messages, auto-fading.
