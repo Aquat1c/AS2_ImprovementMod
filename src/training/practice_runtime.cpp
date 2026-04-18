@@ -675,11 +675,20 @@ static uint32_t ReadEntityCharacterId(uintptr_t entityBase) {
 }
 
 static bool IsActionable(uint32_t actionId) {
-    return actionId == 2 || actionId == 4 || actionId == 5 || actionId == 7 || actionId == 22;
+    // 2=stand, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand, 22=air neutral
+    // 63/66/69=ProxGuard (cancellable), 106=healing stance cancel
+    return actionId == 2  || actionId == 4  || actionId == 5  ||
+           actionId == 6  || actionId == 7  || actionId == 8  || actionId == 22 ||
+           actionId == 63 || actionId == 66 || actionId == 69 ||
+           actionId == 106;
 }
 
 static bool IsBlockstun(uint32_t actionId) {
-    return actionId >= 63 && actionId <= 71;
+    // Real forced blockstun only: Hold/Hit pairs.
+    // ProxGuard (63, 66, 69) is cancellable and lives in IsActionable instead.
+    return (actionId == 64 || actionId == 65) ||
+           (actionId == 67 || actionId == 68) ||
+           (actionId == 70 || actionId == 71);
 }
 
 static bool IsHitstun(uint32_t actionId) {

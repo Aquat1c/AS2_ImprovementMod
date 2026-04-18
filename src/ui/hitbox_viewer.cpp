@@ -74,8 +74,9 @@ static const ImU32 COL_P1_CROSS  = IM_COL32(255, 120, 120, 255);
 static const ImU32 COL_P2_CROSS  = IM_COL32(120, 120, 255, 255);
 static const ImU32 COL_CANCEL    = IM_COL32(255, 245, 120, 255);
 static const ImU32 COL_INVINCIBLE = IM_COL32(90, 175, 255, 255);
-static const ImU32 COL_ARMOR     = IM_COL32(255, 160, 0, 255);
-static const ImU32 COL_IMMUNE    = IM_COL32(180, 0, 255, 255);
+static const ImU32 COL_ARMOR      = IM_COL32(255, 160, 0, 255);
+static const ImU32 COL_IMMUNE     = IM_COL32(180, 0, 255, 255);
+static const ImU32 COL_PROX_GUARD = IM_COL32(100, 220, 255, 255);
 
 // ============================================================================
 // Helpers
@@ -965,6 +966,11 @@ static void RenderStateFlags(ImDrawList* dl,
 
     if (entity.attackState == 1 && entity.hitActive != 0) {
         drawLabel(COL_HITBOX, "ATK");
+    }
+
+    // Proximity guard — cancellable, shown so players can see the window
+    if (entity.actionId == 63 || entity.actionId == 66 || entity.actionId == 69) {
+        drawLabel(COL_PROX_GUARD, "PROX GUARD");
     }
 }
 

@@ -123,11 +123,21 @@ constexpr uintptr_t kEntityBases[2] = {
 };
 
 bool IsActionable(uint32_t actionId) {
-    return actionId == 2 || actionId == 4 || actionId == 5 || actionId == 7 || actionId == 22;
+    // 2=standing, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand, 22=air neutral
+    // 63/66/69=StandProxGuard/CrouchProxGuard/AirProxGuard — cancellable, not blockstun
+    // 106=healing stance cancel — cancelling heal returns to actionable immediately
+    return actionId == 2  || actionId == 4  || actionId == 5  ||
+           actionId == 6  || actionId == 7  || actionId == 8  || actionId == 22 ||
+           actionId == 63 || actionId == 66 || actionId == 69 ||
+           actionId == 106;
 }
 
 bool IsBlockstun(uint32_t actionId) {
-    return actionId >= 63 && actionId <= 71;
+    // StandBlockHold/Hit=64/65, CrouchBlockHold/Hit=67/68, AirBlockHold/Hit=70/71.
+    // ProxGuard (63, 66, 69) is cancellable and lives in IsActionable instead.
+    return (actionId == 64 || actionId == 65) ||
+           (actionId == 67 || actionId == 68) ||
+           (actionId == 70 || actionId == 71);
 }
 
 bool IsHitstun(uint32_t actionId) {
@@ -140,6 +150,12 @@ bool IsWakeupNoTech(uint32_t actionId) {
 
 bool IsTech(uint32_t actionId) {
     return actionId >= 78 && actionId <= 82;
+}
+
+bool IsHealing(uint32_t actionId) {
+    // 105=healing active (inactionable, cancellable into 106)
+    // 106=healing stance cancel — treated as actionable, not locked
+    return actionId == 105 || actionId == 106;
 }
 
 bool IsStunned(uint32_t actionId) {
@@ -187,6 +203,7 @@ const char* ActionCategory(uint32_t actionId) {
     if (IsWakeupNoTech(actionId)) return "WakeupNoTech";
     if (IsTech(actionId)) return "Tech";
     if (IsKnockdownOrLaunch(actionId)) return "Knockdown";
+    if (IsHealing(actionId)) return "Healing";
     return "Other";
 }
 
