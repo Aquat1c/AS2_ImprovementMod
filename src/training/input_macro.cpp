@@ -456,7 +456,9 @@ void InputMacro_RenderOverlay(void) {
     if (!s_initialized || s_state == MACRO_IDLE) return;
     if (!PracticeTools_IsPracticeModeActive()) return;
 
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImDrawList* dl = PracticeTools_ShouldRenderHudBehindMenu()
+        ? ImGui::GetBackgroundDrawList()
+        : ImGui::GetForegroundDrawList();
     if (!dl) return;
 
     char buf[64];

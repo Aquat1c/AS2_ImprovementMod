@@ -7,6 +7,7 @@
 #include "rollback/savestate.h"
 #include "patches/memory_utils.h"
 #include "ui/hitbox_viewer.h"
+#include "ui/mod_menu.h"
 #include "input_system.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -266,6 +267,7 @@ struct PlayerSnapshot {
     uint8_t facingRaw;
     bool facingRight;
     uint32_t actionId;
+    uint8_t nativeActionable;
     uint8_t attackState;
     uint32_t attackFlags;
     uint8_t hitActive;
@@ -306,6 +308,8 @@ struct ComboSummary {
     uint8_t defender;
     uint16_t hits;
     int damage;
+    int attackerMeterDelta;
+    int defenderMeterDelta;
     uint8_t scale[4];
     uint32_t defenderCharId;
     uint16_t defenderMaxHp;
@@ -313,9 +317,14 @@ struct ComboSummary {
 
 struct ComboTracker {
     bool active;
-    uint16_t defenderStartHp;
-    uint16_t maxHits;
+    uint16_t hits;
     int damage;
+    int attackerMeterDelta;
+    int defenderMeterDelta;
+    uint16_t defenderHpAtStart;
+    uint16_t attackerMeterAtStart;
+    uint16_t defenderMeterAtStart;
+    uint8_t scale[4];
     ComboSummary last;
 };
 
@@ -533,36 +542,6 @@ static const uint16_t kCharacterMaxHp[kPracticeRosterCount] = {
      9000, 9100,  9400,  9400, 10500, 14000, 10000, 20000, 24000, 30000, 39000,
 };
 
-static const uint8_t kCharacterWeight[kPracticeRosterCount] = {
-    105, 100, 105, 110, 110, 100, 100, 105, 100, 100, 95,
-     95,  95,  95, 105,  98, 100, 100, 105,  95, 100,  98,
-};
-
-static const uint8_t kCharacterWeightClass[kPracticeRosterCount] = {
-    WEIGHT_CLASS_MEDIUM,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_HEAVY,
-    WEIGHT_CLASS_MEDIUM,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_HEAVY,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_VERY_LIGHT,
-    WEIGHT_CLASS_VERY_LIGHT,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_VERY_LIGHT,
-    WEIGHT_CLASS_MEDIUM,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_MEDIUM,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_LIGHTER,
-    WEIGHT_CLASS_MEDIUM,
-    WEIGHT_CLASS_VERY_LIGHT,
-    WEIGHT_CLASS_LIGHT,
-    WEIGHT_CLASS_LIGHTER,
-};
-
 static const char* kWeightClassLabels[] = {
     "Very Light",
     "Lighter",
@@ -644,16 +623,26 @@ static uint16_t GetCharacterMaxHp(uint32_t charId) {
 
 static uint8_t GetCharacterWeightValue(uint32_t charId) {
     if (charId < kPracticeRosterCount) {
-        return kCharacterWeight[charId];
+        return ReadMemory<uint8_t>(ADDR_CHARACTER_WEIGHT_TABLE + charId);
     }
     return 100;
 }
 
 static uint8_t GetCharacterWeightClass(uint32_t charId) {
-    if (charId < kPracticeRosterCount) {
-        return kCharacterWeightClass[charId];
+    switch (GetCharacterWeightValue(charId)) {
+        case 95:
+            return WEIGHT_CLASS_VERY_LIGHT;
+        case 98:
+            return WEIGHT_CLASS_LIGHTER;
+        case 100:
+            return WEIGHT_CLASS_LIGHT;
+        case 105:
+            return WEIGHT_CLASS_MEDIUM;
+        case 110:
+            return WEIGHT_CLASS_HEAVY;
+        default:
+            return WEIGHT_CLASS_LIGHT;
     }
-    return WEIGHT_CLASS_LIGHT;
 }
 
 static const char* GetWeightClassLabel(uint32_t charId) {
@@ -674,20 +663,24 @@ static uint32_t ReadEntityCharacterId(uintptr_t entityBase) {
     return (charId < kPracticeRosterCount) ? charId : 0;
 }
 
-static bool IsActionable(uint32_t actionId) {
-    // 2=stand, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand,
+static bool IsLegacyActionableAction(uint32_t actionId) {
+    // 2=stand, 3=turnaround, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand,
     // 22=air neutral, 23=landing
     // 63/66/69=ProxGuard (cancellable), 106=healing stance cancel
-    return actionId == 2  || actionId == 4  || actionId == 5  ||
+    return actionId == 2  || actionId == 3  || actionId == 4  || actionId == 5  ||
            actionId == 6  || actionId == 7  || actionId == 8  || actionId == 22 ||
            actionId == 23 ||
            actionId == 63 || actionId == 66 || actionId == 69 ||
            actionId == 106;
 }
 
+static bool IsActionable(const PlayerSnapshot& snapshot) {
+    return snapshot.nativeActionable != 0;
+}
+
 static bool IsBlockstun(uint32_t actionId) {
     // Real forced blockstun only: Hold/Hit pairs.
-    // ProxGuard (63, 66, 69) is cancellable and lives in IsActionable instead.
+    // ProxGuard (63, 66, 69) is cancellable and lives in IsLegacyActionableAction instead.
     return (actionId == 64 || actionId == 65) ||
            (actionId == 67 || actionId == 68) ||
            (actionId == 70 || actionId == 71);
@@ -730,8 +723,13 @@ static bool IsThreateningAttack(const PlayerSnapshot& snapshot) {
     return snapshot.attackState != 0 || hitActive;
 }
 
-static uint16_t ReadComboCount(int attacker) {
-    return ReadMemory<uint8_t>(ADDR_COMBO_COUNT + attacker);
+static uint16_t ReadComboCount(uintptr_t entityBase) {
+    if (!entityBase) {
+        return 0;
+    }
+
+    // The live combo count is the per-entity byte at +0xD0.
+    return ReadMemory<uint8_t>(entityBase + ENTITY_OFF_DISPLAY_COMBO_COUNT);
 }
 
 enum P1DirectionBindingIndex {
@@ -827,12 +825,13 @@ static PlayerSnapshot ReadPlayerSnapshot(int player) {
     snapshot.facingRaw = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_FACING);
     snapshot.facingRight = (int8_t)snapshot.facingRaw > 0;  // 1=right, -1/0xFF=left
     snapshot.actionId = ReadMemory<uint32_t>(snapshot.base + ENTITY_OFF_ACTION_ID);
+    snapshot.nativeActionable = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_NATIVE_ACTIONABLE);
     snapshot.attackState = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_ATTACK_STATE);
     snapshot.attackFlags = ReadMemory<uint32_t>(snapshot.base + ENTITY_OFF_ATTACK_TYPE);
     snapshot.hitActive = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_HIT_ACTIVE);
     snapshot.blockstun = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_BLOCKSTUN);
     snapshot.hitstunDuration = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_HITSTUN_DURATION);
-    snapshot.comboCount = ReadComboCount(player);
+    snapshot.comboCount = ReadComboCount(snapshot.base);
     return snapshot;
 }
 
@@ -1494,58 +1493,98 @@ static void UpdateComboTrackers(const PlayerSnapshot snapshots[kPracticePlayerCo
     for (int attacker = 0; attacker < kPracticePlayerCount; ++attacker) {
         ComboTracker& tracker = s_comboTrackers[attacker];
         const PlayerSnapshot& attackerSnapshot = snapshots[attacker];
-        const PlayerSnapshot& defenderSnapshot = snapshots[1 - attacker];
+        const int defender = 1 - attacker;
+        const PlayerSnapshot& defenderSnapshot = snapshots[defender];
 
         if (!attackerSnapshot.valid || !defenderSnapshot.valid) {
             continue;
         }
 
-        const uint16_t comboCount = attackerSnapshot.comboCount;
-        if (comboCount > 0) {
-            if (!tracker.active) {
+        const uint16_t liveHits = attackerSnapshot.comboCount;
+        if (liveHits > 0) {
+            const bool wasInactive = !tracker.active;
+            if (wasInactive) {
                 tracker.active = true;
-                tracker.defenderStartHp = defenderSnapshot.hp;
-                tracker.maxHits = comboCount;
+                tracker.hits = 0;
                 tracker.damage = 0;
-                LOG_INFO("[Practice] Combo start: attacker=%s defender=%s frame=%u start_hp=%u",
+                tracker.attackerMeterDelta = 0;
+                tracker.defenderMeterDelta = 0;
+                tracker.defenderHpAtStart = defenderSnapshot.hp;
+                tracker.attackerMeterAtStart = attackerSnapshot.meter;
+                tracker.defenderMeterAtStart = defenderSnapshot.meter;
+                if (s_playerRuntime[defender].hasPrev && s_playerRuntime[defender].prev.valid) {
+                    tracker.defenderHpAtStart = s_playerRuntime[defender].prev.hp;
+                    tracker.defenderMeterAtStart = s_playerRuntime[defender].prev.meter;
+                }
+                if (s_playerRuntime[attacker].hasPrev && s_playerRuntime[attacker].prev.valid) {
+                    tracker.attackerMeterAtStart = s_playerRuntime[attacker].prev.meter;
+                }
+                memset(tracker.scale, 0, sizeof(tracker.scale));
+                LOG_INFO("[Practice] Combo start: attacker=%s defender=%s frame=%u start_hp=%u curr_hp=%u atk_meter=%u def_meter=%u",
                          SideLabel(attacker),
-                         SideLabel(1 - attacker),
+                         SideLabel(defender),
                          ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER),
-                         defenderSnapshot.hp);
+                         (unsigned int)tracker.defenderHpAtStart,
+                         (unsigned int)defenderSnapshot.hp,
+                         (unsigned int)tracker.attackerMeterAtStart,
+                         (unsigned int)tracker.defenderMeterAtStart);
             }
 
-            if (comboCount > tracker.maxHits) {
-                tracker.maxHits = comboCount;
+            int liveDamage = (int)tracker.defenderHpAtStart - (int)defenderSnapshot.hp;
+            if (liveDamage < 0) {
+                liveDamage = 0;
             }
 
-            tracker.damage = tracker.defenderStartHp > defenderSnapshot.hp
-                ? (int)(tracker.defenderStartHp - defenderSnapshot.hp)
-                : 0;
+            int liveAtkMeter = (int)attackerSnapshot.meter - (int)tracker.attackerMeterAtStart;
+            int liveDefMeter = (int)defenderSnapshot.meter - (int)tracker.defenderMeterAtStart;
+
+            const bool comboAdvanced = wasInactive || liveHits > tracker.hits || liveDamage != tracker.damage
+                || liveAtkMeter != tracker.attackerMeterDelta || liveDefMeter != tracker.defenderMeterDelta;
+            if (liveHits > tracker.hits) {
+                tracker.hits = liveHits;
+            }
+            tracker.damage = liveDamage;
+            tracker.attackerMeterDelta = liveAtkMeter;
+            tracker.defenderMeterDelta = liveDefMeter;
+            if (comboAdvanced) {
+                tracker.scale[0] = ReadComboScale(attackerSnapshot.base, 0);
+                tracker.scale[1] = ReadComboScale(attackerSnapshot.base, 1);
+                tracker.scale[2] = ReadComboScale(attackerSnapshot.base, 2);
+                tracker.scale[3] = ReadComboScale(attackerSnapshot.base, 3);
+            }
         } else if (tracker.active) {
-            tracker.last.valid = true;
-            tracker.last.attacker = (uint8_t)attacker;
-            tracker.last.defender = (uint8_t)(1 - attacker);
-            tracker.last.hits = tracker.maxHits;
-            tracker.last.damage = tracker.damage;
-            tracker.last.defenderCharId = defenderSnapshot.charId;
-            tracker.last.defenderMaxHp = defenderSnapshot.maxHp;
-            tracker.last.scale[0] = ReadComboScale(attackerSnapshot.base, 0);
-            tracker.last.scale[1] = ReadComboScale(attackerSnapshot.base, 1);
-            tracker.last.scale[2] = ReadComboScale(attackerSnapshot.base, 2);
-            tracker.last.scale[3] = ReadComboScale(attackerSnapshot.base, 3);
-            LOG_INFO("[Practice] Combo end: attacker=%s hits=%u damage=%d scale=[%u,%u,%u,%u]",
-                     SideLabel(attacker),
-                     tracker.last.hits,
-                     tracker.last.damage,
-                     (unsigned int)tracker.last.scale[0],
-                     (unsigned int)tracker.last.scale[1],
-                     (unsigned int)tracker.last.scale[2],
-                     (unsigned int)tracker.last.scale[3]);
+            tracker.last.valid = tracker.hits > 0 || tracker.damage > 0;
+            if (tracker.last.valid) {
+                tracker.last.attacker = (uint8_t)attacker;
+                tracker.last.defender = (uint8_t)defender;
+                tracker.last.hits = tracker.hits;
+                tracker.last.damage = tracker.damage;
+                tracker.last.attackerMeterDelta = tracker.attackerMeterDelta;
+                tracker.last.defenderMeterDelta = tracker.defenderMeterDelta;
+                tracker.last.defenderCharId = defenderSnapshot.charId;
+                tracker.last.defenderMaxHp = defenderSnapshot.maxHp;
+                memcpy(tracker.last.scale, tracker.scale, sizeof(tracker.last.scale));
+                LOG_INFO("[Practice] Combo end: attacker=%s hits=%u damage=%d atk_meter=%+d def_meter=%+d scale=[%u,%u,%u,%u]",
+                         SideLabel(attacker),
+                         tracker.last.hits,
+                         tracker.last.damage,
+                         tracker.last.attackerMeterDelta,
+                         tracker.last.defenderMeterDelta,
+                         (unsigned int)tracker.last.scale[0],
+                         (unsigned int)tracker.last.scale[1],
+                         (unsigned int)tracker.last.scale[2],
+                         (unsigned int)tracker.last.scale[3]);
+            }
 
             tracker.active = false;
-            tracker.defenderStartHp = 0;
-            tracker.maxHits = 0;
+            tracker.hits = 0;
             tracker.damage = 0;
+            tracker.attackerMeterDelta = 0;
+            tracker.defenderMeterDelta = 0;
+            tracker.defenderHpAtStart = 0;
+            tracker.attackerMeterAtStart = 0;
+            tracker.defenderMeterAtStart = 0;
+            memset(tracker.scale, 0, sizeof(tracker.scale));
         }
     }
 }
@@ -1565,7 +1604,7 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
             runtime.jumpCooldown--;
         }
 
-        const bool actionable = IsActionable(current.actionId);
+        const bool actionable = IsLegacyActionableAction(current.actionId);
         if (actionable) {
             if (!runtime.neutralValid) {
                 runtime.neutralValid = true;
@@ -1589,7 +1628,7 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
                      (unsigned int)opponent.attackState,
                      (unsigned int)opponent.hitActive,
                      runtime.randomBlockThisWindow ? 1 : 0);
-        } else if (runtime.threatWindowActive && !threatNow && IsActionable(opponent.actionId)) {
+        } else if (runtime.threatWindowActive && !threatNow && IsLegacyActionableAction(opponent.actionId)) {
             LOG_INFO("[Practice] Threat window end: defender=%s attacker=%s frame=%u opp_act=%u contact_seen=%d",
                      SideLabel(player),
                      SideLabel(1 - player),
@@ -1633,7 +1672,7 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
             if (runtime.pendingAirTechCompletion &&
                 !IsAirTechState(current.actionId) &&
                 !IsPostTechState(current.actionId) &&
-                !IsActionable(current.actionId)) {
+                !IsActionable(current)) {
                 LOG_INFO("[Practice] Air tech completion canceled: %s frame=%u action=%u",
                          SideLabel(player),
                          simFrame,
@@ -1643,7 +1682,7 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
             if (runtime.pendingGroundTechCompletion &&
                 !IsGroundTechState(current.actionId) &&
                 !IsPostTechState(current.actionId) &&
-                !IsActionable(current.actionId)) {
+                !IsActionable(current)) {
                 LOG_INFO("[Practice] Ground tech completion canceled: %s frame=%u action=%u",
                          SideLabel(player),
                          simFrame,
@@ -1652,11 +1691,11 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
             }
 
             if (s_practiceConfig.triggerMasterEnabled) {
-                if (IsBlockstun(runtime.prev.actionId) && IsActionable(current.actionId)) {
+                if (IsBlockstun(runtime.prev.actionId) && IsActionable(current)) {
                     ScheduleTriggerAction(player, TRIGGER_AFTER_BLOCK, simFrame, false);
                 }
 
-                if (IsHitstun(runtime.prev.actionId) && (IsActionable(current.actionId) || IsTechState(current.actionId))) {
+                if (IsHitstun(runtime.prev.actionId) && (IsActionable(current) || IsTechState(current.actionId))) {
                     ScheduleTriggerAction(player, TRIGGER_AFTER_HITSTUN, simFrame, false);
                 }
 
@@ -1673,15 +1712,15 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
                         ScheduleTriggerAction(player, TRIGGER_ON_WAKEUP, simFrame, true);
                     }
                 } else {
-                    if (runtime.pendingAirTechCompletion && IsActionable(current.actionId)) {
+                    if (runtime.pendingAirTechCompletion && IsActionable(current)) {
                         ScheduleTriggerAction(player, TRIGGER_AFTER_AIRTECH, simFrame, false);
                         runtime.pendingAirTechCompletion = false;
                     }
-                    if (runtime.pendingGroundTechCompletion && IsActionable(current.actionId)) {
+                    if (runtime.pendingGroundTechCompletion && IsActionable(current)) {
                         ScheduleTriggerAction(player, TRIGGER_AFTER_GROUNDTECH, simFrame, false);
                         runtime.pendingGroundTechCompletion = false;
                     }
-                    if (IsWakeupNoTechState(runtime.prev.actionId) && IsActionable(current.actionId)) {
+                    if (IsWakeupNoTechState(runtime.prev.actionId) && IsActionable(current)) {
                         ScheduleTriggerAction(player, TRIGGER_ON_WAKEUP, simFrame, false);
                     }
                 }
@@ -1902,7 +1941,7 @@ static uint16_t ComputeAutomationInput(int player,
         if (InputSystem_GetControlSwap()) {
             runtime.jumpHoldFrames = 0;
             runtime.jumpHoldInput = 0;
-        } else if (!IsGroundedAction(dummy) || !IsActionable(dummy.actionId)) {
+        } else if (!IsGroundedAction(dummy) || !IsLegacyActionableAction(dummy.actionId)) {
             LOG_INFO("[Practice] Dummy jump accepted: action=%u y=%d frame=%u",
                      dummy.actionId,
                      dummy.y,
@@ -1922,7 +1961,7 @@ static uint16_t ComputeAutomationInput(int player,
     }
 
     if (!InputSystem_GetControlSwap() &&
-        IsActionable(dummy.actionId) &&
+        IsLegacyActionableAction(dummy.actionId) &&
         IsGroundedAction(dummy)) {
         const bool wantsJumpLoop = s_practiceConfig.stanceMode == DUMMY_STANCE_JUMP ||
                                    s_practiceConfig.jumpMode != DUMMY_JUMP_DISABLED;
@@ -2757,36 +2796,45 @@ static void RenderComboOverlayPanel(ImDrawList* dl,
     const PlayerSnapshot& attackerSnapshot = snapshots[attacker];
     const PlayerSnapshot& defenderSnapshot = snapshots[1 - attacker];
 
-    const uint16_t hits = tracker.active ? attackerSnapshot.comboCount : tracker.last.hits;
+    const uint16_t hits = tracker.active ? tracker.hits : tracker.last.hits;
     const int damage = tracker.active ? tracker.damage : tracker.last.damage;
+    const int atkMeter = tracker.active ? tracker.attackerMeterDelta : tracker.last.attackerMeterDelta;
+    const int defMeter = tracker.active ? tracker.defenderMeterDelta : tracker.last.defenderMeterDelta;
     const uint32_t defenderCharId = tracker.active ? defenderSnapshot.charId : tracker.last.defenderCharId;
     const uint16_t defenderMaxHp = tracker.active ? defenderSnapshot.maxHp : tracker.last.defenderMaxHp;
     const int attackerTier = ComputeHpTierIndex(attackerSnapshot.hp, attackerSnapshot.maxHp);
     const int defenderTier = ComputeHpTierIndex(defenderSnapshot.hp, defenderMaxHp);
 
-    char line1[96];
+    // Line 1: header
+    // Line 2: hits + damage
+    // Line 3: signed meter delta for both players
+    // Line 4: defender character + weight
+    // Line 5: HP tiers
+    char line1[48];
     char line2[96];
     char line3[96];
     char line4[96];
+    char line5[96];
     snprintf(line1, sizeof(line1), "%s Combo", attacker == 0 ? "P1" : "P2");
-    snprintf(line2, sizeof(line2), "%u hits | %d dmg", hits, damage);
-    snprintf(line3, sizeof(line3), "%s | %s %u",
+    snprintf(line2, sizeof(line2), "%u hits  |  %d dmg", hits, damage);
+    snprintf(line3, sizeof(line3), "Atk %+d meter  |  Def %+d meter", atkMeter, defMeter);
+    snprintf(line4, sizeof(line4), "vs %s  (%s)",
              GetCharacterName(defenderCharId),
-             GetWeightClassLabel(defenderCharId),
-             (unsigned int)GetCharacterWeightValue(defenderCharId));
-    snprintf(line4, sizeof(line4), "Atk tier %d | Def tier %d", attackerTier, defenderTier);
+             GetWeightClassLabel(defenderCharId));
+    snprintf(line5, sizeof(line5), "Atk tier %d  |  Def tier %d", attackerTier, defenderTier);
 
-    const float width = 220.0f;
+    const float width = 240.0f;
     const float lineHeight = ImGui::GetTextLineHeight();
-    const float height = lineHeight * 4.0f + 18.0f;
+    const float height = lineHeight * 5.0f + 18.0f;
     dl->AddRectFilled(topLeft,
                       ImVec2(topLeft.x + width, topLeft.y + height),
                       IM_COL32(0, 0, 0, 180),
                       4.0f);
-    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f), IM_COL32(255, 255, 255, 255), line1);
-    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f + lineHeight), IM_COL32(255, 230, 160, 255), line2);
-    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f + lineHeight * 2.0f), IM_COL32(180, 220, 255, 255), line3);
-    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f + lineHeight * 3.0f), IM_COL32(180, 255, 180, 255), line4);
+    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f),                     IM_COL32(255, 255, 255, 255), line1);
+    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f + lineHeight),        IM_COL32(255, 230, 160, 255), line2);
+    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f + lineHeight * 2.0f), IM_COL32(120, 220, 255, 255), line3);
+    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f + lineHeight * 3.0f), IM_COL32(180, 220, 255, 255), line4);
+    dl->AddText(ImVec2(topLeft.x + 8.0f, topLeft.y + 6.0f + lineHeight * 4.0f), IM_COL32(180, 255, 180, 255), line5);
 }
 
 } // namespace
@@ -3104,7 +3152,9 @@ void PracticeTools_RenderHUD() {
     if (!s_initialized) return;
     if (!IsPracticeModeNow()) return;
 
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImDrawList* dl = PracticeTools_ShouldRenderHudBehindMenu()
+        ? ImGui::GetBackgroundDrawList()
+        : ImGui::GetForegroundDrawList();
     if (!dl) return;
 
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
@@ -3220,4 +3270,8 @@ bool PracticeTools_HasVisibleHud() {
             FrameAdvantage_HasVisibleOverlay() ||
             InputMacro_GetState() != MACRO_IDLE ||
             HasComboOverlayContent());
+}
+
+bool PracticeTools_ShouldRenderHudBehindMenu() {
+    return ModMenu_IsOpen();
 }

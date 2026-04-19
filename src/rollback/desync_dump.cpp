@@ -170,7 +170,8 @@ void DesyncDump_WriteEntityDetail(FILE* f, const char* label, uintptr_t base) {
 
     // === Combo tracking ===
     fprintf(f, "  [Combo]\n");
-    fprintf(f, "    Combo:         %u\n",  ReadMemory<uint8_t>(base + ENTITY_OFF_COMBO));
+    fprintf(f, "    ComboHUD:      %u\n",  ReadMemory<uint8_t>(base + ENTITY_OFF_DISPLAY_COMBO_COUNT));
+    fprintf(f, "    ComboRawA:     %u\n",  ReadMemory<uint16_t>(base + ENTITY_OFF_MAX_HIT_RAW_A));
     fprintf(f, "    ComboScale1:   %u\n",  ReadMemory<uint8_t>(base + ENTITY_OFF_COMBO_SCALE1));
     fprintf(f, "    ComboScale2:   %u\n",  ReadMemory<uint8_t>(base + ENTITY_OFF_COMBO_SCALE2));
     fprintf(f, "    ComboScale3:   %u\n",  ReadMemory<uint8_t>(base + ENTITY_OFF_COMBO_SCALE3));
@@ -179,7 +180,6 @@ void DesyncDump_WriteEntityDetail(FILE* f, const char* label, uintptr_t base) {
     // === Guard / Character-specific state ===
     fprintf(f, "  [Guard/Char State]\n");
     fprintf(f, "    GuardGauge:    %u\n",  ReadMemory<uint16_t>(base + ENTITY_OFF_GUARD_GAUGE));
-    fprintf(f, "    RoundWins:     %u\n",  ReadMemory<uint8_t>(base + ENTITY_OFF_ROUND_WINS));
     fprintf(f, "    HPDisplay:     %u\n",  ReadMemory<uint16_t>(base + ENTITY_OFF_HP_DISPLAY));
     fprintf(f, "    GameState:     %u\n",  ReadMemory<uint32_t>(base + ENTITY_OFF_GAME_STATE));
 

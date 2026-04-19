@@ -122,15 +122,19 @@ constexpr uintptr_t kEntityBases[2] = {
     ADDR_P2_ENTITY_BASE,
 };
 
-bool IsActionable(uint32_t actionId) {
-    // 2=standing, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand,
+bool IsLegacyActionableAction(uint32_t actionId) {
+    // 2=standing, 3=turnaround, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand,
     // 22=air neutral, 23=landing
     // 63/66/69=StandProxGuard/CrouchProxGuard/AirProxGuard — cancellable, not blockstun
     // 106=healing stance cancel — cancelling heal returns to actionable immediately
-    return actionId == 2  || actionId == 4  || actionId == 5  ||
+    return actionId == 2  || actionId == 3  || actionId == 4  || actionId == 5  ||
            actionId == 6  || actionId == 7  || actionId == 8  || actionId == 22 ||
            actionId == 23 ||
            actionId == 63 || actionId == 66 || actionId == 69;
+}
+
+bool IsActionable(uint32_t actionId) {
+    return IsLegacyActionableAction(actionId);
 }
 
 bool IsBlockstun(uint32_t actionId) {
@@ -827,7 +831,9 @@ void FrameAdvantage_RenderOverlay(void) {
         return;
     }
 
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImDrawList* dl = PracticeTools_ShouldRenderHudBehindMenu()
+        ? ImGui::GetBackgroundDrawList()
+        : ImGui::GetForegroundDrawList();
     if (!dl) {
         return;
     }

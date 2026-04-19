@@ -449,10 +449,8 @@
 // Combo Counter System Addresses
 // ============================================================================
 
-#define ENTITY_OFF_COMBO_P1     41254     // 0xA126 - P1 combo counter (byte)
-#define ENTITY_OFF_COMBO_P2     150066    // 0x249F2 - P2 combo counter (byte)
+#define ENTITY_OFF_DISPLAY_COMBO_COUNT 0x00D0 // +208, live per-entity combo/hit counter
 #define ENTITY_OFF_GUARD_GAUGE  0x00B2    // +178, word - guard gauge fill (reset=10000; decremented on guard damage)
-#define ENTITY_OFF_ROUND_WINS   41254     // 0xA126 - Round wins (shared offset with combo)
 #define ENTITY_OFF_HP_DISPLAY_PREVIOUS 0x00D2 // +210, word - HP bar trailing value
 #define ENTITY_OFF_HP_DISPLAY   0x00D4    // +212, word - HP bar visible value
 #define ENTITY_OFF_GAME_STATE   42952     // 0xA7D8 - Game state (11 = active match)
@@ -479,7 +477,7 @@
 // State blocks
 #define ENTITY_OFF_STATE_A      0x0690  // +1680, set by sub_4BF630
 #define ENTITY_OFF_STATE_B      0x06CC  // +1740, cleared by sub_49E720
-#define ENTITY_OFF_COMBO        0x078C  // +1932, combo tracking
+#define ENTITY_OFF_COMBO        ENTITY_OFF_MAX_HIT_RAW_A  // Legacy alias retained for compatibility; this is not the HUD combo count
 #define ENTITY_OFF_FLAG_CE      0x00B6  // +182, flag used in AI calculations
 #define ENTITY_OFF_HITSTUN      0x1A7F0 // +108528, hitstun array (sub_4C1F60)
 
@@ -521,6 +519,7 @@
 
 // Box system offsets
 #define ENTITY_OFF_BOX_FLAGS    0x0674  // +1652, 24 bytes
+#define ENTITY_OFF_NATIVE_ACTIONABLE 0x0676 // +1654, user-verified live actionable flag (1=actionable, 0=inactionable)
 #define ENTITY_OFF_ANIM_INDEX   0x1004  // +4100, DWORD
 #define ENTITY_OFF_ANIM_DATA    0x1008  // +4104, animation data array
 #define ENTITY_OFF_BOX_ARRAY    0xA33F  // +41791, box processing array
@@ -550,7 +549,8 @@
 
 #define ADDR_ROUND_TIMER        0x790E50
 #define ADDR_WIN_COUNT          0x790E54
-#define ADDR_COMBO_COUNT        0x790E56
+#define ADDR_COMBO_COUNT        0x790E56  // byte_790E56 combo timer/state bookkeeping; not the vanilla HUD hit counter
+#define ADDR_CHARACTER_WEIGHT_TABLE (GAME_BASE + 0x33DD38)  // byte_73DD38[charId], numeric knockback weight
 
 #define ADDR_CHAR_DATA_TABLE    0x8E95F8
 #define ADDR_CHAR_INFO_TABLE    0x8E9650
