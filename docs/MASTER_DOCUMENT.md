@@ -166,7 +166,7 @@ ModOnGameExit()           -- Log exit
 | Spectator system | Complete | Server + client + local playback, frame archive, palette propagation, relay/LAN discovery, fast-forward/hard-sync |
 | Netplay menu | Complete | Full in-game menu for hosting, joining, spectating, settings |
 | Replay tools | Complete | Replay browser controls, pause/step/rewind, HUD, takeover |
-| Practice tools | Complete | Pause, frame-step, control swap, hitbox viewer |
+| Practice tools | Complete | Pause/step, control swap, position presets/snapshots, live value editor, dummy automation (block/stance/jump/recovery), 5-event reversal triggers, 8-slot input macros, frame advantage overlay, rebindable hotkeys |
 | Hitbox viewer | Complete | Collision, attack, hurt, throw, projectile box rendering |
 | Mod loader | Complete | Ordered file override and DLL mod loading |
 | Test harness | Complete | Two-instance autoconnect, network simulation, fighting AI, shared memory dashboard |
@@ -896,22 +896,161 @@ Replay takeover lets live player input replace recorded replay input from a chos
 
 ## Training Mode
 
-Practice mode tools (`practice_tools.cpp`, ~450 lines) exclusively for training mode (GAMETYPE_TRAINING in MODE_MATCH):
+Training mode is the largest in-game subsystem outside of networking and is split across six files under `src/training/`. It is active only when `GAMETYPE_TRAINING` is set in `MODE_MATCH`.
 
-**Hotkeys:**
+| File | Lines | Role |
+|------|-------|------|
+| `practice_tools.cpp` | 137 | Thin public API + `Hook_CmdHistoryUpdate` (controls-swap redirection) |
+| `practice_runtime.cpp` | 3276 | Seven-tab ImGui menu, automation engine, triggers, combo/position/value tools |
+| `practice_internal.h` | 36 | Shared state + toast notification system |
+| `frame_advantage.cpp` | 964 | Frame-advantage calculator, history ring, and gap overlay |
+| `hotkey_config.cpp` | 537 | Persistent, rebindable hotkeys with SDL scancode + gamepad bindings |
+| `input_macro.cpp` | 609 | Eight-slot input recorder/player for the dummy |
 
-| Key | Action |
-|-----|--------|
-| F4 | Toggle hitbox viewer |
-| F7 | Pause / unpause |
-| F8 | Single-frame step (one frame per press while paused) |
-| F9 | Controller swap (P1 <-> P2 with CPU flag management) |
+### Practice Tabs
 
-**Controller swap:** Toggles `ADDR_P1_CPU_FLAG` and `ADDR_P2_CPU_FLAG`. Default: P1 human, P2 CPU dummy. Swapped: P1 CPU, P2 human.
+The Practice tab inside the mod menu (F1) contains seven sub-tabs:
 
-**Toast notification system:** Up to 4 simultaneous toasts, 1.5s duration with fade-out at 1.0s, color-coded by action type.
+| Tab | Contents |
+|-----|----------|
+| Overview | Player status, combo overlay toggle, position preset quick buttons, mode exits (CharSel / Menu / Title) |
+| Opponent | Native training settings bridge (HP%, Meter bars, CPU on/off, AirTech, GroundTech, BlockType, DummyState) plus the advanced-mod block/stance/jump/cadence controls |
+| Values | Live-editable HP, Meter, Guard Gauge, X/Y position per player (seeded from live entity, clamped to character max) |
+| Options | Per-player recovery (HP / Meter / Guard) with delay gate + optional "both neutral" requirement, combo overlay toggle, dummy control mode |
+| Triggers | Master enable, P1/P2/Both target, randomize flag, wake buffer, and five trigger slots |
+| Macros | Eight-slot macro recorder panel with facing-aware playback, HUD status, slot browser |
+| Hotkeys | Rebinding table for all nine practice actions (keyboard + gamepad chord) |
 
-**Integration:** `PracticeTools_ShouldFreezeFrame()` is queried by input_sync_hooks to suppress frame advancement during pause.
+### Dummy Automation
+
+**Block modes:** None, All, First Hit, After First Hit, Random, Adaptive. Each frame opens a "threat window" when the opponent's `attackState` or `hitActive` goes live, then holds the correct guard direction until the attack resolves.
+
+**Stance modes:** Neutral, Stand, Crouch, Jump -- forced constantly while no scripted trigger is active.
+
+**Jump modes:** Disabled, Neutral, Forward, Backward, Random, with configurable cadence (frames between jumps) and a 3-frame jump-hold pulse.
+
+**Recovery:** Per-player HP / Meter / Guard refill with a shared delay gate. Supports Off, Full, zero'd, stepped meter (0 / 3000 / 6000 / 9000), and custom targets. Optional "both neutral" requirement prevents refill during hitstun or blockstun.
+
+**Control mode:** Advanced Mod (runs the mod's automation engine + input overrides) vs. Native Training (writes directly into the game's built-in training settings addresses and lets the vanilla dummy run).
+
+### Trigger Engine
+
+Five scripted reversal events, fired on actionable-edge transitions:
+
+| Trigger | Condition |
+|---------|-----------|
+| After Block | Defender leaves blockstun (actions 64/65/67/68/70/71 → actionable) |
+| On Wakeup | Defender exits WakeupNoTech (74) or post-tech (82) into actionable |
+| After Hitstun | Defender leaves hitstun (72/73) into actionable |
+| After Airtech | Defender exits air tech (78) |
+| After Ground Tech | Defender exits ground tech (79-81) |
+
+**Action library (22 entries):** `5X`, `2X`, `jX`, `6X`, `4X`, `236X`, `623X`, `214X`, `421X`, `624X`, `412X`, `22X`, `41236X`, `214236X`, `[2]8X`, `2[8]X`, `[4]6X`, `4[6]X`, Jump, Dash Forward, Dash Back. Button-suffixed actions accept A/B/C/D; charge motions hold for 30 frames.
+
+**Wake buffer:** Subtracts N frames (default 3) from the configured delay so reversals land on the first actionable frame rather than one frame late.
+
+**Randomize:** Deterministic coin flip seeded by sim frame + trigger id + player -- reproducible during replay/rollback.
+
+**Trigger status overlay:** Right-aligned EFZ-style panel drawn over the HUD. Gold = configured, green = fired within the last 60 sim frames.
+
+### Position Tools
+
+**Presets:** Mid Screen, Round Start, Right Corner, Left Corner. Each preset encodes X/Y for both players plus facing (`1` = right, `0xFF` = left). Camera scroll is recentered when a preset is applied.
+
+**Snapshot save/load:** Manual capture of both players' X/Y/facing, restored atomically with a full player-state reset (action → 2 standing idle, velocities and acceleration zeroed, hit/clash/max-hit markers cleared). HP, meter, and guard are preserved.
+
+**Modifier load:** While `Position Load` is held, the P1 direction bindings pick a preset instead of the saved snapshot:
+
+| Modifier | Preset |
+|----------|--------|
+| + Up | Round Start |
+| + Down | Mid Screen |
+| + Right | Right Corner |
+| + Left | Left Corner |
+
+**Gating:** Position tools lock out during match intro lock, round-end transition, and any non-gameplay substate. A "Wait for round start" toast fires if the user tries to use them too early.
+
+### Value Editor
+
+Per-player HP, Meter, Guard Gauge, X, Y fields seeded from the live entity. Edits apply on Enter with clamping: HP is capped at `max(current, character-table max)`, meter at 9000, guard at 10000. A dirty flag prevents live reseed from overwriting in-progress edits.
+
+### Combo Tracker and Overlay
+
+Tracks hit count, damage, attacker meter delta, defender meter delta, and the four scaling bytes read from the attacker entity. Finalises into a `last` summary when the combo ends so the overlay keeps the final numbers after the string drops. Combo overlay panel is toggled in Options.
+
+### Frame Advantage Calculator
+
+Three-stage interaction tracking -- pending attack → contact → recovery -- reporting the difference between the attacker's first actionable frame and the defender's first actionable frame.
+
+| Label | Meaning |
+|-------|---------|
+| Blocked / Hit / Trade | Interaction result (Trade has a 1-frame window) |
+| `+N` (green) | Attacker advantage |
+| `-N` (red) | Defender advantage |
+| `=` (neutral) | Both recover the same frame |
+| `gap N` (yellow) | Defender recovered N frames before the next contact (max 60) |
+
+**Action classification** used to detect the actionable edge: Actionable / Blockstun / Hitstun / WakeupNoTech / Tech / Knockdown / Healing / Other.
+
+- Overlay is anchored above the meter bars and shares its slot with the pause and macro overlays
+- History ring buffer retains the last 20 interactions for the ImGui panel
+- Debug logging toggle in the Options tab logs every sample transition
+- Timeouts: 180-frame pending window, 300-frame interaction window, 180-frame result display, 30-frame gap display
+
+### Input Macros
+
+Eight slots x 3600 frames (60 seconds at 60 fps) recorded on the dummy side:
+
+1. Press **Macro Record** (default F10) → enters **PreRecord**, auto-swaps controls to the dummy.
+2. Press again → **Recording** (clears the current slot first).
+3. Press again → finalises the slot and restores the original control swap.
+4. Press **Macro Play** (default Delete) → injects the recorded inputs into P2 while forcing both CPU flags to 0.
+5. Press **Macro Slot Next** (default F12) → cycles through slots 1-8.
+
+**Facing-aware playback:** Each recorded frame stores the P2 facing. On playback, if the live facing differs, LEFT/RIGHT are swapped before injection, so macros survive side swaps between rounds.
+
+**Safety:**
+
+- System buttons (START, SELECT, L1-L2, R1-R2) are stripped before recording so they cannot escape the match
+- State machine cancels on savestate load (partial recording is discarded, playback releases the override, slot data survives)
+- Recording and playback are gated on practice mode being active with no rollback session running
+
+### Hotkey Configuration
+
+Nine rebindable actions (each SDL scancode + optional gamepad button/axis, OR'd together):
+
+| Action | Default |
+|--------|---------|
+| Hitbox Toggle | F4 |
+| Pause Toggle | F7 |
+| Frame Step | F8 |
+| Control Swap | F9 |
+| Position Load | `1` |
+| Position Save | `2` |
+| Macro Record | F10 |
+| Macro Play/Stop | Delete |
+| Macro Slot Next | F12 |
+
+**Persistence:** `as2_practice_hotkeys.cfg` (magic `'AS2H'` = 0x48325341, version 1, fixed-size binary blob). Written on every rebind through the ImGui panel.
+
+**Suppression:** Hotkeys are ignored when the game window is unfocused or when an ImGui text field is capturing input (`io.WantTextInput` or any active item). Edge detection is per-frame (just-pressed transitions) and bindings are de-conflicted component-by-component when a key is reassigned.
+
+### Controller Swap
+
+Toggles `ADDR_P1_CPU_FLAG` and `ADDR_P2_CPU_FLAG`. Default state: P1 human, P2 CPU dummy. Swapped state: P1 CPU, P2 human. When swapped, `Hook_CmdHistoryUpdate` redirects the displayed input history buffer to the P2 entity so the on-screen command log tracks the side the player is actually driving.
+
+### Toast Notifications
+
+Shared across all practice subsystems. Up to 4 concurrent toasts, 1.5 s duration with fade starting at 1.0 s. Color-coded: yellow = paused, green = success / enabled, blue = control swap / info, red = disabled, orange = warning / "wait for round start".
+
+### Integration Points
+
+- `input_sync_hooks.cpp` queries `PracticeTools_ShouldFreezeFrame()` to suppress vanilla frame advancement during pause, except on the one-shot step frame
+- `input_override.cpp` routes macro and automation inputs through `InputSystem_SetOverride`; the runtime tracks `s_ownedOverrideActive[player]` so it only clears its own overrides
+- `mod_main.cpp` drives `PracticeTools_FrameUpdate` and `PracticeTools_RenderHUD` each frame
+- `mod_menu.cpp` renders the Practice tab via `PracticeTools_RenderImGui`
+- `Hook_CmdHistoryUpdate` (installed from `hook_installer.cpp`) redirects the buffer pointer to the P2 entity when controls are swapped
+- `InputMacro_OnSavestateLoad` is called by the savestate/rollback path to cancel any active recording or playback on state restore
 
 ---
 
@@ -1285,6 +1424,11 @@ If the game directory already contains a third-party `d3d9.dll`, back it up befo
 | F7 | Pause / unpause | Training mode |
 | F8 | Single-frame advance (one frame per press) | Training mode, while paused |
 | F9 | Swap P1/P2 controls | Training mode |
+| 1 | Load saved position snapshot (or preset with +Up/Down/Left/Right) | Training mode |
+| 2 | Save current positions as snapshot | Training mode |
+| F10 | Start / stop macro recording (dummy side) | Training mode |
+| Delete | Play / stop current macro slot | Training mode |
+| F12 | Cycle to next macro slot | Training mode |
 | Bksl | Pause / unpause replay playback | Replay |
 | `[` | Step backward one frame | Replay, while paused |
 | `]` | Step forward one frame | Replay, while paused |
@@ -1295,6 +1439,8 @@ If the game directory already contains a third-party `d3d9.dll`, back it up befo
 | 2 | Start or restart P2 replay takeover | Replay |
 | 0 | Exit replay takeover and restore base replay | Replay takeover |
 
+All training hotkeys (F4, F7-F10, F12, `1`, `2`, Delete) are rebindable from the Practice > Hotkeys tab and persist to `as2_practice_hotkeys.cfg`. The defaults above apply until the user saves a different binding.
+
 ---
 
 ## Configuration Files
@@ -1304,6 +1450,7 @@ If the game directory already contains a third-party `d3d9.dll`, back it up befo
 | `as2_input.cfg` | Input bindings (keyboard + gamepad) | Yes, on first save |
 | `as2_netplay.cfg` | Netplay settings (nickname, ports, delay, NAT, spectator, palette) | Yes, on first use |
 | `as2_autoconnect.cfg` | Automated testing configuration | No, manual or harness |
+| `as2_practice_hotkeys.cfg` | Rebindable training hotkeys (keyboard + gamepad) | Yes, on first rebind |
 | `mods/mods.ini` | Mod loader configuration | Yes, on first launch |
 | `custom_palettes/char_XXX_base_N.bin` | Custom palette data | No, user-created |
 
@@ -1420,7 +1567,12 @@ mod/
       stress_hooks.cpp            Network stress testing (~180 lines)
 
     training/                   Practice mode tools
-      practice_tools.cpp          Pause/step/swap/hitbox hotkeys (~450 lines)
+      practice_tools.cpp          Public API + command history hook (137 lines)
+      practice_runtime.cpp        7-tab ImGui menu, automation, triggers, combo/position/value tools (3276 lines)
+      practice_internal.h         Shared state + toast notification system (36 lines)
+      frame_advantage.cpp         Frame-advantage calculator + overlay + history ring (964 lines)
+      hotkey_config.cpp           Persistent rebindable hotkeys (SDL + gamepad) (537 lines)
+      input_macro.cpp             8-slot input recorder/player for the dummy (609 lines)
 
     testing/                    Automated testing
       autoconnect_harness.cpp     SHM + fighting AI (~600 lines)
@@ -1443,7 +1595,7 @@ mod/
     net/                        All net headers + protocol.h, session_types.h, netplay_menu_state.h
     replay/                     replay_runtime.h
     rollback/                   All rollback headers
-    training/                   practice_tools.h
+    training/                   practice_tools.h, frame_advantage.h, hotkey_config.h, input_macro.h
     testing/                    autoconnect_harness.h, harness_shared_memory.h, scripted_input_runner.h, test_scenarios.h
     ui/                         All UI headers
 
