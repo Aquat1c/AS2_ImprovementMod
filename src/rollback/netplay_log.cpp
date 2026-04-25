@@ -62,6 +62,16 @@ static void WriteLogHeader(FILE* file, const char* title, DWORD pid) {
     fflush(file);
 }
 
+static void WriteStartupLine(FILE* file, const char* label, const char* value) {
+    if (!file) {
+        return;
+    }
+
+    WriteTimestamp(file);
+    fprintf(file, "[STARTUP ]        %s%s\n", label ? label : "", value ? value : "");
+    fflush(file);
+}
+
 static void CloseLogFile(FILE** file, const char* footer) {
     if (!file || !*file) {
         return;
@@ -193,6 +203,8 @@ void NetplayLog_SetLogDir(const char* dir) {
     if (s_logFile) {
         setvbuf(s_logFile, nullptr, _IOFBF, 256 * 1024);
         WriteLogHeader(s_logFile, "ALICE SENKI 2 - FULL-PATH NETPLAY LOG", pid);
+        WriteStartupLine(s_logFile, "LogDir=", dir);
+        WriteStartupLine(s_logFile, "File=", path);
     }
 
     snprintf(path, sizeof(path), "%s\\as2_spectator_fullpath_%lu.log", dir, pid);
@@ -200,6 +212,8 @@ void NetplayLog_SetLogDir(const char* dir) {
     if (s_spectatorLogFile) {
         setvbuf(s_spectatorLogFile, nullptr, _IOFBF, 256 * 1024);
         WriteLogHeader(s_spectatorLogFile, "ALICE SENKI 2 - SPECTATOR LOG", pid);
+        WriteStartupLine(s_spectatorLogFile, "LogDir=", dir);
+        WriteStartupLine(s_spectatorLogFile, "File=", path);
     }
 }
 
@@ -214,11 +228,13 @@ void NetplayLog_SetVerbose(bool verbose) {
         WriteTimestamp(s_logFile);
         fprintf(s_logFile, "[CONFIG ] Verbose mode: %s\n", verbose ? "ON" : "OFF");
         FlushIfNeeded(s_logFile, &s_netplayLinesSinceFlush);
+        fflush(s_logFile);
     }
     if (s_spectatorLogFile) {
         WriteTimestamp(s_spectatorLogFile);
         fprintf(s_spectatorLogFile, "[CONFIG ] Verbose mode: %s\n", verbose ? "ON" : "OFF");
         FlushIfNeeded(s_spectatorLogFile, &s_spectatorLinesSinceFlush);
+        fflush(s_spectatorLogFile);
     }
 }
 

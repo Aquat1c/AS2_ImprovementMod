@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <vector>
 #include <DbgHelp.h>  // For stack walking
+#include <wchar.h>
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -811,6 +812,13 @@ static bool g_consoleVisible = false;
 static char g_dllPath[MAX_PATH] = {0};
 static char g_dllDir[MAX_PATH] = {0};
 static char g_logDir[MAX_PATH] = {0};
+static wchar_t g_dllPathW[MAX_PATH] = {0};
+static wchar_t g_dllDirW[MAX_PATH] = {0};
+static wchar_t g_logDirW[MAX_PATH] = {0};
+static DWORD g_processAttachTick = 0;
+static unsigned int g_proxyLogSequence = 0;
+static bool g_proxyFlushEveryLine = true;
+static char g_startupStage[128] = "before process attach";
 
 // ============================================================================
 // Display Config — persist window mode + size to as2_display.cfg
@@ -819,6 +827,193 @@ static char g_logDir[MAX_PATH] = {0};
 // Forward declaration — ProxyLog is defined later in the file
 void ProxyLog(const char* fmt, ...);
 
+static void WideToUtf8(const wchar_t* wide, char* out, int cap) {
+    if (!out || cap <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!wide) {
+        strncpy_s(out, cap, "<null>", _TRUNCATE);
+        return;
+    }
+
+    int written = WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, cap, nullptr, nullptr);
+    if (written <= 0) {
+        snprintf(out, cap, "<utf8 conversion failed err=%lu>", GetLastError());
+    }
+}
+
+static void WideToAnsi(UINT codePage, const wchar_t* wide, char* out, int cap, BOOL* usedDefaultChar) {
+    if (!out || cap <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (usedDefaultChar) {
+        *usedDefaultChar = FALSE;
+    }
+    if (!wide) {
+        return;
+    }
+
+    BOOL usedDefault = FALSE;
+    int written = WideCharToMultiByte(codePage, 0, wide, -1, out, cap, nullptr, &usedDefault);
+    if (usedDefaultChar) {
+        *usedDefaultChar = usedDefault;
+    }
+    if (written <= 0) {
+        snprintf(out, cap, "<cp%u conversion failed err=%lu>", codePage, GetLastError());
+    }
+}
+
+static void FormatWin32Error(DWORD err, char* out, int cap) {
+    if (!out || cap <= 0) {
+        return;
+    }
+
+    DWORD written = FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        err,
+        0,
+        out,
+        (DWORD)cap,
+        nullptr);
+    if (!written) {
+        snprintf(out, cap, "Win32 error %lu", err);
+        return;
+    }
+
+    while (written > 0 && (out[written - 1] == '\r' || out[written - 1] == '\n' || out[written - 1] == ' ')) {
+        out[--written] = '\0';
+    }
+}
+
+static void SetStartupStage(const char* stage) {
+    if (!stage || !stage[0]) {
+        return;
+    }
+    strncpy_s(g_startupStage, sizeof(g_startupStage), stage, _TRUNCATE);
+    ProxyLog("[STAGE] %s", g_startupStage);
+}
+
+static void ProxyLogWideValue(const char* label, const wchar_t* value) {
+    char utf8[1024];
+    WideToUtf8(value, utf8, sizeof(utf8));
+    ProxyLog("%s%s", label ? label : "", utf8);
+}
+
+static void ProxyLogFileProbe(const char* label, const char* path) {
+    if (!path || !path[0]) {
+        ProxyLog("[PROBE] %s path=<empty>", label ? label : "file");
+        return;
+    }
+
+    DWORD attrs = GetFileAttributesA(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD err = GetLastError();
+        char errText[256];
+        FormatWin32Error(err, errText, sizeof(errText));
+        ProxyLog("[PROBE] %s missing/unreadable: %s (err=%lu %s)",
+                 label ? label : "file", path, err, errText);
+        return;
+    }
+
+    LARGE_INTEGER size = {};
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            GetFileSizeEx(file, &size);
+            CloseHandle(file);
+        }
+    }
+
+    ProxyLog("[PROBE] %s exists: %s attrs=0x%08lX size=%lld",
+             label ? label : "file", path, attrs, (long long)size.QuadPart);
+}
+
+static void ProxyLogModuleByName(const char* moduleName) {
+    HMODULE module = GetModuleHandleA(moduleName);
+    if (!module) {
+        ProxyLog("[MODULE] %-18s not loaded", moduleName ? moduleName : "<null>");
+        return;
+    }
+
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(module, path, MAX_PATH);
+    ProxyLog("[MODULE] %-18s base=0x%p path=%s", moduleName, module, path[0] ? path : "<unknown>");
+}
+
+static void ProxyLogModuleSnapshot(const char* reason) {
+    ProxyLog("[MODULE] Snapshot: %s", reason ? reason : "<unspecified>");
+    const char* modules[] = {
+        "d3d9.dll",
+        "as2_rollback.dll",
+        "SDL3.dll",
+        "wsock32.dll",
+        "ddraw.dll",
+        "dinput.dll",
+        "dinput8.dll",
+        "dsound.dll",
+        "kernel32.dll",
+        "user32.dll",
+        "imm32.dll",
+    };
+    for (const char* name : modules) {
+        ProxyLogModuleByName(name);
+    }
+}
+
+static void ProxyLogProcessDiagnostics(HMODULE proxyModule) {
+    ProxyLog("[ENV] PID=%lu TID=%lu attachTick=%lu", GetCurrentProcessId(), GetCurrentThreadId(), g_processAttachTick);
+    ProxyLog("[ENV] CodePages: ACP=%u OEMCP=%u ThreadLocale=0x%08lX UIlang=0x%04X",
+             GetACP(), GetOEMCP(), (DWORD)GetThreadLocale(), (unsigned)GetThreadUILanguage());
+
+    char localeName[128] = {};
+    if (GetLocaleInfoA(LOCALE_SYSTEM_DEFAULT, LOCALE_SNAME, localeName, sizeof(localeName)) > 0) {
+        ProxyLog("[ENV] System locale: %s", localeName);
+    }
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SNAME, localeName, sizeof(localeName)) > 0) {
+        ProxyLog("[ENV] User locale: %s", localeName);
+    }
+
+    BOOL wow64 = FALSE;
+    if (IsWow64Process(GetCurrentProcess(), &wow64)) {
+        ProxyLog("[ENV] Process architecture: 32-bit%s", wow64 ? " on 64-bit Windows (WOW64)" : "");
+    }
+
+    char cwdA[MAX_PATH] = {};
+    if (GetCurrentDirectoryA(MAX_PATH, cwdA) > 0) {
+        ProxyLog("[ENV] CurrentDirectoryA: %s", cwdA);
+    }
+    wchar_t cwdW[MAX_PATH] = {};
+    if (GetCurrentDirectoryW(MAX_PATH, cwdW) > 0) {
+        ProxyLogWideValue("[ENV] CurrentDirectoryW: ", cwdW);
+    }
+
+    ProxyLog("[ENV] CommandLineA: %s", GetCommandLineA());
+    ProxyLogWideValue("[ENV] CommandLineW: ", GetCommandLineW());
+
+    char proxyPathFromHandle[MAX_PATH] = {};
+    if (GetModuleFileNameA(proxyModule, proxyPathFromHandle, MAX_PATH) > 0) {
+        ProxyLog("[ENV] Proxy path from handle A: %s", proxyPathFromHandle);
+    }
+    wchar_t proxyPathFromHandleW[MAX_PATH] = {};
+    if (GetModuleFileNameW(proxyModule, proxyPathFromHandleW, MAX_PATH) > 0) {
+        ProxyLogWideValue("[ENV] Proxy path from handle W: ", proxyPathFromHandleW);
+    }
+
+    HMODULE gameModule = GetModuleHandleA(nullptr);
+    char gamePathA[MAX_PATH] = {};
+    if (GetModuleFileNameA(gameModule, gamePathA, MAX_PATH) > 0) {
+        ProxyLog("[ENV] Game module A: base=0x%p path=%s", gameModule, gamePathA);
+    }
+    wchar_t gamePathW[MAX_PATH] = {};
+    if (GetModuleFileNameW(gameModule, gamePathW, MAX_PATH) > 0) {
+        ProxyLogWideValue("[ENV] Game module W: ", gamePathW);
+    }
+}
+
 static void DisplayConfig_GetPath(char* out, int cap) {
     snprintf(out, cap, "%s\\as2_display.cfg", g_dllDir);
 }
@@ -826,6 +1021,7 @@ static void DisplayConfig_GetPath(char* out, int cap) {
 static void DisplayConfig_Load() {
     char path[MAX_PATH];
     DisplayConfig_GetPath(path, MAX_PATH);
+    ProxyLogFileProbe("[CONFIG] as2_display.cfg", path);
 
     FILE* f = fopen(path, "r");
     if (!f) {
@@ -1002,7 +1198,15 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
     // Open crash log file
     char crashLogPath[MAX_PATH];
     snprintf(crashLogPath, MAX_PATH, "%s\\crash_log.txt", g_dllDir);
-    FILE* crashFile = fopen(crashLogPath, "a");
+    FILE* crashFile = nullptr;
+    if (g_dllDirW[0]) {
+        wchar_t crashLogPathW[MAX_PATH] = {};
+        swprintf_s(crashLogPathW, MAX_PATH, L"%s\\crash_log.txt", g_dllDirW);
+        _wfopen_s(&crashFile, crashLogPathW, L"a");
+    }
+    if (!crashFile) {
+        crashFile = fopen(crashLogPath, "a");
+    }
     
     // Get timestamp
     SYSTEMTIME st;
@@ -1024,6 +1228,33 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
         pRecord->ExceptionCode,
         GetExceptionCodeName(pRecord->ExceptionCode),
         pRecord->ExceptionAddress);
+
+    char dllPathUtf8[1024] = {};
+    char dllDirUtf8[1024] = {};
+    WideToUtf8(g_dllPathW, dllPathUtf8, sizeof(dllPathUtf8));
+    WideToUtf8(g_dllDirW, dllDirUtf8, sizeof(dllDirUtf8));
+    len += snprintf(msg + len, sizeof(msg) - len,
+        "Startup Stage: %s\n"
+        "PID/TID: %lu/%lu\n"
+        "Attach Tick: %lu  Current Tick: %lu  Elapsed: %lu ms\n"
+        "ACP/OEMCP: %u/%u  ThreadLocale: 0x%08lX\n"
+        "Proxy DLL A: %s\n"
+        "Proxy DLL W(utf8): %s\n"
+        "Proxy Dir A: %s\n"
+        "Proxy Dir W(utf8): %s\n",
+        g_startupStage,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        g_processAttachTick,
+        GetTickCount(),
+        g_processAttachTick ? (GetTickCount() - g_processAttachTick) : 0,
+        GetACP(),
+        GetOEMCP(),
+        (DWORD)GetThreadLocale(),
+        g_dllPath,
+        dllPathUtf8,
+        g_dllDir,
+        dllDirUtf8);
     
     // For access violations, show the address that was accessed
     if (pRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && pRecord->NumberParameters >= 2) {
@@ -1420,6 +1651,31 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static int ProxyLogExceptionFilter(const char* where, EXCEPTION_POINTERS* info) {
+    if (!info || !info->ExceptionRecord) {
+        ProxyLog("[SEH] EXCEPTION in %s (no exception record)", where ? where : "<unknown>");
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    PEXCEPTION_RECORD record = info->ExceptionRecord;
+    ProxyLog("[SEH] EXCEPTION in %s: code=0x%08lX (%s) address=0x%p params=%lu",
+             where ? where : "<unknown>",
+             record->ExceptionCode,
+             GetExceptionCodeName(record->ExceptionCode),
+             record->ExceptionAddress,
+             record->NumberParameters);
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+        const char* accessType = (record->ExceptionInformation[0] == 0) ? "READ" :
+                                 (record->ExceptionInformation[0] == 1) ? "WRITE" : "EXECUTE";
+        ProxyLog("[SEH]   access=%s target=0x%p", accessType, (void*)record->ExceptionInformation[1]);
+    }
+    ProxyLogModuleSnapshot("exception filter");
+    if (g_logFile) {
+        fflush(g_logFile);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // ============================================================================
 // Console Window Setup
 // ============================================================================
@@ -1512,16 +1768,36 @@ void ProxyLog(const char* fmt, ...) {
         // Create dated log folder: logs/<YYYY-MM-DD_HH-MM-SS>/
         SYSTEMTIME st;
         GetLocalTime(&st);
-        char logsBase[MAX_PATH];
+        char logsBase[MAX_PATH] = {};
         snprintf(logsBase, MAX_PATH, "%s\\logs", g_dllDir);
-        CreateDirectoryA(logsBase, nullptr);
-        snprintf(g_logDir, MAX_PATH, "%s\\%04d-%02d-%02d_%02d-%02d-%02d",
-                 logsBase, st.wYear, st.wMonth, st.wDay,
-                 st.wHour, st.wMinute, st.wSecond);
-        CreateDirectoryA(g_logDir, nullptr);
-        char logPath[MAX_PATH];
-        snprintf(logPath, MAX_PATH, "%s\\d3d9_proxy_%lu.log", g_logDir, GetCurrentProcessId());
-        g_logFile = fopen(logPath, "w");
+
+        if (g_dllDirW[0]) {
+            wchar_t logsBaseW[MAX_PATH] = {};
+            swprintf_s(logsBaseW, MAX_PATH, L"%s\\logs", g_dllDirW);
+            CreateDirectoryW(logsBaseW, nullptr);
+            swprintf_s(g_logDirW, MAX_PATH, L"%s\\%04d-%02d-%02d_%02d-%02d-%02d",
+                       logsBaseW, st.wYear, st.wMonth, st.wDay,
+                       st.wHour, st.wMinute, st.wSecond);
+            CreateDirectoryW(g_logDirW, nullptr);
+
+            BOOL usedDefault = FALSE;
+            WideToAnsi(CP_ACP, g_logDirW, g_logDir, MAX_PATH, &usedDefault);
+
+            wchar_t logPathW[MAX_PATH] = {};
+            swprintf_s(logPathW, MAX_PATH, L"%s\\d3d9_proxy_%lu.log", g_logDirW, GetCurrentProcessId());
+            _wfopen_s(&g_logFile, logPathW, L"w");
+        }
+
+        if (!g_logFile) {
+            CreateDirectoryA(logsBase, nullptr);
+            snprintf(g_logDir, MAX_PATH, "%s\\%04d-%02d-%02d_%02d-%02d-%02d",
+                     logsBase, st.wYear, st.wMonth, st.wDay,
+                     st.wHour, st.wMinute, st.wSecond);
+            CreateDirectoryA(g_logDir, nullptr);
+            char logPath[MAX_PATH];
+            snprintf(logPath, MAX_PATH, "%s\\d3d9_proxy_%lu.log", g_logDir, GetCurrentProcessId());
+            g_logFile = fopen(logPath, "w");
+        }
         if (g_logFile) {
             setvbuf(g_logFile, nullptr, _IOFBF, 256 * 1024);
             g_logLinesSinceFlush = 0;
@@ -1544,7 +1820,9 @@ void ProxyLog(const char* fmt, ...) {
     
     // Write to log file
     if (g_logFile) {
-        fprintf(g_logFile, "%s %s\n", timestamp, buffer);
+        const DWORD elapsedMs = g_processAttachTick ? (GetTickCount() - g_processAttachTick) : 0;
+        fprintf(g_logFile, "%s +%06lums #%05u %s\n",
+                timestamp, elapsedMs, ++g_proxyLogSequence, buffer);
         g_logLinesSinceFlush++;
 
         const bool criticalLog =
@@ -1554,7 +1832,7 @@ void ProxyLog(const char* fmt, ...) {
             strstr(buffer, "CRASH") ||
             strstr(buffer, "EXCEPTION");
 
-        if (criticalLog || g_logLinesSinceFlush >= kProxyLogFlushEveryLines) {
+        if (g_proxyFlushEveryLine || criticalLog || g_logLinesSinceFlush >= kProxyLogFlushEveryLines) {
             fflush(g_logFile);
             g_logLinesSinceFlush = 0;
         }
@@ -4852,9 +5130,48 @@ public:
     HRESULT STDMETHODCALLTYPE CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow,
                                             DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters,
                                             IDirect3DDevice9** ppReturnedDeviceInterface) override {
+        static unsigned int s_createDeviceCallCount = 0;
+        s_createDeviceCallCount++;
+        SetStartupStage("IDirect3D9::CreateDevice");
         ProxyLog("[CREATEDEVICE] CreateDevice called!");
+        ProxyLog("[CREATEDEVICE] Call #%u", s_createDeviceCallCount);
         ProxyLog("[CREATEDEVICE] Adapter=%u, DeviceType=%d, Window=0x%p, Flags=0x%08X",
                  Adapter, DeviceType, hFocusWindow, BehaviorFlags);
+
+        if (!pPresentationParameters) {
+            ProxyLog("[CREATEDEVICE] ERROR: pPresentationParameters is NULL");
+            return D3DERR_INVALIDCALL;
+        }
+        if (!ppReturnedDeviceInterface) {
+            ProxyLog("[CREATEDEVICE] ERROR: ppReturnedDeviceInterface is NULL");
+            return D3DERR_INVALIDCALL;
+        }
+
+        D3DADAPTER_IDENTIFIER9 adapterId = {};
+        HRESULT adapterHr = m_pReal->GetAdapterIdentifier(Adapter, 0, &adapterId);
+        if (SUCCEEDED(adapterHr)) {
+            ProxyLog("[CREATEDEVICE] Adapter identifier: Driver='%s' Description='%s' Device='%s' Vendor=0x%04X DeviceId=0x%04X Revision=0x%08X",
+                     adapterId.Driver,
+                     adapterId.Description,
+                     adapterId.DeviceName,
+                     adapterId.VendorId,
+                     adapterId.DeviceId,
+                     adapterId.Revision);
+        } else {
+            ProxyLog("[CREATEDEVICE] WARNING: GetAdapterIdentifier failed: 0x%08X", adapterHr);
+        }
+
+        D3DDISPLAYMODE displayMode = {};
+        HRESULT displayHr = m_pReal->GetAdapterDisplayMode(Adapter, &displayMode);
+        if (SUCCEEDED(displayHr)) {
+            ProxyLog("[CREATEDEVICE] Adapter display mode: %ux%u fmt=%d refresh=%u",
+                     displayMode.Width,
+                     displayMode.Height,
+                     displayMode.Format,
+                     displayMode.RefreshRate);
+        } else {
+            ProxyLog("[CREATEDEVICE] WARNING: GetAdapterDisplayMode failed: 0x%08X", displayHr);
+        }
         
         if (hFocusWindow) {
             LogWindowInfo(hFocusWindow, "[CREATEDEVICE]");
@@ -4862,11 +5179,20 @@ public:
             ProxyLog("[CREATEDEVICE] hFocusWindow is NULL");
         }
 
-        ProxyLog("[CREATEDEVICE] Original BackBuffer: %ux%u, Format=%d, Windowed=%d",
+        ProxyLog("[CREATEDEVICE] Original params: BB=%ux%u Format=%d Windowed=%d SwapEffect=%d BackBufferCount=%u MultiSample=%d/%lu AutoDepth=%d DepthFmt=%d Flags=0x%08lX Refresh=%u Interval=0x%08X",
                  pPresentationParameters->BackBufferWidth,
                  pPresentationParameters->BackBufferHeight,
                  pPresentationParameters->BackBufferFormat,
-                 pPresentationParameters->Windowed);
+                 pPresentationParameters->Windowed,
+                 pPresentationParameters->SwapEffect,
+                 pPresentationParameters->BackBufferCount,
+                 pPresentationParameters->MultiSampleType,
+                 pPresentationParameters->MultiSampleQuality,
+                 pPresentationParameters->EnableAutoDepthStencil,
+                 pPresentationParameters->AutoDepthStencilFormat,
+                 pPresentationParameters->Flags,
+                 pPresentationParameters->FullScreen_RefreshRateInHz,
+                 pPresentationParameters->PresentationInterval);
         
         // Save the game's native resolution
         g_nativeWidth = pPresentationParameters->BackBufferWidth;
@@ -4936,8 +5262,17 @@ public:
             ProxyLog("[CREATEDEVICE] Force-windowed (test harness) - overriding fullscreen request");
         }
         
+        ProxyLog("[CREATEDEVICE] Calling real CreateDevice with params: BB=%ux%u Format=%d Windowed=%d Refresh=%u Interval=0x%08X",
+                 pPresentationParameters->BackBufferWidth,
+                 pPresentationParameters->BackBufferHeight,
+                 pPresentationParameters->BackBufferFormat,
+                 pPresentationParameters->Windowed,
+                 pPresentationParameters->FullScreen_RefreshRateInHz,
+                 pPresentationParameters->PresentationInterval);
+
         HRESULT hr = m_pReal->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags,
                                            pPresentationParameters, ppReturnedDeviceInterface);
+        ProxyLog("[CREATEDEVICE] Real CreateDevice returned: 0x%08X", hr);
         
         if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
             IDirect3DDevice9* pDevice = *ppReturnedDeviceInterface;
@@ -5048,23 +5383,37 @@ public:
 
 bool LoadRealD3D9() {
     char systemPath[MAX_PATH];
-    GetSystemDirectoryA(systemPath, MAX_PATH);
+    if (!GetSystemDirectoryA(systemPath, MAX_PATH)) {
+        DWORD err = GetLastError();
+        char errText[256];
+        FormatWin32Error(err, errText, sizeof(errText));
+        ProxyLog("[D3D9] ERROR: GetSystemDirectoryA failed: err=%lu %s", err, errText);
+        return false;
+    }
     
     char d3d9Path[MAX_PATH];
     snprintf(d3d9Path, MAX_PATH, "%s\\d3d9.dll", systemPath);
     
     ProxyLog("[D3D9] Loading real d3d9.dll from: %s", d3d9Path);
+    ProxyLogFileProbe("[D3D9] real d3d9.dll", d3d9Path);
     
     g_hRealD3D9 = LoadLibraryA(d3d9Path);
     if (!g_hRealD3D9) {
-        ProxyLog("[D3D9] ERROR: Failed to load real d3d9.dll! Error: %d", GetLastError());
+        DWORD err = GetLastError();
+        char errText[256];
+        FormatWin32Error(err, errText, sizeof(errText));
+        ProxyLog("[D3D9] ERROR: Failed to load real d3d9.dll! Error: %lu %s", err, errText);
         return false;
     }
     ProxyLog("[D3D9] Real d3d9.dll loaded: 0x%p", g_hRealD3D9);
+    ProxyLogModuleByName("d3d9.dll");
     
     g_pRealDirect3DCreate9 = (RealDirect3DCreate9_t)GetProcAddress(g_hRealD3D9, "Direct3DCreate9");
     if (!g_pRealDirect3DCreate9) {
-        ProxyLog("[D3D9] ERROR: Failed to get Direct3DCreate9!");
+        DWORD err = GetLastError();
+        char errText[256];
+        FormatWin32Error(err, errText, sizeof(errText));
+        ProxyLog("[D3D9] ERROR: Failed to get Direct3DCreate9! Error: %lu %s", err, errText);
         return false;
     }
     ProxyLog("[D3D9] Direct3DCreate9 address: 0x%p", g_pRealDirect3DCreate9);
@@ -5277,11 +5626,16 @@ static void LoadConfiguredUserModDLLs(HMODULE gameModule) {
         }
 
         ProxyLog("[MODLOADER] Loading DLL mod: %s", mod.dllPath.c_str());
+        ProxyLogFileProbe("[MODLOADER] user DLL", mod.dllPath.c_str());
         mod.module = LoadLibraryA(mod.dllPath.c_str());
         if (!mod.module) {
-            ProxyLog("[MODLOADER] WARNING: failed to load %s (err=%lu)",
+            DWORD err = GetLastError();
+            char errText[256];
+            FormatWin32Error(err, errText, sizeof(errText));
+            ProxyLog("[MODLOADER] WARNING: failed to load %s (err=%lu %s)",
                      mod.dllPath.c_str(),
-                     GetLastError());
+                     err,
+                     errText);
             continue;
         }
 
@@ -5362,10 +5716,15 @@ bool LoadCoreModDLL() {
     // Load SDL3 first
     char sdlPath[MAX_PATH];
     snprintf(sdlPath, MAX_PATH, "%s\\SDL3.dll", g_dllDir);
+    ProxyLogFileProbe("[MOD] SDL3.dll", sdlPath);
     
+    SetStartupStage("loading SDL3.dll");
     HMODULE hSDL = LoadLibraryA(sdlPath);
     if (!hSDL) {
-        ProxyLog("[MOD] WARNING: SDL3.dll not found at: %s (Error: %d)", sdlPath, GetLastError());
+        DWORD err = GetLastError();
+        char errText[256];
+        FormatWin32Error(err, errText, sizeof(errText));
+        ProxyLog("[MOD] WARNING: SDL3.dll not found at: %s (Error: %lu %s)", sdlPath, err, errText);
         ProxyLog("[MOD] Make sure SDL3.dll is in the game folder!");
         MessageBoxA(NULL,
             "SDL3.dll was not found in the game folder.\n\n"
@@ -5374,7 +5733,9 @@ bool LoadCoreModDLL() {
             "Alice Senki 2 - Improvement Mod", MB_OK | MB_ICONERROR);
         return false;
     } else {
-        ProxyLog("[MOD] SDL3.dll loaded from: %s", sdlPath);
+        char loadedSdlPath[MAX_PATH] = {};
+        GetModuleFileNameA(hSDL, loadedSdlPath, MAX_PATH);
+        ProxyLog("[MOD] SDL3.dll loaded: base=0x%p path=%s", hSDL, loadedSdlPath[0] ? loadedSdlPath : sdlPath);
     }
     
     // Load core rollback DLL after its shared dependencies.
@@ -5382,11 +5743,15 @@ bool LoadCoreModDLL() {
     snprintf(modPath, MAX_PATH, "%s\\as2_rollback.dll", g_dllDir);
     
     ProxyLog("[MOD] Loading mod DLL: %s", modPath);
+    ProxyLogFileProbe("[MOD] as2_rollback.dll", modPath);
     
+    SetStartupStage("loading as2_rollback.dll");
     g_hModDLL = LoadLibraryA(modPath);
     if (!g_hModDLL) {
         DWORD err = GetLastError();
-        ProxyLog("[MOD] ERROR: as2_rollback.dll failed to load! Error: %d", err);
+        char errText[256];
+        FormatWin32Error(err, errText, sizeof(errText));
+        ProxyLog("[MOD] ERROR: as2_rollback.dll failed to load! Error: %lu %s", err, errText);
         if (err == 126) {
             ProxyLog("[MOD]   Error 126 = Module not found. Check that:");
             ProxyLog("[MOD]   1. as2_rollback.dll exists at: %s", modPath);
@@ -5402,7 +5767,10 @@ bool LoadCoreModDLL() {
         MessageBoxA(NULL, errMsg, "Alice Senki 2 - Improvement Mod", MB_OK | MB_ICONERROR);
         return false;
     }
-    ProxyLog("[MOD] as2_rollback.dll loaded: 0x%p", g_hModDLL);
+    char loadedModPath[MAX_PATH] = {};
+    GetModuleFileNameA(g_hModDLL, loadedModPath, MAX_PATH);
+    ProxyLog("[MOD] as2_rollback.dll loaded: base=0x%p path=%s", g_hModDLL, loadedModPath[0] ? loadedModPath : modPath);
+    ProxyLogModuleSnapshot("after core mod DLL load");
     
     g_pModInit = (ModInit_t)GetProcAddress(g_hModDLL, "ModInit");
     g_pModShutdown = (ModShutdown_t)GetProcAddress(g_hModDLL, "ModShutdown");
@@ -5420,7 +5788,13 @@ bool LoadCoreModDLL() {
     // Pass log directory to mod so all logs end up in the same dated folder
     auto pModSetLogDir = (ModSetLogDir_t)GetProcAddress(g_hModDLL, "ModSetLogDir");
     if (pModSetLogDir && g_logDir[0]) {
+        SetStartupStage("passing log dir to as2_rollback.dll");
+        ProxyLog("[MOD] Passing log directory to mod: %s", g_logDir);
         pModSetLogDir(g_logDir);
+    } else if (!pModSetLogDir) {
+        ProxyLog("[MOD] WARNING: ModSetLogDir export missing");
+    } else {
+        ProxyLog("[MOD] WARNING: g_logDir is empty; mod will create its own log directory");
     }
     
     ProxyLog("[MOD] Exports - Init:0x%p Shutdown:0x%p OnFrame:0x%p OnPresent:0x%p SetCtx:0x%p Exit:0x%p ToggleMenu:0x%p MenuState:0x%p ShouldRender:0x%p Hud:0x%p MatchHud:0x%p Exclusive:0x%p",
@@ -5436,18 +5810,26 @@ bool LoadCoreModDLL() {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
         case DLL_PROCESS_ATTACH: {
+            g_processAttachTick = GetTickCount();
             DisableThreadLibraryCalls(hModule);
             
             // Get our DLL path
+            GetModuleFileNameW(hModule, g_dllPathW, MAX_PATH);
+            wcscpy_s(g_dllDirW, g_dllPathW);
+            wchar_t* lastSlashW = wcsrchr(g_dllDirW, L'\\');
+            if (lastSlashW) *lastSlashW = L'\0';
+
             GetModuleFileNameA(hModule, g_dllPath, MAX_PATH);
             strcpy_s(g_dllDir, g_dllPath);
             char* lastSlash = strrchr(g_dllDir, '\\');
             if (lastSlash) *lastSlash = '\0';
             
             // Install crash handler FIRST (before anything else can crash)
+            strncpy_s(g_startupStage, sizeof(g_startupStage), "installing crash handler", _TRUNCATE);
             g_previousExceptionFilter = SetUnhandledExceptionFilter(CrashHandler);
             
             // Initialize console
+            strncpy_s(g_startupStage, sizeof(g_startupStage), "initializing console", _TRUNCATE);
             InitConsole();
             
             ProxyLog("========================================");
@@ -5457,35 +5839,52 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             ProxyLog("========================================");
             ProxyLog("[INIT] Proxy DLL path: %s", g_dllPath);
             ProxyLog("[INIT] Working directory: %s", g_dllDir);
+            ProxyLogWideValue("[INIT] Proxy DLL path W: ", g_dllPathW);
+            ProxyLogWideValue("[INIT] Working directory W: ", g_dllDirW);
+            ProxyLogProcessDiagnostics(hModule);
+            ProxyLogModuleSnapshot("process attach start");
             
             // Load real D3D9
+            SetStartupStage("loading real d3d9.dll");
             if (!LoadRealD3D9()) {
                 return FALSE;
             }
             
             // Load mod DLL
+            SetStartupStage("loading core mod DLLs");
             LoadCoreModDLL();
             
             // Load persistent display settings (borderless, window size, aspect)
+            SetStartupStage("loading display config");
             DisplayConfig_Load();
             
             // Call mod init
             if (g_pModInit) {
+                SetStartupStage("calling ModInit");
                 HMODULE gameModule = GetModuleHandleA(NULL);
                 char gamePath[MAX_PATH];
                 GetModuleFileNameA(gameModule, gamePath, MAX_PATH);
                 ProxyLog("[INIT] Calling ModInit with game module: 0x%p (%s)", gameModule, gamePath);
-                g_pModInit(gameModule);
+                __try {
+                    g_pModInit(gameModule);
+                }
+                __except(ProxyLogExceptionFilter("g_pModInit", GetExceptionInformation())) {
+                }
+                ProxyLog("[INIT] ModInit returned");
+                SetStartupStage("loading configured user mod DLLs");
                 LoadConfiguredUserModDLLs(gameModule);
             } else {
+                SetStartupStage("loading configured user mod DLLs without core ModInit");
                 LoadConfiguredUserModDLLs(GetModuleHandleA(NULL));
             }
             
             // If test harness autoconnect config exists, force windowed mode
             // so two instances don't fight over a fullscreen TOPMOST window.
             {
+                SetStartupStage("checking test harness config");
                 char cfgPath[MAX_PATH];
                 snprintf(cfgPath, MAX_PATH, "%s\\as2_autoconnect.cfg", g_dllDir);
+                ProxyLogFileProbe("[INIT] as2_autoconnect.cfg", cfgPath);
                 if (GetFileAttributesA(cfgPath) != INVALID_FILE_ATTRIBUTES) {
                     g_useBorderlessFullscreen = false;
                     g_isCurrentlyBorderless = false;
@@ -5494,6 +5893,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
                 }
             }
             
+            SetStartupStage("process attach complete");
+            ProxyLogModuleSnapshot("process attach complete");
             ProxyLog("[INIT] Initialization complete - waiting for game to create D3D9 device...");
             break;
         }
@@ -5518,13 +5919,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
 // ============================================================================
 
 IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT SDKVersion) {
+    static unsigned int s_direct3DCreateCallCount = 0;
+    s_direct3DCreateCallCount++;
+    SetStartupStage("Direct3DCreate9 export");
     ProxyLog("[EXPORT] Direct3DCreate9 called - SDK version: %u", SDKVersion);
+    ProxyLog("[EXPORT] Direct3DCreate9 call #%u", s_direct3DCreateCallCount);
     
     if (!g_pRealDirect3DCreate9) {
         ProxyLog("[EXPORT] ERROR: Real Direct3DCreate9 not available!");
         return nullptr;
     }
     
+    ProxyLog("[EXPORT] Calling real Direct3DCreate9 at 0x%p", g_pRealDirect3DCreate9);
     IDirect3D9* pD3D9 = g_pRealDirect3DCreate9(SDKVersion);
     if (!pD3D9) {
         ProxyLog("[EXPORT] ERROR: Real Direct3DCreate9 returned NULL!");

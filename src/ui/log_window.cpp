@@ -97,11 +97,12 @@ static unsigned int g_logLinesSinceFlush = 0;
 static unsigned int g_pktLinesSinceFlush = 0;
 static unsigned int g_netLinesSinceFlush = 0;
 static unsigned int g_gekkoLinesSinceFlush = 0;
+static bool g_forceFlush = false;
 
 static void FlushIfNeeded(FILE* f, LogLevel level, unsigned int* linesSinceFlush, unsigned int flushEveryLines) {
     if (!f || !linesSinceFlush) return;
     (*linesSinceFlush)++;
-    if (level >= LOG_ERROR || (*linesSinceFlush) >= flushEveryLines) {
+    if (g_forceFlush || level >= LOG_ERROR || (*linesSinceFlush) >= flushEveryLines) {
         fflush(f);
         *linesSinceFlush = 0;
     }
@@ -143,6 +144,7 @@ const char* LogWindow_GetLogDir(void) {
 
 void LogWindow_Init(void) {
     g_logEntries.clear();
+    g_forceFlush = true;
     
     // Use PID-stamped log filenames so two game instances don't clobber each other.
     DWORD pid = GetCurrentProcessId();
@@ -168,6 +170,10 @@ void LogWindow_Init(void) {
     if (g_logFile) {
         // Buffer file IO to avoid frame hitches.
         setvbuf(g_logFile, nullptr, _IOFBF, 256 * 1024);
+        fprintf(g_logFile, "=== ALICE SENKI 2 - ROLLBACK LOG ===\n");
+        fprintf(g_logFile, "=== PID: %lu ===\n", pid);
+        fprintf(g_logFile, "=== LogDir: %s ===\n\n", logDir);
+        fflush(g_logFile);
     }
 
     // Packet log is opt-in via env var to avoid massive IO + stutter.
@@ -178,6 +184,9 @@ void LogWindow_Init(void) {
         g_packetLogFile = fopen(path, "w");
         if (g_packetLogFile) {
             setvbuf(g_packetLogFile, nullptr, _IOFBF, 512 * 1024);
+            fprintf(g_packetLogFile, "=== ALICE SENKI 2 - PACKET LOG ===\n");
+            fprintf(g_packetLogFile, "=== PID: %lu ===\n\n", pid);
+            fflush(g_packetLogFile);
         }
     }
 
@@ -186,6 +195,9 @@ void LogWindow_Init(void) {
     g_netcodeLogFile = fopen(path, "w");
     if (g_netcodeLogFile) {
         setvbuf(g_netcodeLogFile, nullptr, _IOFBF, 256 * 1024);
+        fprintf(g_netcodeLogFile, "=== ALICE SENKI 2 - NETCODE LOG ===\n");
+        fprintf(g_netcodeLogFile, "=== PID: %lu ===\n\n", pid);
+        fflush(g_netcodeLogFile);
     }
 
     // Gekko log — always enabled, separate file for rollback transport internals
@@ -193,9 +205,34 @@ void LogWindow_Init(void) {
     g_gekkoLogFile = fopen(path, "w");
     if (g_gekkoLogFile) {
         setvbuf(g_gekkoLogFile, nullptr, _IOFBF, 256 * 1024);
+        fprintf(g_gekkoLogFile, "=== ALICE SENKI 2 - GEKKO LOG ===\n");
+        fprintf(g_gekkoLogFile, "=== PID: %lu ===\n\n", pid);
+        fflush(g_gekkoLogFile);
     }
     
     LOG_INFO("Log window initialized (PID %lu, logDir=%s)", pid, logDir);
+}
+
+void LogWindow_SetForceFlush(bool enabled) {
+    g_forceFlush = enabled;
+    if (enabled) {
+        LogWindow_Flush();
+    }
+}
+
+void LogWindow_Flush(void) {
+    if (g_logFile) {
+        fflush(g_logFile);
+    }
+    if (g_packetLogFile) {
+        fflush(g_packetLogFile);
+    }
+    if (g_netcodeLogFile) {
+        fflush(g_netcodeLogFile);
+    }
+    if (g_gekkoLogFile) {
+        fflush(g_gekkoLogFile);
+    }
 }
 
 void LogWindow_Shutdown(void) {

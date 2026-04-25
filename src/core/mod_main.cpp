@@ -94,6 +94,87 @@ typedef void (__cdecl *ProxyGetResolution_t)(int* width, int* height);
 // Config accessors (for other modules)
 // ============================================================================
 
+static void ModWideToUtf8(const wchar_t* wide, char* out, int cap) {
+    if (!out || cap <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!wide) {
+        strncpy_s(out, cap, "<null>", _TRUNCATE);
+        return;
+    }
+
+    int written = WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, cap, nullptr, nullptr);
+    if (written <= 0) {
+        snprintf(out, cap, "<utf8 conversion failed err=%lu>", GetLastError());
+    }
+}
+
+static void LogModulePath(const char* label, HMODULE module) {
+    char pathA[MAX_PATH] = {};
+    wchar_t pathW[MAX_PATH] = {};
+    char pathUtf8[1024] = {};
+
+    if (module && GetModuleFileNameA(module, pathA, MAX_PATH) > 0) {
+        LOG_INFO("[StartupDiag] %s A: base=0x%p path=%s", label ? label : "module", module, pathA);
+    } else {
+        LOG_WARN("[StartupDiag] %s A path unavailable (err=%lu)", label ? label : "module", GetLastError());
+    }
+
+    if (module && GetModuleFileNameW(module, pathW, MAX_PATH) > 0) {
+        ModWideToUtf8(pathW, pathUtf8, sizeof(pathUtf8));
+        LOG_INFO("[StartupDiag] %s W: %s", label ? label : "module", pathUtf8);
+    } else {
+        LOG_WARN("[StartupDiag] %s W path unavailable (err=%lu)", label ? label : "module", GetLastError());
+    }
+}
+
+static void LogStartupEnvironment(HMODULE gameModule) {
+    LOG_INFO("[StartupDiag] PID=%lu TID=%lu ACP=%u OEMCP=%u ThreadLocale=0x%08lX UIlang=0x%04X",
+             GetCurrentProcessId(),
+             GetCurrentThreadId(),
+             GetACP(),
+             GetOEMCP(),
+             (DWORD)GetThreadLocale(),
+             (unsigned)GetThreadUILanguage());
+
+    char localeName[128] = {};
+    if (GetLocaleInfoA(LOCALE_SYSTEM_DEFAULT, LOCALE_SNAME, localeName, sizeof(localeName)) > 0) {
+        LOG_INFO("[StartupDiag] System locale: %s", localeName);
+    }
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SNAME, localeName, sizeof(localeName)) > 0) {
+        LOG_INFO("[StartupDiag] User locale: %s", localeName);
+    }
+
+    char cwdA[MAX_PATH] = {};
+    if (GetCurrentDirectoryA(MAX_PATH, cwdA) > 0) {
+        LOG_INFO("[StartupDiag] CurrentDirectoryA: %s", cwdA);
+    }
+    wchar_t cwdW[MAX_PATH] = {};
+    if (GetCurrentDirectoryW(MAX_PATH, cwdW) > 0) {
+        char cwdUtf8[1024] = {};
+        ModWideToUtf8(cwdW, cwdUtf8, sizeof(cwdUtf8));
+        LOG_INFO("[StartupDiag] CurrentDirectoryW: %s", cwdUtf8);
+    }
+
+    LOG_INFO("[StartupDiag] CommandLineA: %s", GetCommandLineA());
+    char cmdUtf8[2048] = {};
+    ModWideToUtf8(GetCommandLineW(), cmdUtf8, sizeof(cmdUtf8));
+    LOG_INFO("[StartupDiag] CommandLineW: %s", cmdUtf8);
+
+    LogModulePath("Game module", gameModule);
+    HMODULE selfModule = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&ModInit, &selfModule)) {
+        LogModulePath("Mod DLL", selfModule);
+    }
+}
+
+static void LogInitStep(const char* step, const char* state) {
+    LOG_INFO("[InitStep] %s %s", state ? state : "?", step ? step : "?");
+    LogWindow_Flush();
+}
+
 bool ModConfig_UseSDLInput() {
     return g_config.useSDLInput;
 }
@@ -362,70 +443,120 @@ void AS2_ClearVanillaNetplayBuffers() {
 static void DeferredInit() {
     LOG_INFO("Performing deferred initialization...");
 
+    LogInitStep("InputSystem_Init", "BEGIN");
     if (!InputSystem_Init()) {
         LOG_WARN("Failed to initialize SDL input system - using native input only");
     } else {
         LOG_INFO("SDL3 input system initialized");
     }
+    LogInitStep("InputSystem_Init", "END");
 
+    LogInitStep("InstallHooks", "BEGIN");
     if (!InstallHooks()) {
         LOG_ERROR("Failed to install hooks!");
         return;
     }
+    LogInitStep("InstallHooks", "END");
 
+    LogInitStep("GameConsole_Init", "BEGIN");
     GameConsole_Init();
+    LogInitStep("GameConsole_Init", "END");
 
     // Initialize determinism verification system
+    LogInitStep("DetVer_Init", "BEGIN");
     DetVer_Init();
     DetVer_SetLogDir(LogWindow_GetLogDir());
+    LogInitStep("DetVer_Init", "END");
 
     // Initialize savestate system
+    LogInitStep("Savestate_Init", "BEGIN");
     Savestate_Init();
     Savestate_SetLogDir(LogWindow_GetLogDir());
+    LogInitStep("Savestate_Init", "END");
 
     // Initialize networking
+    LogInitStep("Transport_GlobalInit", "BEGIN");
     Net::Transport_GlobalInit();
+    LogInitStep("Transport_GlobalInit", "END");
+    LogInitStep("Session_Init", "BEGIN");
     Net::Session_Init();
+    LogInitStep("Session_Init", "END");
+    LogInitStep("NetplayPaletteRuntime_Init", "BEGIN");
     Net::NetplayPaletteRuntime_Init();
+    LogInitStep("NetplayPaletteRuntime_Init", "END");
+    LogInitStep("SpectatorRuntime_Init", "BEGIN");
     Net::SpectatorRuntime_Init();
+    LogInitStep("SpectatorRuntime_Init", "END");
+    LogInitStep("SpectatorClient_Init", "BEGIN");
     Net::SpectatorClient_Init();
+    LogInitStep("SpectatorClient_Init", "END");
+    LogInitStep("SpectatorPlayback_Init", "BEGIN");
     Net::SpectatorPlayback_Init();
+    LogInitStep("SpectatorPlayback_Init", "END");
 
     // Initialize netplay menu controller and mode ownership hooks
+    LogInitStep("NetMenu::Init", "BEGIN");
     NetMenu::Init();
+    LogInitStep("NetMenu::Init", "END");
+    LogInitStep("ModeOwnership::Install", "BEGIN");
     if (!ModeOwnership::Install()) {
         LOG_ERROR("Failed to install mode ownership hooks!");
     }
+    LogInitStep("ModeOwnership::Install", "END");
 
     // Initialize pre-game synchronization layer
+    LogInitStep("PregameSync_Init", "BEGIN");
     Net::PregameSync_Init();
+    LogInitStep("PregameSync_Init", "END");
 
     // Initialize match lifecycle state management
+    LogInitStep("MatchLifecycle_Init", "BEGIN");
     Net::MatchLifecycle_Init();
+    LogInitStep("MatchLifecycle_Init", "END");
 
     // Initialize sync policy and delay policy
+    LogInitStep("SyncPolicy_Init", "BEGIN");
     Net::SyncPolicy_Init();
+    LogInitStep("SyncPolicy_Init", "END");
+    LogInitStep("DelayPolicy_Init", "BEGIN");
     Net::DelayPolicy_Init();
+    LogInitStep("DelayPolicy_Init", "END");
 
     // Initialize gameplay bridge (checks GekkoNet availability for future use)
+    LogInitStep("GameplayBridge_Init", "BEGIN");
     Net::GameplayBridge_Init();
+    LogInitStep("GameplayBridge_Init", "END");
 
     // Initialize rollback gameplay subsystems
+    LogInitStep("RollbackSession_Init", "BEGIN");
     Rollback::RollbackSession_Init();
+    LogInitStep("RollbackSession_Init", "END");
+    LogInitStep("RollbackDebug_Init", "BEGIN");
     Rollback::RollbackDebug_Init();
+    LogInitStep("RollbackDebug_Init", "END");
 
     // Initialize netplay full-path log, stress hooks, and online wiring
+    LogInitStep("NetplayLog_Init", "BEGIN");
     Rollback::NetplayLog_Init();
     Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
     Rollback::NetplayLog_SetVerbose(g_config.verboseLogging);
+    LogInitStep("NetplayLog_Init", "END");
+    LogInitStep("OnlineWiring_Init", "BEGIN");
     Rollback::OnlineWiring_Init();
+    LogInitStep("OnlineWiring_Init", "END");
 
     // Initialize scripted input runner
+    LogInitStep("SIR_Init", "BEGIN");
     SIR_Init();
+    LogInitStep("SIR_Init", "END");
 
     // Initialize practice mode tools
+    LogInitStep("PracticeTools_Init", "BEGIN");
     PracticeTools_Init();
+    LogInitStep("PracticeTools_Init", "END");
+    LogInitStep("ReplayRuntime_Init", "BEGIN");
     Replay::ReplayRuntime_Init();
+    LogInitStep("ReplayRuntime_Init", "END");
 
     LOG_INFO("Frame Counter: 0x%08X = %d", ADDR_SIM_FRAME_COUNTER, AS2_GetFrameNumber());
     LOG_INFO("Game Mode: 0x%08X = %d", ADDR_GAME_MODE, GetGameMode());
@@ -434,13 +565,19 @@ static void DeferredInit() {
 
     g_initialized = true;
 
+    LogInitStep("ModMenu_Init", "BEGIN");
     ModMenu_Init();
+    LogInitStep("ModMenu_Init", "END");
+    LogInitStep("HitboxViewer_Init", "BEGIN");
     HitboxViewer_Init();
+    LogInitStep("HitboxViewer_Init", "END");
 
     LOG_INFO("========================================");
     LOG_INFO("Initialization complete!");
     LOG_INFO("Hotkeys: F1=Menu  F4=Hitbox  F5=SaveState  F6=LoadState  F7=Pause  F8=Step  F9=Swap");
     LOG_INFO("========================================");
+    LogWindow_SetForceFlush(false);
+    LogWindow_Flush();
 }
 
 // ============================================================================
@@ -470,6 +607,8 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
     LOG_INFO("Build: %s %s", __DATE__, __TIME__);
     LOG_INFO("========================================");
     LOG_INFO("Game module: 0x%p", gameModule);
+    LOG_INFO("[ModInit] External log dir: %s", LogWindow_GetLogDir());
+    LogStartupEnvironment(gameModule);
 
     HMODULE selfModule = nullptr;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -477,17 +616,24 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
         LOG_INFO("Mod DLL base: 0x%p", selfModule);
     }
 
+    LogInitStep("FilesystemPatch_Init", "BEGIN");
     FilesystemPatch_Init(gameModule);
+    LogInitStep("FilesystemPatch_Init", "END");
+    LogInitStep("FilesystemPatch_InstallHooks", "BEGIN");
     if (!FilesystemPatch_InstallHooks()) {
         LOG_WARN("Filesystem hooks failed during ModInit; file overrides will be unavailable");
     }
+    LogInitStep("FilesystemPatch_InstallHooks", "END");
 
     LOG_INFO("Initialization deferred - will complete when game is ready...");
 
     // Cache autoconnect config immediately at DLL load time.
     // The test harness overwrites this file 3s later with the client config,
     // so we must snapshot it before DeferredInit (which may run after that).
+    LogInitStep("NetMenu::CacheAutoConnectFile", "BEGIN");
     NetMenu::CacheAutoConnectFile();
+    LogInitStep("NetMenu::CacheAutoConnectFile", "END");
+    LogWindow_Flush();
 }
 
 __declspec(dllexport) void ModShutdown() {

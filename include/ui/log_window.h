@@ -65,6 +65,10 @@ void LogWindow_Init(void);
 // Shutdown and cleanup
 void LogWindow_Shutdown(void);
 
+// Force logs to hit disk immediately while debugging startup crashes.
+void LogWindow_SetForceFlush(bool enabled);
+void LogWindow_Flush(void);
+
 // Standard logging
 void LogWindow_Log(LogLevel level, const char* fmt, ...);
 void LogWindow_LogV(LogLevel level, const char* fmt, va_list args);
