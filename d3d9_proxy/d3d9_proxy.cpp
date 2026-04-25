@@ -73,7 +73,7 @@ typedef bool (*ModGetNetplayHudText_t)(char* out, int cap);
 typedef bool (*ModWantsExclusiveOverlay_t)();
 typedef void (*ModSetLogDir_t)(const char* dir);
 
-// Match HUD structured data (must match as2_rollback.cpp MatchHudData)
+// Match HUD structured data (must match include/core/mod_main.h MatchHudData)
 struct MatchHudData {
     bool     active;
     char     p1_name[64];
@@ -86,6 +86,9 @@ struct MatchHudData {
     int      local_frame;
     int      remote_frame;
     bool     is_host;
+    bool     spectator_mode;
+    bool     show_connection_stats;
+    char     status_text[64];
 };
 typedef bool (*ModGetMatchHudData_t)(MatchHudData* out);
 
@@ -462,6 +465,7 @@ static HWND g_pendingFocusReclaimWindow = nullptr;
 static DWORD g_pendingFocusReclaimEarliestTick = 0;
 static IDirect3DDevice9* g_pDevice = nullptr;
 static bool g_imguiDrawDataReady = false;
+static bool g_renderingPreparedImGuiToScalingTarget = false;
 
 // Menu state
 static bool g_showMenu = true;
@@ -819,6 +823,21 @@ static DWORD g_processAttachTick = 0;
 static unsigned int g_proxyLogSequence = 0;
 static bool g_proxyFlushEveryLine = true;
 static char g_startupStage[128] = "before process attach";
+static HMODULE g_hPinnedProxyModule = nullptr;
+static bool g_proxyModulePinned = false;
+static DWORD g_lastBorderlessDelayLogTick = 0;
+
+static constexpr DWORD kGameDefaultFontHandleAddr = 0x009CC064;
+static constexpr DWORD kGameFontCacheRebuildStart = 0x006222E0;
+static constexpr DWORD kGameFontCacheRebuildEnd = 0x0062247F;
+static constexpr DWORD kGameFontInitStart = 0x00622730;
+static constexpr DWORD kGameFontInitEnd = 0x00622EF1;
+static constexpr DWORD kGameGraphCreateStart = 0x00612080;
+static constexpr DWORD kGameGraphCreateEnd = 0x006127C9;
+static constexpr DWORD kGameGraphHandleBindStart = 0x00613230;
+static constexpr DWORD kGameGraphHandleBindEnd = 0x006133A0;
+static constexpr DWORD kGameImageRegisterHandleStart = 0x00620930;
+static constexpr DWORD kGameImageRegisterHandleEnd = 0x00620A00;
 
 // ============================================================================
 // Display Config — persist window mode + size to as2_display.cfg
@@ -888,12 +907,111 @@ static void FormatWin32Error(DWORD err, char* out, int cap) {
     }
 }
 
+static void PinProxyModuleForProcessLifetime(HMODULE attachModule) {
+    if (g_proxyModulePinned) {
+        return;
+    }
+
+    HMODULE pinnedModule = nullptr;
+    const BOOL pinned = GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&g_startupStage),
+        &pinnedModule);
+
+    if (pinned) {
+        g_hPinnedProxyModule = pinnedModule;
+        g_proxyModulePinned = true;
+        ProxyLog("[INIT] Proxy DLL pinned for process lifetime: attach=0x%p pinned=0x%p",
+                 attachModule,
+                 g_hPinnedProxyModule);
+        if (attachModule && attachModule != g_hPinnedProxyModule) {
+            ProxyLog("[INIT] WARNING: pinned proxy module handle differs from DllMain handle");
+        }
+        return;
+    }
+
+    const DWORD err = GetLastError();
+    char errText[256];
+    FormatWin32Error(err, errText, sizeof(errText));
+    ProxyLog("[INIT] WARNING: failed to pin proxy DLL; FreeLibrary could unload live hooks (err=%lu %s)",
+             err,
+             errText);
+}
+
 static void SetStartupStage(const char* stage) {
     if (!stage || !stage[0]) {
         return;
     }
     strncpy_s(g_startupStage, sizeof(g_startupStage), stage, _TRUNCATE);
     ProxyLog("[STAGE] %s", g_startupStage);
+}
+
+static void UpdateStartupStageSilently(const char* stage) {
+    if (!stage || !stage[0]) {
+        return;
+    }
+    strncpy_s(g_startupStage, sizeof(g_startupStage), stage, _TRUNCATE);
+}
+
+static bool ReadGameDwordSafe(DWORD address, DWORD* outValue) {
+    if (!outValue) {
+        return false;
+    }
+    __try {
+        *outValue = *reinterpret_cast<volatile DWORD*>(address);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        *outValue = 0;
+        return false;
+    }
+}
+
+static bool IsGameDefaultFontReady(DWORD* outHandle = nullptr) {
+    DWORD handle = 0;
+    if (!ReadGameDwordSafe(kGameDefaultFontHandleAddr, &handle)) {
+        if (outHandle) {
+            *outHandle = 0;
+        }
+        return false;
+    }
+    if (outHandle) {
+        *outHandle = handle;
+    }
+    return handle != 0 && handle != 0xFFFFFFFFu;
+}
+
+static bool ShouldDelayInitialBorderlessForFontInit() {
+    DWORD fontHandle = 0;
+    if (IsGameDefaultFontReady(&fontHandle)) {
+        return false;
+    }
+
+    const DWORD now = GetTickCount();
+    if (g_lastBorderlessDelayLogTick == 0 || now - g_lastBorderlessDelayLogTick >= 1000) {
+        g_lastBorderlessDelayLogTick = now;
+        ProxyLog("[BORDERLESS] Delaying initial borderless resize until game default font cache is ready (fontHandle=0x%08lX)",
+                 fontHandle);
+    }
+    return true;
+}
+
+static const char* DescribeKnownGameAddress(DWORD address) {
+    if (address >= kGameFontInitStart && address <= kGameFontInitEnd) {
+        return "DXLib font initialization / CreateFontToHandle";
+    }
+    if (address >= kGameFontCacheRebuildStart && address <= kGameFontCacheRebuildEnd) {
+        return "DXLib font cache rebuild / graph surface creation";
+    }
+    if (address >= kGameGraphCreateStart && address <= kGameGraphCreateEnd) {
+        return "DXLib graph/screen handle creation";
+    }
+    if (address >= kGameGraphHandleBindStart && address <= kGameGraphHandleBindEnd) {
+        return "DXLib graph handle bind/setup";
+    }
+    if (address >= kGameImageRegisterHandleStart && address <= kGameImageRegisterHandleEnd) {
+        return "DXLib image handle registration";
+    }
+    return nullptr;
 }
 
 static void ProxyLogWideValue(const char* label, const wchar_t* value) {
@@ -1228,6 +1346,11 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
         pRecord->ExceptionCode,
         GetExceptionCodeName(pRecord->ExceptionCode),
         pRecord->ExceptionAddress);
+    if (const char* knownAddress = DescribeKnownGameAddress((DWORD)(DWORD_PTR)pRecord->ExceptionAddress)) {
+        len += snprintf(msg + len, sizeof(msg) - len,
+            "Known Address: %s\n",
+            knownAddress);
+    }
 
     char dllPathUtf8[1024] = {};
     char dllDirUtf8[1024] = {};
@@ -1255,6 +1378,17 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
         dllPathUtf8,
         g_dllDir,
         dllDirUtf8);
+
+    DWORD defaultFontHandle = 0;
+    const bool defaultFontReadable = ReadGameDwordSafe(kGameDefaultFontHandleAddr, &defaultFontHandle);
+    len += snprintf(msg + len, sizeof(msg) - len,
+        "Display State: borderless=%d currentBorderless=%d scalingInit=%d presentFrame=%d defaultFontHandle=%s0x%08lX\n",
+        g_useBorderlessFullscreen ? 1 : 0,
+        g_isCurrentlyBorderless ? 1 : 0,
+        g_scalingInitialized ? 1 : 0,
+        g_presentCallCount,
+        defaultFontReadable ? "" : "<unreadable> ",
+        defaultFontHandle);
     
     // For access violations, show the address that was accessed
     if (pRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && pRecord->NumberParameters >= 2) {
@@ -1588,9 +1722,16 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
                 GetModuleFileNameA(hStackMod, stackModName, MAX_PATH);
                 char* lastSlash = strrchr(stackModName, '\\');
                 DWORD_PTR stackOffset = addr - (DWORD_PTR)hStackMod;
-                len += snprintf(msg + len, sizeof(msg) - len,
-                    "  [%02d] 0x%08X (%s+0x%X)\n",
-                    i, addr, lastSlash ? lastSlash + 1 : stackModName, (unsigned int)stackOffset);
+                const char* knownStackAddress = DescribeKnownGameAddress(addr);
+                if (knownStackAddress) {
+                    len += snprintf(msg + len, sizeof(msg) - len,
+                        "  [%02d] 0x%08X (%s+0x%X) %s\n",
+                        i, addr, lastSlash ? lastSlash + 1 : stackModName, (unsigned int)stackOffset, knownStackAddress);
+                } else {
+                    len += snprintf(msg + len, sizeof(msg) - len,
+                        "  [%02d] 0x%08X (%s+0x%X)\n",
+                        i, addr, lastSlash ? lastSlash + 1 : stackModName, (unsigned int)stackOffset);
+                }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             // Can't read this stack location, stop
@@ -1674,6 +1815,28 @@ static int ProxyLogExceptionFilter(const char* where, EXCEPTION_POINTERS* info) 
         fflush(g_logFile);
     }
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InvokeModOnFrameSafely() {
+    if (!g_pModOnFrame) {
+        return;
+    }
+
+    __try {
+        g_pModOnFrame();
+    } __except(ProxyLogExceptionFilter("g_pModOnFrame", GetExceptionInformation())) {
+    }
+}
+
+static void InvokeModOnPresentSafely(IDirect3DDevice9* device) {
+    if (!g_pModOnPresent) {
+        return;
+    }
+
+    __try {
+        g_pModOnPresent(device);
+    } __except(ProxyLogExceptionFilter("g_pModOnPresent", GetExceptionInformation())) {
+    }
 }
 
 // ============================================================================
@@ -3453,6 +3616,18 @@ static bool RenderPreparedImGuiToScalingTarget(IDirect3DDevice9* pDevice,
         return false;
     }
 
+    if (g_renderingPreparedImGuiToScalingTarget) {
+        ProxyLog("[IMGUI] Skipping prepared draw: re-entrant scaling-target render");
+        g_imguiDrawDataReady = false;
+        return false;
+    }
+
+    struct ScopedPreparedImGuiRender {
+        bool& flag;
+        explicit ScopedPreparedImGuiRender(bool& value) : flag(value) { flag = true; }
+        ~ScopedPreparedImGuiRender() { flag = false; }
+    } preparedRenderGuard(g_renderingPreparedImGuiToScalingTarget);
+
     ImDrawData* drawData = ImGui::GetDrawData();
     if (!drawData || drawData->CmdListsCount <= 0 ||
         drawData->DisplaySize.x <= 0.0f || drawData->DisplaySize.y <= 0.0f) {
@@ -3488,8 +3663,9 @@ static bool RenderPreparedImGuiToScalingTarget(IDirect3DDevice9* pDevice,
 
     pDevice->SetDepthStencilSurface(nullptr);
 
-    hr = pDevice->BeginScene();
+    hr = g_pOriginalBeginScene ? g_pOriginalBeginScene(pDevice) : pDevice->BeginScene();
     if (FAILED(hr)) {
+        ProxyLog("[IMGUI] BeginScene failed while rendering prepared draw data: 0x%08X", hr);
         if (previousDepthStencil) {
             pDevice->SetDepthStencilSurface(previousDepthStencil);
         }
@@ -3524,7 +3700,10 @@ static bool RenderPreparedImGuiToScalingTarget(IDirect3DDevice9* pDevice,
         originalDisplayPos.x,
         originalDisplayPos.y);
 
-    pDevice->EndScene();
+    hr = g_pOriginalEndScene ? g_pOriginalEndScene(pDevice) : pDevice->EndScene();
+    if (FAILED(hr)) {
+        ProxyLog("[IMGUI] EndScene failed while rendering prepared draw data: 0x%08X", hr);
+    }
 
     if (previousDepthStencil) {
         pDevice->SetDepthStencilSurface(previousDepthStencil);
@@ -3619,7 +3798,7 @@ void RenderImGui() {
             g_pModSetImGuiContext(ctx);
             g_imguiContextShared = true;
         }
-        g_pModOnPresent(g_pDevice);
+        InvokeModOnPresentSafely(g_pDevice);
     }
     
     // Render
@@ -3697,8 +3876,13 @@ static HWND g_pendingBorderlessWindow = nullptr;
 
 
 HRESULT WINAPI HookedEndScene(IDirect3DDevice9* pDevice) {
+    UpdateStartupStageSilently("IDirect3DDevice9::EndScene");
     static bool firstCall = true;
     static int frameCount = 0;
+
+    if (g_renderingPreparedImGuiToScalingTarget) {
+        return g_pOriginalEndScene ? g_pOriginalEndScene(pDevice) : D3D_OK;
+    }
     
     if (firstCall) {
         ProxyLog("[ENDSCENE] First EndScene call! Device: 0x%p", pDevice);
@@ -3759,7 +3943,7 @@ HRESULT WINAPI HookedEndScene(IDirect3DDevice9* pDevice) {
     // Call mod's OnFrame function EVERY frame (not just when menu is shown)
     // This handles hotkeys, per-frame mod logic, netplay updates, etc.
     if (g_pModOnFrame) {
-        g_pModOnFrame();
+        InvokeModOnFrameSafely();
     }
     
     // Render ImGui overlay (after game rendering, on the native backbuffer)
@@ -3878,6 +4062,7 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* pDevice,
                               const RECT* pDestRect,
                               HWND hDestWindowOverride, 
                               const RGNDATA* pDirtyRegion) {
+    UpdateStartupStageSilently("IDirect3DDevice9::Present");
     g_presentCallCount++;
     TryProcessDeferredFocusReclaim();
     
@@ -3936,6 +4121,10 @@ HRESULT WINAPI HookedPresent(IDirect3DDevice9* pDevice,
     
     // Handle the legacy deferred borderless flow (if g_pendingBorderlessWindow was set in EndScene)
     if (g_needsInitialBorderless && g_useBorderlessFullscreen && g_pendingBorderlessWindow) {
+        if (ShouldDelayInitialBorderlessForFontInit()) {
+            return g_pOriginalPresent(pDevice, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+        }
+
         ProxyLog("[PRESENT] Applying deferred borderless fullscreen (legacy flow)...");
         
         // First, present the current frame normally
@@ -5329,11 +5518,15 @@ public:
                 
                 // Force the style immediately if we are going borderless
                 if (g_useBorderlessFullscreen) {
-                    SetBorderlessState(hFocusWindow, true);
+                    // DXLib creates its default font cache shortly after device creation.
+                    // Some systems crash in that path if the client area has already been
+                    // expanded to borderless size, so leave the startup window alone until
+                    // Present sees the default font handle become valid.
+                    g_pendingBorderlessWindow = hFocusWindow;
                     // NOTE: Don't call InitializeLetterboxing here!
                     // We use the scaling swap chain approach instead (initialized in Present hook)
                     // The LetterboxScaler conflicts with the swap chain approach
-                    ProxyLog("[CREATEDEVICE] Scaling swap chain will be initialized in first Present");
+                    ProxyLog("[CREATEDEVICE] Borderless resize delayed until game default font cache is ready");
                 } else if (g_windowedWidth > 0 && g_windowedHeight > 0) {
                     // Apply saved windowed dimensions
                     SetBorderlessState(hFocusWindow, false);
@@ -5346,9 +5539,9 @@ public:
                 // Set a clearer title for multi-instance testing/debugging.
                 ApplyCustomWindowTitle(hFocusWindow);
                 if (g_useBorderlessFullscreen && hFocusWindow) {
-                    SetBorderlessState(hFocusWindow, true);
+                    g_pendingBorderlessWindow = hFocusWindow;
                     // NOTE: Scaling swap chain initialized in first Present
-                    ProxyLog("[CREATEDEVICE] Scaling swap chain will be initialized in first Present (no WndProc hook)");
+                    ProxyLog("[CREATEDEVICE] Borderless resize delayed until game default font cache is ready (no WndProc hook)");
                 } else if (g_windowedWidth > 0 && g_windowedHeight > 0 && hFocusWindow) {
                     SetBorderlessState(hFocusWindow, false);
                     ProxyLog("[CREATEDEVICE] Applied saved windowed size (no WndProc hook): %dx%d", g_windowedWidth, g_windowedHeight);
@@ -5841,6 +6034,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             ProxyLog("[INIT] Working directory: %s", g_dllDir);
             ProxyLogWideValue("[INIT] Proxy DLL path W: ", g_dllPathW);
             ProxyLogWideValue("[INIT] Working directory W: ", g_dllDirW);
+            PinProxyModuleForProcessLifetime(hModule);
             ProxyLogProcessDiagnostics(hModule);
             ProxyLogModuleSnapshot("process attach start");
             
@@ -5904,6 +6098,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             ProxyLog("[SHUTDOWN] DLL_PROCESS_DETACH process_terminating=%d fast_exit=%d",
                      processTerminating ? 1 : 0,
                      g_fastExitRequested ? 1 : 0);
+            if (!processTerminating) {
+                ProxyLog("[SHUTDOWN] WARNING: proxy DLL is being unloaded before process termination; self-pin may have failed or the module was forcibly unmapped");
+            }
             // Always use fast path: complex teardown (thread joins, hook removal,
             // 25+ subsystem shutdowns) must not run under DllMain/loader lock.
             // The process is exiting — Windows will reclaim all resources.

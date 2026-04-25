@@ -126,6 +126,9 @@ static void* s_lastDInputKeyboardDevice = nullptr;
 static HWND s_lastDInputKeyboardWindow = nullptr;
 static bool s_dinputKeyboardCoopApplied = false;
 static uint32_t s_dinputKeyboardCoopHookLogCount = 0;
+static uint32_t s_dinputJoyRefreshLogCount = 0;
+static uint32_t s_joystickStateLogCount = 0;
+static uint32_t s_joystickUnknownLogCount = 0;
 
 InputDebugInfo g_inputDebug = {};
 
@@ -148,6 +151,31 @@ static inline bool ShouldHoldCharSelUntilLockstep(uint32_t mode, uint32_t substa
 
 static constexpr DWORD kDInputCoopExclusive = 0x00000001u;
 static constexpr DWORD kDInputCoopNonexclusive = 0x00000002u;
+
+static bool ClearVanillaDInputJoyState(int joyIndex, const char* reason) {
+    if (joyIndex < 0 || joyIndex >= DINPUT_JOY_MAX) {
+        return false;
+    }
+
+    static const uint8_t kZeroJoyState[0x50] = {};
+    const uintptr_t joyBase = ADDR_DINPUT_JOYSTICK + (joyIndex * DINPUT_JOY_STRUCT_SIZE);
+    const bool ok = WriteMemoryBlockSafe(reinterpret_cast<void*>(joyBase),
+                                         kZeroJoyState,
+                                         sizeof(kZeroJoyState));
+
+    if ((s_dinputJoyRefreshLogCount < 16 || !ok) && reason) {
+        LOG_INFO("[InputHook] Cleared vanilla DInput joy state idx=%d base=0x%08X bytes=%u buttonsOff=0x%X ok=%d reason=%s",
+                 joyIndex,
+                 (unsigned)joyBase,
+                 (unsigned)sizeof(kZeroJoyState),
+                 DINPUT_JOY_BTN_OFFSET,
+                 ok ? 1 : 0,
+                 reason);
+        s_dinputJoyRefreshLogCount++;
+    }
+
+    return ok;
+}
 static constexpr DWORD kDInputCoopForeground = 0x00000004u;
 static constexpr DWORD kDInputCoopBackground = 0x00000008u;
 static constexpr DWORD kDInputCoopNoWinKey = 0x00000010u;
@@ -769,15 +797,18 @@ int __cdecl Hook_DInputJoyRefresh(int joyID) {
     EnsureInputUpdated();
     
     if (ModConfig_UseSDLInput()) {
-        for (int i = 0; i < DINPUT_JOY_MAX; i++) {
-            uintptr_t joyBase = ADDR_DINPUT_JOYSTICK + (i * DINPUT_JOY_STRUCT_SIZE);
-            WriteMemory<int32_t>(joyBase + 0, 0);
-            WriteMemory<int32_t>(joyBase + 4, 0);
-            for (int j = 0; j < 24; j++) {
-                WriteMemory<uint8_t>(joyBase + DINPUT_JOY_BTN_OFFSET + j, 0);
-            }
+        const int result = g_origDInputJoyRefresh ? g_origDInputJoyRefresh(joyID) : 0;
+
+        if (joyID >= 0 && joyID < DINPUT_JOY_MAX) {
+            ClearVanillaDInputJoyState(joyID, "SDL owns game input");
+        } else if (s_dinputJoyRefreshLogCount < 24) {
+            LOG_INFO("[InputHook] DInputJoyRefresh received unexpected joyID=%d under SDL input; result=%d",
+                     joyID,
+                     result);
+            s_dinputJoyRefreshLogCount++;
         }
-        return 0;
+
+        return result;
     }
     
     int result = g_origDInputJoyRefresh(joyID);
@@ -877,11 +908,38 @@ int __cdecl Hook_JoystickState(int playerID) {
         
         int p1JoyID = ReadMemory<int>(P1_JOY_ID_ADDR);
         int p2JoyID = ReadMemory<int>(P2_JOY_ID_ADDR);
+        int baseJoyID = playerID & ~0x1000;
         g_inputDebug.p1JoyID = p1JoyID;
         g_inputDebug.p2JoyID = p2JoyID;
         
-        int playerIndex = (playerID == p1JoyID) ? 0 : (playerID == p2JoyID) ? 1 : 0;
+        int playerIndex = -1;
+        if (baseJoyID == p1JoyID) {
+            playerIndex = 0;
+        } else if (baseJoyID == p2JoyID) {
+            playerIndex = 1;
+        } else if ((p1JoyID <= 0 || p1JoyID > DINPUT_JOY_MAX) && baseJoyID == 1) {
+            playerIndex = 0;
+        } else if ((p2JoyID <= 0 || p2JoyID > DINPUT_JOY_MAX) && baseJoyID == 2) {
+            playerIndex = 1;
+        }
         g_inputDebug.lastMappedPlayer = playerIndex;
+
+        if (baseJoyID >= 1 && baseJoyID <= DINPUT_JOY_MAX) {
+            ClearVanillaDInputJoyState(baseJoyID - 1, "JoystickState SDL override");
+        }
+
+        if (playerIndex < 0) {
+            g_inputDebug.lastFinalResult = 0;
+            if (s_joystickUnknownLogCount < 16) {
+                LOG_INFO("[InputHook] JoystickState SDL ignored unmapped playerID=%d baseJoyID=%d p1JoyID=%d p2JoyID=%d",
+                         playerID,
+                         baseJoyID,
+                         p1JoyID,
+                         p2JoyID);
+                s_joystickUnknownLogCount++;
+            }
+            return 0;
+        }
         
         // During netplay: suppress local P2 hardware input entirely.
         // P2 is controlled by the remote peer (charsel_sync / rollback input).
@@ -908,6 +966,18 @@ int __cdecl Hook_JoystickState(int playerID) {
             g_inputDebug.lastInjectedJoyInput = gameInput;
         }
         
+        if (s_joystickStateLogCount < 24) {
+            LOG_INFO("[InputHook] JoystickState SDL playerID=%d baseJoyID=%d p1JoyID=%d p2JoyID=%d mappedP%d sdl=0x%04X game=0x%04X",
+                     playerID,
+                     baseJoyID,
+                     p1JoyID,
+                     p2JoyID,
+                     playerIndex + 1,
+                     sdlInput,
+                     gameInput);
+            s_joystickStateLogCount++;
+        }
+
         g_inputDebug.lastFinalResult = (int)gameInput;
         return (int)gameInput;
     }
@@ -2642,7 +2712,7 @@ static void WriteJoystickInputDirect(int joyIndex, uint16_t input) {
     if (input & INPUT_DOWN) yAxis = +1000;
     WriteMemory<int32_t>(joyBase + 4, yAxis);
     
-    uint8_t* buttons = reinterpret_cast<uint8_t*>(joyBase + 64);
+    uint8_t* buttons = reinterpret_cast<uint8_t*>(joyBase + DINPUT_JOY_BTN_OFFSET);
     for (int i = 0; i < 24; i++) {
         buttons[i] = 0;
     }
@@ -2715,12 +2785,12 @@ void UpdateInputDebugInfo() {
     if (CopyMemorySafe(joyState, (const void*)joyBase, sizeof(joyState))) {
         memcpy(&g_inputDebug.dinputJoyAxisX, joyState + 0, sizeof(g_inputDebug.dinputJoyAxisX));
         memcpy(&g_inputDebug.dinputJoyAxisY, joyState + 4, sizeof(g_inputDebug.dinputJoyAxisY));
-        memcpy(g_inputDebug.dinputJoyButtons, joyState + 64, sizeof(g_inputDebug.dinputJoyButtons));
+        memcpy(g_inputDebug.dinputJoyButtons, joyState + DINPUT_JOY_BTN_OFFSET, sizeof(g_inputDebug.dinputJoyButtons));
     } else {
         g_inputDebug.dinputJoyAxisX = ReadMemory<int32_t>(joyBase + 0);
         g_inputDebug.dinputJoyAxisY = ReadMemory<int32_t>(joyBase + 4);
         for (int i = 0; i < 8; i++) {
-            g_inputDebug.dinputJoyButtons[i] = ReadMemory<uint8_t>(joyBase + 64 + i);
+            g_inputDebug.dinputJoyButtons[i] = ReadMemory<uint8_t>(joyBase + DINPUT_JOY_BTN_OFFSET + i);
         }
     }
 

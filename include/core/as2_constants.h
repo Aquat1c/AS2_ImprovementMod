@@ -257,7 +257,10 @@
 #define ADDR_DINPUT_JOYSTICK    0x9D2AE8
 #define DINPUT_JOY_STRUCT_SIZE  664
 #define DINPUT_JOY_MAX          16
-#define DINPUT_JOY_BTN_OFFSET   64
+// ADDR_DINPUT_JOYSTICK points at the first axis field (DXLib base+0x10).
+// sub_62FF50 reads button bytes from DXLib base+0x40, so the relative offset
+// from ADDR_DINPUT_JOYSTICK is 0x30.
+#define DINPUT_JOY_BTN_OFFSET   48
 
 #define ADDR_DINPUT_INTERFACE   0x9D09B8
 #define ADDR_DINPUT_KB_DEVICE   0x9D09C0

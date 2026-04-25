@@ -10,6 +10,7 @@
 
 #include "input_system.h"
 #include "rollback/netplay_log.h"
+#include "ui/log_window.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +27,13 @@ static PlayerBindings_t g_bindings[2] = {};
 #define MAX_GAMEPADS 4
 static SDL_Gamepad* g_gamepads[MAX_GAMEPADS] = {};
 static int g_gamepadCount = 0;
+static bool g_gamepadSubsystemInitialized = false;
+static bool g_gamepadSubsystemFailed = false;
+static DWORD g_nextDeferredGamepadLogTick = 0;
+
+// DXLib's startup font/cache code is fragile while Steam Input devices are
+// present. Avoid touching SDL's gamepad backends until this handle is live.
+static constexpr uintptr_t ADDR_GAME_DEFAULT_FONT_HANDLE = 0x009CC064;
 
 // Override state for netplay
 static bool g_overrideActive[2] = {};
@@ -168,16 +176,66 @@ static void LogGameWindowActiveState(bool active) {
 // SDL3 Gamepad Management
 // ============================================================================
 
+static bool ReadGameDefaultFontHandle(uint32_t* outHandle) {
+    uint32_t value = 0;
+    __try {
+        value = *reinterpret_cast<volatile uint32_t*>(ADDR_GAME_DEFAULT_FONT_HANDLE);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        value = 0;
+    }
+
+    if (outHandle) {
+        *outHandle = value;
+    }
+    return value != 0 && value != 0xFFFFFFFFu;
+}
+
+static void ConfigureGamepadHints() {
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "0");
+    LOG_INFO("[Input] SDL gamepad hints: HIDAPI_STEAM=%s",
+             SDL_GetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM)
+                 ? SDL_GetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM)
+                 : "(unset)");
+}
+
+static void LogGamepadDetails(int slot, SDL_Gamepad* gp, const char* eventName) {
+    if (!gp) return;
+
+    SDL_GamepadType type = SDL_GetGamepadType(gp);
+    SDL_GamepadType realType = SDL_GetRealGamepadType(gp);
+    const char* typeName = SDL_GetGamepadStringForType(type);
+    const char* realTypeName = SDL_GetGamepadStringForType(realType);
+    const char* name = SDL_GetGamepadName(gp);
+    const char* path = SDL_GetGamepadPath(gp);
+
+    LOG_INFO("[Input] Gamepad %s slot=%d id=%u name='%s' path='%s' vid=0x%04X pid=0x%04X ver=0x%04X type=%s real=%s",
+             eventName ? eventName : "opened",
+             slot,
+             (unsigned)SDL_GetGamepadID(gp),
+             name ? name : "(null)",
+             path ? path : "(null)",
+             (unsigned)SDL_GetGamepadVendor(gp),
+             (unsigned)SDL_GetGamepadProduct(gp),
+             (unsigned)SDL_GetGamepadProductVersion(gp),
+             typeName ? typeName : "unknown",
+             realTypeName ? realTypeName : "unknown");
+}
+
 static void OpenInitialGamepads() {
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    LOG_INFO("[Input] SDL reports %d gamepad candidate(s) after deferred init", count);
     if (ids) {
         for (int i = 0; i < count && g_gamepadCount < MAX_GAMEPADS; i++) {
             SDL_Gamepad* gp = SDL_OpenGamepad(ids[i]);
             if (gp) {
-                g_gamepads[g_gamepadCount++] = gp;
-                printf("[Input] Gamepad %d connected: %s\n",
-                       g_gamepadCount - 1, SDL_GetGamepadName(gp));
+                const int slot = g_gamepadCount++;
+                g_gamepads[slot] = gp;
+                LogGamepadDetails(slot, gp, "opened");
+            } else {
+                LOG_WARN("[Input] SDL_OpenGamepad failed for id=%u: %s",
+                         (unsigned)ids[i],
+                         SDL_GetError());
             }
         }
         SDL_free(ids);
@@ -185,6 +243,8 @@ static void OpenInitialGamepads() {
 }
 
 static void HandleGamepadEvents() {
+    if (!g_gamepadSubsystemInitialized) return;
+
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
@@ -192,9 +252,13 @@ static void HandleGamepadEvents() {
             if (g_gamepadCount < MAX_GAMEPADS) {
                 SDL_Gamepad* gp = SDL_OpenGamepad(event.gdevice.which);
                 if (gp) {
-                    g_gamepads[g_gamepadCount++] = gp;
-                    printf("[Input] Gamepad %d connected: %s\n",
-                           g_gamepadCount - 1, SDL_GetGamepadName(gp));
+                    const int slot = g_gamepadCount++;
+                    g_gamepads[slot] = gp;
+                    LogGamepadDetails(slot, gp, "connected");
+                } else {
+                    LOG_WARN("[Input] SDL_OpenGamepad hotplug failed for id=%u: %s",
+                             (unsigned)event.gdevice.which,
+                             SDL_GetError());
                 }
             }
             break;
@@ -202,8 +266,7 @@ static void HandleGamepadEvents() {
         case SDL_EVENT_GAMEPAD_REMOVED:
             for (int i = 0; i < g_gamepadCount; i++) {
                 if (SDL_GetGamepadID(g_gamepads[i]) == event.gdevice.which) {
-                    printf("[Input] Gamepad %d disconnected: %s\n",
-                           i, SDL_GetGamepadName(g_gamepads[i]));
+                    LogGamepadDetails(i, g_gamepads[i], "disconnected");
                     SDL_CloseGamepad(g_gamepads[i]);
                     for (int j = i; j < g_gamepadCount - 1; j++)
                         g_gamepads[j] = g_gamepads[j + 1];
@@ -216,6 +279,36 @@ static void HandleGamepadEvents() {
     }
 }
 
+static bool EnsureGamepadSubsystemReady() {
+    if (g_gamepadSubsystemInitialized) return true;
+    if (g_gamepadSubsystemFailed) return false;
+
+    uint32_t fontHandle = 0;
+    if (!ReadGameDefaultFontHandle(&fontHandle)) {
+        DWORD now = GetTickCount();
+        if (now >= g_nextDeferredGamepadLogTick) {
+            LOG_INFO("[Input] Deferring SDL gamepad init until game default font is ready (handle=0x%08X)",
+                     (unsigned)fontHandle);
+            g_nextDeferredGamepadLogTick = now + 1000;
+        }
+        return false;
+    }
+
+    ConfigureGamepadHints();
+    LOG_INFO("[Input] Initializing SDL gamepad subsystem after default font ready (handle=0x%08X)",
+             (unsigned)fontHandle);
+
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+        LOG_ERROR("[Input] SDL_InitSubSystem(SDL_INIT_GAMEPAD) failed: %s", SDL_GetError());
+        g_gamepadSubsystemFailed = true;
+        return false;
+    }
+
+    g_gamepadSubsystemInitialized = true;
+    OpenInitialGamepads();
+    return true;
+}
+
 // ============================================================================
 // SDL3 Gamepad Reading
 // ============================================================================
@@ -224,6 +317,7 @@ static const int16_t STICK_DEADZONE = 8000;
 static const int16_t TRIGGER_THRESHOLD = 8000;
 
 static uint16_t ReadGamepadPlayer(int player) {
+    if (!g_gamepadSubsystemInitialized) return 0;
     if (player < 0 || player >= g_gamepadCount) return 0;
     SDL_Gamepad* gp = g_gamepads[player];
     if (!gp) return 0;
@@ -476,20 +570,18 @@ static uint16_t ReadKeyboardPlayer(int player) {
 bool InputSystem_Init(void) {
     if (g_initialized) return true;
 
-    // SDL_INIT_GAMEPAD implies JOYSTICK implies EVENTS
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        printf("[Input] ERROR: SDL_Init(SDL_INIT_GAMEPAD) failed: %s\n", SDL_GetError());
-        return false;
-    }
-
     SetDefaultBindings(&g_bindings[0], 0);
     SetDefaultBindings(&g_bindings[1], 1);
     InputSystem_LoadConfig("as2_input.cfg");
 
-    OpenInitialGamepads();
-
     g_initialized = true;
-    printf("[Input] Input system initialized (SDL3 keyboard + gamepad)\n");
+    g_gamepadSubsystemInitialized = false;
+    g_gamepadSubsystemFailed = false;
+    g_gamepadCount = 0;
+    memset(g_gamepads, 0, sizeof(g_gamepads));
+    g_nextDeferredGamepadLogTick = 0;
+    printf("[Input] Input system initialized (Win32 keyboard; SDL3 gamepad deferred)\n");
+    LOG_INFO("[Input] Input system initialized (Win32 keyboard active; SDL3 gamepad deferred until default font ready)");
     return true;
 }
 
@@ -503,7 +595,11 @@ void InputSystem_Shutdown(void) {
     }
     g_gamepadCount = 0;
 
-    SDL_Quit();
+    if (g_gamepadSubsystemInitialized) {
+        SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    }
+    g_gamepadSubsystemInitialized = false;
+    g_gamepadSubsystemFailed = false;
     g_initialized = false;
     printf("[Input] Input system shutdown\n");
 }
@@ -514,8 +610,11 @@ void InputSystem_Update(void) {
     // Tick down binding cooldown
     if (g_bindingCooldown > 0) g_bindingCooldown--;
 
-    // Process SDL events (gamepad hotplug + keyboard state pump)
-    HandleGamepadEvents();
+    // Gamepad/Steam-facing SDL startup is intentionally delayed until after
+    // the game's early DXLib font/cache setup is complete.
+    if (EnsureGamepadSubsystemReady()) {
+        HandleGamepadEvents();
+    }
 
     const bool windowActive = IsGameWindowActive();
     if (!g_windowActiveStateKnown || g_lastWindowActive != windowActive) {
@@ -680,6 +779,7 @@ bool InputSystem_IsNetplayInputActive(int player) {
 // ============================================================================
 
 bool InputSystem_HasGamepad(int player) {
+    if (!g_gamepadSubsystemInitialized) return false;
     return (player >= 0 && player < g_gamepadCount && g_gamepads[player] != nullptr);
 }
 
@@ -688,6 +788,7 @@ bool InputSystem_HasXInput(int player) {
 }
 
 const char* InputSystem_GetGamepadName(int player) {
+    if (!g_gamepadSubsystemInitialized) return nullptr;
     if (player < 0 || player >= g_gamepadCount || !g_gamepads[player]) return nullptr;
     return SDL_GetGamepadName(g_gamepads[player]);
 }
