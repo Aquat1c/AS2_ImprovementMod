@@ -553,6 +553,7 @@
 #define ADDR_ROUND_TIMER        0x790E50
 #define ADDR_WIN_COUNT          0x790E54
 #define ADDR_COMBO_COUNT        0x790E56  // byte_790E56 combo timer/state bookkeeping; not the vanilla HUD hit counter
+#define ADDR_CHARACTER_MAX_HP_TABLE (GAME_BASE + 0x33DCF4)  // word_73DCF4[22], int16_t max HP per character
 #define ADDR_CHARACTER_WEIGHT_TABLE (GAME_BASE + 0x33DD38)  // byte_73DD38[charId], numeric knockback weight
 
 #define ADDR_CHAR_DATA_TABLE    0x8E95F8

@@ -537,10 +537,6 @@ static const char* kCharacterNames[kPracticeRosterCount] = {
     "Nalzgis (Boss)",
 };
 
-static const uint16_t kCharacterMaxHp[kPracticeRosterCount] = {
-    11000, 9800, 15000, 10700, 9800, 9700, 12000, 9200, 9700, 12350, 9600,
-     9000, 9100,  9400,  9400, 10500, 14000, 10000, 20000, 24000, 30000, 39000,
-};
 
 static const char* kWeightClassLabels[] = {
     "Very Light",
@@ -616,7 +612,7 @@ static const char* GetCharacterName(uint32_t charId) {
 
 static uint16_t GetCharacterMaxHp(uint32_t charId) {
     if (charId < kPracticeRosterCount) {
-        return kCharacterMaxHp[charId];
+        return ReadMemory<uint16_t>(ADDR_CHARACTER_MAX_HP_TABLE + charId * sizeof(uint16_t));
     }
     return 10000;
 }
