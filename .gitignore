@@ -4,7 +4,6 @@ bin/
 out/
 
 # VSCode
-.vscode/
 .github
 docs/*
 !docs/MASTER_DOCUMENT.md
@@ -22,7 +21,5 @@ CMakeFiles/
 # OS
 Thumbs.db
 .DS_Store
-*.bat
-*.ps1
 *.txt
 *.c

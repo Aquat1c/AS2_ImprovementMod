@@ -1,0 +1,74 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Release",
+			"type": "shell",
+			"command": "cmake",
+			"args": ["--build", "build", "--config", "Release"],
+			"problemMatcher": ["$msCompile"],
+			"group": "build",
+			"options": {
+				"cwd": "${workspaceFolder}/mod"
+			}
+		},
+		{
+			"label": "Clean & Build Release",
+			"type": "shell",
+			"command": "cmake",
+			"args": ["--build", "build", "--config", "Release", "--clean-first"],
+			"problemMatcher": ["$msCompile"],
+			"group": "build",
+			"options": {
+				"cwd": "${workspaceFolder}/mod"
+			}
+		},
+		{
+			"label": "Clean",
+			"type": "shell",
+			"command": "cmake",
+			"args": ["--build", "build", "--target", "clean"],
+			"problemMatcher": [],
+			"group": "build",
+			"options": {
+				"cwd": "${workspaceFolder}/mod"
+			}
+		},
+		{
+			"label": "Configure CMake",
+			"type": "shell",
+			"command": "cmake",
+			"args": ["-B", "build", "-A", "Win32"],
+			"problemMatcher": [],
+			"group": "build",
+			"options": {
+				"cwd": "${workspaceFolder}/mod"
+			}
+		},
+		{
+			"label": "Install to Game",
+			"type": "shell",
+			"command": "cmake",
+			"args": ["--install", "build", "--config", "Release"],
+			"problemMatcher": [],
+			"group": "build",
+			"options": {
+				"cwd": "${workspaceFolder}/mod"
+			}
+		},
+		{
+			"label": "Build & Install",
+			"type": "shell",
+			"command": "cmake",
+			"args": ["--build", "build", "--config", "Release", "--target", "install"],
+			"problemMatcher": ["$msCompile"],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"options": {
+				"cwd": "${workspaceFolder}/mod"
+			}
+		}
+	]
+}
