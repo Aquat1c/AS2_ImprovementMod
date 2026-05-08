@@ -22,4 +22,5 @@ CMakeFiles/
 Thumbs.db
 .DS_Store
 *.txt
+!CMAKELISTS.TXT
 *.c
