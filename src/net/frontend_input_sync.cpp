@@ -70,6 +70,7 @@ static DWORD             s_waitingForCurrentFrameSince = 0;
 static DWORD             s_lastPressureSampleTime = 0;
 static uint8_t           s_jitterPressureSamples = 0;
 static uint8_t           s_starvationPressureSamples = 0;
+static bool              s_receivedRemoteInputThisPhase = false;
 static bool              s_timedOut = false;
 
 static bool              s_pendingDelayBump = false;
@@ -209,6 +210,7 @@ static void ClearPhaseInputState() {
     s_localInputFrame = 0;
     s_remoteLatestFrame = 0;
     s_lastRemoteInputTime = NowMs();
+    s_receivedRemoteInputThisPhase = false;
     s_lastResendTime = 0;
     s_lastTargetedResendTime = 0;
     s_lastDelayBumpRequestTime = 0;
@@ -476,8 +478,9 @@ static void MaybeRequestLiveDelayIncrease(DWORD now) {
         ? (now - s_waitingForCurrentFrameSince)
         : 0;
     const bool jitterPressure = details.recommended_delay > delayFloor;
-    const bool starvationPressure = remoteSilenceMs >= FRONTEND_STARVATION_PRESSURE_MS ||
-        waitMs >= FRONTEND_STARVATION_PRESSURE_MS;
+    const bool starvationPressure = s_receivedRemoteInputThisPhase &&
+        (remoteSilenceMs >= FRONTEND_STARVATION_PRESSURE_MS ||
+         waitMs >= FRONTEND_STARVATION_PRESSURE_MS);
 
     s_jitterPressureSamples = jitterPressure
         ? (uint8_t)(s_jitterPressureSamples < 0xFF ? s_jitterPressureSamples + 1 : 0xFF)
@@ -583,6 +586,7 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     }
     if (acceptedAny) {
         s_lastRemoteInputTime = NowMs();
+        s_receivedRemoteInputThisPhase = true;
         s_waitingForCurrentFrameSince = 0;
         s_starvationPressureSamples = 0;
     }

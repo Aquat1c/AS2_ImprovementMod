@@ -2287,9 +2287,12 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
     // Primary rematch signature: previous pregame run ended in GameplayHandoff
     // and the game routed back to CharSel from win screen.
     const bool staleGameplayHandoff = (prePhase == Net::PregamePhase::GameplayHandoff);
+    if (Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::WinScreenActive) {
+        return;
+    }
+
     const bool lifecycleSuggestsPostMatch =
         Net::MatchLifecycle_IsPostMatchRouting() ||
-        Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::WinScreenActive ||
         Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::PostMatchRoute ||
         Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::ReturningToCharSel;
 

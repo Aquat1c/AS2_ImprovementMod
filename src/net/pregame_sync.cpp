@@ -706,8 +706,6 @@ static void UpdateFrontendLocked() {
     // frontend-owned and stall the bootstrap handoff.
     CharSelSync_Abort();
 
-    NetplayPaletteRuntime_OnLockedMatchConfig(&s_lockedConfig);
-
     SetPhase(PregamePhase::ConfigExchange, "config ready");
     MatchBootstrap_BeginConfigExchange(&s_lockedConfig);
 }
@@ -736,11 +734,9 @@ static void UpdateConfigExchange() {
             memcpy(&s_lockedConfig, agreed, sizeof(LockedMatchConfig));
         }
 
-        // Palette transport starts before bootstrap agreement, but the local
-        // pre-agreement config can differ between peers because host-owned
-        // fields (such as seeds) are only finalized once config exchange
-        // completes. Re-arm the palette runtime on the shared agreed config so
-        // both sides use the same packet key and accept remote custom banks.
+        // Palette transport is keyed by the final agreed config. Starting it
+        // here avoids sending custom banks under a tentative local hash while
+        // host-owned config fields are still settling.
         NetplayPaletteRuntime_OnLockedMatchConfig(&s_lockedConfig);
 
         s_configHash = LockedMatchConfig_Hash(&s_lockedConfig);

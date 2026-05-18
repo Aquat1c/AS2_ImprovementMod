@@ -466,6 +466,7 @@ set(REPLAY_SOURCES
 add_executable(frontend_sync_tests
     tests/frontend_sync_tests.cpp
     src/net/frontend_input_sync.cpp
+    src/net/winscreen_sync.cpp
     src/net/delay_policy.cpp
     src/net/stagesel_sync.cpp
     src/net/stage_watchdog_tracker.cpp

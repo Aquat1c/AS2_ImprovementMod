@@ -327,13 +327,21 @@ static bool ShouldUseSelectedCustomBank(int gameSlot) {
                s_player[gameSlot].base_palette);
 }
 
+static bool RemoteSelectionClaimsCustomBank(int gameSlot) {
+    return s_matchActive &&
+           IsValidGameSlot(gameSlot) &&
+           gameSlot != s_localGameSlot &&
+           s_player[gameSlot].valid &&
+           (s_player[gameSlot].remote_flags & NETPLAY_PALETTE_FLAG_HAS_CUSTOM_DATA) != 0;
+}
+
 static bool HasRemoteMatchNetplayBank(int gameSlot) {
     return s_matchActive &&
            IsValidGameSlot(gameSlot) &&
            gameSlot != s_localGameSlot &&
            s_player[gameSlot].valid &&
            s_player[gameSlot].remote_custom_loaded &&
-           ShouldUseSelectedCustomBank(gameSlot);
+           RemoteSelectionClaimsCustomBank(gameSlot);
 }
 
 static bool HasRemoteMatchVanillaBank(int gameSlot) {
@@ -342,7 +350,7 @@ static bool HasRemoteMatchVanillaBank(int gameSlot) {
            gameSlot != s_localGameSlot &&
            s_player[gameSlot].valid &&
            s_player[gameSlot].vanilla_bank.valid &&
-           ShouldUseSelectedCustomBank(gameSlot);
+           RemoteSelectionClaimsCustomBank(gameSlot);
 }
 
 static bool HasRemoteMatchPaletteChoice(int gameSlot) {
@@ -461,6 +469,10 @@ static bool ShouldUseVisualCustomBank(int gameSlot) {
 
     if (!s_matchActive && GetGameMode() == MODE_CHARSEL) {
         return ShouldUsePreviewCustomBank(gameSlot);
+    }
+
+    if (s_matchActive && gameSlot != s_localGameSlot) {
+        return RemoteSelectionClaimsCustomBank(gameSlot);
     }
 
     return ShouldUseSelectedCustomBank(gameSlot);
@@ -825,7 +837,8 @@ static bool SendLocalConfig() {
         sizeof(config),
         true);
 
-    bool dataSent = true;
+    bool dataPacketSent = false;
+    bool dataOk = !hasCustomData;
     if (configSent && hasCustomData) {
         PaletteDataPayload data{};
         data.epoch = s_localEpoch;
@@ -836,19 +849,20 @@ static bool SendLocalConfig() {
         data.payload_crc = local.local_custom_bank.crc32;
         data.payload_size = NETPLAY_PALETTE_BANK_SIZE;
         memcpy(data.payload, local.local_custom_bank.data, NETPLAY_PALETTE_BANK_SIZE);
-        dataSent = Session_SendPacket(
+        dataPacketSent = Session_SendPacket(
             CHANNEL_CONTROL,
             PacketType::PaletteData,
             &data,
             sizeof(data),
             true);
+        dataOk = dataPacketSent;
     }
 
     if (configSent) {
         s_localSent = true;
         s_localDirty = false;
         s_lastSendAt = GetTickCount();
-            SetStatus("Sent a palette update for P%d", s_localGameSlot + 1);
+        SetStatus("Sent a palette update for P%d", s_localGameSlot + 1);
         Rollback::NetplayLog_Write("PALETTE", -1,
             "Local palette send: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X data_sent=%d",
             s_localEpoch,
@@ -859,10 +873,10 @@ static bool SendLocalConfig() {
             config.flags,
             (unsigned)config.payload_size,
             config.payload_crc,
-            dataSent ? 1 : 0);
+            dataPacketSent ? 1 : 0);
     }
 
-    return configSent && dataSent;
+    return configSent && dataOk;
 }
 
 static bool CopyBank(const NetplayPaletteBank& bank, NetplayPaletteBank* out) {
@@ -1055,14 +1069,17 @@ void NetplayPaletteRuntime_OnLockedMatchConfig(const LockedMatchConfig* config) 
     AdvanceStateRevision();
     s_localDirty = true;
 
+    const bool localSelectedCustom = ShouldUseSelectedCustomBank(s_localGameSlot);
+    const bool localTransportCustom = LocalTransportHasCustomBank();
     SetStatus("Palette sync ready for P%d", s_localGameSlot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
-        "Palette runtime armed: epoch=%u config=0x%08X local=P%d remote=P%d local_custom=%d",
+        "Palette runtime armed: epoch=%u config=0x%08X local=P%d remote=P%d local_custom=%d selected_custom=%d",
         s_localEpoch,
         s_configHash,
         s_localGameSlot + 1,
         s_localGameSlot == 0 ? 2 : 1,
-        s_player[s_localGameSlot].local_custom_loaded ? 1 : 0);
+        localTransportCustom ? 1 : 0,
+        localSelectedCustom ? 1 : 0);
 }
 
 void NetplayPaletteRuntime_OnRoundRestart() {
@@ -1154,9 +1171,6 @@ void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
         return;
     }
 
-    PlayerRuntime& remote = s_player[payload->game_slot];
-    remote.remote_flags = payload->flags;
-
     if (!s_matchActive || payload->config_hash != s_configHash) {
         SendAck(payload->game_slot,
             payload->epoch,
@@ -1164,9 +1178,19 @@ void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
             0,
             0,
             0);
+        Rollback::NetplayLog_Write("PALETTE", -1,
+            "Rejected remote palette config: epoch=%u config=0x%08X local_config=0x%08X slot=P%d active=%u flags=0x%02X",
+            payload->epoch,
+            payload->config_hash,
+            s_configHash,
+            payload->game_slot + 1,
+            s_matchActive ? 1 : 0,
+            payload->flags);
         return;
     }
 
+    PlayerRuntime& remote = s_player[payload->game_slot];
+    remote.remote_flags = payload->flags;
     remote.valid = true;
     remote.game_slot = payload->game_slot;
     remote.character_id = payload->character_id;
@@ -1202,7 +1226,7 @@ void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
             : "Received palette settings for P%d",
         payload->game_slot + 1);
     Rollback::NetplayLog_Write("PALETTE", -1,
-        "Remote palette config: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X expects_data=%d",
+        "Remote palette config: epoch=%u config=0x%08X slot=P%d char=%u base=%u flags=0x%02X size=%u crc=0x%08X expects_data=%d remote_custom=%d",
         payload->epoch,
         payload->config_hash,
         payload->game_slot + 1,
@@ -1211,7 +1235,8 @@ void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {
         payload->flags,
         (unsigned)payload->payload_size,
         payload->payload_crc,
-        expectsData ? 1 : 0);
+        expectsData ? 1 : 0,
+        RemoteSelectionClaimsCustomBank(payload->game_slot) ? 1 : 0);
 }
 
 void NetplayPaletteRuntime_OnRemoteData(const PaletteDataPayload* payload) {
@@ -1578,7 +1603,7 @@ bool NetplayPaletteRuntime_CopySpectatorBank(uint8_t gameSlot, NetplayPaletteBan
         return CopyBank(s_player[gameSlot].local_custom_bank, out);
     }
 
-    if (!ShouldUseSelectedCustomBank(gameSlot)) {
+    if (!RemoteSelectionClaimsCustomBank(gameSlot)) {
         return false;
     }
 

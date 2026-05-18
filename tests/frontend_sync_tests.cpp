@@ -4,6 +4,8 @@
 #include "net/session_manager.h"
 #include "net/stagesel_sync.h"
 #include "net/stage_watchdog_tracker.h"
+#include "net/winscreen_sync.h"
+#include "input/input_system.h"
 #include "rollback/netplay_log.h"
 #include "rollback/rollback_session.h"
 #include "ui/log_window.h"
@@ -24,6 +26,7 @@ struct SentPacket {
 
 static std::vector<SentPacket> g_sentPackets;
 static bool g_sessionConnected = false;
+static Net::SessionRole g_sessionRole = Net::SessionRole::Host;
 static Net::ConnectionStats g_sessionStats = {};
 static int g_testChecks = 0;
 static int g_testFailures = 0;
@@ -72,18 +75,34 @@ static Net::CharSelFrameInputPayload MakeFrameInput(uint32_t epochId,
     return payload;
 }
 
+static Net::WinScreenFrameInputPayload MakeWinScreenFrameInput(uint32_t epochId,
+                                                               uint32_t frame,
+                                                               uint16_t input) {
+    Net::WinScreenFrameInputPayload payload{};
+    payload.epoch_id = epochId;
+    payload.phase = (uint16_t)Net::FrontendSyncPhase::WinScreen;
+    payload.frame = frame;
+    payload.ack_frame = 0;
+    payload.input_count = 1;
+    payload.inputs[0] = input;
+    return payload;
+}
+
 static void ResetSubsystems(uint32_t nowMs = 100) {
     ClearSentPackets();
     g_sessionConnected = false;
+    g_sessionRole = Net::SessionRole::Host;
     memset(&g_sessionStats, 0, sizeof(g_sessionStats));
 
     Net::FrontendInputSync_Test_SetClockMs(nowMs);
+    Net::WinScreenSync_Shutdown();
     Net::FrontendInputSync_Shutdown();
     Net::DelayPolicy_Shutdown();
     Net::StageSelSync_Shutdown();
 
     Net::DelayPolicy_Init();
     Net::FrontendInputSync_Init();
+    Net::WinScreenSync_Init();
     Net::StageSelSync_Init();
 }
 
@@ -95,6 +114,16 @@ static void BeginNegotiatedPhase(uint16_t sharedDelay,
     TEST_CHECK(Net::FrontendInputSync_FinalizeDelayNegotiation("test finalize"),
         "frontend delay negotiation should succeed");
     Net::FrontendInputSync_BeginInputPhase(phase, packetType, "test phase");
+}
+
+static void BeginNegotiatedWinScreen(uint16_t sharedDelay) {
+    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Join, 0x87654321u, sharedDelay, "test winscreen epoch");
+    Net::FrontendInputSync_OnRemoteSyncAnnounce(sharedDelay, "test winscreen remote announce");
+    Net::FrontendInputSync_OnRemoteSyncConfirm(sharedDelay, sharedDelay, "test winscreen remote confirm");
+    TEST_CHECK(Net::FrontendInputSync_FinalizeDelayNegotiation("test winscreen finalize"),
+        "winscreen frontend delay negotiation should succeed");
+    g_sessionRole = Net::SessionRole::Join;
+    Net::WinScreenSync_Begin();
 }
 
 static void TestJitterAwareProposalAndSharedNegotiation() {
@@ -145,6 +174,49 @@ static void TestJitterPressureTriggersIncreaseOnlyDelayBump() {
     }
 }
 
+static void TestStarvationDelayBumpRequiresRemoteFrame() {
+    ResetSubsystems(100);
+
+    Net::DelayPolicy_UpdateMeasurement(18.0f, 0.0f);
+    BeginNegotiatedPhase(3, Net::FrontendSyncPhase::CharSel);
+    Net::FrontendInputSync_CaptureLocalInput(0);
+    ClearSentPackets();
+
+    Net::FrontendInputSync_Test_SetClockMs(1100);
+    Net::FrontendInputSync_HasInputsForCurrentFrame();
+    Net::FrontendInputSync_Test_SetClockMs(1350);
+    Net::FrontendInputSync_HasInputsForCurrentFrame();
+    Net::FrontendInputSync_Test_SetClockMs(1600);
+    Net::FrontendInputSync_HasInputsForCurrentFrame();
+
+    TEST_CHECK(FindLastDelayReq() == nullptr,
+        "phase-entry starvation before any remote frame should not increase frontend delay");
+
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    Net::CharSelFrameInputPayload remote0 =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0);
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote0);
+
+    uint16_t local = 0;
+    uint16_t remote = 0;
+    TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
+        "first remote frame should allow frontend frame zero to consume");
+    ClearSentPackets();
+
+    Net::FrontendInputSync_Test_SetClockMs(2600);
+    Net::FrontendInputSync_HasInputsForCurrentFrame();
+    Net::FrontendInputSync_Test_SetClockMs(2850);
+    Net::FrontendInputSync_HasInputsForCurrentFrame();
+
+    const Net::DelayChangeReqPayload* req = FindLastDelayReq();
+    TEST_CHECK(req != nullptr,
+        "starvation after remote traffic has started should still request a delay bump");
+    if (req) {
+        TEST_CHECK(req->reason_code == (uint8_t)Net::FrontendDelayBumpReason::Starvation,
+            "post-traffic starvation bump should carry the starvation reason");
+    }
+}
+
 static void TestOutOfOrderFrontendInputWaitsForMissingCurrentFrame() {
     ResetSubsystems();
     BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
@@ -186,6 +258,40 @@ static void TestStageMergeOpposingDirectionsAndConfirm() {
     const uint16_t confirm = Net::StageSelSync_MergeConfirmed(4, 0x0010, 0x0010);
     TEST_CHECK(confirm == 0x0010,
         "same-frame stage confirm should remain deterministic when both peers press confirm");
+}
+
+static void TestWinScreenAdvanceWaitsForBothPeers() {
+    ResetSubsystems();
+    BeginNegotiatedWinScreen(2);
+
+    Net::WinScreenSync_CaptureLocalInput(0);
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    Net::WinScreenFrameInputPayload remoteAdvance =
+        MakeWinScreenFrameInput(epochId, 0, INPUT_A);
+    Net::WinScreenSync_OnRemoteFrameInput(&remoteAdvance);
+
+    uint16_t p1 = 0;
+    uint16_t p2 = 0;
+    TEST_CHECK(Net::WinScreenSync_HasInputsForCurrentFrame(),
+        "winscreen frame should be ready after local and remote inputs arrive");
+    TEST_CHECK(Net::WinScreenSync_ConsumeCurrentFrame(&p1, &p2),
+        "winscreen frame should consume deterministically");
+    TEST_CHECK(((p1 | p2) & (INPUT_A | INPUT_C | INPUT_START)) == 0,
+        "a single peer's winscreen advance should be suppressed until both peers confirm");
+    TEST_CHECK(!Net::WinScreenSync_LocalConfirmed() && Net::WinScreenSync_RemoteConfirmed(),
+        "remote advance should be remembered while local advance is still pending");
+
+    Net::WinScreenSync_CaptureLocalInput(INPUT_A);
+    Net::WinScreenFrameInputPayload remoteHold =
+        MakeWinScreenFrameInput(epochId, 1, 0);
+    Net::WinScreenSync_OnRemoteFrameInput(&remoteHold);
+
+    TEST_CHECK(Net::WinScreenSync_ConsumeCurrentFrame(&p1, &p2),
+        "winscreen should consume the release frame once both peers have confirmed");
+    TEST_CHECK((p1 & INPUT_A) != 0 && (p2 & INPUT_A) != 0,
+        "once both peers confirm, winscreen should emit a synchronized confirm pulse");
+    TEST_CHECK(Net::WinScreenSync_BothConfirmed(),
+        "winscreen should remember that both peers confirmed");
 }
 
 static void TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters() {
@@ -289,6 +395,32 @@ static void TestNoLiveDelayDecreaseDuringActivePhase() {
         "frontend delay must not auto-decrease during an active phase");
 }
 
+static void TestFrontendInputPacketsCarrySixteenFramesOfHistory() {
+    ResetSubsystems(100);
+    BeginNegotiatedPhase(1, Net::FrontendSyncPhase::CharSel);
+    ClearSentPackets();
+
+    for (uint16_t i = 0; i < 20; i++) {
+        Net::FrontendInputSync_CaptureLocalInput((uint16_t)(0x100u + i));
+    }
+
+    const SentPacket* packet = FindLastPacket(Net::PacketType::CharSelFrameInput);
+    TEST_CHECK(packet != nullptr,
+        "capturing frontend input should send a CharSelFrameInput packet");
+    TEST_CHECK(packet && packet->payload.size() == sizeof(Net::CharSelFrameInputPayload),
+        "frontend input packet payload should match the expanded wire struct size");
+
+    const auto* payload = packet && packet->payload.size() >= sizeof(Net::CharSelFrameInputPayload)
+        ? reinterpret_cast<const Net::CharSelFrameInputPayload*>(packet->payload.data())
+        : nullptr;
+    TEST_CHECK(payload && payload->input_count == 16,
+        "frontend input packets should carry sixteen redundant input frames once history is available");
+    TEST_CHECK(payload && payload->inputs[0] == 0x113,
+        "frontend input history should place the latest input first");
+    TEST_CHECK(payload && payload->inputs[15] == 0x104,
+        "frontend input history should preserve the sixteenth newest input");
+}
+
 } // namespace
 
 namespace Net {
@@ -307,6 +439,12 @@ bool BarrierProtocol_SendPacket(PacketType type, const void* payload, size_t len
 bool Session_IsConnected() {
     return g_sessionConnected;
 }
+
+SessionRole Session_GetRole() {
+    return g_sessionRole;
+}
+
+void Session_Cancel() {}
 
 void Session_GetStats(ConnectionStats* out) {
     if (out) {
@@ -382,13 +520,17 @@ int main() {
 
     TestJitterAwareProposalAndSharedNegotiation();
     TestJitterPressureTriggersIncreaseOnlyDelayBump();
+    TestStarvationDelayBumpRequiresRemoteFrame();
     TestOutOfOrderFrontendInputWaitsForMissingCurrentFrame();
     TestStageMergeOpposingDirectionsAndConfirm();
+    TestWinScreenAdvanceWaitsForBothPeers();
     TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters();
     TestDuplicateFrontendInputAndStageSyncAreIdempotent();
     TestNoLiveDelayDecreaseDuringActivePhase();
+    TestFrontendInputPacketsCarrySixteenFramesOfHistory();
 
     Net::FrontendInputSync_Test_ClearClockOverride();
+    Net::WinScreenSync_Shutdown();
     Net::FrontendInputSync_Shutdown();
     Net::DelayPolicy_Shutdown();
     Net::StageSelSync_Shutdown();

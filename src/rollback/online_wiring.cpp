@@ -746,6 +746,15 @@ static bool TryStartRollbackSession() {
 // Safe Teardown
 // ============================================================================
 
+static bool ShouldPreservePaletteRuntimeForPostMatch(const char* reason) {
+    if (!reason) {
+        return false;
+    }
+
+    return strstr(reason, "match ended") != nullptr ||
+           strcmp(reason, "match end event") == 0;
+}
+
 static void StopRollbackSession(const char* reason) {
     if (!s_rollbackActive) return;
 
@@ -788,7 +797,13 @@ static void StopRollbackSession(const char* reason) {
     s_liveReleaseArmed = false;
     ResetStartupBarrierState(reason ? reason : "rollback stop");
     Net::SpectatorRuntime_OnMatchEnd(reason ? reason : "rollback stop");
-    Net::NetplayPaletteRuntime_OnMatchEnd(reason ? reason : "rollback stop");
+    if (ShouldPreservePaletteRuntimeForPostMatch(reason)) {
+        NetplayLog_Write("PALETTE", frame,
+            "Palette runtime retained for win-screen cleanup: reason=%s",
+            reason ? reason : "rollback stop");
+    } else {
+        Net::NetplayPaletteRuntime_OnMatchEnd(reason ? reason : "rollback stop");
+    }
 
     NetplayLog_Write("TEARDOWN", frame,
         "=== ROLLBACK SESSION ENDED ===");

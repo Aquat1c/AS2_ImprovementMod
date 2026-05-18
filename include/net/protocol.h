@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 9;
+constexpr uint16_t PROTOCOL_VERSION = 11;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -189,6 +189,9 @@ struct FrontendBoundaryDigestPayload {
     uint8_t  p1_palette;
     uint8_t  p2_character;
     uint8_t  p2_palette;
+    uint8_t  p1_palette_custom;
+    uint8_t  p2_palette_custom;
+    uint8_t  _palette_pad[2];
     uint8_t  stage_cursor;
     uint8_t  stage_confirmed;
     uint8_t  stage_counter;
@@ -229,6 +232,8 @@ struct CharSelLockPayload {
     uint16_t phase;              // Net::FrontendSyncPhase (must be CharSel)
     uint8_t  character_id;       // Resolved character ID from grid table
     uint8_t  palette;            // Final palette
+    uint8_t  flags;              // CHARSEL_LOCK_FLAG_*
+    uint8_t  _pad[3];
 };
 
 struct StageSyncPayload {
@@ -356,8 +361,8 @@ struct CharSelFrameInputPayload {
     uint16_t _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
-    uint16_t inputs[8];          // Redundant history: [frame, frame-1, ..., frame-7]
-    uint16_t input_count;        // Number of valid entries in inputs[] (1-8)
+    uint16_t inputs[16];         // Redundant history: [frame, frame-1, ..., frame-15]
+    uint16_t input_count;        // Number of valid entries in inputs[] (1-16)
     uint16_t _pad;
 };
 
@@ -367,8 +372,8 @@ struct WinScreenFrameInputPayload {
     uint16_t _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
-    uint16_t inputs[8];          // Redundant history: [frame, frame-1, ..., frame-7]
-    uint16_t input_count;        // Number of valid entries in inputs[] (1-8)
+    uint16_t inputs[16];         // Redundant history: [frame, frame-1, ..., frame-15]
+    uint16_t input_count;        // Number of valid entries in inputs[] (1-16)
     uint16_t _pad;
 };
 
@@ -431,6 +436,8 @@ struct DelayChangeAckPayload {
 // GekkoReadyPayload flags
 constexpr uint8_t GEKKO_READY_FLAG_READY = 1 << 0;  // Local reached post-intro interactive boundary
 constexpr uint8_t GEKKO_READY_FLAG_ACK   = 1 << 1;  // Local has observed peer READY
+
+constexpr uint8_t CHARSEL_LOCK_FLAG_CUSTOM_PALETTE = 1 << 0;
 
 constexpr uint8_t NETPLAY_PALETTE_FLAG_TRANSPORT_ENABLED = 1 << 0;
 constexpr uint8_t NETPLAY_PALETTE_FLAG_REMOTE_PREVIEW_ENABLED = 1 << 1;

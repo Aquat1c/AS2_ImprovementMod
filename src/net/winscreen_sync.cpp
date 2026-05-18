@@ -21,14 +21,18 @@ using namespace Net;
 static bool s_initialized = false;
 static bool s_active = false;
 static bool s_isHost = false;
+static bool s_advanceGateReleased = false;
+
+constexpr uint16_t WINSCREEN_ADVANCE_MASK = (uint16_t)(INPUT_A | INPUT_C | INPUT_START);
 
 static bool IsAdvanceIntent(uint16_t packedInput) {
-    return (packedInput & (INPUT_A | INPUT_C | INPUT_START)) != 0;
+    return (packedInput & WINSCREEN_ADVANCE_MASK) != 0;
 }
 
 static void ResetState() {
     s_active = false;
     s_isHost = false;
+    s_advanceGateReleased = false;
 }
 
 } // anonymous namespace
@@ -148,6 +152,27 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
 
     if (IsAdvanceIntent(remoteInput)) {
         FrontendInputSync_ReportRemoteAdvanceIntent(1);
+    }
+
+    if (!FrontendInputSync_BothAdvanceObserved()) {
+        if (IsAdvanceIntent(localInput) || IsAdvanceIntent(remoteInput)) {
+            Rollback::NetplayLog_Verbose(
+                "WINLOCK", -1,
+                "Holding win-screen advance until both peers confirm: local_adv=%d remote_adv=%d",
+                FrontendInputSync_LocalAdvanceObserved() ? 1 : 0,
+                FrontendInputSync_RemoteAdvanceObserved() ? 1 : 0);
+        }
+        localInput = (uint16_t)(localInput & (uint16_t)~WINSCREEN_ADVANCE_MASK);
+        remoteInput = (uint16_t)(remoteInput & (uint16_t)~WINSCREEN_ADVANCE_MASK);
+    } else {
+        if (!s_advanceGateReleased) {
+            s_advanceGateReleased = true;
+            Rollback::NetplayLog_Write(
+                "WINLOCK", -1,
+                "Win-screen advance gate released: local_adv=1 remote_adv=1");
+        }
+        localInput = (uint16_t)(localInput | INPUT_A);
+        remoteInput = (uint16_t)(remoteInput | INPUT_A);
     }
 
     if (s_isHost) {

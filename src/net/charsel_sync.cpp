@@ -64,8 +64,10 @@ static bool     s_stageDigestSent = false;
 
 static uint8_t  s_localChar = 0;
 static uint8_t  s_localPalette = 0;
+static bool     s_localPaletteCustom = false;
 static uint8_t  s_remoteChar = 0;
 static uint8_t  s_remotePalette = 0;
+static bool     s_remotePaletteCustom = false;
 static uint8_t  s_localStage = 0;
 static uint8_t  s_remoteStage = 0;
 static uint8_t  s_finalStageId = 0;
@@ -130,8 +132,10 @@ static void ResetState() {
     s_stageDigestSent = false;
     s_localChar = 0;
     s_localPalette = 0;
+    s_localPaletteCustom = false;
     s_remoteChar = 0;
     s_remotePalette = 0;
+    s_remotePaletteCustom = false;
     s_localStage = 0;
     s_remoteStage = 0;
     s_finalStageId = 0;
@@ -147,27 +151,35 @@ static void ResetState() {
 static void SendCharSelLock() {
     const uintptr_t cursorAddr = s_isHost ? ADDR_CHARSEL_P1_CURSOR : ADDR_CHARSEL_P2_CURSOR;
     const uintptr_t paletteAddr = s_isHost ? ADDR_CHARSEL_P1_PALETTE : ADDR_CHARSEL_P2_PALETTE;
+    const uint8_t localGameSlot = s_isHost ? 0 : 1;
 
     s_localChar = LookupCharId(ReadMemory<uint8_t>(cursorAddr));
     s_localPalette = ReadMemory<uint8_t>(paletteAddr);
+    s_localPaletteCustom = CharSelPaletteSelect_ShouldUseCustomBank(
+        localGameSlot,
+        s_localChar,
+        s_localPalette);
 
     CharSelLockPayload payload{};
     payload.epoch_id = FrontendInputSync_GetEpochId();
     payload.phase = (uint16_t)FrontendSyncPhase::CharSel;
     payload.character_id = s_localChar;
     payload.palette = s_localPalette;
+    payload.flags = s_localPaletteCustom ? CHARSEL_LOCK_FLAG_CUSTOM_PALETTE : 0;
 
     BarrierProtocol_SendPacket(PacketType::CharSelLock, &payload, sizeof(payload));
 
     Rollback::NetplayLog_Write(
         "CHARSEL", -1,
-        "Sent CharSelLock: epoch=%u char=%u palette=%u",
+        "Sent CharSelLock: epoch=%u char=%u palette=%u custom=%u",
         payload.epoch_id,
         payload.character_id,
-        payload.palette);
-    LOG_NETPLAY(LOG_INFO, "[CharSelSync] Sent CharSelLock: char=%u pal=%u",
+        payload.palette,
+        s_localPaletteCustom ? 1 : 0);
+    LOG_NETPLAY(LOG_INFO, "[CharSelSync] Sent CharSelLock: char=%u pal=%u custom=%u",
         payload.character_id,
-        payload.palette);
+        payload.palette,
+        s_localPaletteCustom ? 1 : 0);
 }
 
 static StageWatchdogState ReadLocalStageWatchdogState() {
@@ -261,6 +273,8 @@ static uint32_t BuildCharBoundaryDigest() {
         uint8_t p1_palette;
         uint8_t p2_character;
         uint8_t p2_palette;
+        uint8_t p1_palette_custom;
+        uint8_t p2_palette_custom;
         uint8_t local_confirmed;
         uint8_t remote_confirmed;
         uint8_t _pad[2];
@@ -269,13 +283,17 @@ static uint32_t BuildCharBoundaryDigest() {
     if (s_isHost) {
         data.p1_character = s_localChar;
         data.p1_palette = s_localPalette;
+        data.p1_palette_custom = s_localPaletteCustom ? 1 : 0;
         data.p2_character = s_remoteChar;
         data.p2_palette = s_remotePalette;
+        data.p2_palette_custom = s_remotePaletteCustom ? 1 : 0;
     } else {
         data.p1_character = s_remoteChar;
         data.p1_palette = s_remotePalette;
+        data.p1_palette_custom = s_remotePaletteCustom ? 1 : 0;
         data.p2_character = s_localChar;
         data.p2_palette = s_localPalette;
+        data.p2_palette_custom = s_localPaletteCustom ? 1 : 0;
     }
     data.local_confirmed = s_localCharConfirmed ? 1 : 0;
     data.remote_confirmed = s_remoteCharLocked ? 1 : 0;
@@ -293,13 +311,17 @@ static void SendCharBoundaryDigest() {
     if (s_isHost) {
         payload.p1_character = s_localChar;
         payload.p1_palette = s_localPalette;
+        payload.p1_palette_custom = s_localPaletteCustom ? 1 : 0;
         payload.p2_character = s_remoteChar;
         payload.p2_palette = s_remotePalette;
+        payload.p2_palette_custom = s_remotePaletteCustom ? 1 : 0;
     } else {
         payload.p1_character = s_remoteChar;
         payload.p1_palette = s_remotePalette;
+        payload.p1_palette_custom = s_remotePaletteCustom ? 1 : 0;
         payload.p2_character = s_localChar;
         payload.p2_palette = s_localPalette;
+        payload.p2_palette_custom = s_localPaletteCustom ? 1 : 0;
     }
     payload.digest = BuildCharBoundaryDigest();
     FrontendInputSync_SendBoundaryDigest(&payload, "character lock boundary");
@@ -312,20 +334,26 @@ static uint32_t BuildStageBoundaryDigest(const StageWatchdogState& state) {
         uint8_t p1_palette;
         uint8_t p2_character;
         uint8_t p2_palette;
+        uint8_t p1_palette_custom;
+        uint8_t p2_palette_custom;
         uint8_t final_stage_id;
-        uint8_t _pad[3];
+        uint8_t _pad;
     } data{};
 
     if (s_isHost) {
         data.p1_character = s_localChar;
         data.p1_palette = s_localPalette;
+        data.p1_palette_custom = s_localPaletteCustom ? 1 : 0;
         data.p2_character = s_remoteChar;
         data.p2_palette = s_remotePalette;
+        data.p2_palette_custom = s_remotePaletteCustom ? 1 : 0;
     } else {
         data.p1_character = s_remoteChar;
         data.p1_palette = s_remotePalette;
+        data.p1_palette_custom = s_remotePaletteCustom ? 1 : 0;
         data.p2_character = s_localChar;
         data.p2_palette = s_localPalette;
+        data.p2_palette_custom = s_localPaletteCustom ? 1 : 0;
     }
     // Only hash stable boundary state. Post-lock UI bytes like substate,
     // confirm-menu state, and transition counters can advance on different
@@ -349,13 +377,17 @@ static void SendStageBoundaryDigest() {
     if (s_isHost) {
         payload.p1_character = s_localChar;
         payload.p1_palette = s_localPalette;
+        payload.p1_palette_custom = s_localPaletteCustom ? 1 : 0;
         payload.p2_character = s_remoteChar;
         payload.p2_palette = s_remotePalette;
+        payload.p2_palette_custom = s_remotePaletteCustom ? 1 : 0;
     } else {
         payload.p1_character = s_remoteChar;
         payload.p1_palette = s_remotePalette;
+        payload.p1_palette_custom = s_remotePaletteCustom ? 1 : 0;
         payload.p2_character = s_localChar;
         payload.p2_palette = s_localPalette;
+        payload.p2_palette_custom = s_localPaletteCustom ? 1 : 0;
     }
 
     payload.stage_cursor = boundaryState.stage_cursor;
@@ -586,11 +618,16 @@ void CharSelSync_FrameUpdate() {
             s_localCharConfirmed = true;
             s_localChar = LookupCharId(ReadMemory<uint8_t>(localCursorAddr));
             s_localPalette = ReadMemory<uint8_t>(s_isHost ? ADDR_CHARSEL_P1_PALETTE : ADDR_CHARSEL_P2_PALETTE);
+            s_localPaletteCustom = CharSelPaletteSelect_ShouldUseCustomBank(
+                localGameSlot,
+                s_localChar,
+                s_localPalette);
             Rollback::NetplayLog_Write(
                 "CHARSEL", -1,
-                "Local character finalized: char=%u pal=%u slot=P%d",
+                "Local character finalized: char=%u pal=%u custom=%u slot=P%d",
                 s_localChar,
                 s_localPalette,
+                s_localPaletteCustom ? 1 : 0,
                 localGameSlot + 1);
         }
 
@@ -653,16 +690,32 @@ void CharSelSync_OnRemoteLock(const CharSelLockPayload* p) {
     s_remoteCharLocked = true;
     s_remoteChar = p->character_id;
     s_remotePalette = p->palette;
+    s_remotePaletteCustom = (p->flags & CHARSEL_LOCK_FLAG_CUSTOM_PALETTE) != 0;
+
+    const uint8_t remoteGameSlot = s_isHost ? 1 : 0;
+    CharSelPaletteSelect_SetExternalCustomHint(
+        remoteGameSlot,
+        s_remoteChar,
+        s_remotePalette,
+        s_remotePaletteCustom);
+    const bool forced = CharSelPaletteSelect_ForceSelectionLocked(
+        remoteGameSlot,
+        s_remoteChar,
+        s_remotePalette,
+        s_remotePaletteCustom);
 
     Rollback::NetplayLog_Write(
         "CHARSEL", -1,
-        "Remote character locked: epoch=%u char=%u palette=%u",
+        "Remote character locked: epoch=%u char=%u palette=%u custom=%u forced=%u",
         p->epoch_id,
         p->character_id,
-        p->palette);
-    LOG_NETPLAY(LOG_INFO, "[CharSelSync] Remote character locked: char=%u palette=%u",
+        p->palette,
+        s_remotePaletteCustom ? 1 : 0,
+        forced ? 1 : 0);
+    LOG_NETPLAY(LOG_INFO, "[CharSelSync] Remote character locked: char=%u palette=%u custom=%u",
         p->character_id,
-        p->palette);
+        p->palette,
+        s_remotePaletteCustom ? 1 : 0);
 }
 
 void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
