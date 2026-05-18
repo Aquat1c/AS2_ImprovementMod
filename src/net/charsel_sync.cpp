@@ -197,10 +197,13 @@ static StageWatchdogState ReadLocalStageWatchdogState() {
     return state;
 }
 
-static void ApplyAuthoritativeStageStateToLocalMenu(const StageWatchdogState& state) {
+static void ApplyAuthoritativeStageStateToLocalMenu(const StageWatchdogState& state,
+                                                    bool preserveLocalStageCounter) {
+    const uint8_t localStageCounter = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR + 2);
     WriteMemory<uint8_t>(ADDR_STAGE_CURSOR, state.stage_cursor);
     WriteMemory<uint8_t>(ADDR_STAGE_CURSOR + 1, state.stage_confirmed);
-    WriteMemory<uint8_t>(ADDR_STAGE_CURSOR + 2, state.stage_counter);
+    WriteMemory<uint8_t>(ADDR_STAGE_CURSOR + 2,
+        preserveLocalStageCounter ? localStageCounter : state.stage_counter);
     WriteMemory<uint8_t>(ADDR_STAGE_AUX, state.stage_aux);
     WriteMemory<uint8_t>(ADDR_CHARSEL_CANCEL, state.stage_cancel);
     WriteMemory<uint8_t>(ADDR_STAGE_CONFIRM_MENU_CURSOR, state.confirm_menu_cursor);
@@ -208,14 +211,40 @@ static void ApplyAuthoritativeStageStateToLocalMenu(const StageWatchdogState& st
     WriteMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID, state.committed_stage_id);
 }
 
+static bool ShouldPreserveLocalStageCounter(const StageWatchdogState& state) {
+    if (s_isHost || !s_inStagePhase) {
+        return false;
+    }
+
+    const uint8_t localSubstate = (uint8_t)GetSubstate();
+    return localSubstate == CHARSEL_SUB_STAGESEL_GRID &&
+           state.substate != CHARSEL_SUB_STAGESEL_GRID;
+}
+
 static void MirrorHostStageStateOnClient(const StageWatchdogState& state, const char* reason) {
     if (s_isHost || !s_inStagePhase) {
         return;
     }
 
-    ApplyAuthoritativeStageStateToLocalMenu(state);
-    s_localStageState = state;
-    s_localStage = ResolveFinalStageId(state);
+    const bool preserveLocalCounter = ShouldPreserveLocalStageCounter(state);
+    ApplyAuthoritativeStageStateToLocalMenu(state, preserveLocalCounter);
+    s_localStageState = ReadLocalStageWatchdogState();
+    s_localStageState.stage_id = ResolveFinalStageId(state);
+    s_localStage = ResolveFinalStageId(s_localStageState);
+
+    if (preserveLocalCounter) {
+        Rollback::NetplayLog_Write(
+            "STAGESEL", -1,
+            "Mirrored host stage transition while preserving local counter: local_sub=%u remote_sub=%u stage=%u cursor=%u confirmed=%u local_counter=%u remote_counter=%u reason=%s",
+            (unsigned)GetSubstate(),
+            state.substate,
+            ResolveFinalStageId(state),
+            state.stage_cursor,
+            state.stage_confirmed,
+            s_localStageState.stage_counter,
+            state.stage_counter,
+            reason ? reason : "?");
+    }
 
     if (state.stage_confirmed ||
         state.committed_stage_id != 0 ||

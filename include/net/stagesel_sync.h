@@ -62,6 +62,17 @@ bool StageSelSync_ConsumeEdgeReset();
 /// callers should not pre-merge elsewhere.
 uint16_t StageSelSync_MergeConfirmed(uint32_t frame, uint16_t p1, uint16_t p2);
 
+/// Gate the native stage-grid confirm edge until the peer has acknowledged
+/// consuming the lockstep frame that carried the confirm intent. While pending,
+/// stage-grid input is held neutral so the selected stage cannot drift before
+/// the synchronized release.
+void StageSelSync_ApplyConfirmAckGate(uint32_t frame,
+                                      uint16_t* ioHeld,
+                                      uint16_t* ioPressed,
+                                      uint32_t remoteAckFrame,
+                                      uint16_t sharedDelay,
+                                      uint8_t stageCursor);
+
 
 // ============================================================================
 // Diagnostics

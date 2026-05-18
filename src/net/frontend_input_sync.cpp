@@ -50,6 +50,7 @@ static bool              s_inputPhaseActive = false;
 static uint32_t          s_consumeFrame = 0;
 static uint32_t          s_localInputFrame = 0;
 static uint32_t          s_remoteLatestFrame = 0;
+static uint32_t          s_remoteAckFrame = 0;
 static uint16_t          s_localInputs[FRONTEND_RING_SIZE] = {};
 static uint16_t          s_remoteInputs[FRONTEND_RING_SIZE] = {};
 static bool              s_hasLocalInput[FRONTEND_RING_SIZE] = {};
@@ -209,6 +210,7 @@ static void ClearPhaseInputState() {
     s_consumeFrame = 0;
     s_localInputFrame = 0;
     s_remoteLatestFrame = 0;
+    s_remoteAckFrame = 0;
     s_lastRemoteInputTime = NowMs();
     s_receivedRemoteInputThisPhase = false;
     s_lastResendTime = 0;
@@ -545,6 +547,9 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         FrontendInputSync_RequestRecovery("frontend packet carried invalid input redundancy");
         return;
     }
+    if (ackFrame > s_remoteAckFrame) {
+        s_remoteAckFrame = ackFrame;
+    }
     if (frame > (s_consumeFrame + FRONTEND_RING_SIZE)) {
         FrontendInputSync_RequestRecovery("frontend packet was outside ring window");
         return;
@@ -879,6 +884,10 @@ uint32_t FrontendInputSync_GetLocalInputFrame() {
 
 uint32_t FrontendInputSync_GetRemoteLatestFrame() {
     return s_remoteLatestFrame;
+}
+
+uint32_t FrontendInputSync_GetRemoteAckFrame() {
+    return s_remoteAckFrame;
 }
 
 void FrontendInputSync_FrameUpdate() {

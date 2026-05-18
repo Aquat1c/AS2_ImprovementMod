@@ -2434,7 +2434,18 @@ int __cdecl Hook_InputProcess(int gameState) {
             const uint16_t merged = Net::StageSelSync_MergeConfirmed(
                 mergedFrontendFrame, p1, p2);
             const uint16_t adjPrevHeld = edgeReset ? (uint16_t)0 : prevHeldP1;
-            const uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~adjPrevHeld);
+            uint16_t gatedMerged = merged;
+            uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~adjPrevHeld);
+            if (subState == CHARSEL_SUB_STAGESEL_GRID) {
+                const uint8_t stageCursor = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR);
+                Net::StageSelSync_ApplyConfirmAckGate(
+                    mergedFrontendFrame,
+                    &gatedMerged,
+                    &pressedMerged,
+                    Net::FrontendInputSync_GetRemoteAckFrame(),
+                    Net::FrontendInputSync_GetSharedDelay(),
+                    stageCursor);
+            }
 
             // g_origInputProcess already populated the stage-select raw input
             // block from unsynchronized local hardware state. Clear the safe
@@ -2446,7 +2457,7 @@ int __cdecl Hook_InputProcess(int gameState) {
                 const uint16_t mask = g_buttonMasks[i];
 
                 WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (i * 2),
-                    (merged & mask) ? 1 : 0);
+                    (gatedMerged & mask) ? 1 : 0);
                 WriteMemory<uint16_t>(ADDR_P1_INPUT_BUFFER + (JUST_PRESSED_OFFSET_WORDS * 2) + (i * 2),
                     (pressedMerged & mask) ? 1 : 0);
 

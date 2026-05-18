@@ -36,6 +36,8 @@ static const uint16_t MASK_LEFT  = (1 << 2);
 static const uint16_t MASK_RIGHT = (1 << 3);
 static const uint16_t MASK_VERT  = MASK_UP | MASK_DOWN;
 static const uint16_t MASK_HORZ  = MASK_LEFT | MASK_RIGHT;
+static const uint16_t MASK_DIR   = MASK_UP | MASK_DOWN | MASK_LEFT | MASK_RIGHT;
+static const uint16_t MASK_CONFIRM = 0x0010 | 0x0040;  // A / C
 
 // Select button — stripped during stage select to prevent roulette
 // (roulette uses rand() which is not synced during charsel → guaranteed desync).
@@ -49,6 +51,12 @@ static const uint16_t MASK_SELECT = (1 << 9);  // 0x0200
 static bool     s_initialized = false;
 static bool     s_active      = false;
 static bool     s_needsEdgeReset = false;
+static bool     s_confirmPending = false;
+static uint32_t s_confirmFrame = 0;
+static uint32_t s_confirmReleaseFrame = 0;
+static uint32_t s_confirmLastWaitLogFrame = 0;
+static uint16_t s_confirmReleaseMask = 0;
+static uint8_t  s_confirmStageCursor = 0;
 
 // Confirmed frame audit ring (for desync diagnostics)
 static Net::StageSelConfirmedFrame s_auditRing[AUDIT_RING_SIZE] = {};
@@ -81,6 +89,12 @@ void StageSelSync_Shutdown() {
 void StageSelSync_Begin() {
     s_active = true;
     s_needsEdgeReset = true;
+    s_confirmPending = false;
+    s_confirmFrame = 0;
+    s_confirmReleaseFrame = 0;
+    s_confirmLastWaitLogFrame = 0;
+    s_confirmReleaseMask = 0;
+    s_confirmStageCursor = 0;
     s_auditWriteIdx = 0;
     s_confirmedCount = 0;
     memset(s_auditRing, 0, sizeof(s_auditRing));
@@ -93,6 +107,7 @@ void StageSelSync_Begin() {
 void StageSelSync_Abort() {
     if (!s_active) return;
     s_active = false;
+    s_confirmPending = false;
     LOG_NETPLAY(LOG_INFO, "[StageSelSync] Aborted (confirmed %u frames)", s_confirmedCount);
 }
 
@@ -136,6 +151,90 @@ uint16_t StageSelSync_MergeConfirmed(uint32_t frame, uint16_t p1, uint16_t p2) {
     s_confirmedCount++;
 
     return combined;
+}
+
+void StageSelSync_ApplyConfirmAckGate(uint32_t frame,
+                                      uint16_t* ioHeld,
+                                      uint16_t* ioPressed,
+                                      uint32_t remoteAckFrame,
+                                      uint16_t sharedDelay,
+                                      uint8_t stageCursor) {
+    if (!ioHeld || !ioPressed) {
+        return;
+    }
+
+    if (!s_active) {
+        return;
+    }
+
+    if (!s_confirmPending) {
+        const uint16_t pressed = *ioPressed;
+        const bool confirmPressed = (pressed & MASK_CONFIRM) != 0;
+        const bool higherPriorityGridAction = (pressed & MASK_DIR) != 0;
+        if (!confirmPressed || higherPriorityGridAction) {
+            return;
+        }
+
+        s_confirmPending = true;
+        s_confirmFrame = frame;
+        const uint32_t releaseLeadFrames = (uint32_t)(sharedDelay > 0 ? sharedDelay : 1) + 2u;
+        s_confirmReleaseFrame = frame + releaseLeadFrames;
+        s_confirmLastWaitLogFrame = frame;
+        s_confirmReleaseMask = (uint16_t)(pressed & MASK_CONFIRM);
+        if (s_confirmReleaseMask == 0) {
+            s_confirmReleaseMask = 0x0010;
+        }
+        s_confirmStageCursor = stageCursor;
+
+        Rollback::NetplayLog_Write(
+            "STAGESEL", -1,
+            "Stage confirm gated: frame=%u release_frame=%u stage=%u mask=0x%04X remote_ack=%u shared_delay=%u",
+            s_confirmFrame,
+            s_confirmReleaseFrame,
+            s_confirmStageCursor,
+            s_confirmReleaseMask,
+            remoteAckFrame,
+            sharedDelay);
+    }
+
+    *ioHeld = 0;
+    *ioPressed = 0;
+
+    const bool peerConsumedConfirm = remoteAckFrame > s_confirmFrame;
+    const bool releaseFrameReached = frame >= s_confirmReleaseFrame;
+    if (!peerConsumedConfirm || !releaseFrameReached) {
+        if (frame == s_confirmFrame ||
+            frame - s_confirmLastWaitLogFrame >= 30 ||
+            (peerConsumedConfirm && !releaseFrameReached)) {
+            Rollback::NetplayLog_Verbose(
+                "STAGESEL", -1,
+                "Stage confirm waiting: frame=%u confirm_frame=%u release_frame=%u stage=%u remote_ack=%u acked=%u release_due=%u",
+                frame,
+                s_confirmFrame,
+                s_confirmReleaseFrame,
+                s_confirmStageCursor,
+                remoteAckFrame,
+                peerConsumedConfirm ? 1 : 0,
+                releaseFrameReached ? 1 : 0);
+            s_confirmLastWaitLogFrame = frame;
+        }
+        return;
+    }
+
+    *ioHeld = s_confirmReleaseMask;
+    *ioPressed = s_confirmReleaseMask;
+
+    Rollback::NetplayLog_Write(
+        "STAGESEL", -1,
+        "Stage confirm released: frame=%u confirm_frame=%u release_frame=%u stage=%u remote_ack=%u mask=0x%04X",
+        frame,
+        s_confirmFrame,
+        s_confirmReleaseFrame,
+        s_confirmStageCursor,
+        remoteAckFrame,
+        s_confirmReleaseMask);
+
+    s_confirmPending = false;
 }
 
 bool StageSelSync_GetLastConfirmedFrame(StageSelConfirmedFrame* out) {

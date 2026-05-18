@@ -145,6 +145,7 @@ bool FrontendInputSync_IsInputPhaseActive();
 uint32_t FrontendInputSync_GetConsumeFrame();
 uint32_t FrontendInputSync_GetLocalInputFrame();
 uint32_t FrontendInputSync_GetRemoteLatestFrame();
+uint32_t FrontendInputSync_GetRemoteAckFrame();
 
 void FrontendInputSync_FrameUpdate();
 void FrontendInputSync_CaptureLocalInput(uint16_t packedInput);
