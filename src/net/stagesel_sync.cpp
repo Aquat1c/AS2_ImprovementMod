@@ -41,7 +41,8 @@ static const uint16_t MASK_CONFIRM = 0x0010 | 0x0040;  // A / C
 
 // Select button — stripped during stage select to prevent roulette
 // (roulette uses rand() which is not synced during charsel → guaranteed desync).
-// B/D still available for cancel, Start for back.
+// B is reserved by Hook_InputProcess for synchronized back-to-charsel cancel.
+// D remains available for native stage UI, Start for native back.
 static const uint16_t MASK_SELECT = (1 << 9);  // 0x0200
 
 // ============================================================================
@@ -123,6 +124,10 @@ bool StageSelSync_ConsumeEdgeReset() {
     return false;
 }
 
+bool StageSelSync_IsConfirmPending() {
+    return s_active && s_confirmPending;
+}
+
 uint16_t StageSelSync_MergeConfirmed(uint32_t frame, uint16_t p1, uint16_t p2) {
     // Pure function: OR all inputs, cancel opposing directions.
     // No internal state — identical (p1, p2) always yields identical result.
@@ -131,7 +136,7 @@ uint16_t StageSelSync_MergeConfirmed(uint32_t frame, uint16_t p1, uint16_t p2) {
     // Strip Select button: stage select roulette (hidden feature activated by
     // holding A/C + pressing Select during confirm) calls rand() which is NOT
     // synced during charsel — guaranteed desync if triggered.
-    // B/D still available for cancel, Start for back. Select has no other
+    // B is handled by the caller before injection. Select has no other
     // legitimate use in stage select (sub=7) or confirm menu (sub=8).
     combined &= ~MASK_SELECT;
 

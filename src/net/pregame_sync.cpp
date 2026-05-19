@@ -670,6 +670,14 @@ static void UpdateFrontendStageSel() {
     s_localStageLocked = csSnap.local_stage_confirmed;
     s_remoteStageLocked = csSnap.remote_stage_confirmed;
 
+    if (!csSnap.in_stage_phase && !csSnap.both_stage_locked) {
+        s_localStageLocked = false;
+        s_remoteStageLocked = false;
+        SetStatusFmt("Stage canceled. Character select...");
+        SetPhase(PregamePhase::FrontendCharSel, "stage cancel back to charsel");
+        return;
+    }
+
     if (csSnap.both_stage_locked) {
         SetStatusFmt("Stage locked. Building match config...");
         SetPhase(PregamePhase::FrontendLocked, "stage confirmed");

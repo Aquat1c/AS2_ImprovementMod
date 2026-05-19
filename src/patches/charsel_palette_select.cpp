@@ -32,6 +32,12 @@ constexpr uintptr_t ADDR_CHARSEL_CANCEL_SE = 0x816258;
 constexpr uintptr_t ADDR_CHARSEL_UNLOCK_TABLE = 0x815FE8;
 constexpr uint8_t kVisibleVanillaPaletteCount = 8;
 constexpr size_t kOptionCapacity = kVisibleVanillaPaletteCount * 2;
+constexpr int kRawHeldBIndex = 5;
+constexpr int kRawJustPressedOffset = 28;
+constexpr int kRawJustAIndex = kRawJustPressedOffset + 4;
+constexpr int kRawJustBIndex = kRawJustPressedOffset + 5;
+constexpr int kRawJustCIndex = kRawJustPressedOffset + 6;
+constexpr int kRawJustDIndex = kRawJustPressedOffset + 7;
 
 static_assert(kVisibleVanillaPaletteCount <= NETPLAY_PALETTE_BANK_COUNT,
     "Visible palette count must fit inside stored palette banks");
@@ -575,6 +581,45 @@ static void CancelSelection(int localSelection, uint8_t* control, uint8_t gameSl
     ResetFrontendSlotState(&s_slotState[gameSlot]);
 }
 
+static bool RawBJustPressed(const uint16_t* rawInput) {
+    return rawInput && rawInput[kRawJustBIndex] != 0;
+}
+
+static bool CancelSlotSelection(uint8_t gameSlot, const char* reason) {
+    if (gameSlot > 1 || !s_frontendActive) {
+        return false;
+    }
+
+    FrontendSlotState& slotState = s_slotState[gameSlot];
+    if (slotState.phase == SlotPhase::None && !s_matchSelection[gameSlot].valid) {
+        return false;
+    }
+
+    PaletteOption previousOption{};
+    bool hadPreviousOption = TryGetDisplayedOption(gameSlot, slotState, &previousOption);
+    if (!hadPreviousOption && s_matchSelection[gameSlot].valid) {
+        previousOption.base_palette = s_matchSelection[gameSlot].base_palette;
+        previousOption.use_custom = s_matchSelection[gameSlot].use_custom;
+        hadPreviousOption = true;
+    }
+
+    memset(&s_matchSelection[gameSlot], 0, sizeof(s_matchSelection[gameSlot]));
+    memset(&s_externalCustomHint[gameSlot], 0, sizeof(s_externalCustomHint[gameSlot]));
+    ResetNativeSelectionState(gameSlot);
+    ResetFrontendSlotState(&slotState);
+    MaybeRequestPreviewReload(gameSlot,
+        hadPreviousOption,
+        hadPreviousOption ? &previousOption : nullptr,
+        false,
+        nullptr);
+
+    Rollback::NetplayLog_Write("CHARPAL", -1,
+        "Palette selection canceled: slot=P%d reason=%s",
+        gameSlot + 1,
+        reason ? reason : "?");
+    return true;
+}
+
 static void PlayCharSelSound(uintptr_t handleAddress) {
     const uint32_t handle = ReadU32(handleAddress, 0);
     if (handle != 0) {
@@ -582,8 +627,27 @@ static void PlayCharSelSound(uintptr_t handleAddress) {
     }
 }
 
-static bool AnyAttackJustPressed(const uint16_t* rawInput) {
-    return rawInput[32] || rawInput[33] || rawInput[34] || rawInput[35];
+static bool AnyConfirmAttackJustPressed(const uint16_t* rawInput) {
+    return rawInput[kRawJustAIndex] || rawInput[kRawJustCIndex] || rawInput[kRawJustDIndex];
+}
+
+static char CallOriginalWithBStripped(CharSelSelectPlayer_t original,
+                                      uint16_t* rawInput,
+                                      int localSelection,
+                                      int otherSelection,
+                                      uint8_t* control) {
+    if (!original || !rawInput) {
+        return 0;
+    }
+
+    const uint16_t heldB = rawInput[kRawHeldBIndex];
+    const uint16_t justB = rawInput[kRawJustBIndex];
+    rawInput[kRawHeldBIndex] = 0;
+    rawInput[kRawJustBIndex] = 0;
+    const char result = original(rawInput, localSelection, otherSelection, control);
+    rawInput[kRawHeldBIndex] = heldB;
+    rawInput[kRawJustBIndex] = justB;
+    return result;
 }
 
 static void DrawTextShadowed(int x,
@@ -679,6 +743,13 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
     }
 
     if (slotState.phase == SlotPhase::LockedFinal) {
+        if (RawBJustPressed(rawInput)) {
+            if (CancelSlotSelection((uint8_t)gameSlot, "locked-final B")) {
+                PlayCharSelSound(ADDR_CHARSEL_CANCEL_SE);
+            }
+            return 0;
+        }
+
         PaletteOption options[kOptionCapacity] = {};
         const int optionCount = BuildOptions((uint8_t)gameSlot,
             slotState.character_id,
@@ -717,14 +788,8 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
             slotState.display_index = 0;
         }
 
-        if (rawInput[37]) {
-            const PaletteOption previousOption = options[slotState.display_index];
-            CancelSelection(localSelection, control, (uint8_t)gameSlot);
-            MaybeRequestPreviewReload((uint8_t)gameSlot,
-                true,
-                &previousOption,
-                false,
-                nullptr);
+        if (RawBJustPressed(rawInput)) {
+            CancelSlotSelection((uint8_t)gameSlot, "palette-select B");
             PlayCharSelSound(ADDR_CHARSEL_CANCEL_SE);
             return 0;
         }
@@ -749,7 +814,7 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
                 true,
                 &currentOption);
             PlayCharSelSound(ADDR_CHARSEL_MOVE_SE);
-        } else if (AnyAttackJustPressed(rawInput)) {
+        } else if (AnyConfirmAttackJustPressed(rawInput)) {
             const PaletteOption& option = options[slotState.display_index];
             WriteSelectionValues(localSelection,
                 control,
@@ -779,7 +844,18 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
         return 0;
     }
 
-    if (!AnyAttackJustPressed(rawInput)) {
+    if (RawBJustPressed(rawInput)) {
+        Rollback::NetplayLog_Write("CHARPAL", -1,
+            "B ignored on character grid: slot=P%d reason=no character selected",
+            gameSlot + 1);
+        return CallOriginalWithBStripped(s_originalSelectPlayer,
+            rawInput,
+            localSelection,
+            otherSelection,
+            control);
+    }
+
+    if (!AnyConfirmAttackJustPressed(rawInput)) {
         return s_originalSelectPlayer(rawInput, localSelection, otherSelection, control);
     }
 
@@ -979,6 +1055,16 @@ bool CharSelPaletteSelect_IsCatalogReady() {
 
 bool CharSelPaletteSelect_IsSelectionLocked(uint8_t gameSlot) {
     return gameSlot < 2 && s_slotState[gameSlot].phase == SlotPhase::LockedFinal;
+}
+
+bool CharSelPaletteSelect_CanCancelSelection(uint8_t gameSlot) {
+    return gameSlot < 2 &&
+           s_frontendActive &&
+           s_slotState[gameSlot].phase != SlotPhase::None;
+}
+
+bool CharSelPaletteSelect_CancelSelection(uint8_t gameSlot) {
+    return CancelSlotSelection(gameSlot, "sync B");
 }
 
 bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t gameSlot,

@@ -51,6 +51,10 @@ bool StageSelSync_IsActive();
 /// preventing desync from unsynchronized physical input during animation subs 5-6.
 bool StageSelSync_ConsumeEdgeReset();
 
+/// True while a stage-grid confirm edge has entered the netplay confirm gate
+/// and is waiting for synchronized release.
+bool StageSelSync_IsConfirmPending();
+
 // ============================================================================
 // Shared Input Merge (called from Hook_InputDispatcher)
 // ============================================================================

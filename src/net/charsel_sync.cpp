@@ -15,6 +15,7 @@
 #include "net/stage_watchdog_tracker.h"
 #include "net/stagesel_sync.h"
 #include "core/as2_constants.h"
+#include "input_system.h"
 #include "patches/charsel_palette_select.h"
 #include "patches/memory_utils.h"
 #include "rollback/netplay_log.h"
@@ -30,6 +31,7 @@ constexpr uintptr_t ADDR_STAGE_AUX = 0x816028;
 constexpr uintptr_t ADDR_STAGE_CONFIRM_MENU_CURSOR = 0x81602A;
 constexpr uintptr_t ADDR_STAGE_CONFIRM_MENU_ACTION = 0x81602B;
 constexpr DWORD STAGE_WATCHDOG_RESEND_MS = 250;
+constexpr uint16_t STAGE_CONFIRM_MASK = INPUT_A | INPUT_C;
 
 struct StageWatchdogState {
     uint8_t stage_id;
@@ -146,6 +148,192 @@ static void ResetState() {
     s_stageBoundaryStateValid = false;
     s_lastStageWatchdogSendTime = 0;
     StageWatchdogTracker_Reset(&s_remoteStageTracker);
+}
+
+static void ResetStageSelectionRuntime() {
+    s_inStagePhase = false;
+    s_bothStageLocked = false;
+    s_localStageLocked = false;
+    s_remoteStageLocked = false;
+    s_stageBoundarySent = false;
+    s_stageDigestSent = false;
+    s_localStage = 0;
+    s_remoteStage = 0;
+    s_finalStageId = 0;
+    memset(&s_localStageState, 0, sizeof(s_localStageState));
+    memset(&s_lastSentStageState, 0, sizeof(s_lastSentStageState));
+    memset(&s_remoteStageState, 0, sizeof(s_remoteStageState));
+    memset(&s_stageBoundaryState, 0, sizeof(s_stageBoundaryState));
+    s_stageBoundaryStateValid = false;
+    s_lastStageWatchdogSendTime = 0;
+    StageWatchdogTracker_Reset(&s_remoteStageTracker);
+}
+
+static void ClearNativeStageSelectionState() {
+    WriteMemory<uint8_t>(ADDR_STAGE_CURSOR + 1, 0);
+    WriteMemory<uint8_t>(ADDR_STAGE_CURSOR + 2, 0);
+    WriteMemory<uint8_t>(ADDR_STAGE_AUX, 0);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_CANCEL, 0);
+    WriteMemory<uint8_t>(ADDR_STAGE_CONFIRM_MENU_CURSOR, 0);
+    WriteMemory<uint8_t>(ADDR_STAGE_CONFIRM_MENU_ACTION, 0);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID, 0);
+}
+
+static void RefreshLocalCharacterSelectionFromMemory() {
+    const uintptr_t cursorAddr = s_isHost ? ADDR_CHARSEL_P1_CURSOR : ADDR_CHARSEL_P2_CURSOR;
+    const uintptr_t paletteAddr = s_isHost ? ADDR_CHARSEL_P1_PALETTE : ADDR_CHARSEL_P2_PALETTE;
+    const uint8_t localGameSlot = s_isHost ? 0 : 1;
+
+    s_localChar = LookupCharId(ReadMemory<uint8_t>(cursorAddr));
+    s_localPalette = ReadMemory<uint8_t>(paletteAddr);
+    s_localPaletteCustom = CharSelPaletteSelect_ShouldUseCustomBank(
+        localGameSlot,
+        s_localChar,
+        s_localPalette);
+}
+
+static void RestartCharacterInputPhase(const char* reason) {
+    const uint32_t nextEpoch = FrontendInputSync_GetEpochId() + 1u;
+    FrontendInputSync_RebindEpoch(nextEpoch, reason);
+    FrontendInputSync_BeginInputPhase(
+        FrontendSyncPhase::CharSel,
+        PacketType::CharSelFrameInput,
+        reason);
+}
+
+static void ResetCharacterBoundaryAfterCancel(const char* reason) {
+    const uint8_t localGameSlot = s_isHost ? 0 : 1;
+
+    s_bothCharsLocked = false;
+    s_charBoundarySent = false;
+    s_charDigestSent = false;
+    s_localLockSent = false;
+    s_remoteCharLocked = false;
+    s_remoteChar = 0;
+    s_remotePalette = 0;
+    s_remotePaletteCustom = false;
+
+    s_localCharConfirmed = CharSelPaletteSelect_IsSelectionLocked(localGameSlot);
+    if (s_localCharConfirmed) {
+        RefreshLocalCharacterSelectionFromMemory();
+    } else {
+        s_localChar = 0;
+        s_localPalette = 0;
+        s_localPaletteCustom = false;
+    }
+
+    ResetStageSelectionRuntime();
+    FrontendInputSync_ClearPhaseBarrier();
+    RestartCharacterInputPhase(reason);
+}
+
+static bool CancelCharacterSlot(uint8_t gameSlot, const char* reason) {
+    if (!CharSelPaletteSelect_CanCancelSelection(gameSlot)) {
+        Rollback::NetplayLog_Write(
+            "CHARSEL", -1,
+            "Character cancel ignored: slot=P%d reason=no cancelable selection context=%s",
+            gameSlot + 1,
+            reason ? reason : "?");
+        return false;
+    }
+    if (!CharSelPaletteSelect_CancelSelection(gameSlot)) {
+        Rollback::NetplayLog_Write(
+            "CHARSEL", -1,
+            "Character cancel ignored: slot=P%d reason=palette frontend refused context=%s",
+            gameSlot + 1,
+            reason ? reason : "?");
+        return false;
+    }
+
+    Rollback::NetplayLog_Write(
+        "CHARSEL", -1,
+        "Character selection canceled: slot=P%d reason=%s",
+        gameSlot + 1,
+        reason ? reason : "?");
+    return true;
+}
+
+static bool IsOfflineStageCancelSupportedGameType(uint32_t gameType) {
+    switch (gameType) {
+        case GAMETYPE_ARCADE:
+        case GAMETYPE_VS_CPU:
+        case GAMETYPE_VS_HUMAN:
+        case GAMETYPE_TRAINING:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool CanApplyStageCancel(uint16_t mergedJust, const char* context) {
+    if ((mergedJust & INPUT_B) == 0) {
+        return false;
+    }
+
+    const uint32_t substate = GetSubstate();
+    const uint8_t stageConfirmed = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR + 1);
+    const uint8_t committedStage = ReadMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID);
+    const bool confirmSameFrame = (mergedJust & STAGE_CONFIRM_MASK) != 0;
+    const bool confirmPending = StageSelSync_IsConfirmPending();
+    const bool committedSubstate = IsStageSelCommittedSubstate(substate);
+
+    const char* ignoredReason = nullptr;
+    if (confirmSameFrame) {
+        ignoredReason = "confirm same frame";
+    } else if (confirmPending) {
+        ignoredReason = "confirm gate pending";
+    } else if (substate != CHARSEL_SUB_STAGESEL_GRID) {
+        ignoredReason = "not stage grid";
+    } else if (stageConfirmed != 0 || committedStage != 0 || committedSubstate) {
+        ignoredReason = "stage already confirmed";
+    }
+
+    if (ignoredReason) {
+        Rollback::NetplayLog_Write(
+            "STAGESEL", -1,
+            "Stage B cancel ignored: reason=%s context=%s sub=%u confirmed=%u committed=%u confirm_pending=%u merged_just=0x%04X",
+            ignoredReason,
+            context ? context : "?",
+            substate,
+            stageConfirmed,
+            committedStage,
+            confirmPending ? 1 : 0,
+            mergedJust);
+        return false;
+    }
+
+    return true;
+}
+
+static void ResetCharacterSelectionRuntimeForStageCancel() {
+    s_bothCharsLocked = false;
+    s_localCharConfirmed = false;
+    s_remoteCharLocked = false;
+    s_localLockSent = false;
+    s_charBoundarySent = false;
+    s_charDigestSent = false;
+    s_localChar = 0;
+    s_localPalette = 0;
+    s_localPaletteCustom = false;
+    s_remoteChar = 0;
+    s_remotePalette = 0;
+    s_remotePaletteCustom = false;
+}
+
+static void ForceStageCancelBackToCharacterSelect(bool netplay, const char* reason) {
+    ClearNativeStageSelectionState();
+    WriteMemory<uint32_t>(ADDR_SUB_STATE, CHARSEL_SUB_SELECT);
+    WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0);
+    CharSelPaletteSelect_OnCharSelBegin(netplay, netplay ? (s_isHost ? 0 : 1) : 0);
+
+    Rollback::NetplayLog_Write(
+        "STAGESEL", -1,
+        "Stage selection canceled back to character select: mode=%u type=%u sub=%u netplay=%u reason=%s",
+        GetGameMode(),
+        GetGameType(),
+        GetSubstate(),
+        netplay ? 1 : 0,
+        reason ? reason : "?");
 }
 
 static void SendCharSelLock() {
@@ -628,6 +816,77 @@ bool CharSelSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
     *outP1 = p1;
     *outP2 = p2;
 
+    return true;
+}
+
+uint8_t CharSelSync_HandleCharacterCancelInput(uint16_t p1Just, uint16_t p2Just) {
+    if (!s_active || s_inStagePhase || GetGameMode() != MODE_CHARSEL) {
+        return 0;
+    }
+
+    uint8_t canceledMask = 0;
+    if ((p1Just & INPUT_B) != 0 &&
+        CancelCharacterSlot(0, "P1 B")) {
+        canceledMask |= 0x01;
+    }
+    if ((p2Just & INPUT_B) != 0 &&
+        CancelCharacterSlot(1, "P2 B")) {
+        canceledMask |= 0x02;
+    }
+
+    if (canceledMask == 0) {
+        return 0;
+    }
+
+    ResetCharacterBoundaryAfterCancel("character B cancel");
+    Rollback::NetplayLog_Write(
+        "CHARSEL", -1,
+        "Character cancel applied: slots=0x%02X epoch=%u local_locked=%u",
+        canceledMask,
+        FrontendInputSync_GetEpochId(),
+        s_localCharConfirmed ? 1 : 0);
+    return canceledMask;
+}
+
+bool CharSelSync_HandleStageCancelInput(uint16_t mergedJust) {
+    if (!s_active ||
+        !s_inStagePhase ||
+        GetGameMode() != MODE_CHARSEL) {
+        return false;
+    }
+    if (!CanApplyStageCancel(mergedJust, "netplay")) {
+        return false;
+    }
+
+    StageSelSync_Abort();
+    ResetStageSelectionRuntime();
+    ResetCharacterSelectionRuntimeForStageCancel();
+    ForceStageCancelBackToCharacterSelect(true, "netplay B");
+    FrontendInputSync_ClearPhaseBarrier();
+    RestartCharacterInputPhase("stage B cancel back to charsel");
+    return true;
+}
+
+bool CharSelSync_HandleOfflineStageCancelInput(uint16_t mergedJust) {
+    if (s_active || GetGameMode() != MODE_CHARSEL) {
+        return false;
+    }
+    if (!IsOfflineStageCancelSupportedGameType(GetGameType())) {
+        if ((mergedJust & INPUT_B) != 0) {
+            Rollback::NetplayLog_Write(
+                "STAGESEL", -1,
+                "Offline stage B cancel ignored: unsupported game type=%u sub=%u",
+                GetGameType(),
+                GetSubstate());
+        }
+        return false;
+    }
+    if (!CanApplyStageCancel(mergedJust, "offline")) {
+        return false;
+    }
+
+    ResetStageSelectionRuntime();
+    ForceStageCancelBackToCharacterSelect(false, "offline B");
     return true;
 }
 

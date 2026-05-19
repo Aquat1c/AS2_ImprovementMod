@@ -1001,6 +1001,7 @@ int __cdecl Hook_JoystickState(int playerID) {
 // Edge detection state for raw array overwrite
 static uint16_t s_dispPrevP1 = 0;
 static uint16_t s_dispPrevP2 = 0;
+static uint16_t s_stageCancelPrevMerged = 0;
 
 // Logging throttle
 static uint32_t s_dispatchCount = 0;
@@ -1229,12 +1230,39 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             Rollback::NetplayLog_Flush();
         }
 
-        // Write to output array
+        // Edge detection for raw array just-pressed
+        const uint16_t rawP1 = p1;
+        const uint16_t rawP2 = p2;
+        uint16_t justP1 = rawP1 & ~s_dispPrevP1;
+        uint16_t justP2 = rawP2 & ~s_dispPrevP2;
+        s_dispPrevP1 = rawP1;
+        s_dispPrevP2 = rawP2;
+
+        const uint8_t canceledSlots = Net::CharSelSync_HandleCharacterCancelInput(justP1, justP2);
+        if ((canceledSlots & 0x01) != 0) {
+            p1 = 0;
+            justP1 = 0;
+        } else {
+            p1 &= (uint16_t)~INPUT_B;
+            justP1 &= (uint16_t)~INPUT_B;
+        }
+        if ((canceledSlots & 0x02) != 0) {
+            p2 = 0;
+            justP2 = 0;
+        } else {
+            p2 &= (uint16_t)~INPUT_B;
+            justP2 &= (uint16_t)~INPUT_B;
+        }
+
+        // Write to output array after applying frontend-only B handling.
         outputInputs[0] = (__int16)p1;
         outputInputs[1] = (__int16)p2;
 
         Rollback::NetplayLog_Write("INPUT", -1,
-            "Step 6: Wrote outputInputs[0]=0x%04X [1]=0x%04X", (uint16_t)outputInputs[0], (uint16_t)outputInputs[1]);
+            "Step 6: Wrote outputInputs[0]=0x%04X [1]=0x%04X canceled_slots=0x%02X",
+            (uint16_t)outputInputs[0],
+            (uint16_t)outputInputs[1],
+            canceledSlots);
         Rollback::NetplayLog_Flush();
 
         // Advance Frame_Inputs (vanilla dispatcher does this)
@@ -1245,15 +1273,9 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             "Step 7: Frame_Inputs incremented to %d", *pFrameWrite);
         Rollback::NetplayLog_Flush();
 
-        // Edge detection for raw array just-pressed
-        uint16_t justP1 = p1 & ~s_dispPrevP1;
-        uint16_t justP2 = p2 & ~s_dispPrevP2;
-        s_dispPrevP1 = p1;
-        s_dispPrevP2 = p2;
-
         Rollback::NetplayLog_Write("INPUT", -1,
-            "Step 8: Edge detect: justP1=0x%04X justP2=0x%04X prevP1=0x%04X prevP2=0x%04X",
-            justP1, justP2, s_dispPrevP1, s_dispPrevP2);
+            "Step 8: Edge detect: rawP1=0x%04X rawP2=0x%04X justP1=0x%04X justP2=0x%04X prevP1=0x%04X prevP2=0x%04X",
+            rawP1, rawP2, justP1, justP2, s_dispPrevP1, s_dispPrevP2);
         Rollback::NetplayLog_Flush();
 
         // Overwrite P1/P2 raw input arrays (held + just-pressed).
@@ -2336,6 +2358,24 @@ int __cdecl Hook_InputProcess(int gameState) {
         WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_STATE, zeroState, sizeof(zeroState));
     };
 
+    auto stripLiveInputButton = [](int buttonIndex) {
+        if (buttonIndex < 0 || buttonIndex >= 10) {
+            return;
+        }
+        const uintptr_t p1Held = ADDR_P1_INPUT_BUFFER + (buttonIndex * 2);
+        const uintptr_t p2Held = ADDR_P2_INPUT_BUFFER + (buttonIndex * 2);
+        const uintptr_t p1Just = ADDR_P1_INPUT_BUFFER +
+            (JUST_PRESSED_OFFSET_WORDS * 2) + (buttonIndex * 2);
+        const uintptr_t p2Just = ADDR_P2_INPUT_BUFFER +
+            (JUST_PRESSED_OFFSET_WORDS * 2) + (buttonIndex * 2);
+        WriteMemory<uint16_t>(p1Held, 0);
+        WriteMemory<uint16_t>(p2Held, 0);
+        WriteMemory<uint16_t>(p1Just, 0);
+        WriteMemory<uint16_t>(p2Just, 0);
+        WriteMemory<uint16_t>(ADDR_P1_INPUT_STATE + (buttonIndex * 2), 0);
+        WriteMemory<uint16_t>(ADDR_P2_INPUT_STATE + (buttonIndex * 2), 0);
+    };
+
     auto writeLiveInputBuffers = [](uint16_t currentP1,
                                     uint16_t currentP2,
                                     uint16_t pressedP1,
@@ -2433,9 +2473,29 @@ int __cdecl Hook_InputProcess(int gameState) {
 
             const uint16_t merged = Net::StageSelSync_MergeConfirmed(
                 mergedFrontendFrame, p1, p2);
+            if (edgeReset) {
+                s_stageCancelPrevMerged = merged;
+            }
+            const uint16_t stageCancelPressed =
+                (uint16_t)(merged & (uint16_t)~s_stageCancelPrevMerged);
+            s_stageCancelPrevMerged = merged;
+
             const uint16_t adjPrevHeld = edgeReset ? (uint16_t)0 : prevHeldP1;
             uint16_t gatedMerged = merged;
             uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~adjPrevHeld);
+            if ((stageCancelPressed & INPUT_B) != 0 &&
+                Net::CharSelSync_HandleStageCancelInput(stageCancelPressed)) {
+                clearLiveInputBuffers();
+                s_dispPrevP1 = 0;
+                s_dispPrevP2 = 0;
+                s_stageCancelPrevMerged = 0;
+                s_dispatchFirstLog = false;
+                s_charsel_produced_this_loop = false;
+                return result;
+            }
+
+            gatedMerged &= (uint16_t)~INPUT_B;
+            pressedMerged &= (uint16_t)~INPUT_B;
             if (subState == CHARSEL_SUB_STAGESEL_GRID) {
                 const uint8_t stageCursor = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR);
                 Net::StageSelSync_ApplyConfirmAckGate(
@@ -2466,6 +2526,25 @@ int __cdecl Hook_InputProcess(int gameState) {
             }
 
             return result;
+        }
+    }
+
+    if (gameMode == MODE_CHARSEL &&
+        IsStageSelRawLockstepSubstate(subState) &&
+        !Net::CharSelSync_IsLockstepActive()) {
+        const uint16_t currentP1 = ReadHeldMaskFromAltBuffer(ADDR_P1_INPUT_BUFFER);
+        const uint16_t currentP2 = ReadHeldMaskFromAltBuffer(ADDR_P2_INPUT_BUFFER);
+        const uint16_t pressedMerged = (uint16_t)((currentP1 & (uint16_t)~prevHeldP1) |
+                                                  (currentP2 & (uint16_t)~prevHeldP2));
+        const bool bHeld = ((currentP1 | currentP2) & INPUT_B) != 0;
+        if ((pressedMerged & INPUT_B) != 0 &&
+            Net::CharSelSync_HandleOfflineStageCancelInput(pressedMerged)) {
+            clearLiveInputBuffers();
+            s_stageCancelPrevMerged = 0;
+            return result;
+        }
+        if (bHeld) {
+            stripLiveInputButton(5);
         }
     }
 

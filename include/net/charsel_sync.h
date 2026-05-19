@@ -98,6 +98,18 @@ bool CharSelSync_HasInputsForCurrentFrame();
 /// Hook_InputProcess via StageSelSync_MergeConfirmed.
 bool CharSelSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2);
 
+/// Apply B-button cancellation from a confirmed character-select lockstep
+/// frame. Returns a bitmask of game slots that actually canceled (bit0=P1,
+/// bit1=P2). B itself should be stripped from injected input by the caller.
+uint8_t CharSelSync_HandleCharacterCancelInput(uint16_t p1_just, uint16_t p2_just);
+
+/// Apply B-button cancellation from a confirmed stage-select lockstep frame.
+/// Returns true when stage select was canceled back to character select.
+bool CharSelSync_HandleStageCancelInput(uint16_t merged_just);
+
+/// Apply B-button stage cancel for non-netplay character select modes.
+bool CharSelSync_HandleOfflineStageCancelInput(uint16_t merged_just);
+
 /// Is the lockstep system actively running?
 bool CharSelSync_IsLockstepActive();
 
