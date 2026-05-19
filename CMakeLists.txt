@@ -267,6 +267,7 @@ set(PATCH_HEADERS
     include/patches/filesystem_patch.h
     include/patches/palette_asset_hook.h
     include/patches/charsel_palette_select.h
+    include/patches/charsel_select_actions.h
 )
 
 # Dead NETPLAY_HEADERS removed — old src/netplay/ code was moved to old_files/
@@ -366,6 +367,7 @@ set(PATCH_SOURCES
     src/patches/filesystem_patch.cpp
     src/patches/palette_asset_hook.cpp
     src/patches/charsel_palette_select.cpp
+    src/patches/charsel_select_actions.cpp
     src/patches/input_override.cpp
     src/patches/input_sync_hooks.cpp
     src/patches/tick_hooks.cpp

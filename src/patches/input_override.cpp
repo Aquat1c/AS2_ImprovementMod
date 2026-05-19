@@ -18,6 +18,7 @@
 #include "net/winscreen_sync.h"
 #include "net/player_side_mapping.h"
 #include "patches/charsel_palette_select.h"
+#include "patches/charsel_select_actions.h"
 #include "core/game_state.h"
 #include "replay/replay_runtime.h"
 #include "rollback/rollback_session.h"
@@ -1239,19 +1240,36 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         s_dispPrevP2 = rawP2;
 
         const uint8_t canceledSlots = Net::CharSelSync_HandleCharacterCancelInput(justP1, justP2);
+        const uint8_t randomSlots = Net::CharSelSelectActions_HandleNetplayCharacterRandomInput(
+            (canceledSlots & 0x01) ? (uint16_t)0 : justP1,
+            (canceledSlots & 0x02) ? (uint16_t)0 : justP2,
+            rawP1,
+            rawP2);
+        const bool p1RandomActive = Net::CharSelPaletteSelect_IsRandomCharacterActive(0);
+        const bool p2RandomActive = Net::CharSelPaletteSelect_IsRandomCharacterActive(1);
         if ((canceledSlots & 0x01) != 0) {
+            p1 = 0;
+            justP1 = 0;
+        } else if ((randomSlots & 0x01) != 0 || p1RandomActive) {
             p1 = 0;
             justP1 = 0;
         } else {
             p1 &= (uint16_t)~INPUT_B;
             justP1 &= (uint16_t)~INPUT_B;
+            p1 &= (uint16_t)~INPUT_D;
+            justP1 &= (uint16_t)~INPUT_D;
         }
         if ((canceledSlots & 0x02) != 0) {
+            p2 = 0;
+            justP2 = 0;
+        } else if ((randomSlots & 0x02) != 0 || p2RandomActive) {
             p2 = 0;
             justP2 = 0;
         } else {
             p2 &= (uint16_t)~INPUT_B;
             justP2 &= (uint16_t)~INPUT_B;
+            p2 &= (uint16_t)~INPUT_D;
+            justP2 &= (uint16_t)~INPUT_D;
         }
 
         // Write to output array after applying frontend-only B handling.
@@ -1259,10 +1277,13 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         outputInputs[1] = (__int16)p2;
 
         Rollback::NetplayLog_Write("INPUT", -1,
-            "Step 6: Wrote outputInputs[0]=0x%04X [1]=0x%04X canceled_slots=0x%02X",
+            "Step 6: Wrote outputInputs[0]=0x%04X [1]=0x%04X canceled_slots=0x%02X random_slots=0x%02X random_active=%u/%u",
             (uint16_t)outputInputs[0],
             (uint16_t)outputInputs[1],
-            canceledSlots);
+            canceledSlots,
+            randomSlots,
+            p1RandomActive ? 1 : 0,
+            p2RandomActive ? 1 : 0);
         Rollback::NetplayLog_Flush();
 
         // Advance Frame_Inputs (vanilla dispatcher does this)
@@ -2322,6 +2343,24 @@ static uint16_t ReadHeldMaskFromAltBuffer(uintptr_t altBufferAddr) {
     return heldMask;
 }
 
+static uint16_t ReadJustPressedMaskFromAltBuffer(uintptr_t altBufferAddr) {
+    uint16_t pressedMask = 0;
+    __try {
+        for (int i = 0; i < 10; i++) {
+            const uintptr_t justAddr = altBufferAddr +
+                (JUST_PRESSED_OFFSET_WORDS * 2) +
+                (i * 2);
+            const uint16_t pressedVal = ReadMemory<uint16_t>(justAddr);
+            if (pressedVal) {
+                pressedMask |= g_buttonMasks[i];
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return pressedMask;
+}
+
 int __cdecl Hook_InputProcess(int gameState) {
     const bool consumeForCustomMenu =
         InputSystem_IsBindingActive() ||
@@ -2358,24 +2397,6 @@ int __cdecl Hook_InputProcess(int gameState) {
         WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_STATE, zeroState, sizeof(zeroState));
     };
 
-    auto stripLiveInputButton = [](int buttonIndex) {
-        if (buttonIndex < 0 || buttonIndex >= 10) {
-            return;
-        }
-        const uintptr_t p1Held = ADDR_P1_INPUT_BUFFER + (buttonIndex * 2);
-        const uintptr_t p2Held = ADDR_P2_INPUT_BUFFER + (buttonIndex * 2);
-        const uintptr_t p1Just = ADDR_P1_INPUT_BUFFER +
-            (JUST_PRESSED_OFFSET_WORDS * 2) + (buttonIndex * 2);
-        const uintptr_t p2Just = ADDR_P2_INPUT_BUFFER +
-            (JUST_PRESSED_OFFSET_WORDS * 2) + (buttonIndex * 2);
-        WriteMemory<uint16_t>(p1Held, 0);
-        WriteMemory<uint16_t>(p2Held, 0);
-        WriteMemory<uint16_t>(p1Just, 0);
-        WriteMemory<uint16_t>(p2Just, 0);
-        WriteMemory<uint16_t>(ADDR_P1_INPUT_STATE + (buttonIndex * 2), 0);
-        WriteMemory<uint16_t>(ADDR_P2_INPUT_STATE + (buttonIndex * 2), 0);
-    };
-
     auto writeLiveInputBuffers = [](uint16_t currentP1,
                                     uint16_t currentP2,
                                     uint16_t pressedP1,
@@ -2396,6 +2417,37 @@ int __cdecl Hook_InputProcess(int gameState) {
                 WriteMemory<uint16_t>(heldAddr, (currentP2 & mask) ? 1 : 0);
                 WriteMemory<uint16_t>(justPressedAddr, (pressedP2 & mask) ? 1 : 0);
             }
+        }
+    };
+
+    auto readSdlFrontendInputs = [](uint16_t* outP1, uint16_t* outP2) {
+        const uint16_t allowedMask = (INPUT_UP | INPUT_DOWN | INPUT_LEFT | INPUT_RIGHT |
+                                      INPUT_A | INPUT_B | INPUT_C | INPUT_D |
+                                      INPUT_START | INPUT_SELECT);
+
+        const InputState_t* p1State = InputSystem_GetState(0);
+        const InputState_t* p2State = InputSystem_GetState(1);
+        uint16_t currentP1 = (uint16_t)((p1State ? p1State->current : 0) & allowedMask);
+        uint16_t currentP2 = (uint16_t)((p2State ? p2State->current : 0) & allowedMask);
+
+        // During netplay, P2 hardware is remote-owned. This mirrors the
+        // generic SDL injection path below so offline stage handling does not
+        // accidentally reintroduce a second local controller.
+        if (Net::Session_IsConnected()) {
+            currentP2 = 0;
+        }
+
+        if (InputSystem_GetControlSwap()) {
+            const uint16_t tmp = currentP1;
+            currentP1 = currentP2;
+            currentP2 = tmp;
+        }
+
+        if (outP1) {
+            *outP1 = currentP1;
+        }
+        if (outP2) {
+            *outP2 = currentP2;
         }
     };
 
@@ -2432,6 +2484,11 @@ int __cdecl Hook_InputProcess(int gameState) {
         !Net::CharSelPaletteSelect_IsCatalogReady()) {
         clearLiveInputBuffers();
         return result;
+    }
+
+    if (!(gameMode == MODE_CHARSEL && IsStageSelRawLockstepSubstate(subState)) &&
+        Net::CharSelSelectActions_IsStageRandomScrollActive()) {
+        Net::CharSelSelectActions_ResetStageRandomScroll();
     }
 
     if (Net::CharSelSync_IsLockstepActive()) {
@@ -2484,7 +2541,7 @@ int __cdecl Hook_InputProcess(int gameState) {
             uint16_t gatedMerged = merged;
             uint16_t pressedMerged = (uint16_t)(merged & (uint16_t)~adjPrevHeld);
             if ((stageCancelPressed & INPUT_B) != 0 &&
-                Net::CharSelSync_HandleStageCancelInput(stageCancelPressed)) {
+                Net::CharSelSelectActions_HandleNetplayStageCancelInput(stageCancelPressed)) {
                 clearLiveInputBuffers();
                 s_dispPrevP1 = 0;
                 s_dispPrevP2 = 0;
@@ -2494,8 +2551,21 @@ int __cdecl Hook_InputProcess(int gameState) {
                 return result;
             }
 
+            const bool stageRandomStarted =
+                ((stageCancelPressed & INPUT_D) != 0) &&
+                Net::CharSelSelectActions_HandleNetplayStageRandomInput(stageCancelPressed, merged);
+            const bool stageRandomAdvanced = Net::CharSelSelectActions_AdvanceStageRandomScroll();
+
             gatedMerged &= (uint16_t)~INPUT_B;
             pressedMerged &= (uint16_t)~INPUT_B;
+            gatedMerged &= (uint16_t)~INPUT_D;
+            pressedMerged &= (uint16_t)~INPUT_D;
+            if (stageRandomStarted ||
+                stageRandomAdvanced ||
+                Net::CharSelSelectActions_IsStageRandomScrollActive()) {
+                gatedMerged = 0;
+                pressedMerged = 0;
+            }
             if (subState == CHARSEL_SUB_STAGESEL_GRID) {
                 const uint8_t stageCursor = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR);
                 Net::StageSelSync_ApplyConfirmAckGate(
@@ -2532,19 +2602,66 @@ int __cdecl Hook_InputProcess(int gameState) {
     if (gameMode == MODE_CHARSEL &&
         IsStageSelRawLockstepSubstate(subState) &&
         !Net::CharSelSync_IsLockstepActive()) {
-        const uint16_t currentP1 = ReadHeldMaskFromAltBuffer(ADDR_P1_INPUT_BUFFER);
-        const uint16_t currentP2 = ReadHeldMaskFromAltBuffer(ADDR_P2_INPUT_BUFFER);
-        const uint16_t pressedMerged = (uint16_t)((currentP1 & (uint16_t)~prevHeldP1) |
-                                                  (currentP2 & (uint16_t)~prevHeldP2));
-        const bool bHeld = ((currentP1 | currentP2) & INPUT_B) != 0;
+        uint16_t currentP1 = 0;
+        uint16_t currentP2 = 0;
+        uint16_t justP1 = 0;
+        uint16_t justP2 = 0;
+        const bool usingSdlInput = ModConfig_UseSDLInput();
+        if (usingSdlInput) {
+            readSdlFrontendInputs(&currentP1, &currentP2);
+            justP1 = (uint16_t)(currentP1 & (uint16_t)~prevHeldP1);
+            justP2 = (uint16_t)(currentP2 & (uint16_t)~prevHeldP2);
+        } else {
+            currentP1 = ReadHeldMaskFromAltBuffer(ADDR_P1_INPUT_BUFFER);
+            currentP2 = ReadHeldMaskFromAltBuffer(ADDR_P2_INPUT_BUFFER);
+            justP1 = ReadJustPressedMaskFromAltBuffer(ADDR_P1_INPUT_BUFFER);
+            justP2 = ReadJustPressedMaskFromAltBuffer(ADDR_P2_INPUT_BUFFER);
+        }
+
+        const uint16_t pressedMerged = (uint16_t)(justP1 | justP2);
+        const uint16_t heldMerged = (uint16_t)(currentP1 | currentP2);
+
+        if ((pressedMerged & (INPUT_B | INPUT_D)) != 0 ||
+            Net::CharSelSelectActions_IsStageRandomScrollActive()) {
+            Rollback::NetplayLog_Write(
+                "STAGESEL", -1,
+                "Offline stage frontend input: source=%s sub=%u held=0x%04X just=0x%04X p1=0x%04X p2=0x%04X p1_just=0x%04X p2_just=0x%04X random_active=%u",
+                usingSdlInput ? "sdl" : "raw",
+                subState,
+                heldMerged,
+                pressedMerged,
+                currentP1,
+                currentP2,
+                justP1,
+                justP2,
+                Net::CharSelSelectActions_IsStageRandomScrollActive() ? 1 : 0);
+        }
+
         if ((pressedMerged & INPUT_B) != 0 &&
-            Net::CharSelSync_HandleOfflineStageCancelInput(pressedMerged)) {
+            Net::CharSelSelectActions_HandleOfflineStageCancelInput(pressedMerged)) {
             clearLiveInputBuffers();
             s_stageCancelPrevMerged = 0;
             return result;
         }
-        if (bHeld) {
-            stripLiveInputButton(5);
+        const bool stageRandomStarted =
+            ((pressedMerged & INPUT_D) != 0) &&
+            Net::CharSelSelectActions_HandleOfflineStageRandomInput(pressedMerged,
+                (uint16_t)(currentP1 | currentP2));
+        const bool stageRandomAdvanced = Net::CharSelSelectActions_AdvanceStageRandomScroll();
+        if (stageRandomStarted ||
+            stageRandomAdvanced ||
+            Net::CharSelSelectActions_IsStageRandomScrollActive()) {
+            clearLiveInputBuffers();
+            return result;
+        }
+        if ((heldMerged & (INPUT_B | INPUT_D)) != 0) {
+            const uint16_t stageFrontendMask = (INPUT_B | INPUT_D);
+            writeLiveInputBuffers(
+                (uint16_t)(currentP1 & (uint16_t)~stageFrontendMask),
+                (uint16_t)(currentP2 & (uint16_t)~stageFrontendMask),
+                (uint16_t)(justP1 & (uint16_t)~stageFrontendMask),
+                (uint16_t)(justP2 & (uint16_t)~stageFrontendMask));
+            return result;
         }
     }
 
@@ -2704,26 +2821,9 @@ int __cdecl Hook_InputProcess(int gameState) {
     }
 
     if (ModConfig_UseSDLInput()) {
-        const uint16_t allowedMask = (INPUT_UP | INPUT_DOWN | INPUT_LEFT | INPUT_RIGHT |
-                                      INPUT_A | INPUT_B | INPUT_C | INPUT_D |
-                                      INPUT_START | INPUT_SELECT);
-
-        const InputState_t* p1State = InputSystem_GetState(0);
-        const InputState_t* p2State = InputSystem_GetState(1);
-        uint16_t currentP1 = (uint16_t)((p1State ? p1State->current : 0) & allowedMask);
-        uint16_t currentP2 = (uint16_t)((p2State ? p2State->current : 0) & allowedMask);
-
-        // During netplay: suppress local P2 hardware input.
-        // P2 is controlled by the remote peer via charsel_sync or rollback input injection.
-        if (Net::Session_IsConnected()) {
-            currentP2 = 0;
-        }
-
-        if (InputSystem_GetControlSwap()) {
-            const uint16_t tmp = currentP1;
-            currentP1 = currentP2;
-            currentP2 = tmp;
-        }
+        uint16_t currentP1 = 0;
+        uint16_t currentP2 = 0;
+        readSdlFrontendInputs(&currentP1, &currentP2);
 
         uint16_t pressedP1 = (uint16_t)(currentP1 & (uint16_t)~prevHeldP1);
         uint16_t pressedP2 = (uint16_t)(currentP2 & (uint16_t)~prevHeldP2);

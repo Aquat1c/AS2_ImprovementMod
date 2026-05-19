@@ -32,7 +32,10 @@ constexpr uintptr_t ADDR_CHARSEL_CANCEL_SE = 0x816258;
 constexpr uintptr_t ADDR_CHARSEL_UNLOCK_TABLE = 0x815FE8;
 constexpr uint8_t kVisibleVanillaPaletteCount = 8;
 constexpr size_t kOptionCapacity = kVisibleVanillaPaletteCount * 2;
+constexpr uint8_t kRandomCharacterMaxGridIndex = 17;
+constexpr uint8_t kRandomCharacterRange = kRandomCharacterMaxGridIndex + 1;
 constexpr int kRawHeldBIndex = 5;
+constexpr int kRawHeldDIndex = 7;
 constexpr int kRawJustPressedOffset = 28;
 constexpr int kRawJustAIndex = kRawJustPressedOffset + 4;
 constexpr int kRawJustBIndex = kRawJustPressedOffset + 5;
@@ -87,6 +90,12 @@ struct ExternalCustomHint {
     uint8_t base_palette;
 };
 
+struct RandomCharacterScrollState {
+    bool    active;
+    uint8_t target_grid_index;
+    uint8_t steps_remaining;
+};
+
 static CharSelSelectPlayer_t s_originalSelectPlayer = nullptr;
 static CharSelRenderHelper_t s_originalRenderHelper = nullptr;
 static RenderCreateColor_t s_createColor = reinterpret_cast<RenderCreateColor_t>(ADDR_RENDER_CREATE_COLOR);
@@ -104,8 +113,10 @@ static uint16_t s_pendingCatalogMasks[2][256] = {};
 static FrontendSlotState s_slotState[2] = {};
 static MatchSelection s_matchSelection[2] = {};
 static ExternalCustomHint s_externalCustomHint[2] = {};
+static RandomCharacterScrollState s_randomScroll[2] = {};
 
 static void RefreshSlotAfterCatalogChange(uint8_t gameSlot);
+static void PlayCharSelSound(uintptr_t handleAddress);
 
 static uint8_t ReadU8(uintptr_t address, uint8_t fallback = 0) {
     __try {
@@ -218,6 +229,12 @@ static void ResetFrontendSlotState(FrontendSlotState* state) {
     state->phase = SlotPhase::None;
 }
 
+static void ResetRandomScroll(uint8_t gameSlot) {
+    if (gameSlot < 2) {
+        memset(&s_randomScroll[gameSlot], 0, sizeof(s_randomScroll[gameSlot]));
+    }
+}
+
 static void DeactivateFrontend() {
     if (s_frontendNetplay && GetGameMode() == MODE_CHARSEL) {
         // Netplay tears down the palette frontend before the game fully leaves
@@ -232,6 +249,8 @@ static void DeactivateFrontend() {
     memset(s_pendingCatalogMasks, 0, sizeof(s_pendingCatalogMasks));
     ResetFrontendSlotState(&s_slotState[0]);
     ResetFrontendSlotState(&s_slotState[1]);
+    ResetRandomScroll(0);
+    ResetRandomScroll(1);
     memset(s_externalCustomHint, 0, sizeof(s_externalCustomHint));
 }
 
@@ -276,6 +295,8 @@ static void BeginFrontend(bool netplay, uint8_t localGameSlot) {
     memset(s_matchSelection, 0, sizeof(s_matchSelection));
     ResetFrontendSlotState(&s_slotState[0]);
     ResetFrontendSlotState(&s_slotState[1]);
+    ResetRandomScroll(0);
+    ResetRandomScroll(1);
     memset(s_catalogReceived, 0, sizeof(s_catalogReceived));
     memset(s_catalogMasks, 0, sizeof(s_catalogMasks));
     ResetNativeSelectionState(0);
@@ -351,6 +372,8 @@ static void EnsureFrontendState() {
             s_frontendActive = false;
             ResetFrontendSlotState(&s_slotState[0]);
             ResetFrontendSlotState(&s_slotState[1]);
+            ResetRandomScroll(0);
+            ResetRandomScroll(1);
         }
         return;
     }
@@ -579,10 +602,140 @@ static void CancelSelection(int localSelection, uint8_t* control, uint8_t gameSl
     control[4] = 0;
     control[5] = 0;
     ResetFrontendSlotState(&s_slotState[gameSlot]);
+    ResetRandomScroll(gameSlot);
 }
 
 static bool RawBJustPressed(const uint16_t* rawInput) {
     return rawInput && rawInput[kRawJustBIndex] != 0;
+}
+
+static bool RawDJustPressed(const uint16_t* rawInput) {
+    return rawInput && rawInput[kRawJustDIndex] != 0;
+}
+
+static bool CanRandomCharacter(uint8_t gameSlot) {
+    if (gameSlot > 1 || !s_frontendActive) {
+        return false;
+    }
+    if (s_slotState[gameSlot].phase != SlotPhase::None) {
+        return false;
+    }
+
+    const uintptr_t enableAddress = gameSlot == 0 ? ADDR_CHARSEL_P1_ENABLE : ADDR_CHARSEL_P2_ENABLE;
+    const uint8_t enableValue = ReadU8(enableAddress, 0xFF);
+    if ((int8_t)enableValue == -1) {
+        return false;
+    }
+    return ReadU8(enableAddress + 2, 0) == 0;
+}
+
+static uint32_t MixRandomTargetSeed(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15;
+    value *= 0x846CA68Bu;
+    value ^= value >> 16;
+    return value;
+}
+
+static uint8_t ChooseOfflineRandomCharacterTarget(uint8_t gameSlot, uint8_t currentCursor) {
+    const uint32_t frame = ReadU32(ADDR_FRAME_COUNTER, 0);
+    uint32_t seed = frame ^ (GetTickCount() * 0x45D9F3Bu);
+    seed ^= ((uint32_t)gameSlot + 1u) * 0x9E3779B9u;
+    seed ^= ((uint32_t)currentCursor + 17u) * 0x85EBCA6Bu;
+    return (uint8_t)(MixRandomTargetSeed(seed) % kRandomCharacterRange);
+}
+
+static bool BeginRandomCharacterScroll(uint8_t gameSlot,
+                                       uint8_t targetGridIndex,
+                                       const char* context) {
+    if (!CanRandomCharacter(gameSlot)) {
+        Rollback::NetplayLog_Write("CHARPAL", -1,
+            "Character random ignored: slot=P%d reason=not on character grid context=%s",
+            gameSlot + 1,
+            context ? context : "?");
+        return false;
+    }
+
+    if (targetGridIndex > kRandomCharacterMaxGridIndex) {
+        targetGridIndex = (uint8_t)(targetGridIndex % kRandomCharacterRange);
+    }
+
+    const uintptr_t cursorAddress = gameSlot == 0 ? ADDR_CHARSEL_P1_CURSOR : ADDR_CHARSEL_P2_CURSOR;
+    uint8_t currentCursor = ReadU8(cursorAddress, 0);
+    if (currentCursor > kRandomCharacterMaxGridIndex) {
+        currentCursor = 0;
+        WriteU8(cursorAddress, currentCursor);
+    }
+
+    uint8_t steps = (uint8_t)((targetGridIndex + kRandomCharacterRange - currentCursor) %
+        kRandomCharacterRange);
+    if (steps == 0) {
+        steps = kRandomCharacterRange;
+    }
+
+    RandomCharacterScrollState& random = s_randomScroll[gameSlot];
+    random.active = true;
+    random.target_grid_index = targetGridIndex;
+    random.steps_remaining = steps;
+
+    Rollback::NetplayLog_Write("CHARPAL", -1,
+        "Character random start: slot=P%d current=%u target=%u steps=%u context=%s",
+        gameSlot + 1,
+        currentCursor,
+        targetGridIndex,
+        steps,
+        context ? context : "?");
+    PlayCharSelSound(ADDR_CHARSEL_MOVE_SE);
+    return true;
+}
+
+static bool AdvanceRandomCharacterScroll(uint8_t gameSlot, uint8_t* control) {
+    if (gameSlot > 1 || !control) {
+        return false;
+    }
+
+    RandomCharacterScrollState& random = s_randomScroll[gameSlot];
+    if (!random.active) {
+        return false;
+    }
+
+    if (!CanRandomCharacter(gameSlot)) {
+        Rollback::NetplayLog_Write("CHARPAL", -1,
+            "Character random aborted: slot=P%d reason=left character grid target=%u remaining=%u",
+            gameSlot + 1,
+            random.target_grid_index,
+            random.steps_remaining);
+        ResetRandomScroll(gameSlot);
+        return false;
+    }
+
+    uint8_t currentCursor = control[1];
+    if (currentCursor > kRandomCharacterMaxGridIndex) {
+        currentCursor = 0;
+    }
+    const uint8_t nextCursor = (uint8_t)((currentCursor + 1) % kRandomCharacterRange);
+    control[1] = nextCursor;
+    if (random.steps_remaining > 0) {
+        random.steps_remaining--;
+    }
+
+    Rollback::NetplayLog_Verbose("CHARPAL", -1,
+        "Character random step: slot=P%d cursor=%u target=%u remaining=%u",
+        gameSlot + 1,
+        nextCursor,
+        random.target_grid_index,
+        random.steps_remaining);
+
+    if (random.steps_remaining == 0) {
+        Rollback::NetplayLog_Write("CHARPAL", -1,
+            "Character random complete: slot=P%d target=%u",
+            gameSlot + 1,
+            random.target_grid_index);
+        ResetRandomScroll(gameSlot);
+    }
+
+    return true;
 }
 
 static bool CancelSlotSelection(uint8_t gameSlot, const char* reason) {
@@ -607,6 +760,7 @@ static bool CancelSlotSelection(uint8_t gameSlot, const char* reason) {
     memset(&s_externalCustomHint[gameSlot], 0, sizeof(s_externalCustomHint[gameSlot]));
     ResetNativeSelectionState(gameSlot);
     ResetFrontendSlotState(&slotState);
+    ResetRandomScroll(gameSlot);
     MaybeRequestPreviewReload(gameSlot,
         hadPreviousOption,
         hadPreviousOption ? &previousOption : nullptr,
@@ -628,25 +782,31 @@ static void PlayCharSelSound(uintptr_t handleAddress) {
 }
 
 static bool AnyConfirmAttackJustPressed(const uint16_t* rawInput) {
-    return rawInput[kRawJustAIndex] || rawInput[kRawJustCIndex] || rawInput[kRawJustDIndex];
+    return rawInput[kRawJustAIndex] || rawInput[kRawJustCIndex];
 }
 
-static char CallOriginalWithBStripped(CharSelSelectPlayer_t original,
-                                      uint16_t* rawInput,
-                                      int localSelection,
-                                      int otherSelection,
-                                      uint8_t* control) {
+static char CallOriginalWithFrontendButtonsStripped(CharSelSelectPlayer_t original,
+                                                    uint16_t* rawInput,
+                                                    int localSelection,
+                                                    int otherSelection,
+                                                    uint8_t* control) {
     if (!original || !rawInput) {
         return 0;
     }
 
     const uint16_t heldB = rawInput[kRawHeldBIndex];
     const uint16_t justB = rawInput[kRawJustBIndex];
+    const uint16_t heldD = rawInput[kRawHeldDIndex];
+    const uint16_t justD = rawInput[kRawJustDIndex];
     rawInput[kRawHeldBIndex] = 0;
     rawInput[kRawJustBIndex] = 0;
+    rawInput[kRawHeldDIndex] = 0;
+    rawInput[kRawJustDIndex] = 0;
     const char result = original(rawInput, localSelection, otherSelection, control);
     rawInput[kRawHeldBIndex] = heldB;
     rawInput[kRawJustBIndex] = justB;
+    rawInput[kRawHeldDIndex] = heldD;
+    rawInput[kRawJustDIndex] = justD;
     return result;
 }
 
@@ -725,16 +885,22 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
 
     if ((int8_t)control[0] == -1) {
         ResetFrontendSlotState(&s_slotState[gameSlot]);
+        ResetRandomScroll((uint8_t)gameSlot);
         return s_originalSelectPlayer(rawInput, localSelection, otherSelection, control);
     }
 
     FrontendSlotState& slotState = s_slotState[gameSlot];
+
+    if (AdvanceRandomCharacterScroll((uint8_t)gameSlot, control)) {
+        return 0;
+    }
 
     if (slotState.phase == SlotPhase::LockedFinal && control[2] == 0) {
         PaletteOption previousOption{};
         const bool hadPreviousOption = TryGetDisplayedOption((uint8_t)gameSlot, slotState, &previousOption);
         memset(&s_matchSelection[gameSlot], 0, sizeof(s_matchSelection[gameSlot]));
         ResetFrontendSlotState(&slotState);
+        ResetRandomScroll((uint8_t)gameSlot);
         MaybeRequestPreviewReload((uint8_t)gameSlot,
             hadPreviousOption,
             &previousOption,
@@ -747,6 +913,12 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
             if (CancelSlotSelection((uint8_t)gameSlot, "locked-final B")) {
                 PlayCharSelSound(ADDR_CHARSEL_CANCEL_SE);
             }
+            return 0;
+        }
+        if (RawDJustPressed(rawInput)) {
+            Rollback::NetplayLog_Write("CHARPAL", -1,
+                "D ignored during locked character selection: slot=P%d",
+                gameSlot + 1);
             return 0;
         }
 
@@ -791,6 +963,12 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
         if (RawBJustPressed(rawInput)) {
             CancelSlotSelection((uint8_t)gameSlot, "palette-select B");
             PlayCharSelSound(ADDR_CHARSEL_CANCEL_SE);
+            return 0;
+        }
+        if (RawDJustPressed(rawInput)) {
+            Rollback::NetplayLog_Write("CHARPAL", -1,
+                "D ignored during palette selection: slot=P%d",
+                gameSlot + 1);
             return 0;
         }
 
@@ -848,20 +1026,35 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
         Rollback::NetplayLog_Write("CHARPAL", -1,
             "B ignored on character grid: slot=P%d reason=no character selected",
             gameSlot + 1);
-        return CallOriginalWithBStripped(s_originalSelectPlayer,
+        return CallOriginalWithFrontendButtonsStripped(s_originalSelectPlayer,
             rawInput,
             localSelection,
             otherSelection,
             control);
     }
 
+    if (RawDJustPressed(rawInput)) {
+        const uint8_t currentCursor = control[1] <= kRandomCharacterMaxGridIndex ? control[1] : 0;
+        const uint8_t target = ChooseOfflineRandomCharacterTarget((uint8_t)gameSlot, currentCursor);
+        BeginRandomCharacterScroll((uint8_t)gameSlot, target, "offline D");
+        return 0;
+    }
+
     if (!AnyConfirmAttackJustPressed(rawInput)) {
-        return s_originalSelectPlayer(rawInput, localSelection, otherSelection, control);
+        return CallOriginalWithFrontendButtonsStripped(s_originalSelectPlayer,
+            rawInput,
+            localSelection,
+            otherSelection,
+            control);
     }
 
     const uint8_t characterId = LookupCharId(control[1]);
     if (!IsSelectableCharacter(characterId)) {
-        return s_originalSelectPlayer(rawInput, localSelection, otherSelection, control);
+        return CallOriginalWithFrontendButtonsStripped(s_originalSelectPlayer,
+            rawInput,
+            localSelection,
+            otherSelection,
+            control);
     }
 
     PaletteOption options[kOptionCapacity] = {};
@@ -870,7 +1063,11 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
         options,
         (int)kOptionCapacity);
     if (optionCount <= 0) {
-        return s_originalSelectPlayer(rawInput, localSelection, otherSelection, control);
+        return CallOriginalWithFrontendButtonsStripped(s_originalSelectPlayer,
+            rawInput,
+            localSelection,
+            otherSelection,
+            control);
     }
 
     slotState.phase = SlotPhase::Selecting;
@@ -1067,6 +1264,16 @@ bool CharSelPaletteSelect_CancelSelection(uint8_t gameSlot) {
     return CancelSlotSelection(gameSlot, "sync B");
 }
 
+bool CharSelPaletteSelect_RequestRandomCharacter(uint8_t gameSlot,
+                                                 uint8_t targetGridIndex,
+                                                 const char* context) {
+    return BeginRandomCharacterScroll(gameSlot, targetGridIndex, context);
+}
+
+bool CharSelPaletteSelect_IsRandomCharacterActive(uint8_t gameSlot) {
+    return gameSlot < 2 && s_randomScroll[gameSlot].active;
+}
+
 bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t gameSlot,
                                                uint8_t characterId,
                                                uint8_t basePalette,
@@ -1110,6 +1317,7 @@ bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t gameSlot,
     uint8_t* const control = reinterpret_cast<uint8_t*>(gameSlot == 0 ? ADDR_CHARSEL_P1_ENABLE : ADDR_CHARSEL_P2_ENABLE);
     const PaletteOption& option = options[optionIndex];
 
+    ResetRandomScroll(gameSlot);
     control[0] = 0;
     control[1] = gridIndex;
 

@@ -33,6 +33,10 @@ bool CharSelPaletteSelect_IsCatalogReady();
 bool CharSelPaletteSelect_IsSelectionLocked(uint8_t game_slot);
 bool CharSelPaletteSelect_CanCancelSelection(uint8_t game_slot);
 bool CharSelPaletteSelect_CancelSelection(uint8_t game_slot);
+bool CharSelPaletteSelect_RequestRandomCharacter(uint8_t game_slot,
+                                                uint8_t target_grid_index,
+                                                const char* context);
+bool CharSelPaletteSelect_IsRandomCharacterActive(uint8_t game_slot);
 bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t game_slot,
                                               uint8_t character_id,
                                               uint8_t base_palette,
