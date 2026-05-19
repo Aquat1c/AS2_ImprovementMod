@@ -3,6 +3,7 @@
 
 #include "net/netplay_palette_runtime.h"
 #include "net/enet_transport.h"
+#include "net/game_settings_sync.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/set_tracker.h"
@@ -749,12 +750,14 @@ void SpectatorRuntime_OnMatchBegin(const LockedMatchConfig* config) {
         s_p1Wins,
         s_p2Wins);
     SPECTATE_LOG(-1,
-        "Spectator match begin: id=0x%08X ordinal=%u role=%s enabled=%d host_side=%u score=%u-%u draws=%u completed=%u",
+        "Spectator match begin: id=0x%08X ordinal=%u role=%s enabled=%d host_side=%u rounds_raw=%u rounds_to_win=%d score=%u-%u draws=%u completed=%u",
         s_matchId,
         s_matchOrdinal,
         SessionRoleName(Session_GetRole()),
         s_enabled ? 1 : 0,
         config->host_side,
+        config->round_count,
+        GameSettingsSync_RoundsToWin(config->round_count),
         s_p1Wins,
         s_p2Wins,
         s_draws,

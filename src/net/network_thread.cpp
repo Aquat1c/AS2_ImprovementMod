@@ -38,6 +38,8 @@ struct WorkerCommand {
     char              target_host[96];
     uint16_t          target_port;
     bool              send_hole_punch;
+    char              punch_relay_host[96];
+    uint16_t          punch_relay_port;
     uint8_t           channel;
     PacketType        packet_type;
     bool              reliable;
@@ -162,6 +164,7 @@ static void UpdateStats(bool hostActive, ENetPeer* peer) {
 static void WorkerThreadMain() {
     ENetPeer* activePeer = nullptr;
     uint32_t activeSessionToken = 0;
+    bool transportConnected = false;
 
     {
         std::lock_guard<std::mutex> lock(s_statsMutex);
@@ -186,6 +189,7 @@ static void WorkerThreadMain() {
                 case WorkerCommandType::StartHost: {
                     activeSessionToken = cmd.session_token;
                     activePeer = nullptr;
+                    transportConnected = false;
                     Transport_DestroyHost();
                     {
                         std::lock_guard<std::mutex> statsLock(s_statsMutex);
@@ -195,10 +199,24 @@ static void WorkerThreadMain() {
                     if (!Transport_CreateHost(cmd.listen_port)) {
                         PushWorkerErrorEvent(cmd.session_token, "Network thread failed to create host");
                     } else {
+                        uint16_t boundPort = cmd.listen_port;
+                        Transport_GetBoundPort(&boundPort);
+                        if (cmd.send_hole_punch) {
+                            Transport_AutopunchStart(
+                                cmd.punch_relay_host,
+                                cmd.punch_relay_port,
+                                boundPort,
+                                nullptr,
+                                0);
+                        }
                         Rollback::NetplayLog_Write("NTHREAD", -1,
-                            "Worker host created: token=%u listen_port=%u",
+                            "Worker host created: token=%u listen_port=%u bound_port=%u autopunch=%d relay=%s:%u",
                             cmd.session_token,
-                            cmd.listen_port);
+                            cmd.listen_port,
+                            (unsigned)boundPort,
+                            cmd.send_hole_punch ? 1 : 0,
+                            cmd.punch_relay_host,
+                            (unsigned)cmd.punch_relay_port);
                     }
                     break;
                 }
@@ -206,6 +224,7 @@ static void WorkerThreadMain() {
                 case WorkerCommandType::StartJoin: {
                     activeSessionToken = cmd.session_token;
                     activePeer = nullptr;
+                    transportConnected = false;
                     Transport_DestroyHost();
                     {
                         std::lock_guard<std::mutex> statsLock(s_statsMutex);
@@ -229,17 +248,28 @@ static void WorkerThreadMain() {
                         PushWorkerErrorEvent(cmd.session_token, "Network thread failed to create join host");
                         break;
                     }
+                    uint16_t boundPort = cmd.listen_port;
+                    Transport_GetBoundPort(&boundPort);
                     if (cmd.send_hole_punch) {
+                        Transport_AutopunchStart(
+                            cmd.punch_relay_host,
+                            cmd.punch_relay_port,
+                            boundPort,
+                            cmd.target_host,
+                            cmd.target_port);
                         const bool burstOk = Transport_SendHolePunchBurst(
                             cmd.target_host,
                             cmd.target_port,
-                            6,
-                            10);
+                            8,
+                            5);
                         Rollback::NetplayLog_Write("NTHREAD", -1,
-                            "Join hole-punch assist requested: token=%u target=%s:%u burst_ok=%d",
+                            "Join hole-punch assist requested: token=%u local_port=%u target=%s:%u relay=%s:%u burst_ok=%d",
                             cmd.session_token,
+                            (unsigned)boundPort,
                             cmd.target_host,
                             cmd.target_port,
+                            cmd.punch_relay_host,
+                            (unsigned)cmd.punch_relay_port,
                             burstOk ? 1 : 0);
                     }
                     ENetPeer* peer = Transport_Connect(cmd.target_host, cmd.target_port);
@@ -307,6 +337,7 @@ static void WorkerThreadMain() {
                         Transport_ForceDisconnectPeer(activePeer);
                         activePeer = nullptr;
                     }
+                    transportConnected = false;
                     Transport_DestroyHost();
                     Rollback::NetplayLog_Write("NTHREAD", -1,
                         "Worker host destroyed: token=%u",
@@ -342,6 +373,8 @@ static void WorkerThreadMain() {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
                     activePeer = ev.peer;
+                    transportConnected = true;
+                    Transport_AutopunchService(GetTickCount(), true);
                     NetworkThreadEvent out{};
                     out.type = NetworkThreadEventType::Connected;
                     out.session_token = activeSessionToken;
@@ -395,6 +428,7 @@ static void WorkerThreadMain() {
                     if (ev.peer == activePeer) {
                         activePeer = nullptr;
                     }
+                    transportConnected = false;
                     NetworkThreadEvent out{};
                     out.type = NetworkThreadEventType::Disconnected;
                     out.session_token = activeSessionToken;
@@ -416,13 +450,15 @@ static void WorkerThreadMain() {
             }
         }
 
-        UpdateStats(Transport_IsHostActive(), activePeer);
+        Transport_AutopunchService(GetTickCount(), transportConnected);
+        UpdateStats(Transport_IsHostActive(), transportConnected ? activePeer : nullptr);
     }
 
     if (activePeer) {
         Transport_ForceDisconnectPeer(activePeer);
         activePeer = nullptr;
     }
+    transportConnected = false;
     Transport_DestroyHost();
 
     {
@@ -499,24 +535,37 @@ void NetworkThread_Shutdown() {
     Rollback::NetplayLog_Write("NTHREAD", -1, "Network worker thread stopped");
 }
 
-bool NetworkThread_StartHost(uint32_t session_token, uint16_t listen_port) {
+bool NetworkThread_StartHost(uint32_t session_token, uint16_t listen_port,
+                             bool enable_autopunch,
+                             const char* punch_relay_host,
+                             uint16_t punch_relay_port) {
     WorkerCommand cmd{};
     cmd.type = WorkerCommandType::StartHost;
     cmd.session_token = session_token;
     cmd.listen_port = listen_port;
+    cmd.send_hole_punch = enable_autopunch;
+    if (punch_relay_host && punch_relay_host[0]) {
+        strncpy_s(cmd.punch_relay_host, sizeof(cmd.punch_relay_host), punch_relay_host, _TRUNCATE);
+    }
+    cmd.punch_relay_port = punch_relay_port;
     const bool ok = EnqueueCommand(cmd);
     if (ok) {
         Rollback::NetplayLog_Write("NTHREAD", -1,
-            "Queued StartHost: token=%u listen_port=%u",
+            "Queued StartHost: token=%u listen_port=%u autopunch=%d relay=%s:%u",
             session_token,
-            listen_port);
+            listen_port,
+            enable_autopunch ? 1 : 0,
+            cmd.punch_relay_host,
+            (unsigned)cmd.punch_relay_port);
     }
     return ok;
 }
 
 bool NetworkThread_StartJoin(uint32_t session_token, uint16_t listen_port,
                              const char* target_host, uint16_t target_port,
-                             bool send_hole_punch) {
+                             bool send_hole_punch,
+                             const char* punch_relay_host,
+                             uint16_t punch_relay_port) {
     if (!target_host || !target_host[0]) {
         return false;
     }
@@ -528,15 +577,21 @@ bool NetworkThread_StartJoin(uint32_t session_token, uint16_t listen_port,
     strncpy_s(cmd.target_host, sizeof(cmd.target_host), target_host, _TRUNCATE);
     cmd.target_port = target_port;
     cmd.send_hole_punch = send_hole_punch;
+    if (punch_relay_host && punch_relay_host[0]) {
+        strncpy_s(cmd.punch_relay_host, sizeof(cmd.punch_relay_host), punch_relay_host, _TRUNCATE);
+    }
+    cmd.punch_relay_port = punch_relay_port;
     const bool ok = EnqueueCommand(cmd);
     if (ok) {
         Rollback::NetplayLog_Write("NTHREAD", -1,
-            "Queued StartJoin: token=%u local_listen=%u target=%s:%u hole_punch=%d",
+            "Queued StartJoin: token=%u local_listen=%u target=%s:%u hole_punch=%d relay=%s:%u",
             session_token,
             listen_port,
             target_host,
             target_port,
-            send_hole_punch ? 1 : 0);
+            send_hole_punch ? 1 : 0,
+            cmd.punch_relay_host,
+            (unsigned)cmd.punch_relay_port);
     }
     return ok;
 }

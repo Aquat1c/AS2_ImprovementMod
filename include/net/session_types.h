@@ -62,9 +62,9 @@ inline const char* SessionRoleName(SessionRole role) {
 // ============================================================================
 
 enum class ConnectPreference : uint8_t {
-    AutoDirectThenRelay = 0,  // Direct endpoint first; relay fallback on failure
+    AutoDirectThenRelay = 0,  // Direct endpoint with NAT punch assist
     DirectOnly          = 1,  // Never fallback to relay
-    RelayOnly           = 2,  // Skip direct and connect to relay endpoint
+    RelayOnly           = 2,  // Reserved for a future traffic relay backend
 };
 
 inline const char* ConnectPreferenceName(ConnectPreference pref) {
@@ -134,8 +134,8 @@ struct NatTraversalConfig {
     uint16_t turn_port;                     // TURN server UDP port
     char     turn_username[64];             // TURN username
     char     turn_password[64];             // TURN password
-    char     relay_host[96];                // Relay endpoint hostname/IP (fallback)
-    uint16_t relay_port;                    // Relay endpoint port
+    char     relay_host[96];                // Autopunch relay endpoint override
+    uint16_t relay_port;                    // Autopunch relay endpoint port
     uint32_t gather_timeout_ms;             // Candidate gather timeout
     uint32_t connect_timeout_ms;            // ICE connect timeout after signaling
     uint32_t mapping_timeout_ms;            // UPnP/PCP mapping timeout

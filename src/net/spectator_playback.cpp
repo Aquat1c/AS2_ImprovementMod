@@ -4,6 +4,7 @@
 #include "core/game_state.h"
 #include "core/mod_main.h"
 #include "input/input_system.h"
+#include "net/game_settings_sync.h"
 #include "net/mode_ownership.h"
 #include "net/netplay_menu_controller.h"
 #include "net/spectator_client.h"
@@ -62,6 +63,7 @@ static int s_manualCatchupScaleIndex = 0;
 static char s_status[128] = "Watch playback idle.";
 static bool s_speedSlowerKeyWasDown = false;
 static bool s_speedFasterKeyWasDown = false;
+static bool s_matchSettingsApplied = false;
 static uint32_t s_lastBootstrapMode = 0xFFFFFFFFu;
 static uint32_t s_lastBootstrapSub = 0xFFFFFFFFu;
 static uint32_t s_bootstrapSubFrames = 0;
@@ -320,8 +322,41 @@ static void ClearPlaybackOverrides() {
     InputSystem_ClearOverride(1);
 }
 
+static void ApplySpectatorMatchSettings(const LockedMatchConfig& config, const char* reason) {
+    if (!s_matchSettingsApplied) {
+        GameSettingsSync_BeginNetplaySession(
+            reason ? reason : "spectator match settings");
+        s_matchSettingsApplied = true;
+    }
+
+    GameSettingsSync_ApplyLockedConfig(
+        &config,
+        reason ? reason : "spectator match settings");
+    SPLAY_LOG(
+        s_localPlaybackRbFrame,
+        "Applied spectator match settings: rounds_raw=%u rounds_to_win=%d reason=%s",
+        config.round_count,
+        GameSettingsSync_RoundsToWin(config.round_count),
+        reason ? reason : "?");
+}
+
+static void RestoreSpectatorMatchSettings(const char* reason) {
+    if (!s_matchSettingsApplied) {
+        return;
+    }
+
+    GameSettingsSync_RestoreLocalSession(
+        reason ? reason : "spectator playback reset");
+    s_matchSettingsApplied = false;
+    SPLAY_LOG(
+        s_localPlaybackRbFrame,
+        "Restored local settings after spectator playback: reason=%s",
+        reason ? reason : "?");
+}
+
 static void ResetLocalSimulationState() {
     ClearPlaybackOverrides();
+    RestoreSpectatorMatchSettings("spectator local simulation reset");
     InputSyncHooks_SetTimesyncFreeze(false);
     ResetTickPacing();
     s_launchIssued = false;
@@ -547,6 +582,7 @@ static void BeginLocalSpectatorLaunch(const SpectatorClientSnapshot& client) {
     ModeOwnership::CallOriginalSetGameMode(MODE_CHARSEL, 1);
     ModeOwnership::ResetCharSelFields();
     DetVer_SetRngSeed(client.config.session_seed);
+    ApplySpectatorMatchSettings(client.config, "spectator playback launch");
 
     s_launchIssued = true;
     SetStatus("Starting watch playback for game %u.",

@@ -8,6 +8,7 @@
 #include "net/spectator_client.h"
 
 #include "net/enet_transport.h"
+#include "net/game_settings_sync.h"
 #include "net/netplay_menu_controller.h"
 #include "net/netplay_palette_runtime.h"
 #include "net/spectator_protocol.h"
@@ -125,6 +126,9 @@ static bool s_relayEnabled = false;
 static uint16_t s_relayListenPort = 10701;
 static uint16_t s_relayBoundListenPort = 0;
 static ENetHost* s_relayServer = nullptr;
+static bool s_autopunchEnabled = true;
+static char s_autopunchRelayHost[96] = "delthas.fr";
+static uint16_t s_autopunchRelayPort = 14763;
 static std::unordered_map<ENetPeer*, RelayPeerState> s_relayPeers;
 static DWORD s_lastRelayHeartbeatAt = 0;
 static uint32_t s_lastRelayPaletteEpochSent = 0;
@@ -521,6 +525,7 @@ static void DestroyClientHostNow(const char* reason) {
         s_peer = nullptr;
     }
     if (s_clientHost) {
+        Transport_AutopunchStopForHost(s_clientHost, reason && reason[0] ? reason : "watch client destroyed");
         enet_host_destroy(s_clientHost);
         s_clientHost = nullptr;
     }
@@ -848,6 +853,7 @@ static void DestroyRelayServer(const char* reason) {
 
     enet_host_flush(s_relayServer);
 
+    Transport_AutopunchStopForHost(s_relayServer, reason && reason[0] ? reason : "watch relay destroyed");
     enet_host_destroy(s_relayServer);
     s_relayServer = nullptr;
     s_relayPeers.clear();
@@ -894,6 +900,25 @@ static bool EnsureRelayServer() {
         s_relayBoundListenPort,
         usedFallback ? 1 : 0,
         usedEphemeral ? 1 : 0);
+    if (s_autopunchEnabled) {
+        Transport_AutopunchStartForHost(
+            s_relayServer,
+            "SPECTATE_REBROADCAST",
+            s_autopunchRelayHost,
+            s_autopunchRelayPort,
+            s_relayBoundListenPort,
+            nullptr,
+            0);
+        SCLIENT_LOG(LOG_INFO, s_playbackRbFrame,
+            "[SCLIENT] relay_autopunch_start relay=%s:%u local_port=%u",
+            s_autopunchRelayHost,
+            s_autopunchRelayPort,
+            s_relayBoundListenPort);
+    } else {
+        SCLIENT_LOG(LOG_INFO, s_playbackRbFrame,
+            "[SCLIENT] relay_autopunch_disabled local_port=%u",
+            s_relayBoundListenPort);
+    }
     return true;
 }
 
@@ -1428,6 +1453,10 @@ static void ServiceRelayServer() {
         }
     }
 
+    if (s_autopunchEnabled) {
+        Transport_AutopunchServiceForHost(s_relayServer, GetTickCount(), false);
+    }
+
     if (!s_matchActive || !s_haveMatchState) {
         enet_host_flush(s_relayServer);
         return;
@@ -1570,6 +1599,9 @@ void SpectatorClient_Init() {
     s_relayEnabled = false;
     s_relayListenPort = 10701;
     s_relayBoundListenPort = 0;
+    s_autopunchEnabled = true;
+    CopyText(s_autopunchRelayHost, sizeof(s_autopunchRelayHost), "delthas.fr");
+    s_autopunchRelayPort = 14763;
     LockedMatchConfig_Clear(&s_matchConfig);
     CopyText(s_p1Name, sizeof(s_p1Name), "P1");
     CopyText(s_p2Name, sizeof(s_p2Name), "P2");
@@ -1619,6 +1651,64 @@ void SpectatorClient_SetRelayConfig(bool enabled, uint16_t listenPort) {
     }
     if (enabled) {
         EnsureRelayServer();
+    }
+}
+
+void SpectatorClient_SetAutopunchRelay(bool enabled, const char* relayHost, uint16_t relayPort) {
+    const char* nextHost = (relayHost && relayHost[0]) ? relayHost : "delthas.fr";
+    const uint16_t nextPort = relayPort != 0 ? relayPort : 14763;
+    const bool changed =
+        s_autopunchEnabled != enabled ||
+        s_autopunchRelayPort != nextPort ||
+        _stricmp(s_autopunchRelayHost, nextHost) != 0;
+
+    s_autopunchEnabled = enabled;
+    CopyText(s_autopunchRelayHost, sizeof(s_autopunchRelayHost), nextHost);
+    s_autopunchRelayPort = nextPort;
+
+    if (!changed) {
+        return;
+    }
+
+    SCLIENT_LOG(LOG_INFO, s_playbackRbFrame,
+        "[SCLIENT] autopunch_config enabled=%d relay=%s:%u",
+        s_autopunchEnabled ? 1 : 0,
+        s_autopunchRelayHost,
+        s_autopunchRelayPort);
+
+    if (s_clientHost) {
+        Transport_AutopunchStopForHost(s_clientHost, "watch client autopunch reconfigure");
+        if (s_autopunchEnabled && s_endpoint[0]) {
+            char host[96] = {};
+            uint16_t port = 0;
+            uint16_t localPort = 0;
+            if (ParseEndpointText(s_endpoint, host, sizeof(host), &port) &&
+                Transport_GetHostBoundPort(s_clientHost, &localPort) &&
+                localPort != 0) {
+                Transport_AutopunchStartForHost(
+                    s_clientHost,
+                    "SPECTATE_CLIENT",
+                    s_autopunchRelayHost,
+                    s_autopunchRelayPort,
+                    localPort,
+                    host,
+                    port);
+            }
+        }
+    }
+
+    if (s_relayServer) {
+        Transport_AutopunchStopForHost(s_relayServer, "watch relay autopunch reconfigure");
+        if (s_autopunchEnabled && s_relayBoundListenPort != 0) {
+            Transport_AutopunchStartForHost(
+                s_relayServer,
+                "SPECTATE_REBROADCAST",
+                s_autopunchRelayHost,
+                s_autopunchRelayPort,
+                s_relayBoundListenPort,
+                nullptr,
+                0);
+        }
     }
 }
 
@@ -1736,6 +1826,39 @@ bool SpectatorClient_StartConnect(const char* endpoint) {
         return false;
     }
 
+    uint16_t localPort = 0;
+    Transport_GetHostBoundPort(s_clientHost, &localPort);
+    if (s_autopunchEnabled && localPort != 0) {
+        Transport_AutopunchStartForHost(
+            s_clientHost,
+            "SPECTATE_CLIENT",
+            s_autopunchRelayHost,
+            s_autopunchRelayPort,
+            localPort,
+            host,
+            port);
+        Transport_SendHolePunchBurstForHost(
+            s_clientHost,
+            host,
+            port,
+            8,
+            5);
+        SCLIENT_LOG(LOG_INFO, s_playbackRbFrame,
+            "[SCLIENT] client_autopunch_start local_port=%u target=%s:%u relay=%s:%u",
+            localPort,
+            host,
+            port,
+            s_autopunchRelayHost,
+            s_autopunchRelayPort);
+    } else {
+        SCLIENT_LOG(LOG_INFO, s_playbackRbFrame,
+            "[SCLIENT] client_autopunch_skipped enabled=%d local_port=%u target=%s:%u",
+            s_autopunchEnabled ? 1 : 0,
+            localPort,
+            host,
+            port);
+    }
+
     s_peer = enet_host_connect(s_clientHost, &address, Spectator::NUM_CHANNELS, 0);
     if (!s_peer) {
         DestroyClientHostNow("connect_start_failed");
@@ -1803,6 +1926,14 @@ void SpectatorClient_FrameUpdate() {
         return;
     }
 
+    if (s_autopunchEnabled) {
+        const bool upstreamConnected =
+            s_state == SpectatorClientState::Handshaking ||
+            s_state == SpectatorClientState::ConnectedNoActiveMatch ||
+            s_state == SpectatorClientState::Streaming;
+        Transport_AutopunchServiceForHost(s_clientHost, GetTickCount(), upstreamConnected);
+    }
+
     bool stopProcessing = false;
     ENetEvent event{};
     int processedEvents = 0;
@@ -1811,6 +1942,9 @@ void SpectatorClient_FrameUpdate() {
         processedEvents++;
         switch (event.type) {
             case ENET_EVENT_TYPE_CONNECT: {
+                if (s_autopunchEnabled) {
+                    Transport_AutopunchServiceForHost(s_clientHost, GetTickCount(), true);
+                }
                 Spectator::HelloPayload hello{};
                 hello.protocol_version = Spectator::PROTOCOL_VERSION;
                 hello.client_listen_port = s_relayServer ? s_relayBoundListenPort : 0;
@@ -1926,12 +2060,14 @@ void SpectatorClient_FrameUpdate() {
                                     s_p1Wins,
                                     s_p2Wins);
                                 SCLIENT_LOG(LOG_INFO, s_playbackRbFrame,
-                                    "[SCLIENT] stream_active endpoint=%s match_id=0x%08X ordinal=%u live=%d confirmed=%d score=%u-%u draws=%u completed=%u",
+                                    "[SCLIENT] stream_active endpoint=%s match_id=0x%08X ordinal=%u live=%d confirmed=%d rounds_raw=%u rounds_to_win=%d score=%u-%u draws=%u completed=%u",
                                     s_endpoint[0] ? s_endpoint : "(unset)",
                                     s_matchId,
                                     s_matchOrdinal,
                                     s_serverLiveRbFrame,
                                     s_serverConfirmedRbFrame,
+                                    s_matchConfig.round_count,
+                                    GameSettingsSync_RoundsToWin(s_matchConfig.round_count),
                                     s_p1Wins,
                                     s_p2Wins,
                                     s_draws,

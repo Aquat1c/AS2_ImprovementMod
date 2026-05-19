@@ -81,6 +81,33 @@ bool Transport_SendTyped(ENetPeer* peer, uint8_t channel, PacketType type,
 bool Transport_SendHolePunchBurst(const char* host, uint16_t port,
                                   int burstCount, uint32_t intervalMs);
 
+/// Return the actual UDP port bound by the current ENet host.
+bool Transport_GetBoundPort(uint16_t* outPort);
+bool Transport_GetHostBoundPort(ENetHost* host, uint16_t* outPort);
+
+/// Start/stop the autopunch-compatible UDP rendezvous helper.
+/// Calls must stay on the transport owner thread.
+void Transport_AutopunchStart(const char* relayHost, uint16_t relayPort,
+                              uint16_t localPort,
+                              const char* targetHost, uint16_t targetPort);
+void Transport_AutopunchStop(const char* reason);
+void Transport_AutopunchService(uint32_t nowMs, bool peerConnected);
+
+bool Transport_SendHolePunchBurstForHost(ENetHost* enetHost,
+                                         const char* host, uint16_t port,
+                                         int burstCount, uint32_t intervalMs);
+void Transport_AutopunchStartForHost(ENetHost* enetHost,
+                                     const char* logLabel,
+                                     const char* relayHost,
+                                     uint16_t relayPort,
+                                     uint16_t localPort,
+                                     const char* targetHost,
+                                     uint16_t targetPort);
+void Transport_AutopunchStopForHost(ENetHost* enetHost, const char* reason);
+void Transport_AutopunchServiceForHost(ENetHost* enetHost,
+                                       uint32_t nowMs,
+                                       bool peerConnected);
+
 // ============================================================================
 // Polling
 // ============================================================================

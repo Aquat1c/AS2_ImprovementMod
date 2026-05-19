@@ -100,6 +100,7 @@ bool SpectatorClient_BeginLanDiscovery();
 bool SpectatorClient_StartConnect(const char* endpoint);
 void SpectatorClient_Disconnect(const char* reason);
 void SpectatorClient_SetRelayConfig(bool enabled, uint16_t listenPort);
+void SpectatorClient_SetAutopunchRelay(bool enabled, const char* relayHost, uint16_t relayPort);
 
 void SpectatorClient_SetFastForwardEnabled(bool enabled);
 void SpectatorClient_SetHardSyncEnabled(bool enabled);

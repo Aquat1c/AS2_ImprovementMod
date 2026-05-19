@@ -521,7 +521,7 @@ static const char* ConnectModeLabel(int mode) {
     switch (mode) {
         case 0: return "Automatic";
         case 1: return "Direct Only";
-        case 2: return "Relay Only";
+        case 2: return "Relay N/A";
         default: return "Unknown";
     }
 }
@@ -570,7 +570,13 @@ static void RenderHostEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, in
     }
     RenderInfoLine(y, "Address", addrBuf, alpha);
     y += kInfoStep;
-    RenderInfoLine(y, "NAT", snap->nat_status, alpha);
+    RenderInfoLine(y, "Route", snap->nat_route_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Mapping", snap->nat_mapping_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Punch", snap->nat_punch_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "STUN", snap->nat_stun_status, alpha);
 }
 
 static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
@@ -589,7 +595,13 @@ static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, in
     y += kRowStep + 6;
     RenderSectionLabel(y, "Connection", alpha);
     y += 16;
-    RenderInfoLine(y, "NAT", snap->nat_status, alpha);
+    RenderInfoLine(y, "Route", snap->nat_route_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Mapping", snap->nat_mapping_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Punch", snap->nat_punch_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "STUN", snap->nat_stun_status, alpha);
 }
 
 static void RenderSpectateEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
@@ -630,6 +642,8 @@ static void RenderSpectateEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha
         snap->spectator_listen_port,
         snap->connected_spectators);
     RenderInfoLine(y, "Server", serverBuf, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Punch", snap->spectator_punch_status, alpha);
     y += kInfoStep;
     RenderInfoLine(y, "Status", snap->spectator_status, alpha);
     y += kInfoStep;
@@ -688,9 +702,9 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
         } else if (snap->relay_endpoint[0]) {
             _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "%s", snap->relay_endpoint);
         } else {
-            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "(none)");
+            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "(default delthas.fr:14763)");
         }
-        RenderRow(y, "Relay Server", relayVal, snap->selected_index == 5, true, alpha); y += kRowStep;
+        RenderRow(y, "Punch Relay", relayVal, snap->selected_index == 5, true, alpha); y += kRowStep;
 
         char stunVal[120];
         if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::StunEndpoint) {
@@ -736,6 +750,8 @@ static void RenderSpectatorConnecting(const NetMenu::MenuSnapshot* snap, uint8_t
 
     RenderInfoLine(y, "Address", snap->spectator_endpoint, alpha);
     y += kInfoStep;
+    RenderInfoLine(y, "Punch", snap->spectator_punch_status, alpha);
+    y += kInfoStep;
     if (snap->spectator_client_match_id != 0) {
         char matchBuf[40];
         _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, "Game %u",
@@ -763,6 +779,8 @@ static void RenderSpectatorConnected(const NetMenu::MenuSnapshot* snap, uint8_t 
     y += 16;
 
     RenderInfoLine(y, "Address", snap->spectator_endpoint, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Punch", snap->spectator_punch_status, alpha);
     y += kInfoStep;
 
     if (snap->spectator_client_match_id != 0) {
@@ -829,7 +847,13 @@ static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha, i
         RenderInfoLine(y, "Ping", pingBuf, alpha);
         y += kInfoStep;
     }
-    RenderInfoLine(y, "NAT", snap->nat_status, alpha);
+    RenderInfoLine(y, "Route", snap->nat_route_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Mapping", snap->nat_mapping_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Punch", snap->nat_punch_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "STUN", snap->nat_stun_status, alpha);
 }
 
 static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
@@ -925,6 +949,10 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
         _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s", snap->your_address);
     }
     RenderInfoLine(y, "Address", addrBuf, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "Punch", snap->nat_punch_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, "STUN", snap->nat_stun_status, alpha);
 }
 
 static void RenderCharSelTransition(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {

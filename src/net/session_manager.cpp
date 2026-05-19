@@ -619,6 +619,32 @@ static bool HasRelayConfigured(const SessionConfig* cfg) {
            cfg->nat.relay_port > 0;
 }
 
+static bool HasTrafficRelayConfigured(const SessionConfig*) {
+    // The relay endpoint is currently an autopunch rendezvous server. It is not
+    // a data-forwarding ENet relay, so session fallback must not connect to it.
+    return false;
+}
+
+static void GetPunchRelayEndpoint(const SessionConfig* cfg,
+                                  char* outHost, size_t outHostCap,
+                                  uint16_t* outPort) {
+    if (!outHost || outHostCap == 0 || !outPort) {
+        return;
+    }
+
+    outHost[0] = '\0';
+    *outPort = 0;
+
+    if (HasRelayConfigured(cfg)) {
+        strncpy_s(outHost, outHostCap, cfg->nat.relay_host, _TRUNCATE);
+        *outPort = cfg->nat.relay_port;
+        return;
+    }
+
+    strncpy_s(outHost, outHostCap, "delthas.fr", _TRUNCATE);
+    *outPort = 14763;
+}
+
 static bool StartJoinAttempt(const char* host, uint16_t port,
                              bool usingRelay, const char* reason) {
     if (!host || !host[0] || port == 0 || s_activeSessionToken == 0) {
@@ -632,27 +658,34 @@ static bool StartJoinAttempt(const char* host, uint16_t port,
     const bool wantsHolePunch = (!usingRelay && s_config.nat.enable_hole_punch);
     const bool canHolePunch = Nat_IsHolePunchBackendAvailable();
     const bool useHolePunch = wantsHolePunch && canHolePunch;
+    char punchRelayHost[96] = {};
+    uint16_t punchRelayPort = 0;
+    GetPunchRelayEndpoint(&s_config, punchRelayHost, sizeof(punchRelayHost), &punchRelayPort);
 
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Join attempt begin: token=%u host=%s port=%u via=%s reason=%s hole_punch_req=%d hole_punch_use=%d",
+        "Join attempt begin: token=%u host=%s port=%u via=%s reason=%s hole_punch_req=%d hole_punch_use=%d punch_relay=%s:%u",
         s_activeSessionToken,
         s_activeJoinHost,
         s_activeJoinPort,
         usingRelay ? "relay" : "direct",
         reason ? reason : "?",
         wantsHolePunch ? 1 : 0,
-        useHolePunch ? 1 : 0);
+        useHolePunch ? 1 : 0,
+        punchRelayHost,
+        (unsigned)punchRelayPort);
 
     if (wantsHolePunch && !canHolePunch) {
         Rollback::NetplayLog_Write("SESSION", -1,
-            "Hole-punch requested but no OSS backend is linked; continuing with direct connect + relay fallback");
+            "Hole-punch requested but no backend is available; continuing with direct connect");
     }
 
     return NetworkThread_StartJoin(s_activeSessionToken,
                                    s_config.listen_port,
                                    s_activeJoinHost,
                                    s_activeJoinPort,
-                                   useHolePunch);
+                                   useHolePunch,
+                                   punchRelayHost,
+                                   punchRelayPort);
 }
 
 static bool TryRelayFallback(const char* reason) {
@@ -668,7 +701,9 @@ static bool TryRelayFallback(const char* reason) {
     if (s_config.connect_preference != ConnectPreference::AutoDirectThenRelay) {
         return false;
     }
-    if (!HasRelayConfigured(&s_config)) {
+    if (!HasTrafficRelayConfigured(&s_config)) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Traffic relay fallback unavailable; relay endpoint is reserved for autopunch rendezvous");
         return false;
     }
 
@@ -713,7 +748,7 @@ static void SendNatInfo() {
     if (nat.stun_enabled) payload.flags |= NAT_INFO_FLAG_STUN_ENABLED;
     if (nat.stun_status == StunStatus::Available) payload.flags |= NAT_INFO_FLAG_STUN_OK;
     if (nat.hole_punch_enabled) payload.flags |= NAT_INFO_FLAG_HOLE_PUNCH;
-    if (HasRelayConfigured(&s_config)) payload.flags |= NAT_INFO_FLAG_RELAY_FALLBACK;
+    if (HasTrafficRelayConfigured(&s_config)) payload.flags |= NAT_INFO_FLAG_RELAY_FALLBACK;
     if (nat.prefer_portforwarded_direct) payload.flags |= NAT_INFO_FLAG_PREFER_DIRECT;
     if (nat.allow_ipv6_endpoint) payload.flags |= NAT_INFO_FLAG_IPV6_ENDPOINTS;
     if (nat.turn_enabled) payload.extra_flags |= NAT_INFO_EX_FLAG_TURN_ENABLED;
@@ -1343,10 +1378,14 @@ bool Session_StartHost(const SessionConfig* config) {
     s_role = SessionRole::Host;
     GameSettingsSync_BeginNetplaySession("start host");
 
+    char plannedPunchRelayHost[96] = {};
+    uint16_t plannedPunchRelayPort = 0;
+    GetPunchRelayEndpoint(config, plannedPunchRelayHost, sizeof(plannedPunchRelayHost), &plannedPunchRelayPort);
+
     Rollback::NetplayLog_Write("SESSION", -1,
         "StartHost: listen_port=%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u "
         "upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d ipv6=%d pref_direct=%d "
-        "backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d",
+        "backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d punch_relay=%s:%u",
         s_config.listen_port,
         s_config.nickname,
         s_config.build_hash,
@@ -1363,7 +1402,9 @@ bool Session_StartHost(const SessionConfig* config) {
         Nat_IsPcpBackendAvailable() ? 1 : 0,
         Nat_IsStunBackendAvailable() ? 1 : 0,
         Nat_IsHolePunchBackendAvailable() ? 1 : 0,
-        Nat_IsTurnBackendAvailable() ? 1 : 0);
+        Nat_IsTurnBackendAvailable() ? 1 : 0,
+        plannedPunchRelayHost,
+        (unsigned)plannedPunchRelayPort);
 
     NatRuntimeConfig natCfg{};
     NatRuntimeConfig_SetDefaults(&natCfg);
@@ -1394,7 +1435,11 @@ bool Session_StartHost(const SessionConfig* config) {
     NextSessionToken();
     NetworkThread_ClearQueues(0);
     Nat_ClearRemoteHint();
-    if (!NetworkThread_StartHost(s_activeSessionToken, config->listen_port)) {
+    if (!NetworkThread_StartHost(s_activeSessionToken,
+                                 config->listen_port,
+                                 config->nat.enable_hole_punch,
+                                 plannedPunchRelayHost,
+                                 plannedPunchRelayPort)) {
         SetError("Failed to start network host thread command");
         return false;
     }
@@ -1426,12 +1471,17 @@ bool Session_StartJoin(const SessionConfig* config) {
     s_role = SessionRole::Join;
     GameSettingsSync_BeginNetplaySession("start join");
 
-    const bool relayConfigured = HasRelayConfigured(&s_config);
+    const bool relayConfigured = HasTrafficRelayConfigured(&s_config);
+
+    char plannedPunchRelayHost[96] = {};
+    uint16_t plannedPunchRelayPort = 0;
+    GetPunchRelayEndpoint(config, plannedPunchRelayHost, sizeof(plannedPunchRelayHost), &plannedPunchRelayPort);
 
     Rollback::NetplayLog_Write("SESSION", -1,
         "StartJoin: target=%s:%u relay=%s:%u mode=%s nick=%s hash=0x%08X "
         "connect_timeout=%u handshake_timeout=%u upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d "
-        "ipv6=%d pref_direct=%d backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d",
+        "ipv6=%d pref_direct=%d backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d "
+        "punch_relay=%s:%u traffic_relay=%d",
         s_config.target_host,
         s_config.target_port,
         s_config.nat.relay_host,
@@ -1452,7 +1502,10 @@ bool Session_StartJoin(const SessionConfig* config) {
         Nat_IsPcpBackendAvailable() ? 1 : 0,
         Nat_IsStunBackendAvailable() ? 1 : 0,
         Nat_IsHolePunchBackendAvailable() ? 1 : 0,
-        Nat_IsTurnBackendAvailable() ? 1 : 0);
+        Nat_IsTurnBackendAvailable() ? 1 : 0,
+        plannedPunchRelayHost,
+        (unsigned)plannedPunchRelayPort,
+        relayConfigured ? 1 : 0);
 
     NatRuntimeConfig natCfg{};
     NatRuntimeConfig_SetDefaults(&natCfg);
@@ -1488,7 +1541,7 @@ bool Session_StartJoin(const SessionConfig* config) {
     switch (config->connect_preference) {
         case ConnectPreference::RelayOnly:
             if (!relayConfigured) {
-                SetError("Relay mode selected but relay endpoint is missing");
+                SetError("Traffic relay mode is not available; use Automatic with UDP hole punch");
                 return false;
             }
             initialHost = config->nat.relay_host;
@@ -1502,7 +1555,7 @@ bool Session_StartJoin(const SessionConfig* config) {
                 return false;
             }
             if (directLooksIPv6) {
-                SetError("Direct IPv6 endpoints require relay fallback with current ENet transport");
+                SetError("Direct IPv6 endpoints are unsupported by the current ENet IPv4 transport");
                 return false;
             }
             break;
@@ -1515,7 +1568,7 @@ bool Session_StartJoin(const SessionConfig* config) {
                     initialPort = config->nat.relay_port;
                     initialViaRelay = true;
                 } else {
-                    SetError("No valid direct endpoint or relay fallback configured");
+                    SetError("No valid direct endpoint configured");
                     return false;
                 }
             } else if (directLooksIPv6 && relayConfigured) {
@@ -1530,7 +1583,7 @@ bool Session_StartJoin(const SessionConfig* config) {
 
     if (strchr(initialHost, ':')) {
         if (initialViaRelay) {
-            SetError("Relay endpoint is IPv6 literal; current ENet transport requires IPv4/DNS relay");
+            SetError("Traffic relay endpoint is unsupported by the current ENet transport");
             return false;
         }
         if (relayConfigured && config->connect_preference == ConnectPreference::AutoDirectThenRelay) {

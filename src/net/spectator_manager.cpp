@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "net/spectator_manager.h"
+#include "net/enet_transport.h"
 #include "net/session_manager.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
@@ -51,6 +52,9 @@ static uint16_t s_boundListenPort = 0;
 static uint32_t s_activeMatchId = 0;
 static uint32_t s_activeMatchOrdinal = 0;
 static char s_redirectEndpoint[96] = "";
+static bool s_autopunchEnabled = true;
+static char s_autopunchRelayHost[96] = "delthas.fr";
+static uint16_t s_autopunchRelayPort = 14763;
 static char s_status[128] = "Spectator server disabled.";
 static std::unordered_map<ENetPeer*, PeerState> s_peers;
 
@@ -280,6 +284,7 @@ static void DestroyServer(const char* reason) {
         }
     }
 
+    Transport_AutopunchStopForHost(s_server, reason && reason[0] ? reason : "spectator host destroyed");
     enet_host_destroy(s_server);
     s_server = nullptr;
     s_boundListenPort = 0;
@@ -330,6 +335,24 @@ static bool EnsureServer() {
         s_boundListenPort,
         usedFallback ? 1 : 0,
         usedEphemeral ? 1 : 0);
+    if (s_autopunchEnabled) {
+        Transport_AutopunchStartForHost(
+            s_server,
+            "SPECTATE_HOST",
+            s_autopunchRelayHost,
+            s_autopunchRelayPort,
+            s_boundListenPort,
+            nullptr,
+            0);
+        SMGR_LOG(LOG_INFO, -1,
+            "[SpectatorMgr] Autopunch relay active: relay=%s:%u local_port=%u",
+            s_autopunchRelayHost,
+            s_autopunchRelayPort,
+            s_boundListenPort);
+    } else {
+        SMGR_LOG(LOG_INFO, -1,
+            "[SpectatorMgr] Autopunch relay disabled for spectator host");
+    }
     return true;
 }
 
@@ -540,6 +563,9 @@ void SpectatorManager_Init() {
     s_activeMatchId = 0;
     s_activeMatchOrdinal = 0;
     s_status[0] = '\0';
+    s_autopunchEnabled = true;
+    CopyText(s_autopunchRelayHost, sizeof(s_autopunchRelayHost), "delthas.fr");
+    s_autopunchRelayPort = 14763;
     SetStatus("Spectator server disabled.");
     s_initialized = true;
     SMGR_TRACE(-1,
@@ -594,6 +620,43 @@ void SpectatorManager_SetRedirectEndpoint(const char* endpoint) {
     SMGR_TRACE(-1,
         "[SpectatorMgr] Redirect endpoint set to %s",
         s_redirectEndpoint[0] ? s_redirectEndpoint : "(unset)");
+}
+
+void SpectatorManager_SetAutopunchRelay(bool enabled, const char* relayHost, uint16_t relayPort) {
+    const bool changed =
+        s_autopunchEnabled != enabled ||
+        s_autopunchRelayPort != relayPort ||
+        _stricmp(s_autopunchRelayHost, relayHost && relayHost[0] ? relayHost : "") != 0;
+
+    s_autopunchEnabled = enabled;
+    if (relayHost && relayHost[0] && relayPort != 0) {
+        CopyText(s_autopunchRelayHost, sizeof(s_autopunchRelayHost), relayHost);
+        s_autopunchRelayPort = relayPort;
+    } else {
+        CopyText(s_autopunchRelayHost, sizeof(s_autopunchRelayHost), "delthas.fr");
+        s_autopunchRelayPort = 14763;
+    }
+
+    if (changed) {
+        SMGR_LOG(LOG_INFO, -1,
+            "[SpectatorMgr] Autopunch relay config enabled=%d relay=%s:%u",
+            s_autopunchEnabled ? 1 : 0,
+            s_autopunchRelayHost,
+            s_autopunchRelayPort);
+        if (s_server) {
+            Transport_AutopunchStopForHost(s_server, "spectator autopunch reconfigure");
+            if (s_autopunchEnabled && s_boundListenPort != 0) {
+                Transport_AutopunchStartForHost(
+                    s_server,
+                    "SPECTATE_HOST",
+                    s_autopunchRelayHost,
+                    s_autopunchRelayPort,
+                    s_boundListenPort,
+                    nullptr,
+                    0);
+            }
+        }
+    }
 }
 
 void SpectatorManager_BeginMatch(uint32_t match_id, uint32_t match_ordinal) {
@@ -726,6 +789,9 @@ void SpectatorManager_FrameUpdate() {
         }
     }
 
+    if (s_autopunchEnabled) {
+        Transport_AutopunchServiceForHost(s_server, GetTickCount(), false);
+    }
     enet_host_flush(s_server);
 }
 

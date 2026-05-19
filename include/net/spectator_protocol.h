@@ -15,7 +15,7 @@
 
 namespace Net::Spectator {
 
-constexpr uint16_t PROTOCOL_VERSION = 6;
+constexpr uint16_t PROTOCOL_VERSION = 7;
 constexpr int MAX_PACKET_SIZE = 1200;
 constexpr int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;
 constexpr int MAX_FRAME_BATCH = 32;

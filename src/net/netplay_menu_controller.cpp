@@ -20,6 +20,7 @@
 #include "net/set_tracker.h"
 #include "net/delay_policy.h"
 #include "net/spectator_runtime.h"
+#include "net/spectator_manager.h"
 #include "net/spectator_client.h"
 #include "net/spectator_playback.h"
 #include "net/netplay_palette_runtime.h"
@@ -139,12 +140,14 @@ static bool  s_cachedAutoConnectValid = false;
 static void TransitionTo(MenuState next, const char* why);
 static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg);
 static void ApplyNatSettingsToService(const char* reason);
+static bool ParseEndpoint(const char* str, char* outHost, size_t hostCap,
+                          uint16_t* outPort, bool allowIPv6);
 
 static const char* FriendlyConnectPreferenceLabel(Net::ConnectPreference pref) {
     switch (pref) {
         case Net::ConnectPreference::AutoDirectThenRelay: return "Automatic";
         case Net::ConnectPreference::DirectOnly:          return "Direct Only";
-        case Net::ConnectPreference::RelayOnly:           return "Relay Only";
+        case Net::ConnectPreference::RelayOnly:           return "Relay N/A";
         default:                                          return "Unknown";
     }
 }
@@ -394,11 +397,31 @@ static void ApplySpectatorSettingsToRuntime(const char* reason) {
     Net::SpectatorRuntime_SetListenPort(s_spectatorListenPort);
     Net::SpectatorClient_SetRelayConfig(s_spectatorsEnabled, s_spectatorListenPort);
 
+    char punchRelayHost[96] = "delthas.fr";
+    uint16_t punchRelayPort = 14763;
+    if (s_relayEndpoint[0]) {
+        char parsedHost[96] = {};
+        uint16_t parsedPort = 0;
+        if (ParseEndpoint(s_relayEndpoint, parsedHost, sizeof(parsedHost), &parsedPort, false)) {
+            strncpy_s(punchRelayHost, sizeof(punchRelayHost), parsedHost, _TRUNCATE);
+            punchRelayPort = parsedPort;
+        } else {
+            SPECTATE_MENU_LOG(LOG_WARNING, "SMENU",
+                "[NetMenu] Invalid punch relay endpoint for spectator runtime: %s",
+                s_relayEndpoint);
+        }
+    }
+    Net::SpectatorManager_SetAutopunchRelay(s_holePunchEnabled, punchRelayHost, punchRelayPort);
+    Net::SpectatorClient_SetAutopunchRelay(s_holePunchEnabled, punchRelayHost, punchRelayPort);
+
     SPECTATE_MENU_LOG(LOG_INFO, "SMENU",
-        "[NetMenu] Applied spectator settings (%s): enabled=%d port=%u",
+        "[NetMenu] Applied spectator settings (%s): enabled=%d port=%u punch=%d relay=%s:%u",
         reason ? reason : "unspecified",
         s_spectatorsEnabled ? 1 : 0,
-        s_spectatorListenPort);
+        s_spectatorListenPort,
+        s_holePunchEnabled ? 1 : 0,
+        punchRelayHost,
+        punchRelayPort);
 }
 
 static void ApplyPaletteSettingsToRuntime(const char* reason) {
@@ -1242,7 +1265,7 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
         char relayHost[96] = {};
         uint16_t relayPort = 0;
         if (!ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
-            SetStatus("The relay server address is invalid.");
+            SetStatus("The punch relay address is invalid.");
             return false;
         }
         strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
@@ -1698,7 +1721,7 @@ static bool BeginAutoConnectSession() {
         char relayHost[96] = {};
         uint16_t relayPort = 0;
         if (!ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
-            LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Invalid relay endpoint '%s'", s_relayEndpoint);
+            LOG_NETPLAY(LOG_ERROR, "[AutoConnect] Invalid punch relay endpoint '%s'", s_relayEndpoint);
             return false;
         }
         strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
@@ -2379,7 +2402,7 @@ static int SettingGlobalId() {
                 case 2: return 6;   // STUN
                 case 3: return 7;   // UDP Hole Punch
                 case 4: return 8;   // Allow IPv6
-                case 5: return 9;   // Relay Server
+                case 5: return 9;   // Punch Relay
                 case 6: return 10;  // STUN Server
                 default: return -1; // Back
             }
@@ -2486,16 +2509,16 @@ static void FinishTextEdit(bool commit) {
     } else if (field == TextEditField::RelayEndpoint) {
         if (!s_textEditBuffer[0]) {
             s_relayEndpoint[0] = '\0';
-            SetStatus("Relay server cleared.");
+            SetStatus("Punch relay reset to the default server.");
         } else {
             char testHost[96] = {};
             uint16_t testPort = 0;
             if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
                 CopyText(s_relayEndpoint, sizeof(s_relayEndpoint), s_textEditBuffer);
-                LOG_NETPLAY(LOG_INFO, "[NetMenu] Relay endpoint set to: %s", s_relayEndpoint);
-                SetStatus("Relay server: %s", s_relayEndpoint);
+                LOG_NETPLAY(LOG_INFO, "[NetMenu] Punch relay endpoint set to: %s", s_relayEndpoint);
+                SetStatus("Punch relay: %s", s_relayEndpoint);
             } else {
-                SetStatus("Enter a valid relay server address.");
+                SetStatus("Enter a valid punch relay address.");
             }
         }
     } else if (field == TextEditField::StunEndpoint) {
@@ -2522,6 +2545,7 @@ static void FinishTextEdit(bool commit) {
     // Persist settings after any committed change
     if (commit) {
         ApplyNatSettingsToService("text edit commit");
+        ApplySpectatorSettingsToRuntime("text edit commit");
         SaveSettings();
     }
 }
@@ -3067,12 +3091,12 @@ static void HandleNavigationInput() {
                 if (left) {
                     mode--;
                     if (mode < (int)Net::ConnectPreference::AutoDirectThenRelay) {
-                        mode = (int)Net::ConnectPreference::RelayOnly;
+                        mode = (int)Net::ConnectPreference::DirectOnly;
                     }
                     changed = true;
                 } else if (right) {
                     mode++;
-                    if (mode > (int)Net::ConnectPreference::RelayOnly) {
+                    if (mode > (int)Net::ConnectPreference::DirectOnly) {
                         mode = (int)Net::ConnectPreference::AutoDirectThenRelay;
                     }
                     changed = true;
@@ -3121,8 +3145,9 @@ static void HandleNavigationInput() {
             if (changed) {
                 if (natChanged) {
                     ApplyNatSettingsToService("settings navigation");
+                    ApplySpectatorSettingsToRuntime("settings navigation");
                 }
-                if (spectatorChanged) {
+                if (spectatorChanged && !natChanged) {
                     ApplySpectatorSettingsToRuntime("settings navigation");
                 }
                 if (paletteChanged) {
@@ -3380,7 +3405,7 @@ static void ActivateCurrentSelection() {
             if (gid == 0) {
                 BeginTextEdit(TextEditField::Nickname, s_localNickname, "Enter your display name.");
             } else if (gid == 9) {
-                BeginTextEdit(TextEditField::RelayEndpoint, s_relayEndpoint, "Enter the relay server as host:port or [ipv6]:port.");
+                BeginTextEdit(TextEditField::RelayEndpoint, s_relayEndpoint, "Enter the punch relay as host:port or [ipv6]:port.");
             } else if (gid == 10) {
                 BeginTextEdit(TextEditField::StunEndpoint, s_stunEndpoint, "Enter the STUN server as host:port or [ipv6]:port.");
             } else if (gid == 12) {
@@ -3792,6 +3817,32 @@ void GetSnapshot(MenuSnapshot* out) {
         natSnap.pcp_mapped_port,
         endpointShort);
     CopyText(out->nat_status, sizeof(out->nat_status), natStatus);
+
+    const char* punchRelayText = s_relayEndpoint[0] ? s_relayEndpoint : "delthas.fr:14763";
+    _snprintf_s(out->nat_route_status, sizeof(out->nat_route_status), _TRUNCATE,
+        "%s, %s",
+        FriendlyConnectPreferenceLabel(s_connectPreference),
+        s_allowIPv6Endpoint ? "IPv6 text accepted" : "IPv4/DNS only");
+    _snprintf_s(out->nat_mapping_status, sizeof(out->nat_mapping_status), _TRUNCATE,
+        "UPnP %s, PCP %s, game port %u/%u",
+        Net::NatStatusName(natSnap.upnp_status),
+        Net::NatStatusName(natSnap.pcp_status),
+        natSnap.mapped_port,
+        natSnap.pcp_mapped_port);
+    _snprintf_s(out->nat_punch_status, sizeof(out->nat_punch_status), _TRUNCATE,
+        "%s via %s",
+        s_holePunchEnabled ? "On" : "Off",
+        punchRelayText);
+    _snprintf_s(out->nat_stun_status, sizeof(out->nat_stun_status), _TRUNCATE,
+        "%s%s%s",
+        Net::StunStatusName(natSnap.stun_status),
+        endpointShort[0] && endpointShort[0] != '-' ? " " : "",
+        endpointShort[0] && endpointShort[0] != '-' ? endpointShort : "");
+    _snprintf_s(out->spectator_punch_status, sizeof(out->spectator_punch_status), _TRUNCATE,
+        "%s, watch port %u, relay %s",
+        s_holePunchEnabled ? "Punch on" : "Punch off",
+        s_spectatorListenPort,
+        punchRelayText);
 
     Net::DelayPolicySnapshot delaySnap{};
     Net::DelayPolicy_GetSnapshot(&delaySnap);

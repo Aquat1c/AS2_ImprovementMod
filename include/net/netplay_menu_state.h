@@ -140,6 +140,11 @@ struct MenuSnapshot {
     char          relay_endpoint[96];
     char          stun_endpoint[96];
     char          nat_status[128];
+    char          nat_route_status[96];
+    char          nat_mapping_status[96];
+    char          nat_punch_status[96];
+    char          nat_stun_status[96];
+    char          spectator_punch_status[96];
     bool          spectators_enabled;
     uint16_t      spectator_listen_port;
     int           connected_spectators;

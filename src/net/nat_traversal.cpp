@@ -75,7 +75,7 @@ constexpr bool kSupportsLibjuice =
 #endif
 
 constexpr bool kSupportsStun = kSupportsLibjuice;
-constexpr bool kSupportsHolePunch = kSupportsLibjuice;
+constexpr bool kSupportsHolePunch = true;
 constexpr bool kSupportsTurn = kSupportsLibjuice;
 
 static std::mutex              s_mutex;
@@ -724,7 +724,7 @@ static void WorkerMain() {
         remoteHintHost = s_remoteHintHost;
 
         s_snapshot.local_ipv6_available = LocalIPv6Available();
-        if (!kSupportsLibjuice && (cfg.enable_stun || cfg.enable_hole_punch || cfg.enable_turn)) {
+        if (!kSupportsLibjuice && (cfg.enable_stun || cfg.enable_turn)) {
             CopyText(s_snapshot.failure_reason, sizeof(s_snapshot.failure_reason),
                      "libjuice backend not linked");
         }
@@ -836,19 +836,23 @@ static void WorkerMain() {
 
 #if defined(AS2_HAVE_LIBJUICE)
     juice_agent_t* agent = nullptr;
-    if (cfg.enable_stun || cfg.enable_hole_punch || cfg.enable_turn) {
+    if (cfg.enable_stun || cfg.enable_turn) {
         ConfigureJuiceLogLevel(cfg.traversal_log_verbosity);
 
         juice_config_t jc{};
         jc.concurrency_mode = JUICE_CONCURRENCY_MODE_THREAD;
         jc.stun_server_host = cfg.stun_host[0] ? cfg.stun_host : "stun.l.google.com";
         jc.stun_server_port = cfg.stun_port ? cfg.stun_port : 19302;
-        jc.local_port_range_begin = internalPort;
-        jc.local_port_range_end = internalPort;
+        jc.local_port_range_begin = 0;
+        jc.local_port_range_end = 0;
         jc.cb_state_changed = JuiceStateChanged;
         jc.cb_candidate = JuiceCandidate;
         jc.cb_gathering_done = JuiceGatherDone;
         jc.user_ptr = nullptr;
+
+        Rollback::NetplayLog_Write("NAT", -1,
+            "libjuice diagnostics use an ephemeral socket; ENet socket autopunch owns game-port punching (game_port=%u)",
+            (unsigned)internalPort);
 
         juice_turn_server_t turnServer{};
         if (cfg.enable_turn && cfg.turn_host[0]) {
