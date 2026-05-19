@@ -627,6 +627,7 @@
 #define ADDR_CHARSEL_DISCONNECT 0x81602C  // 1 = disconnect triggered
 #define ADDR_CHARSEL_MATCH_CHAR 0x816024  // LOBYTE = character for match config
 #define ADDR_MATCH_CONFIG_FLAGS  0x816470  // DWORD - round/stage/training match config block
+#define ADDR_MATCH_ROUND_COUNT   0x816470  // LOBYTE(dword_816470) = vanilla round option (wins required = value + 1)
 #define ADDR_STAGE_CURSOR       0x816024  // During sub=7 (Preview): LOBYTE=cursor pos, BYTE1=confirmed, BYTE2=roulette counter
 #define ADDR_CHARSEL_STAGE_ID   0x816471  // BYTE1(dword_816470) = stage ID
 #define ADDR_CHARSEL_TEAM_COLOR 0x815FFE  // Team color selection
@@ -677,6 +678,11 @@
 #define ADDR_TRAINING_DUMMY_STATE_SETTING   0x8E93BE
 // HIBYTE(dword_8E93BC): Native damage display toggle (0=off, 1=on)
 #define ADDR_TRAINING_DAMAGE_DISPLAY        0x8E93BF
+
+// BYTE1(dword_8E93EC) — Number of rounds option (0..2, wins required = value + 1)
+// The game copies this into LOBYTE(dword_816470) when constructing match
+// config, then gameplay compares each player's win count against value + 1.
+#define ADDR_GAMEOPT_ROUND_COUNT 0x8E93ED
 
 // BYTE2(dword_8E93EC) — Stage Select enable/disable toggle (0 or 1)
 // When 0, stage is auto-picked from character's home stage lookup table.

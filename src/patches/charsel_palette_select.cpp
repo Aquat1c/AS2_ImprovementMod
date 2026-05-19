@@ -506,15 +506,60 @@ static bool TryFindOptionIndex(const PaletteOption* options,
     return false;
 }
 
+static bool IsSameVanillaPaletteLockedByOtherSlot(uint8_t gameSlot,
+                                                  uint8_t characterId,
+                                                  const PaletteOption& option) {
+    if (!s_frontendNetplay || gameSlot > 1 || option.use_custom) {
+        return false;
+    }
+
+    const MatchSelection& other = s_matchSelection[gameSlot ^ 1u];
+    return other.valid &&
+           !other.use_custom &&
+           other.character_id == characterId &&
+           other.base_palette == option.base_palette;
+}
+
+static uint8_t FindFirstAllowedOptionIndex(uint8_t gameSlot,
+                                           uint8_t characterId,
+                                           const PaletteOption* options,
+                                           int count) {
+    if (!options || count <= 0) {
+        return 0;
+    }
+
+    for (int index = 0; index < count; ++index) {
+        if (!IsSameVanillaPaletteLockedByOtherSlot(gameSlot,
+                                                   characterId,
+                                                   options[index])) {
+            return (uint8_t)index;
+        }
+    }
+
+    return 0;
+}
+
 static uint8_t ResolveInitialOptionIndex(uint8_t gameSlot,
                                          uint8_t characterId,
                                          const PaletteOption* options,
                                          int count) {
     const MatchSelection& selection = s_matchSelection[gameSlot];
     if (selection.valid && selection.character_id == characterId) {
-        return FindOptionIndex(options, count, selection.base_palette, selection.use_custom);
+        const uint8_t previousIndex =
+            FindOptionIndex(options, count, selection.base_palette, selection.use_custom);
+        if (!IsSameVanillaPaletteLockedByOtherSlot(gameSlot,
+                                                   characterId,
+                                                   options[previousIndex])) {
+            return previousIndex;
+        }
     }
-    return FindOptionIndex(options, count, 0, false);
+    const uint8_t defaultIndex = FindOptionIndex(options, count, 0, false);
+    if (!IsSameVanillaPaletteLockedByOtherSlot(gameSlot,
+                                               characterId,
+                                               options[defaultIndex])) {
+        return defaultIndex;
+    }
+    return FindFirstAllowedOptionIndex(gameSlot, characterId, options, count);
 }
 
 static void RefreshSlotAfterCatalogChange(uint8_t gameSlot) {
@@ -994,6 +1039,17 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
             PlayCharSelSound(ADDR_CHARSEL_MOVE_SE);
         } else if (AnyConfirmAttackJustPressed(rawInput)) {
             const PaletteOption& option = options[slotState.display_index];
+            if (IsSameVanillaPaletteLockedByOtherSlot((uint8_t)gameSlot,
+                                                      slotState.character_id,
+                                                      option)) {
+                PlayCharSelSound(ADDR_CHARSEL_CANCEL_SE);
+                Rollback::NetplayLog_Write("CHARPAL", -1,
+                    "Palette lock rejected: slot=P%d char=%u base=%u reason=other slot already locked same vanilla palette",
+                    gameSlot + 1,
+                    slotState.character_id,
+                    option.base_palette);
+                return 0;
+            }
             WriteSelectionValues(localSelection,
                 control,
                 slotState.character_id,

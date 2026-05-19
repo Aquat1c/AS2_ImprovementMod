@@ -191,6 +191,8 @@ struct MenuSnapshot {
     int           recommended_max_rollback;
     int           stall_threshold;
     bool          stall_warning;
+    int           current_rounds_to_win;
+    char          current_rounds_label[32];
 
     // Accept state
     bool          local_accepted;

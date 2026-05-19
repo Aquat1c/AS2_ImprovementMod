@@ -39,8 +39,9 @@ struct LockedMatchConfig {
     // Session-level seed (for tiebreakers, side assignment derivation)
     uint32_t session_seed;
 
-    // Match parameters (could be extended for round/time config)
-    uint8_t  round_count;        // Best-of-N (default 2)
+    // Match parameters. round_count uses the vanilla zero-based option:
+    // 0,1,2 means first to 1,2,3 wins respectively.
+    uint8_t  round_count;
     uint8_t  time_limit;         // 0 = infinite, else seconds/10
     uint8_t  _pad2[2];
 };

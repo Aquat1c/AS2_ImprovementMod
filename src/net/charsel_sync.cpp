@@ -11,6 +11,7 @@
 
 #include "net/barrier_protocol.h"
 #include "net/frontend_input_sync.h"
+#include "net/game_settings_sync.h"
 #include "net/session_manager.h"
 #include "net/stage_watchdog_tracker.h"
 #include "net/stagesel_sync.h"
@@ -73,6 +74,8 @@ static bool     s_remotePaletteCustom = false;
 static uint8_t  s_localStage = 0;
 static uint8_t  s_remoteStage = 0;
 static uint8_t  s_finalStageId = 0;
+static uint8_t  s_authoritativeRoundOption = 0;
+static bool     s_haveAuthoritativeRoundOption = false;
 
 static StageWatchdogState s_localStageState = {};
 static StageWatchdogState s_lastSentStageState = {};
@@ -108,6 +111,37 @@ static uint8_t ResolveFinalStageId(const StageWatchdogState& state) {
     return state.stage_cursor;
 }
 
+static uint8_t CurrentAuthoritativeRoundOption() {
+    if (s_haveAuthoritativeRoundOption) {
+        return s_authoritativeRoundOption;
+    }
+    return GameSettingsSync_ReadRoundOption();
+}
+
+static void AdoptAuthoritativeRoundOption(uint8_t roundOption, const char* reason) {
+    const uint8_t normalized = GameSettingsSync_NormalizeRoundOption(
+        roundOption,
+        reason ? reason : "stage round sync");
+
+    GameSettingsSyncSnapshot snapshot{};
+    GameSettingsSync_GetSnapshot(&snapshot);
+    const bool memoryMismatch =
+        snapshot.current_round_option != normalized ||
+        snapshot.match_round_option != normalized;
+    const bool changed =
+        !s_haveAuthoritativeRoundOption ||
+        s_authoritativeRoundOption != normalized ||
+        memoryMismatch;
+
+    s_authoritativeRoundOption = normalized;
+    s_haveAuthoritativeRoundOption = true;
+
+    if (changed) {
+        GameSettingsSync_ApplyRoundOption(normalized,
+            reason ? reason : "stage round sync");
+    }
+}
+
 static StageWatchdogState MakeStageBoundaryState(const StageWatchdogState& state) {
     StageWatchdogState boundaryState = state;
     const uint8_t finalStageId = ResolveFinalStageId(state);
@@ -141,6 +175,8 @@ static void ResetState() {
     s_localStage = 0;
     s_remoteStage = 0;
     s_finalStageId = 0;
+    s_authoritativeRoundOption = 0;
+    s_haveAuthoritativeRoundOption = false;
     memset(&s_localStageState, 0, sizeof(s_localStageState));
     memset(&s_lastSentStageState, 0, sizeof(s_lastSentStageState));
     memset(&s_remoteStageState, 0, sizeof(s_remoteStageState));
@@ -161,6 +197,8 @@ static void ResetStageSelectionRuntime() {
     s_localStage = 0;
     s_remoteStage = 0;
     s_finalStageId = 0;
+    s_authoritativeRoundOption = 0;
+    s_haveAuthoritativeRoundOption = false;
     memset(&s_localStageState, 0, sizeof(s_localStageState));
     memset(&s_lastSentStageState, 0, sizeof(s_lastSentStageState));
     memset(&s_remoteStageState, 0, sizeof(s_remoteStageState));
@@ -252,6 +290,97 @@ static bool CancelCharacterSlot(uint8_t gameSlot, const char* reason) {
         "Character selection canceled: slot=P%d reason=%s",
         gameSlot + 1,
         reason ? reason : "?");
+    return true;
+}
+
+static bool HasSameCharacterVanillaPaletteConflict() {
+    return s_localCharConfirmed &&
+           s_remoteCharLocked &&
+           s_localChar == s_remoteChar &&
+           s_localPalette == s_remotePalette &&
+           !s_localPaletteCustom &&
+           !s_remotePaletteCustom;
+}
+
+static void ClearLocalCharacterLock() {
+    s_localCharConfirmed = false;
+    s_localLockSent = false;
+    s_localChar = 0;
+    s_localPalette = 0;
+    s_localPaletteCustom = false;
+    s_bothCharsLocked = false;
+    s_charBoundarySent = false;
+    s_charDigestSent = false;
+}
+
+static bool RejectLocalSameCharacterPaletteLock(uint8_t localGameSlot,
+                                                const char* reason) {
+    if (!HasSameCharacterVanillaPaletteConflict()) {
+        return false;
+    }
+    if (!CancelCharacterSlot(localGameSlot, reason)) {
+        return false;
+    }
+
+    const uint8_t conflictChar = s_localChar;
+    const uint8_t conflictPalette = s_localPalette;
+    ClearLocalCharacterLock();
+    ResetStageSelectionRuntime();
+    FrontendInputSync_ClearPhaseBarrier();
+
+    Rollback::NetplayLog_Write(
+        "CHARSEL", -1,
+        "Local character lock rejected: slot=P%d char=%u palette=%u reason=same vanilla palette as remote",
+        localGameSlot + 1,
+        conflictChar,
+        conflictPalette);
+    return true;
+}
+
+static bool ResolveSameCharacterPaletteConflict(const char* reason) {
+    if (!HasSameCharacterVanillaPaletteConflict()) {
+        return false;
+    }
+
+    const uint8_t p1Char = s_isHost ? s_localChar : s_remoteChar;
+    const uint8_t p1Palette = s_isHost ? s_localPalette : s_remotePalette;
+    const uint8_t p2Char = s_isHost ? s_remoteChar : s_localChar;
+    const uint8_t p2Palette = s_isHost ? s_remotePalette : s_localPalette;
+
+    if (!CancelCharacterSlot(1, reason)) {
+        return false;
+    }
+
+    s_bothCharsLocked = false;
+    s_charBoundarySent = false;
+    s_charDigestSent = false;
+    s_localLockSent = false;
+    s_remoteCharLocked = false;
+    s_remoteChar = 0;
+    s_remotePalette = 0;
+    s_remotePaletteCustom = false;
+
+    const uint8_t localGameSlot = s_isHost ? 0 : 1;
+    s_localCharConfirmed = CharSelPaletteSelect_IsSelectionLocked(localGameSlot);
+    if (s_localCharConfirmed) {
+        RefreshLocalCharacterSelectionFromMemory();
+    } else {
+        s_localChar = 0;
+        s_localPalette = 0;
+        s_localPaletteCustom = false;
+    }
+
+    ResetStageSelectionRuntime();
+    FrontendInputSync_ClearPhaseBarrier();
+    RestartCharacterInputPhase(reason ? reason : "same character palette conflict");
+
+    Rollback::NetplayLog_Write(
+        "CHARSEL", -1,
+        "Same character vanilla palette conflict resolved: p1=%u/%u p2=%u/%u canceled=P2",
+        p1Char,
+        p1Palette,
+        p2Char,
+        p2Palette);
     return true;
 }
 
@@ -431,11 +560,12 @@ static void SendStageWatchdog(const StageWatchdogState& state, bool confirmed, c
     payload.confirm_menu_action = state.confirm_menu_action;
     payload.committed_stage_id = state.committed_stage_id;
     payload.substate = state.substate;
+    payload.round_count = CurrentAuthoritativeRoundOption();
     BarrierProtocol_SendPacket(PacketType::StageSync, &payload, sizeof(payload));
 
     Rollback::NetplayLog_Verbose(
         "STAGESEL", -1,
-        "Sent StageSync watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u counter=%u sub=%u reason=%s",
+        "Sent StageSync watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u counter=%u sub=%u rounds_raw=%u rounds_to_win=%d reason=%s",
         payload.epoch_id,
         payload.frame,
         payload.stage_id,
@@ -443,6 +573,8 @@ static void SendStageWatchdog(const StageWatchdogState& state, bool confirmed, c
         payload.stage_cursor,
         payload.stage_counter,
         payload.substate,
+        payload.round_count,
+        GameSettingsSync_RoundsToWin(payload.round_count),
         reason ? reason : "?");
 }
 
@@ -516,7 +648,7 @@ static uint32_t BuildStageBoundaryDigest(const StageWatchdogState& state) {
         uint8_t p1_palette_custom;
         uint8_t p2_palette_custom;
         uint8_t final_stage_id;
-        uint8_t _pad;
+        uint8_t round_count;
     } data{};
 
     if (s_isHost) {
@@ -538,6 +670,7 @@ static uint32_t BuildStageBoundaryDigest(const StageWatchdogState& state) {
     // confirm-menu state, and transition counters can advance on different
     // frames before the reliable boundary exchange completes.
     data.final_stage_id = ResolveFinalStageId(state);
+    data.round_count = CurrentAuthoritativeRoundOption();
     return CalcCRC32(&data, sizeof(data));
 }
 
@@ -584,6 +717,10 @@ static void SendStageBoundaryDigest() {
 
 static void MaybeFinalizeCharacterBoundary() {
     if (!s_localCharConfirmed || !s_remoteCharLocked || s_bothCharsLocked) {
+        return;
+    }
+
+    if (ResolveSameCharacterPaletteConflict("same character palette conflict")) {
         return;
     }
 
@@ -638,12 +775,15 @@ static void MaybeFinalizeStageBoundary() {
     s_bothStageLocked = true;
     s_inStagePhase = false;
     FrontendInputSync_BeginPassivePhase(FrontendSyncPhase::Locked, "stage boundary agreed");
+    const uint8_t agreedRoundOption = CurrentAuthoritativeRoundOption();
     Rollback::NetplayLog_Write(
         "STAGESEL", -1,
-        "Stage boundary agreed: local=%u remote=%u final=%u",
+        "Stage boundary agreed: local=%u remote=%u final=%u rounds_raw=%u rounds_to_win=%d",
         s_localStage,
         s_remoteStage,
-        s_finalStageId);
+        s_finalStageId,
+        agreedRoundOption,
+        GameSettingsSync_RoundsToWin(agreedRoundOption));
     LOG_NETPLAY(LOG_INFO, "[CharSelSync] Stage boundary agreed: final=%u", s_finalStageId);
 }
 
@@ -710,6 +850,8 @@ void CharSelSync_BeginStagePhase() {
     s_stageBoundaryStateValid = false;
     s_lastStageWatchdogSendTime = 0;
     StageWatchdogTracker_Reset(&s_remoteStageTracker);
+    s_authoritativeRoundOption = 0;
+    s_haveAuthoritativeRoundOption = false;
 
     CharSelPaletteSelect_EndFrontend();
     StageSelSync_Begin();
@@ -718,11 +860,23 @@ void CharSelSync_BeginStagePhase() {
         PacketType::CharSelFrameInput,
         "stage select begin");
 
+    if (s_isHost) {
+        s_authoritativeRoundOption = GameSettingsSync_ReadRoundOption();
+        s_haveAuthoritativeRoundOption = true;
+        GameSettingsSync_ApplyRoundOption(
+            s_authoritativeRoundOption,
+            "host stage select begin");
+    }
+
+    const uint8_t initialRoundOption = CurrentAuthoritativeRoundOption();
     Rollback::NetplayLog_Write(
         "STAGESEL", -1,
-        "=== STAGE SELECT BEGIN: epoch=%u shared_delay=%u ===",
+        "=== STAGE SELECT BEGIN: epoch=%u shared_delay=%u rounds_raw=%u rounds_to_win=%d role=%s ===",
         FrontendInputSync_GetEpochId(),
-        FrontendInputSync_GetSharedDelay());
+        FrontendInputSync_GetSharedDelay(),
+        initialRoundOption,
+        GameSettingsSync_RoundsToWin(initialRoundOption),
+        s_isHost ? "Host" : "Join");
     LOG_NETPLAY(LOG_INFO, "[CharSelSync] Stage phase begin (shared frontend delay preserved)");
 }
 
@@ -853,6 +1007,9 @@ void CharSelSync_FrameUpdate() {
                 s_localPalette,
                 s_localPaletteCustom ? 1 : 0,
                 localGameSlot + 1);
+            RejectLocalSameCharacterPaletteLock(
+                localGameSlot,
+                "same vanilla palette as remote");
         }
 
         if (s_localCharConfirmed && !s_localLockSent) {
@@ -959,16 +1116,20 @@ void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
         applyResult == StageWatchdogApplyResult::IgnoredRegression) {
         Rollback::NetplayLog_Verbose(
             "STAGESEL", -1,
-            "Ignored StageSync watchdog: epoch=%u frame=%u stage=%u confirmed=%u result=%s",
+            "Ignored StageSync watchdog: epoch=%u frame=%u stage=%u confirmed=%u rounds_raw=%u result=%s",
             p->epoch_id,
             p->frame,
             p->stage_id,
             p->confirmed,
+            p->round_count,
             StageWatchdogApplyResultName(applyResult));
         return;
     }
 
     const StageSyncPayload& accepted = s_remoteStageTracker.latest;
+    if (!s_isHost) {
+        AdoptAuthoritativeRoundOption(accepted.round_count, "host stage watchdog");
+    }
 
     s_remoteStageState.stage_id = accepted.stage_id;
     s_remoteStageState.stage_cursor = accepted.stage_cursor;
@@ -989,13 +1150,15 @@ void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
 
     Rollback::NetplayLog_Verbose(
         "STAGESEL", -1,
-        "Remote stage watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u sub=%u result=%s",
+        "Remote stage watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u sub=%u rounds_raw=%u rounds_to_win=%d result=%s",
         accepted.epoch_id,
         accepted.frame,
         accepted.stage_id,
         accepted.confirmed,
         accepted.stage_cursor,
         accepted.substate,
+        accepted.round_count,
+        GameSettingsSync_RoundsToWin(accepted.round_count),
         StageWatchdogApplyResultName(applyResult));
 }
 

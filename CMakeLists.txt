@@ -317,6 +317,7 @@ set(NET_HEADERS
     include/net/netplay_palette_storage.h
     include/net/netplay_pacing.h
     include/net/netplay_phase_runtime.h
+    include/net/game_settings_sync.h
     include/net/nat_traversal.h
     include/net/netplay_menu_state.h
     include/net/mode_ownership.h
@@ -421,6 +422,7 @@ set(NET_SOURCES
     src/net/netplay_palette_storage.cpp
     src/net/netplay_pacing.cpp
     src/net/netplay_phase_runtime.cpp
+    src/net/game_settings_sync.cpp
     src/net/nat_traversal.cpp
     src/net/mode_ownership.cpp
     src/net/netplay_menu_controller.cpp

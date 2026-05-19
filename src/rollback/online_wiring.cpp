@@ -35,6 +35,7 @@
 #include "net/locked_match_config.h"
 #include "net/enet_transport.h"
 #include "net/netplay_pacing.h"
+#include "net/game_settings_sync.h"
 #include "net/player_side_mapping.h"
 #include "net/charsel_sync.h"
 #include "net/winscreen_sync.h"
@@ -646,10 +647,12 @@ static bool TryStartRollbackSession() {
     NetplayLog_Write("HANDOFF", interactiveFrame,
         "=== INTERACTIVE RELEASE -> ROLLBACK START ===");
     NetplayLog_Write("HANDOFF", interactiveFrame,
-        "Config: p1_char=%u p1_pal=%u p2_char=%u p2_pal=%u stage=%u",
+        "Config: p1_char=%u p1_pal=%u p2_char=%u p2_pal=%u stage=%u rounds_raw=%u rounds_to_win=%d",
         config->p1_character, config->p1_palette,
         config->p2_character, config->p2_palette,
-        config->stage_id);
+        config->stage_id,
+        config->round_count,
+        Net::GameSettingsSync_RoundsToWin(config->round_count));
     NetplayLog_Write("HANDOFF", interactiveFrame,
         "RNG seed=0x%08X session_seed=0x%08X config_hash=0x%08X",
         config->rng_seed, config->session_seed, s_configHash);

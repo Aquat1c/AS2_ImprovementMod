@@ -106,6 +106,10 @@ struct PregameSnapshot {
     // Config
     bool          config_agreed;
     uint32_t      config_hash;
+    bool          round_count_valid;
+    uint8_t       round_count;          // Vanilla option 0..2 (wins required = value + 1)
+    int           rounds_to_win;
+    char          rounds_label[32];
 
     // Status
     char          status_text[128];

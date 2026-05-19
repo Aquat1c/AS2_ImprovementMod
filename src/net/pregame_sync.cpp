@@ -21,6 +21,7 @@
 #include "net/protocol.h"
 #include "net/mode_ownership.h"
 #include "net/netplay_menu_controller.h"
+#include "net/game_settings_sync.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "patches/charsel_palette_select.h"
@@ -69,6 +70,8 @@ static bool            s_syncAnnounceSent    = false;
 static bool            s_remoteSyncAnnounced = false;
 static bool            s_syncConfirmSent     = false;
 static bool            s_remoteSyncConfirmed = false;
+static uint8_t         s_syncRoundOption     = 0;
+static bool            s_haveSyncRoundOption = false;
 
 // Phase timeout tracking
 static DWORD           s_phaseStartTime      = 0;
@@ -137,6 +140,61 @@ static bool PhaseTimedOut(DWORD timeoutMs) {
     return (GetTickCount() - s_phaseStartTime) >= timeoutMs;
 }
 
+static uint8_t GetOutgoingSyncRoundOption(const char* reason) {
+    if (Session_GetRole() == SessionRole::Host) {
+        if (!s_haveSyncRoundOption) {
+            s_syncRoundOption = GameSettingsSync_BuildHostRoundOption(
+                reason ? reason : "pregame sync");
+            s_haveSyncRoundOption = true;
+        }
+        GameSettingsSync_ApplyRoundOption(
+            s_syncRoundOption,
+            reason ? reason : "pregame sync");
+        return s_syncRoundOption;
+    }
+
+    if (s_haveSyncRoundOption) {
+        return s_syncRoundOption;
+    }
+    return GameSettingsSync_ReadRoundOption();
+}
+
+static void AdoptHostRoundOption(uint8_t roundOption, const char* reason) {
+    if (Session_GetRole() != SessionRole::Join) {
+        return;
+    }
+
+    s_syncRoundOption = GameSettingsSync_NormalizeRoundOption(
+        roundOption,
+        reason ? reason : "host pregame sync");
+    s_haveSyncRoundOption = true;
+    GameSettingsSync_ApplyRoundOption(
+        s_syncRoundOption,
+        reason ? reason : "host pregame sync");
+}
+
+static bool EnsureRoundOptionBeforeFrontend(const char* reason) {
+    if (Session_GetRole() == SessionRole::Host) {
+        GetOutgoingSyncRoundOption(reason ? reason : "sync confirmed");
+        return true;
+    }
+
+    if (s_haveSyncRoundOption) {
+        return true;
+    }
+
+    SetErrorFmt("Host round count was not synchronized before character select");
+    Rollback::NetplayLog_Write(
+        "PREGAME", -1,
+        "Missing host round count before frontend: reason=%s phase=%s session=0x%08X remoteSession=0x%08X",
+        reason ? reason : "?",
+        PregamePhaseName(s_phase),
+        s_sessionId,
+        s_remoteSessionId);
+    Rollback::NetplayLog_Flush();
+    return false;
+}
+
 static void UpdateBootstrapFreezeForBoundary() {
     const bool inBootstrap =
         s_phase == PregamePhase::BootstrapLoading ||
@@ -169,12 +227,15 @@ static void HandleSyncAnnounce(const SyncAnnouncePayload* p) {
     s_remoteCapabilities = p->capability_flags;
     s_remoteSyncAnnounced = true;
     FrontendInputSync_OnRemoteSyncAnnounce(p->frontend_delay_proposal, "pregame announce");
+    AdoptHostRoundOption(p->round_count, "host sync announce");
 
     LOG_NETPLAY(LOG_INFO,
-        "[PregameSync] Remote SyncAnnounce: session=0x%08X caps=0x%02X frontend_delay=%u",
+        "[PregameSync] Remote SyncAnnounce: session=0x%08X caps=0x%02X frontend_delay=%u round_raw=%u round_wins=%d",
         p->session_id,
         p->capability_flags,
-        p->frontend_delay_proposal);
+        p->frontend_delay_proposal,
+        p->round_count,
+        GameSettingsSync_RoundsToWin(p->round_count));
 }
 
 static void HandleSyncConfirm(const SyncConfirmPayload* p) {
@@ -191,6 +252,7 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
         p->frontend_delay_proposal,
         p->frontend_shared_delay,
         "pregame confirm");
+    AdoptHostRoundOption(p->round_count, "host sync confirm");
 
     // Receiving a SyncConfirm implies the remote already announced
     // (they went through Announce→Exchange→Confirm). If we missed their
@@ -210,12 +272,14 @@ static void HandleSyncConfirm(const SyncConfirmPayload* p) {
     }
 
     LOG_NETPLAY(LOG_INFO,
-        "[PregameSync] Remote SyncConfirm: session=0x%08X side=%u confirmed=%u frontend_delay=%u shared=%u",
+        "[PregameSync] Remote SyncConfirm: session=0x%08X side=%u confirmed=%u frontend_delay=%u shared=%u round_raw=%u round_wins=%d",
         p->session_id,
         p->assigned_side,
         p->confirmed,
         p->frontend_delay_proposal,
-        p->frontend_shared_delay);
+        p->frontend_shared_delay,
+        p->round_count,
+        GameSettingsSync_RoundsToWin(p->round_count));
 }
 
 static void LogPregamePacketAnomaly(const char* reason,
@@ -484,15 +548,18 @@ static void SendSyncAnnounce() {
     payload.session_id = s_sessionId;
     payload.capability_flags = s_localCapabilities;
     payload.frontend_delay_proposal = (uint8_t)FrontendInputSync_GetLocalDelayProposal();
+    payload.round_count = GetOutgoingSyncRoundOption("send sync announce");
 
     BarrierProtocol_SendPacket(PacketType::SyncAnnounce,
                               &payload, sizeof(payload));
     s_syncAnnounceSent = true;
     LOG_NETPLAY(LOG_INFO,
-        "[PregameSync] Sent SyncAnnounce: session=0x%08X caps=0x%02X frontend_delay=%u",
+        "[PregameSync] Sent SyncAnnounce: session=0x%08X caps=0x%02X frontend_delay=%u round_raw=%u round_wins=%d",
         s_sessionId,
         s_localCapabilities,
-        payload.frontend_delay_proposal);
+        payload.frontend_delay_proposal,
+        payload.round_count,
+        GameSettingsSync_RoundsToWin(payload.round_count));
 }
 
 static void SendSyncConfirm() {
@@ -502,16 +569,19 @@ static void SendSyncConfirm() {
     payload.assigned_side = s_assignedSide;
     payload.frontend_delay_proposal = (uint8_t)FrontendInputSync_GetLocalDelayProposal();
     payload.frontend_shared_delay = (uint8_t)FrontendInputSync_GetSharedDelay();
+    payload.round_count = GetOutgoingSyncRoundOption("send sync confirm");
 
     BarrierProtocol_SendPacket(PacketType::SyncConfirm,
                               &payload, sizeof(payload));
     s_syncConfirmSent = true;
     LOG_NETPLAY(LOG_INFO,
-        "[PregameSync] Sent SyncConfirm: session=0x%08X side=%u local_frontend_delay=%u shared=%u",
+        "[PregameSync] Sent SyncConfirm: session=0x%08X side=%u local_frontend_delay=%u shared=%u round_raw=%u round_wins=%d",
         s_sessionId,
         s_assignedSide,
         payload.frontend_delay_proposal,
-        payload.frontend_shared_delay);
+        payload.frontend_shared_delay,
+        payload.round_count,
+        GameSettingsSync_RoundsToWin(payload.round_count));
 }
 
 static DWORD s_lastAnnounceSendTime = 0;
@@ -608,9 +678,16 @@ static void UpdateSyncConfirmed() {
         SetPhase(PregamePhase::Error, "frontend delay missing");
         return;
     }
-    LOG_NETPLAY(LOG_INFO, "[PregameSync] Session sync complete: session=0x%08X side=%u role=%s",
+    if (!EnsureRoundOptionBeforeFrontend("sync confirmed before charsel")) {
+        SetPhase(PregamePhase::Error, "round sync missing before charsel");
+        return;
+    }
+    LOG_NETPLAY(LOG_INFO,
+        "[PregameSync] Session sync complete: session=0x%08X side=%u role=%s round_raw=%u round_wins=%d",
         s_sessionId, s_assignedSide,
-        role == SessionRole::Host ? "Host" : "Join");
+        role == SessionRole::Host ? "Host" : "Join",
+        s_syncRoundOption,
+        GameSettingsSync_RoundsToWin(s_syncRoundOption));
 
     CharSelSync_Begin();
     SetStatusFmt("Character select...");
@@ -704,8 +781,9 @@ static void UpdateFrontendLocked() {
     if (role == SessionRole::Host) {
         s_lockedConfig.rng_seed = GetTickCount() ^ 0xDEADBEEF;
         s_lockedConfig.session_seed = s_sessionId;
-        s_lockedConfig.round_count = 2;
+        s_lockedConfig.round_count = GetOutgoingSyncRoundOption("pregame frontend locked");
         s_lockedConfig.time_limit = 0;
+        GameSettingsSync_ApplyLockedConfig(&s_lockedConfig, "host config build");
     }
 
     // Front-end selections are fully resolved at this point.
@@ -741,6 +819,7 @@ static void UpdateConfigExchange() {
         if (agreed) {
             memcpy(&s_lockedConfig, agreed, sizeof(LockedMatchConfig));
         }
+        GameSettingsSync_ApplyLockedConfig(&s_lockedConfig, "config agreed");
 
         // Palette transport is keyed by the final agreed config. Starting it
         // here avoids sending custom banks under a tentative local hash while
@@ -749,7 +828,9 @@ static void UpdateConfigExchange() {
 
         s_configHash = LockedMatchConfig_Hash(&s_lockedConfig);
         s_configAgreed = true;
-        SetStatusFmt("Config agreed (hash=0x%08X). Loading...", s_configHash);
+        SetStatusFmt("Config agreed (hash=0x%08X, first to %d). Loading...",
+            s_configHash,
+            GameSettingsSync_RoundsToWin(s_lockedConfig.round_count));
         SetPhase(PregamePhase::ConfigAgreed, "config agreed");
     }
 
@@ -930,6 +1011,8 @@ void PregameSync_Init() {
     s_remoteSyncAnnounced = false;
     s_syncConfirmSent = false;
     s_remoteSyncConfirmed = false;
+    s_syncRoundOption = 0;
+    s_haveSyncRoundOption = false;
     s_phaseStartTime = 0;
 
     FrontendInputSync_Init();
@@ -1038,6 +1121,8 @@ bool PregameSync_Begin() {
     s_remoteSyncAnnounced = false;
     s_syncConfirmSent = false;
     s_remoteSyncConfirmed = false;
+    s_syncRoundOption = 0;
+    s_haveSyncRoundOption = false;
     s_lastAnnounceSendTime = 0;
     s_lastConfirmSendTime = 0;
     NetplayPaletteRuntime_OnDisconnect("pregame begin reset");
@@ -1081,6 +1166,8 @@ void PregameSync_Abort(const char* reason) {
     s_remoteSyncAnnounced = false;
     s_syncConfirmSent = false;
     s_remoteSyncConfirmed = false;
+    s_syncRoundOption = 0;
+    s_haveSyncRoundOption = false;
     s_lastAnnounceSendTime = 0;
     s_lastConfirmSendTime = 0;
     NetplayPaletteRuntime_OnDisconnect(reason ? reason : "pregame abort");
@@ -1122,6 +1209,20 @@ void PregameSync_GetSnapshot(PregameSnapshot* out) {
     // Config
     out->config_agreed = s_configAgreed;
     out->config_hash = s_configHash;
+    if (s_configAgreed) {
+        out->round_count_valid = true;
+        out->round_count = s_lockedConfig.round_count;
+    } else if (s_haveSyncRoundOption) {
+        out->round_count_valid = true;
+        out->round_count = s_syncRoundOption;
+    }
+    if (out->round_count_valid) {
+        out->rounds_to_win = GameSettingsSync_RoundsToWin(out->round_count);
+        GameSettingsSync_FormatRoundLabel(
+            out->round_count,
+            out->rounds_label,
+            sizeof(out->rounds_label));
+    }
 
     // Status
     strncpy_s(out->status_text, sizeof(out->status_text), s_statusText, _TRUNCATE);

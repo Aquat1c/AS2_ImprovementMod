@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 11;
+constexpr uint16_t PROTOCOL_VERSION = 13;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -112,6 +112,8 @@ struct HelloPayload {
     uint32_t build_hash;         // Exact local mod build fingerprint
     char     nickname[64];       // Null-terminated UTF-8 nickname
     uint16_t listen_port;        // Port this peer is listening on
+    uint8_t  round_count;        // Sender's current vanilla round option 0..2
+    uint8_t  _pad;
 };
 
 struct HelloAckPayload {
@@ -119,6 +121,8 @@ struct HelloAckPayload {
     uint32_t build_hash;         // Exact local mod build fingerprint
     char     nickname[64];
     uint16_t listen_port;
+    uint8_t  round_count;        // Sender's current vanilla round option 0..2
+    uint8_t  _pad;
 };
 
 struct DisconnectPayload {
@@ -158,7 +162,8 @@ struct SyncAnnouncePayload {
     uint32_t session_id;         // Random session identifier for this match
     uint8_t  capability_flags;   // Bit 0: savestate baseline, Bit 1: desync diagnostics
     uint8_t  frontend_delay_proposal; // Local frontend delay recommendation for this epoch
-    uint16_t _pad;
+    uint8_t  round_count;        // Host-owned vanilla option 0..2 when sent by host
+    uint8_t  _pad;
 };
 
 struct SyncConfirmPayload {
@@ -167,6 +172,8 @@ struct SyncConfirmPayload {
     uint8_t  assigned_side;      // Host decides: 0 = host is P1, 1 = host is P2
     uint8_t  frontend_delay_proposal; // Echo of sender's local recommendation
     uint8_t  frontend_shared_delay;   // Shared frontend delay agreed for this epoch
+    uint8_t  round_count;        // Host-owned vanilla option 0..2 when sent by host
+    uint8_t  _pad[3];
 };
 
 struct FrontendPhaseBarrierPayload {
@@ -250,7 +257,8 @@ struct StageSyncPayload {
     uint8_t  confirm_menu_action; // Confirm-menu action/armed flag
     uint8_t  committed_stage_id; // Final committed stage ID if available
     uint8_t  substate;           // Native charsel substate for diagnostics
-    uint8_t  _pad[2];
+    uint8_t  round_count;        // Host-owned vanilla option 0..2 (wins required = value + 1)
+    uint8_t  _pad;
 };
 
 struct ConfigExchangePayload {
@@ -260,7 +268,7 @@ struct ConfigExchangePayload {
     uint8_t  p2_palette;
     uint8_t  stage_id;
     uint8_t  host_side;          // 0 = host is P1, 1 = host is P2
-    uint8_t  round_count;
+    uint8_t  round_count;        // Vanilla option 0..2 (wins required = value + 1)
     uint8_t  time_limit;
     uint32_t rng_seed;
     uint32_t session_seed;
@@ -448,6 +456,16 @@ static_assert(sizeof(PacketType) + sizeof(PaletteDataPayload) <= MAX_PACKET_SIZE
     "PaletteDataPayload must fit inside one transport packet");
 static_assert(sizeof(PacketType) + sizeof(CharSelInputPayload) <= MAX_PACKET_SIZE,
     "CharSelInputPayload must fit inside one transport packet");
+static_assert(sizeof(HelloPayload) == 74,
+    "HelloPayload wire size must remain stable");
+static_assert(sizeof(HelloAckPayload) == 74,
+    "HelloAckPayload wire size must remain stable");
+static_assert(sizeof(SyncAnnouncePayload) == 8,
+    "SyncAnnouncePayload wire size must remain stable");
+static_assert(sizeof(SyncConfirmPayload) == 12,
+    "SyncConfirmPayload wire size must remain stable");
+static_assert(sizeof(StageSyncPayload) == 20,
+    "StageSyncPayload wire size must remain stable");
 
 // NatInfoPayload flags
 constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;

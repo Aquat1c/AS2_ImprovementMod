@@ -112,6 +112,8 @@ struct PeerInfo {
     uint32_t build_hash;
     uint16_t protocol_version;
     uint16_t listen_port;
+    bool     round_count_valid;
+    uint8_t  round_count;
 };
 
 // ============================================================================

@@ -39,6 +39,7 @@
 #include "net/match_lifecycle.h"
 #include "net/sync_policy.h"
 #include "net/delay_policy.h"
+#include "net/game_settings_sync.h"
 #include "net/gameplay_bridge.h"
 #include "net/set_tracker.h"
 #include "net/player_side_mapping.h"
@@ -493,6 +494,9 @@ static void DeferredInit() {
     LogInitStep("SpectatorPlayback_Init", "BEGIN");
     Net::SpectatorPlayback_Init();
     LogInitStep("SpectatorPlayback_Init", "END");
+    LogInitStep("GameSettingsSync_Init", "BEGIN");
+    Net::GameSettingsSync_Init();
+    LogInitStep("GameSettingsSync_Init", "END");
 
     // Initialize netplay menu controller and mode ownership hooks
     LogInitStep("NetMenu::Init", "BEGIN");
@@ -660,6 +664,7 @@ __declspec(dllexport) void ModShutdown() {
         PaletteAssetHook_Shutdown();
         Net::NetplayPaletteRuntime_Shutdown();
         Net::Session_Shutdown();
+        Net::GameSettingsSync_Shutdown();
         Net::Transport_GlobalDeinit();
         Savestate_Shutdown();
         DetVer_Shutdown();
@@ -705,6 +710,8 @@ __declspec(dllexport) void ModOnFrame() {
             }
         }
     }
+
+    Net::GameSettingsSync_FrameUpdate();
 
     // Update netplay menu controller (pumps session, handles input, renders menu)
     ModeOwnership::FrameUpdate();

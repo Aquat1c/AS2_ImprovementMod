@@ -13,6 +13,7 @@
 #include "net/protocol.h"
 #include "net/locked_match_config.h"
 #include "net/delay_policy.h"
+#include "net/game_settings_sync.h"
 #include "rollback/netplay_log.h"
 #include "rollback/savestate.h"
 #include "rollback/determinism_verify.h"
@@ -206,8 +207,11 @@ static void SendConfig() {
     }
 
     s_configSent = true;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent config (hash=0x%08X my_delay=%d my_max_rb=%d)",
+    LOG_NETPLAY(LOG_INFO,
+        "[MatchBoot] Sent config (hash=0x%08X rounds_raw=%u rounds_to_win=%d my_delay=%d my_max_rb=%d)",
         LockedMatchConfig_Hash(&s_config),
+        s_config.round_count,
+        GameSettingsSync_RoundsToWin(s_config.round_count),
         delayData.local_input_delay, delayData.max_rollback);
 }
 
@@ -408,8 +412,11 @@ static void UpdateConfigExchange() {
         if (s_remoteDelayReceived) {
             DelayPolicy_NegotiateSession(&s_remoteDelayData);
         }
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join accepted early config (hash=0x%08X remote_delay=%d stall_threshold=%d)",
+        LOG_NETPLAY(LOG_INFO,
+            "[MatchBoot] Join accepted early config (hash=0x%08X rounds_raw=%u rounds_to_win=%d remote_delay=%d stall_threshold=%d)",
             hash,
+            s_config.round_count,
+            GameSettingsSync_RoundsToWin(s_config.round_count),
             DelayPolicy_GetRemoteAnnouncedDelay(),
             DelayPolicy_GetStallThreshold());
     }
@@ -642,6 +649,10 @@ void MatchBootstrap_BeginConfigExchange(const LockedMatchConfig* config) {
     if (s_isHost || !s_configReceived) {
         memcpy(&s_config, config, sizeof(LockedMatchConfig));
     }
+    if (s_isHost || s_configReceived) {
+        GameSettingsSync_ApplyLockedConfig(&s_config,
+            s_isHost ? "host begin config exchange" : "join begin config exchange with early host config");
+    }
 
     s_configSent = false;
     // NOTE: Do NOT reset s_configReceived or s_configAgreed here.
@@ -651,10 +662,13 @@ void MatchBootstrap_BeginConfigExchange(const LockedMatchConfig* config) {
     s_error[0] = '\0';
 
     s_phase = BootPhase::ConfigExchange;
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Begin config exchange (role=%s config_already=%s agreed_already=%s)",
+    LOG_NETPLAY(LOG_INFO,
+        "[MatchBoot] Begin config exchange (role=%s config_already=%s agreed_already=%s rounds_raw=%u rounds_to_win=%d)",
         s_isHost ? "Host" : "Join",
         s_configReceived ? "yes" : "no",
-        s_configAgreed ? "yes" : "no");
+        s_configAgreed ? "yes" : "no",
+        s_config.round_count,
+        GameSettingsSync_RoundsToWin(s_config.round_count));
 }
 
 void MatchBootstrap_BeginLoading() {
@@ -800,8 +814,13 @@ void MatchBootstrap_OnConfigExchange(const ConfigExchangePayload* p) {
         // Store the config unconditionally; the ack is sent once the
         // client actually enters ConfigExchange and sees s_configReceived.
         memcpy(&s_config, &received, sizeof(LockedMatchConfig));
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join received config (hash=0x%08X phase=%u)",
-            receivedHash, (unsigned)s_phase);
+        GameSettingsSync_ApplyLockedConfig(&s_config, "join received host config");
+        LOG_NETPLAY(LOG_INFO,
+            "[MatchBoot] Join received config (hash=0x%08X phase=%u rounds_raw=%u rounds_to_win=%d)",
+            receivedHash,
+            (unsigned)s_phase,
+            s_config.round_count,
+            GameSettingsSync_RoundsToWin(s_config.round_count));
 
         // Store host's delay negotiation data
         s_remoteDelayData.local_input_delay = p->my_input_delay;
@@ -840,9 +859,11 @@ void MatchBootstrap_OnConfigAck(const ConfigAckPayload* p) {
         s_configAgreed = true;
         DelayPolicy_NegotiateSession(&s_remoteDelayData);
         LOG_NETPLAY(LOG_INFO,
-            "[MatchBoot] Config agreed (hash=0x%08X phase=%u local_delay=%d local_max_rb=%d remote_delay=%d remote_max_rb=%d stall_threshold=%d)",
+            "[MatchBoot] Config agreed (hash=0x%08X phase=%u rounds_raw=%u rounds_to_win=%d local_delay=%d local_max_rb=%d remote_delay=%d remote_max_rb=%d stall_threshold=%d)",
             localHash,
             (unsigned)s_phase,
+            s_config.round_count,
+            GameSettingsSync_RoundsToWin(s_config.round_count),
             DelayPolicy_GetConfiguredDelay(),
             DelayPolicy_GetRollbackBudget(),
             DelayPolicy_GetRemoteAnnouncedDelay(),

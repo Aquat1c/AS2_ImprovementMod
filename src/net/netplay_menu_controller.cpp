@@ -23,6 +23,7 @@
 #include "net/spectator_client.h"
 #include "net/spectator_playback.h"
 #include "net/netplay_palette_runtime.h"
+#include "net/game_settings_sync.h"
 #include "rollback/netplay_log.h"
 #include "rollback/online_wiring.h"
 #include "core/game_state.h"
@@ -3882,6 +3883,30 @@ void GetSnapshot(MenuSnapshot* out) {
             (int)ceilf(delaySnap.measured_one_way_frames) - delaySnap.remote_announced_delay);
     out->stall_warning = delaySnap.measurement_valid &&
                          (expectedDepth > s_rollbackBudget);
+
+    Net::PregameSnapshot pregameSnap{};
+    Net::PregameSync_GetSnapshot(&pregameSnap);
+    if (pregameSnap.round_count_valid) {
+        out->current_rounds_to_win = pregameSnap.rounds_to_win;
+        CopyText(out->current_rounds_label,
+            sizeof(out->current_rounds_label),
+            pregameSnap.rounds_label);
+    } else if (sessionSnap.active && sessionSnap.role == Net::SessionRole::Host) {
+        Net::GameSettingsSyncSnapshot settingsSnap{};
+        Net::GameSettingsSync_GetSnapshot(&settingsSnap);
+        out->current_rounds_to_win = settingsSnap.current_rounds_to_win;
+        Net::GameSettingsSync_FormatRoundLabel(settingsSnap.current_round_option,
+            out->current_rounds_label,
+            sizeof(out->current_rounds_label));
+    } else if (sessionSnap.active &&
+               sessionSnap.role == Net::SessionRole::Join &&
+               sessionSnap.remote_peer.round_count_valid) {
+        out->current_rounds_to_win =
+            Net::GameSettingsSync_RoundsToWin(sessionSnap.remote_peer.round_count);
+        Net::GameSettingsSync_FormatRoundLabel(sessionSnap.remote_peer.round_count,
+            out->current_rounds_label,
+            sizeof(out->current_rounds_label));
+    }
 
     // Local nickname
     CopyText(out->local_nickname, sizeof(out->local_nickname), s_localNickname);

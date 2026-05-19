@@ -905,6 +905,10 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
         RenderInfoLine(y, "Stall", stallBuf, alpha);
         y += kInfoStep;
     }
+    if (snap->current_rounds_label[0]) {
+        RenderInfoLine(y, "Rounds", snap->current_rounds_label, alpha);
+        y += kInfoStep;
+    }
     // Score
     if (snap->local_wins > 0 || snap->remote_wins > 0) {
         char scoreBuf[48];

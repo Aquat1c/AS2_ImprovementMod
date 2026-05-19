@@ -8,6 +8,7 @@
 #include "net/session_manager.h"
 #include "net/network_thread.h"
 #include "net/nat_traversal.h"
+#include "net/game_settings_sync.h"
 #include "patches/memory_utils.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
@@ -92,6 +93,7 @@ static void SetError(const char* msg) {
     snprintf(s_errorText, sizeof(s_errorText), "%s", msg);
     LOG_ERROR("[Session] Error: %s", msg);
     Rollback::NetplayLog_Write("SESSION", -1, "ERROR: %s", msg);
+    GameSettingsSync_RestoreLocalSession(msg ? msg : "session error");
     Nat_StopServices();
     SetState(SessionState::Failed);
 }
@@ -343,19 +345,26 @@ static bool ProcessHandshakeIdentity(const char* packetName,
                                      uint32_t buildHash,
                                      const char* nickname,
                                      size_t nicknameLen,
-                                     uint16_t listenPort) {
+                                     uint16_t listenPort,
+                                     uint8_t advertisedRoundOption) {
     char remoteNickname[sizeof(s_remotePeer.nickname) + 1] = {};
     CopyHandshakeNickname(nickname, nicknameLen, remoteNickname, sizeof(remoteNickname));
+    const uint8_t normalizedRoundOption = GameSettingsSync_NormalizeRoundOption(
+        advertisedRoundOption,
+        packetName ? packetName : "handshake");
 
-    LOG_INFO("[Session] Received %s (nick=%s, ver=%u, hash=0x%08X, port=%u)",
-             packetName, remoteNickname, protocolVersion, buildHash, listenPort);
+    LOG_INFO("[Session] Received %s (nick=%s, ver=%u, hash=0x%08X, port=%u, rounds=%u)",
+             packetName, remoteNickname, protocolVersion, buildHash, listenPort,
+             normalizedRoundOption);
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Received %s: nick=%s ver=%u hash=0x%08X listen_port=%u local_ver=%u local_hash=0x%08X state=%s role=%s",
+        "Received %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d local_ver=%u local_hash=0x%08X state=%s role=%s",
         packetName,
         remoteNickname,
         protocolVersion,
         buildHash,
         listenPort,
+        normalizedRoundOption,
+        GameSettingsSync_RoundsToWin(normalizedRoundOption),
         PROTOCOL_VERSION,
         s_config.build_hash,
         SessionStateName(s_state),
@@ -409,6 +418,8 @@ static bool ProcessHandshakeIdentity(const char* packetName,
     s_remotePeer.protocol_version = protocolVersion;
     s_remotePeer.build_hash = buildHash;
     s_remotePeer.listen_port = listenPort;
+    s_remotePeer.round_count_valid = true;
+    s_remotePeer.round_count = normalizedRoundOption;
     memset(s_remotePeer.nickname, 0, sizeof(s_remotePeer.nickname));
     strncpy_s(s_remotePeer.nickname, sizeof(s_remotePeer.nickname), remoteNickname, _TRUNCATE);
 
@@ -418,12 +429,14 @@ static bool ProcessHandshakeIdentity(const char* packetName,
              s_remotePeer.protocol_version,
              s_remotePeer.build_hash);
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Accepted %s: nick=%s ver=%u hash=0x%08X listen_port=%u",
+        "Accepted %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d",
         packetName,
         s_remotePeer.nickname,
         s_remotePeer.protocol_version,
         s_remotePeer.build_hash,
-        s_remotePeer.listen_port);
+        s_remotePeer.listen_port,
+        s_remotePeer.round_count,
+        GameSettingsSync_RoundsToWin(s_remotePeer.round_count));
     return true;
 }
 
@@ -770,10 +783,11 @@ static void FlushNatTraversalOutboundSignals() {
 // ============================================================================
 
 static void SendHello() {
-    HelloPayload hello;
+    HelloPayload hello{};
     hello.protocol_version = PROTOCOL_VERSION;
     hello.build_hash = s_config.build_hash;
     hello.listen_port = s_config.listen_port;
+    hello.round_count = GameSettingsSync_ReadRoundOption();
     memset(hello.nickname, 0, sizeof(hello.nickname));
     strncpy(hello.nickname, s_config.nickname, sizeof(hello.nickname) - 1);
 
@@ -782,18 +796,24 @@ static void SendHello() {
         SetError("Failed to send Hello");
         return;
     }
-    LOG_INFO("[Session] Sent Hello (nick=%s, ver=%u, hash=0x%08X)",
-             hello.nickname, hello.protocol_version, hello.build_hash);
+    LOG_INFO("[Session] Sent Hello (nick=%s, ver=%u, hash=0x%08X, rounds=%u)",
+             hello.nickname, hello.protocol_version, hello.build_hash, hello.round_count);
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Sent Hello: nick=%s ver=%u hash=0x%08X listen_port=%u",
-        hello.nickname, hello.protocol_version, hello.build_hash, hello.listen_port);
+        "Sent Hello: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d",
+        hello.nickname,
+        hello.protocol_version,
+        hello.build_hash,
+        hello.listen_port,
+        hello.round_count,
+        GameSettingsSync_RoundsToWin(hello.round_count));
 }
 
 static void SendHelloAck() {
-    HelloAckPayload ack;
+    HelloAckPayload ack{};
     ack.protocol_version = PROTOCOL_VERSION;
     ack.build_hash = s_config.build_hash;
     ack.listen_port = s_config.listen_port;
+    ack.round_count = GameSettingsSync_ReadRoundOption();
     memset(ack.nickname, 0, sizeof(ack.nickname));
     strncpy(ack.nickname, s_config.nickname, sizeof(ack.nickname) - 1);
 
@@ -802,10 +822,15 @@ static void SendHelloAck() {
         SetError("Failed to send HelloAck");
         return;
     }
-    LOG_INFO("[Session] Sent HelloAck");
+    LOG_INFO("[Session] Sent HelloAck (rounds=%u)", ack.round_count);
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Sent HelloAck: nick=%s ver=%u hash=0x%08X listen_port=%u",
-        ack.nickname, ack.protocol_version, ack.build_hash, ack.listen_port);
+        "Sent HelloAck: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d",
+        ack.nickname,
+        ack.protocol_version,
+        ack.build_hash,
+        ack.listen_port,
+        ack.round_count,
+        GameSettingsSync_RoundsToWin(ack.round_count));
 }
 
 static bool ProcessHelloPayload(const void* payload, size_t len) {
@@ -825,7 +850,8 @@ static bool ProcessHelloPayload(const void* payload, size_t len) {
         hello->build_hash,
         hello->nickname,
         sizeof(hello->nickname),
-        hello->listen_port);
+        hello->listen_port,
+        hello->round_count);
 }
 
 static bool ProcessHelloAckPayload(const void* payload, size_t len) {
@@ -839,13 +865,18 @@ static bool ProcessHelloAckPayload(const void* payload, size_t len) {
     }
 
     const HelloAckPayload* ack = static_cast<const HelloAckPayload*>(payload);
-    return ProcessHandshakeIdentity(
+    const bool accepted = ProcessHandshakeIdentity(
         "HelloAck",
         ack->protocol_version,
         ack->build_hash,
         ack->nickname,
         sizeof(ack->nickname),
-        ack->listen_port);
+        ack->listen_port,
+        ack->round_count);
+    if (accepted && s_role == SessionRole::Join) {
+        GameSettingsSync_ApplyRoundOption(ack->round_count, "host hello-ack");
+    }
+    return accepted;
 }
 
 // ============================================================================
@@ -1052,6 +1083,7 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
                 NetworkThread_ClearQueues(s_activeSessionToken);
             }
             s_peerToken = 0;
+            GameSettingsSync_RestoreLocalSession(reason);
             Nat_StopServices();
             ResetState();
             break;
@@ -1309,6 +1341,7 @@ bool Session_StartHost(const SessionConfig* config) {
         return false;
     }
     s_role = SessionRole::Host;
+    GameSettingsSync_BeginNetplaySession("start host");
 
     Rollback::NetplayLog_Write("SESSION", -1,
         "StartHost: listen_port=%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u "
@@ -1391,6 +1424,7 @@ bool Session_StartJoin(const SessionConfig* config) {
         return false;
     }
     s_role = SessionRole::Join;
+    GameSettingsSync_BeginNetplaySession("start join");
 
     const bool relayConfigured = HasRelayConfigured(&s_config);
 
@@ -1535,6 +1569,7 @@ void Session_Cancel() {
     LOG_INFO("[Session] Canceling session (was %s)", SessionStateName(s_state));
     Rollback::NetplayLog_Write("SESSION", -1,
         "Cancel requested from state=%s", SessionStateName(s_state));
+    GameSettingsSync_RestoreLocalSession("session cancel");
 
     const uint32_t cancelToken = s_activeSessionToken;
 
