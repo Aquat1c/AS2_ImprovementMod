@@ -419,6 +419,17 @@ static bool AreRemotePaletteHotkeyModifiersDown() {
            (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
 }
 
+static bool IsGameWindowFocused() {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground) {
+        return false;
+    }
+
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(foreground, &foregroundPid);
+    return foregroundPid == GetCurrentProcessId();
+}
+
 static bool HasForcedLocalVisualCustomBank(int gameSlot) {
     if (!IsValidGameSlot(gameSlot)) {
         return false;
@@ -614,6 +625,12 @@ static void MaybeReapplyGameplayOverrides() {
 
 static void ProcessMatchPaletteHotkeys() {
     const bool tabDown = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+    const bool windowFocused = IsGameWindowFocused();
+    if (!windowFocused) {
+        s_tabWasDown = tabDown;
+        return;
+    }
+
     const bool modifiersDown = AreRemotePaletteHotkeyModifiersDown();
 
     const bool allowHotkey = s_matchActive &&
