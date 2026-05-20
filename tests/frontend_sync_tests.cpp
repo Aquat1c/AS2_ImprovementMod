@@ -247,6 +247,127 @@ static void TestOutOfOrderFrontendInputWaitsForMissingCurrentFrame() {
         "the buffered future remote input should be preserved for the next consume frame");
 }
 
+static void TestCharSelInputUsesNegotiatedFrontendDelay() {
+    ResetSubsystems();
+    BeginNegotiatedPhase(4, Net::FrontendSyncPhase::CharSel);
+
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    Net::FrontendInputSync_CaptureLocalInput(0x0040);
+    for (uint32_t frame = 0; frame <= 4; frame++) {
+        Net::CharSelFrameInputPayload remote =
+            MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, frame, 0);
+        Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote);
+    }
+
+    uint16_t local = 0;
+    uint16_t remote = 0;
+    for (uint32_t frame = 0; frame < 4; frame++) {
+        TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
+            "char-select setup frames should consume while waiting for delayed local input");
+        TEST_CHECK(local == 0,
+            "char-select local input must be blank before the negotiated frontend delay elapses");
+    }
+
+    TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
+        "char-select delayed local input should consume at the shared delay frame");
+    TEST_CHECK(local == 0x0040,
+        "char-select local input should appear exactly after the negotiated frontend delay");
+}
+
+static void TestFrontendInputBeyondRingDoesNotAliasOrRecover() {
+    ResetSubsystems();
+    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    Net::FrontendInputSync_CaptureLocalInput(0x0010);
+
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    Net::CharSelFrameInputPayload alias =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 512, 0x2222);
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&alias);
+
+    TEST_CHECK(!Net::FrontendInputSync_HasRecoveryRequest(),
+        "remote frontend input beyond the retain window should not request session recovery");
+    TEST_CHECK(!Net::FrontendInputSync_HasInputsForCurrentFrame(),
+        "future input exactly one ring ahead must not alias the current consume frame");
+}
+
+static void TestConsumedLocalFrontendInputRemainsResendableUntilAcked() {
+    ResetSubsystems(100);
+    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    Net::FrontendInputSync_CaptureLocalInput(0x0010);
+
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    Net::CharSelFrameInputPayload remote0 =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0x0040);
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote0);
+
+    uint16_t local = 0;
+    uint16_t remote = 0;
+    TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
+        "frontend frame zero should consume before testing resend retention");
+    ClearSentPackets();
+    Net::FrontendInputSync_Test_SetClockMs(250);
+
+    Net::CharSelFrameInputPayload remote1 =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 1, 0x0080);
+    remote1.ack_frame = 0;
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote1);
+
+    const SentPacket* resend = FindLastPacket(Net::PacketType::CharSelFrameInput);
+    const auto* payload = resend && resend->payload.size() >= sizeof(Net::CharSelFrameInputPayload)
+        ? reinterpret_cast<const Net::CharSelFrameInputPayload*>(resend->payload.data())
+        : nullptr;
+    TEST_CHECK(payload != nullptr,
+        "a peer ack behind our consumed frame should trigger a targeted resend");
+    TEST_CHECK(payload && payload->frame == 0,
+        "targeted resend should be able to resend the consumed-but-unacked local frame");
+}
+
+static void TestFrontendSendAheadCannotOverwritePeerAckWindow() {
+    ResetSubsystems(100);
+    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    for (uint32_t i = 0; i < 296; i++) {
+        Net::FrontendInputSync_CaptureLocalInput((uint16_t)(0x1000u + i));
+        Net::CharSelFrameInputPayload remote =
+            MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, i, (uint16_t)(0x2000u + i));
+        remote.ack_frame = i < 39 ? i : 39;
+        Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote);
+
+        uint16_t local = 0;
+        uint16_t remoteInput = 0;
+        TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remoteInput, nullptr),
+            "setup should consume contiguous frontend frames before send-ahead cap test");
+    }
+
+    ClearSentPackets();
+    for (uint32_t i = 0; i < 400; i++) {
+        Net::FrontendInputSync_CaptureLocalInput((uint16_t)(0x3000u + i));
+    }
+
+    Net::FrontendInputSyncSnapshot snap{};
+    Net::FrontendInputSync_GetSnapshot(&snap);
+    TEST_CHECK(snap.local_input_frame <= 551,
+        "frontend send-ahead must stop before overwriting the oldest peer-unacked ring slot");
+
+    Net::FrontendInputSync_Test_SetClockMs(1000);
+    Net::CharSelFrameInputPayload remote =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 296, 0x4000);
+    remote.ack_frame = 39;
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote);
+
+    const SentPacket* resend = FindLastPacket(Net::PacketType::CharSelFrameInput);
+    const auto* payload = resend && resend->payload.size() >= sizeof(Net::CharSelFrameInputPayload)
+        ? reinterpret_cast<const Net::CharSelFrameInputPayload*>(resend->payload.data())
+        : nullptr;
+    TEST_CHECK(payload != nullptr,
+        "a far-behind peer ack should trigger a resend after local send-ahead pressure");
+    TEST_CHECK(payload && payload->frame == 54,
+        "targeted resend should send the newest frame whose history still covers the peer ack");
+    TEST_CHECK(payload && payload->input_count == 16,
+        "targeted resend history must still include the oldest peer-unacked frame");
+}
+
 static void TestStageMergeOpposingDirectionsAndConfirm() {
     ResetSubsystems();
     Net::StageSelSync_Begin();
@@ -522,6 +643,10 @@ int main() {
     TestJitterPressureTriggersIncreaseOnlyDelayBump();
     TestStarvationDelayBumpRequiresRemoteFrame();
     TestOutOfOrderFrontendInputWaitsForMissingCurrentFrame();
+    TestCharSelInputUsesNegotiatedFrontendDelay();
+    TestFrontendInputBeyondRingDoesNotAliasOrRecover();
+    TestConsumedLocalFrontendInputRemainsResendableUntilAcked();
+    TestFrontendSendAheadCannotOverwritePeerAckWindow();
     TestStageMergeOpposingDirectionsAndConfirm();
     TestWinScreenAdvanceWaitsForBothPeers();
     TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters();

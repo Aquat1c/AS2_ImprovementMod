@@ -53,6 +53,8 @@ static uint32_t          s_remoteLatestFrame = 0;
 static uint32_t          s_remoteAckFrame = 0;
 static uint16_t          s_localInputs[FRONTEND_RING_SIZE] = {};
 static uint16_t          s_remoteInputs[FRONTEND_RING_SIZE] = {};
+static uint32_t          s_localInputIds[FRONTEND_RING_SIZE] = {};
+static uint32_t          s_remoteInputIds[FRONTEND_RING_SIZE] = {};
 static bool              s_hasLocalInput[FRONTEND_RING_SIZE] = {};
 static bool              s_hasRemoteInput[FRONTEND_RING_SIZE] = {};
 
@@ -66,6 +68,7 @@ static bool              s_remoteSharedDelaySeen = false;
 static DWORD             s_lastRemoteInputTime = 0;
 static DWORD             s_lastResendTime = 0;
 static DWORD             s_lastTargetedResendTime = 0;
+static DWORD             s_lastRingWindowPressureLogTime = 0;
 static DWORD             s_lastDelayBumpRequestTime = 0;
 static DWORD             s_waitingForCurrentFrameSince = 0;
 static DWORD             s_lastPressureSampleTime = 0;
@@ -109,6 +112,7 @@ static DWORD             s_testClockMs = 0;
 #endif
 
 struct FrontendDelayProposalDetails {
+    uint16_t configured_delay;
     uint16_t configured_floor;
     uint16_t base_delay;
     uint16_t jitter_bump;
@@ -157,7 +161,8 @@ static FrontendDelayProposalDetails ComputeDelayProposalDetails() {
     details.rtt_variance_ms = measurement.rtt_variance_ms;
     details.one_way_frames = measurement.one_way_frames;
     details.jitter_frames = measurement.jitter_frames;
-    details.configured_floor = ClampFrontendDelay((uint16_t)(DelayPolicy_GetConfiguredDelay() + 2));
+    details.configured_delay = (uint16_t)DelayPolicy_GetConfiguredDelay();
+    details.configured_floor = ClampFrontendDelay((uint16_t)(details.configured_delay + 2));
     details.base_delay = ClampFrontendDelay((uint16_t)(DelayPolicy_ComputeRecommendedDelay() + 2));
     if (details.base_delay < details.configured_floor) {
         details.base_delay = details.configured_floor;
@@ -206,6 +211,39 @@ static uint16_t GetEffectiveDelayFloor() {
     return floor;
 }
 
+static bool HasLocalInputFrame(uint32_t frame) {
+    const int idx = (int)(frame & FRONTEND_RING_MASK);
+    return s_hasLocalInput[idx] && s_localInputIds[idx] == frame;
+}
+
+static bool HasRemoteInputFrame(uint32_t frame) {
+    const int idx = (int)(frame & FRONTEND_RING_MASK);
+    return s_hasRemoteInput[idx] && s_remoteInputIds[idx] == frame;
+}
+
+static void StoreLocalInputFrame(uint32_t frame, uint16_t input) {
+    const int idx = (int)(frame & FRONTEND_RING_MASK);
+    s_localInputs[idx] = input;
+    s_localInputIds[idx] = frame;
+    s_hasLocalInput[idx] = true;
+}
+
+static void StoreRemoteInputFrame(uint32_t frame, uint16_t input) {
+    const int idx = (int)(frame & FRONTEND_RING_MASK);
+    s_remoteInputs[idx] = input;
+    s_remoteInputIds[idx] = frame;
+    s_hasRemoteInput[idx] = true;
+}
+
+static uint32_t GetLocalSendHeadLimit() {
+    uint32_t limit = s_consumeFrame + FRONTEND_SEND_HEAD_BUFFER;
+    const uint32_t ackLimited = s_remoteAckFrame + (uint32_t)FRONTEND_RING_SIZE - 1u;
+    if (ackLimited < limit) {
+        limit = ackLimited;
+    }
+    return limit;
+}
+
 static void ClearPhaseInputState() {
     s_consumeFrame = 0;
     s_localInputFrame = 0;
@@ -215,10 +253,13 @@ static void ClearPhaseInputState() {
     s_receivedRemoteInputThisPhase = false;
     s_lastResendTime = 0;
     s_lastTargetedResendTime = 0;
+    s_lastRingWindowPressureLogTime = 0;
     s_lastDelayBumpRequestTime = 0;
     s_timedOut = false;
     memset(s_localInputs, 0, sizeof(s_localInputs));
     memset(s_remoteInputs, 0, sizeof(s_remoteInputs));
+    memset(s_localInputIds, 0, sizeof(s_localInputIds));
+    memset(s_remoteInputIds, 0, sizeof(s_remoteInputIds));
     memset(s_hasLocalInput, 0, sizeof(s_hasLocalInput));
     memset(s_hasRemoteInput, 0, sizeof(s_hasRemoteInput));
     s_pendingDelayBump = false;
@@ -295,7 +336,7 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
             const int f = (int)frame - i;
             if (f < 0) break;
             const int idx = f & FRONTEND_RING_MASK;
-            if (!s_hasLocalInput[idx]) break;
+            if (!HasLocalInputFrame((uint32_t)f)) break;
             payload.inputs[i] = s_localInputs[idx];
             count++;
         }
@@ -328,7 +369,7 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
         const int f = (int)frame - i;
         if (f < 0) break;
         const int idx = f & FRONTEND_RING_MASK;
-        if (!s_hasLocalInput[idx]) break;
+        if (!HasLocalInputFrame((uint32_t)f)) break;
         payload.inputs[i] = s_localInputs[idx];
         count++;
     }
@@ -356,11 +397,9 @@ static void EnsureLocalLead(const char* reason) {
     }
 
     const uint32_t targetLead = (uint32_t)(s_sharedDelay > 0 ? s_sharedDelay : FRONTEND_DELAY_MIN);
-    const uint32_t maxSendFrame = s_consumeFrame + FRONTEND_SEND_HEAD_BUFFER;
+    const uint32_t maxSendFrame = GetLocalSendHeadLimit();
     while (s_localInputFrame < (s_consumeFrame + targetLead) && s_localInputFrame <= maxSendFrame) {
-        const int idx = (int)(s_localInputFrame & FRONTEND_RING_MASK);
-        s_localInputs[idx] = 0;
-        s_hasLocalInput[idx] = true;
+        StoreLocalInputFrame(s_localInputFrame, 0);
         SendInputPacket(s_localInputFrame, reason ? reason : "lead fill");
         s_localInputFrame++;
     }
@@ -550,10 +589,6 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     if (ackFrame > s_remoteAckFrame) {
         s_remoteAckFrame = ackFrame;
     }
-    if (frame > (s_consumeFrame + FRONTEND_RING_SIZE)) {
-        FrontendInputSync_RequestRecovery("frontend packet was outside ring window");
-        return;
-    }
     if (frame < s_consumeFrame) {
         Rollback::NetplayLog_Verbose(
             "FRONTEND", -1,
@@ -568,6 +603,7 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     const uint32_t previousRemoteLatest = s_remoteLatestFrame;
     bool acceptedAny = false;
     int newFramesApplied = 0;
+    int futureFramesIgnored = 0;
     for (uint16_t i = 0; i < inputCount; i++) {
         const int f = (int)frame - (int)i;
         if (f < 0) {
@@ -576,11 +612,13 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         if ((uint32_t)f < s_consumeFrame) {
             continue;
         }
+        if (((uint32_t)f - s_consumeFrame) >= (uint32_t)FRONTEND_RING_SIZE) {
+            futureFramesIgnored++;
+            continue;
+        }
 
-        const int idx = f & FRONTEND_RING_MASK;
-        if (!s_hasRemoteInput[idx]) {
-            s_remoteInputs[idx] = inputs[i];
-            s_hasRemoteInput[idx] = true;
+        if (!HasRemoteInputFrame((uint32_t)f)) {
+            StoreRemoteInputFrame((uint32_t)f, inputs[i]);
             acceptedAny = true;
             newFramesApplied++;
         }
@@ -589,15 +627,18 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     if (frame > s_remoteLatestFrame) {
         s_remoteLatestFrame = frame;
     }
-    if (acceptedAny) {
-        s_lastRemoteInputTime = NowMs();
+    const DWORD now = NowMs();
+    if (acceptedAny || futureFramesIgnored > 0) {
+        s_lastRemoteInputTime = now;
         s_receivedRemoteInputThisPhase = true;
-        s_waitingForCurrentFrameSince = 0;
+        if (acceptedAny) {
+            s_waitingForCurrentFrameSince = 0;
+        }
         s_starvationPressureSamples = 0;
     }
 
     if (ackFrame < s_localInputFrame &&
-        (NowMs() - s_lastTargetedResendTime) >= FRONTEND_TARGETED_RESEND_INTERVAL_MS) {
+        (now - s_lastTargetedResendTime) >= FRONTEND_TARGETED_RESEND_INTERVAL_MS) {
         uint32_t resendFrame = ackFrame;
         if ((s_localInputFrame - ackFrame) > (uint32_t)FRONTEND_INPUT_REDUNDANCY) {
             resendFrame = ackFrame + (uint32_t)FRONTEND_INPUT_REDUNDANCY - 1;
@@ -605,10 +646,48 @@ static void HandleRemoteFrameInput(uint32_t epochId,
                 resendFrame = s_localInputFrame - 1;
             }
         }
-        if (s_hasLocalInput[resendFrame & FRONTEND_RING_MASK]) {
+        if (HasLocalInputFrame(resendFrame)) {
             SendInputPacket(resendFrame, "targeted resend");
             s_lastTargetedResendTime = NowMs();
+        } else if (futureFramesIgnored > 0) {
+            Rollback::NetplayLog_Write(
+                "FRONTEND", -1,
+                "Unable to satisfy targeted frontend resend: type=%s requested=%u local=%u consume=%u remote_ack=%u remote_frame=%u ignored_future=%d",
+                PacketTypeName(type),
+                resendFrame,
+                s_localInputFrame,
+                s_consumeFrame,
+                s_remoteAckFrame,
+                frame,
+                futureFramesIgnored);
         }
+    }
+
+    if (futureFramesIgnored > 0 &&
+        (s_lastRingWindowPressureLogTime == 0 ||
+         (now - s_lastRingWindowPressureLogTime) >= 250)) {
+        s_lastRingWindowPressureLogTime = now;
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Remote frontend input ahead of retain window: type=%s epoch=%u phase=%s frame=%u consume=%u ahead=%u ack=%u count=%u ignored_future=%d accepted_history=%d remoteLatest=%u",
+            PacketTypeName(type),
+            epochId,
+            FrontendSyncPhaseName(s_phase),
+            frame,
+            s_consumeFrame,
+            frame >= s_consumeFrame ? (frame - s_consumeFrame) : 0,
+            ackFrame,
+            inputCount,
+            futureFramesIgnored,
+            newFramesApplied,
+            s_remoteLatestFrame);
+    }
+
+    if (futureFramesIgnored > 0) {
+        RequestDelayIncrease(
+            ClampFrontendDelay((uint16_t)(GetEffectiveDelayFloor() + 1)),
+            FrontendDelayBumpReason::Starvation,
+            "remote frontend input beyond retain window");
     }
 
     if (!acceptedAny && frame <= previousRemoteLatest) {
@@ -675,7 +754,8 @@ int FrontendInputSync_ComputeDelayProposal() {
 
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Local frontend delay proposal: configured_floor=%u base=%u jitter_bump=%u final=%u avg_ping=%.1f variance=%.1f one_way=%.2f jitter_frames=%.2f valid=%d",
+        "Local frontend delay proposal: configured_delay=%u configured_floor=%u base=%u jitter_bump=%u final=%u avg_ping=%.1f variance=%.1f one_way=%.2f jitter_frames=%.2f valid=%d",
+        details.configured_delay,
         details.configured_floor,
         details.base_delay,
         details.jitter_bump,
@@ -913,7 +993,7 @@ void FrontendInputSync_CaptureLocalInput(uint16_t packedInput) {
 
     EnsureLocalLead("delay lead fill");
 
-    const uint32_t maxSendFrame = s_consumeFrame + FRONTEND_SEND_HEAD_BUFFER;
+    const uint32_t maxSendFrame = GetLocalSendHeadLimit();
     if (s_localInputFrame > maxSendFrame) {
         if (s_localInputFrame > 0) {
             SendInputPacket(s_localInputFrame - 1, "send ahead cap");
@@ -921,9 +1001,7 @@ void FrontendInputSync_CaptureLocalInput(uint16_t packedInput) {
         return;
     }
 
-    const int idx = (int)(s_localInputFrame & FRONTEND_RING_MASK);
-    s_localInputs[idx] = packedInput;
-    s_hasLocalInput[idx] = true;
+    StoreLocalInputFrame(s_localInputFrame, packedInput);
     SendInputPacket(s_localInputFrame, "capture");
     s_localInputFrame++;
 }
@@ -933,8 +1011,9 @@ bool FrontendInputSync_HasInputsForCurrentFrame() {
         return false;
     }
 
-    const int idx = (int)(s_consumeFrame & FRONTEND_RING_MASK);
-    const bool ready = s_hasLocalInput[idx] && s_hasRemoteInput[idx];
+    const bool ready =
+        HasLocalInputFrame(s_consumeFrame) &&
+        HasRemoteInputFrame(s_consumeFrame);
     if (ready) {
         ResetDelayPressureTracking();
         return true;
@@ -984,7 +1063,6 @@ bool FrontendInputSync_ConsumeCurrentFrame(uint16_t* outLocal,
         outFrameId->frame = (uint16_t)s_consumeFrame;
     }
 
-    s_hasLocalInput[idx] = false;
     s_hasRemoteInput[idx] = false;
     s_consumeFrame++;
     return true;

@@ -117,10 +117,10 @@ bool WinScreenSync_FrameUpdate() {
     if (FrontendInputSync_HasRecoveryRequest()) {
         Rollback::NetplayLog_Write(
             "WINLOCK", -1,
-            "Frontend recovery requested during winscreen: %s",
+            "Frontend recovery requested during winscreen; keeping session alive and clearing local recovery flag: %s",
             FrontendInputSync_GetRecoveryReason());
-        Session_Cancel();
-        return false;
+        FrontendInputSync_ClearRecoveryRequest();
+        return true;
     }
     return true;
 }

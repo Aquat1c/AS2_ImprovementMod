@@ -29,6 +29,8 @@ static SessionRole    s_role  = SessionRole::None;
 static SessionConfig  s_config;
 static PeerInfo       s_remotePeer;
 static ConnectionStats s_stats;
+static ConnectionStats s_lastLiveStats;
+static bool           s_lastLiveStatsValid = false;
 static uintptr_t      s_peerToken = 0;
 static char           s_statusText[128] = "";
 static char           s_errorText[128]  = "";
@@ -100,6 +102,37 @@ static void SetError(const char* msg) {
 
 static bool IsCompatibilityDisconnectData(uint32_t data) {
     return data == static_cast<uint32_t>(DisconnectReason::VersionMismatch);
+}
+
+static bool HasUsefulStats(const ConnectionStats& stats) {
+    return stats.rtt_ms > 0.0f ||
+           stats.rtt_variance_ms > 0.0f ||
+           stats.packets_sent != 0 ||
+           stats.packets_received != 0 ||
+           stats.packets_lost != 0 ||
+           stats.bytes_sent != 0 ||
+           stats.bytes_received != 0;
+}
+
+static void ClearStatsForNewSession() {
+    memset(&s_stats, 0, sizeof(s_stats));
+    memset(&s_lastLiveStats, 0, sizeof(s_lastLiveStats));
+    s_lastLiveStatsValid = false;
+}
+
+static void RememberLiveStats() {
+    if (!HasUsefulStats(s_stats)) {
+        return;
+    }
+    s_lastLiveStats = s_stats;
+    s_lastLiveStatsValid = true;
+}
+
+static ConnectionStats GetBestStatsSnapshot() {
+    if (HasUsefulStats(s_stats) || !s_lastLiveStatsValid) {
+        return s_stats;
+    }
+    return s_lastLiveStats;
 }
 
 static void RequestCompatibilityDisconnect(const char* packetName,
@@ -547,6 +580,7 @@ static void NotePacketSent(uint8_t channel, PacketType type,
                            size_t payloadLen, bool reliable,
                            const char* context) {
     s_stats.bytes_sent += sizeof(PacketType) + payloadLen;
+    RememberLiveStats();
     Rollback::NetplayLog_Verbose("SESSION", -1,
         "SEND %s ch=%u type=%s payload=%zu total=%zu reliable=%d state=%s",
         context ? context : "packet",
@@ -561,6 +595,7 @@ static void NotePacketSent(uint8_t channel, PacketType type,
 static void NotePacketReceived(uint8_t channel, PacketType type, size_t payloadLen) {
     s_stats.packets_received++;
     s_stats.bytes_received += sizeof(PacketType) + payloadLen;
+    RememberLiveStats();
     Rollback::NetplayLog_Verbose("SESSION", -1,
         "RECV ch=%u type=%s payload=%zu total=%zu state=%s",
         channel,
@@ -1200,16 +1235,53 @@ static void UpdateStats() {
     NetworkThreadStats netStats{};
     NetworkThread_GetStats(&netStats);
 
-    s_stats.rtt_ms = netStats.rtt_ms;
-    s_stats.rtt_variance_ms = netStats.rtt_variance_ms;
-    s_stats.packets_sent = netStats.packets_sent;
-    s_stats.packets_lost = netStats.packets_lost;
+    if (netStats.peer_connected) {
+        s_stats.rtt_ms = netStats.rtt_ms;
+        s_stats.rtt_variance_ms = netStats.rtt_variance_ms;
+        s_stats.packets_sent = netStats.packets_sent;
+        s_stats.packets_lost = netStats.packets_lost;
+        RememberLiveStats();
+    } else if (s_lastLiveStatsValid && s_state != SessionState::Idle) {
+        s_stats = s_lastLiveStats;
+    } else {
+        s_stats.rtt_ms = netStats.rtt_ms;
+        s_stats.rtt_variance_ms = netStats.rtt_variance_ms;
+        s_stats.packets_sent = netStats.packets_sent;
+        s_stats.packets_lost = netStats.packets_lost;
+    }
 
     const DWORD now = GetTickCount();
     const DWORD workerAgeMs =
         (netStats.last_service_tick_ms > 0 && now >= netStats.last_service_tick_ms)
             ? (now - netStats.last_service_tick_ms)
             : 0;
+    const DWORD stateAgeMs =
+        (s_stateEnteredAt > 0 && now >= s_stateEnteredAt)
+            ? (now - s_stateEnteredAt)
+            : 0;
+
+    if ((s_state == SessionState::Connected ||
+         s_state == SessionState::Ready ||
+         s_state == SessionState::Handshaking) &&
+        s_peerToken != 0 &&
+        !netStats.peer_connected &&
+        stateAgeMs >= 250 &&
+        netStats.worker_running &&
+        s_activeSessionToken != 0) {
+        Rollback::NetplayLog_Write("NTHREAD", -1,
+            "Transport peer detached without a drained disconnect event: state=%s role=%s token=%u peer=0x%llX state_age=%lums worker_age=%lums last_rtt=%.1f sent=%u recv=%u lost=%u",
+            SessionStateName(s_state),
+            SessionRoleName(s_role),
+            s_activeSessionToken,
+            (unsigned long long)s_peerToken,
+            (unsigned long)stateAgeMs,
+            (unsigned long)workerAgeMs,
+            s_stats.rtt_ms,
+            s_stats.packets_sent,
+            s_stats.packets_received,
+            s_stats.packets_lost);
+        SetError("Network transport detached from peer");
+    }
 
     if ((netStats.inbound_queue_depth >= 128 || netStats.outbound_queue_depth >= 128) &&
         (now - s_lastQueueSpikeLogAt) >= 250) {
@@ -1343,6 +1415,7 @@ static void DrainNetworkEvents() {
 
 void Session_Init() {
     ResetState();
+    ClearStatsForNewSession();
     s_activeSessionToken = 0;
     if (!NetworkThread_Init()) {
         LOG_ERROR("[Session] Failed to initialize network service thread");
@@ -1359,6 +1432,7 @@ void Session_Shutdown() {
     Nat_StopServices();
     s_activeSessionToken = 0;
     ResetState();
+    ClearStatsForNewSession();
     LOG_INFO("[Session] Session manager shut down");
 }
 
@@ -1370,6 +1444,7 @@ bool Session_StartHost(const SessionConfig* config) {
         return false;
     }
 
+    ClearStatsForNewSession();
     memcpy(&s_config, config, sizeof(s_config));
     if (!ComputeLocalBuildHash(&s_config.build_hash)) {
         SetError("Failed to compute exact local build fingerprint");
@@ -1463,6 +1538,7 @@ bool Session_StartJoin(const SessionConfig* config) {
         return false;
     }
 
+    ClearStatsForNewSession();
     memcpy(&s_config, config, sizeof(s_config));
     if (!ComputeLocalBuildHash(&s_config.build_hash)) {
         SetError("Failed to compute exact local build fingerprint");
@@ -1768,7 +1844,7 @@ void Session_GetSnapshot(SessionSnapshot* out) {
     out->local_listen_port = s_config.listen_port;
     memcpy(out->local_nickname, s_config.nickname, sizeof(out->local_nickname));
     out->remote_peer = s_remotePeer;
-    out->stats  = s_stats;
+    out->stats  = out->active ? GetBestStatsSnapshot() : s_stats;
     out->local_ready  = s_localReady;
     out->remote_ready = s_remoteReady;
     memcpy(out->status_text, s_statusText, sizeof(out->status_text));
@@ -1794,7 +1870,8 @@ const PeerInfo* Session_GetRemotePeer() {
 
 void Session_GetStats(ConnectionStats* out) {
     if (out) {
-        memcpy(out, &s_stats, sizeof(*out));
+        const ConnectionStats stats = GetBestStatsSnapshot();
+        memcpy(out, &stats, sizeof(*out));
     }
 }
 
