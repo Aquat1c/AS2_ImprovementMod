@@ -8,10 +8,16 @@
 # Dependencies:
 #   - MinHook: https://github.com/TsudaKageyu/minhook (static lib)
 #   - SDL3: https://github.com/libsdl-org/SDL (DLL - no static prebuilt available)
-#   - ImGui: https://github.com/ocornut/imgui (compiled into DLL)
+#   - Dear ImGui: https://github.com/ocornut/imgui (static lib)
+#   - ENet: https://github.com/lsalzman/enet (static lib)
+#   - GekkoNet: https://github.com/HeatXD/GekkoNet (static lib)
+#   - libjuice: https://github.com/paullouisageneau/libjuice (optional NAT traversal)
+#   - miniupnpc: https://github.com/miniupnp/miniupnp (optional UPnP)
+#   - libpcpnatpmp: https://github.com/libpcp/pcp (optional PCP/NAT-PMP)
+#   - autopunch: https://github.com/delthas/autopunch (protocol-compatible local client behavior)
 
 cmake_minimum_required(VERSION 3.15)
-project(AS2_Rollback VERSION 0.4.0 LANGUAGES C CXX)
+project(AS2_Rollback VERSION 0.5.0 LANGUAGES C CXX)
 
 enable_testing()
 

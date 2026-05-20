@@ -1,13 +1,13 @@
 /**
  * Alice Senki 2 — Hitbox / Hurtbox / Collision Viewer
  *
- * All geometry and coordinate math derived from decompilation:
+ * All geometry and coordinate math derived from reverse-engineering notes:
  *   - Entity_UpdateHitDetection  (AABB collision formula)
  *   - Weather_UpdateScroll       (camera/scroll system)
  *   - Sprite rendering functions (world-to-screen: pos/10 - scroll)
  *   - HitDef_Create / HitDef_Init / HitDef_SetBaseStats
  *
- * Coordinate conventions (from decompilation):
+ * Coordinate conventions:
  *   World positions : entity+0xB8 / +0xBA are int16 in ×10 fixed-point.
  *   Screen coords   : worldPos / 10 - scroll{X,Y}.
  *   Box center      : entityPos/10 + 2*offset*facing  (X axis mirrors by facing)
@@ -229,7 +229,7 @@ static constexpr uint16_t kAction138 = 138;
 static constexpr uint16_t kAction139 = 139;
 static constexpr uint16_t kAction140 = 140;
 
-// Action-ID labels verified against decomp shared handlers and AI-reference
+// Action-ID labels verified against shared handler notes and AI references
 // patterns. See mod/docs/frame_advantage_design.md for the full table.
 static const char* ActionLabel(uint32_t actionId) {
     switch (actionId) {
@@ -646,7 +646,7 @@ static CancelRouteSnapshot BuildCancelRouteSnapshot(int playerIndex,
     const bool super2Window = ((snapshot.super2GateA != 0 && snapshot.super2GateB == 1) ||
                                (snapshot.super2GateC == 1 && snapshot.super2GateD != 0));
     if (snapshot.command21Timer != 0 && super2Window && snapshot.gateState == 4u) {
-        // Another 139/140 caller (AI_DecideAirTech in the refactored decomp) accepts
+        // Another 139/140 caller observed in internal reverse-engineering notes accepts
         // gateState==4 without the normal 0x1F4 meter threshold. Keep that path visible
         // in the overlay separately until the human-facing route is fully confirmed.
         snapshot.case21State4Path = 1;

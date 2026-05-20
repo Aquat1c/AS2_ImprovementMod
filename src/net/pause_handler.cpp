@@ -4,7 +4,7 @@
  * Detects when the user quits from the pause menu during an online match
  * and cleanly tears down the session so we don't leave a dangling connection.
  *
- * Source-of-truth: decompilation of sub_4CA120 (Mode 8 Sub 4 = pause handler)
+ * Source-of-truth: reverse-engineering notes for sub_4CA120 (Mode 8 Sub 4 = pause handler)
  *   - Calls sub_4C8250 for pause menu logic
  *   - Return 0 = resume → substate back to 3 (gameplay)
  *   - Return 1 = quit match → substate 5 (match end) with route

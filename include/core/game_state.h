@@ -10,7 +10,7 @@
  *   - Sub-State:  dword_816390 (0x816390) - Sub-state within current mode
  *   - Game Type:  dword_816410 (0x816410) - Gameplay type (arcade/vs/netplay/etc)
  * 
- * Research Source: Decompilation at research/アリス戦記２.exe - Copy.c
+ * Research Source: internal reverse-engineering notes.
  */
 
 #pragma once
@@ -632,7 +632,7 @@
 // Match Gameplay Update Functions (from Game_Update_MatchLoop @ 0x4C9B50)
 // ============================================================================
 // These functions are called every gameplay frame in MODE_MATCH SUBSTATE 3.
-// The main loop is in sub_4C9B50 (refactored as Game_Update_MatchLoop).
+// The main loop is at sub_4C9B50.
 // Listed in call order for understanding the game's frame update flow.
 //
 // This information is useful for:

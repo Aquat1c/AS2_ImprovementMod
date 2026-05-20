@@ -360,7 +360,7 @@
 //                  NOT hit by projectiles/summons (Entity_UpdateSummonHitDetection uses @40 only).
 //                  Provides additional melee-only vulnerability beyond primary hurtbox@40.
 // Screen-space: center = entityPos/10 + 2*offset*facing; extent = halfExtent.
-// Verified pointer arithmetic from decompilation:
+// Verified pointer arithmetic from reverse-engineering notes:
 //   animDataBase = entity + 4104; frame@N = animDataBase + 104*animIdx + N.
 //   Entity_UpdateGrabAlignment: attacker hitbox@8 vs defender hurtbox@40 (0x4A4950)
 //   Entity_UpdateDamageApplication: attacker hitbox@8 vs defender ext-hurtbox@72 (0x4A76F0)
@@ -526,7 +526,7 @@
 #define ENTITY_OFF_ANIM_INDEX   0x1004  // +4100, DWORD
 #define ENTITY_OFF_ANIM_DATA    0x1008  // +4104, animation data array
 #define ENTITY_OFF_BOX_ARRAY    0xA33F  // +41791, box processing array
-#define ENTITY_OFF_ASSET_HANDLE_TABLE 0x0834  // +2100 within player entity; decomp match loader passes match_base + 43172 for P1 table
+#define ENTITY_OFF_ASSET_HANDLE_TABLE 0x0834  // +2100 within player entity; match loader passes match_base + 43172 for P1 table
 
 // Animation / box constants
 #define ANIM_DATA_STRIDE        104

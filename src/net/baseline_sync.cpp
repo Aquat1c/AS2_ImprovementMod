@@ -346,7 +346,7 @@ static BaselineBreakdownPayload CaptureCurrentBreakdown() {
     out.game_type = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
     out.match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
 
-    // Names from decomp sub_562550 / sub_5625E0 lineage.
+    // Names from sub_562550 / sub_5625E0 lineage notes.
     out.frame_simulation = ReadMemory<uint32_t>(ADDR_FRAME_SIMULATION);
     out.frame_display = ReadMemory<uint32_t>(ADDR_FRAME_DISPLAY);
     out.frame_write_idx = ReadMemory<uint32_t>(ADDR_FRAME_WRITE_IDX);

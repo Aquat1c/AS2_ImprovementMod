@@ -21,7 +21,7 @@
  * The merged input is written to P1's slot; P2 is zeroed.
  * A confirmed-frame audit ring records each frame for desync diagnostics.
  *
- * Source-of-truth: decompilation of sub_5C0B20 (stage select grid handler).
+ * Source-of-truth: reverse-engineering notes for sub_5C0B20 (stage select grid handler).
  */
 
 #pragma once

@@ -1,6 +1,6 @@
 # Alice Senki 2 Improvement Mod
 
-A comprehensive runtime modification for Alice Senki 2, a doujin 2D fighting game. This mod adds rollback-based online netplay, a modern SDL3 input system, an ImGui debug overlay, training mode tools, a spectator system, custom palette support, NAT traversal, and an extensible mod loader. Built entirely as a DLL proxy stack that requires no modifications to the original game executable.
+A comprehensive runtime modification for Alice Senki 2, a doujin 2D fighting game. This mod adds rollback-based online netplay, a modern SDL3 input system, an ImGui debug overlay, training mode tools, a spectator system, custom palette support, NAT-aware connection setup (port mapping, external-endpoint probing, and UDP punch assist), and an extensible mod loader. Built entirely as a DLL proxy stack that requires no modifications to the original game executable.
 
 ---
 
@@ -162,7 +162,7 @@ ModOnGameExit()           -- Log exit
 | Determinism tools | Complete | RNG hooking, FPU capture, A/B comparison, per-frame checksum, desync dump |
 | Delay negotiation | Complete | RTT-based recommendation, configurable visible delay, hidden delay floor |
 | Adaptive pacing | Complete | Frame-rate scaling to smooth rollback jitter |
-| NAT traversal | Complete | UPnP, STUN, PCP/NAT-PMP, TURN relay, UDP hole punch, IPv6 |
+| NAT traversal | Partial | Optional UPnP + PCP/NAT-PMP mapping, libjuice STUN/TURN diagnostics/signaling, and autopunch-compatible UDP punch assist; gameplay traffic relay and direct IPv6 peer transport are not implemented yet |
 | Spectator system | Complete | Server + client + local playback, frame archive, palette propagation, relay/LAN discovery, fast-forward/hard-sync |
 | Netplay menu | Complete | Full in-game menu for hosting, joining, spectating, settings |
 | Replay tools | Complete | Replay browser controls, pause/step/rewind, HUD, takeover |
@@ -226,6 +226,8 @@ Defined in `protocol.h` (457 lines). Protocol version 6 with 40+ packet types.
 - `BaselineDigestPayload`: CRC32 of baseline savestate for agreement verification
 - `BaselineBreakdownPayload`: Per-region CRCs (main, header, context, effects, summons, entities, input buffers) for mismatch diagnosis
 - `CharSelFrameInputPayload`: Frame number, ack frame, 8-slot input history with redundancy for packet loss recovery
+
+`NatInfo` and `NatTraversalSignal` are post-connect control packets. `NatInfo` reports the local listen/external endpoint snapshot after the ENet peer is already up, while `NatTraversalSignal` forwards libjuice local-description / candidate text through the existing control channel. Neither packet bootstraps the initial gameplay connection by itself.
 
 ### Pre-Game Synchronization
 
@@ -351,22 +353,37 @@ Adaptive frame-pacing (`netplay_pacing.cpp`, 313 lines) smooths out rollback jit
 
 ### NAT Traversal
 
-Full NAT traversal support (`nat_traversal.cpp`, 250+ lines) with multiple backends:
+NAT handling is split across three codepaths rather than one monolithic relay layer:
 
-| Method | Library | Description |
-|--------|---------|-------------|
-| UPnP | miniupnpc | Port mapping via router UPnP |
-| PCP / NAT-PMP | libpcpnatpmp | Port mapping fallback |
-| STUN | libjuice | Server-reflexive address discovery |
-| TURN | libjuice | Relay-based connectivity |
-| Hole punch | Built-in | UDP hole punch burst via ENet |
+| Component | Current responsibility | Notes |
+|-----------|------------------------|-------|
+| `session_manager.cpp` | Starts NAT services, selects the initial connect path, chooses the autopunch rendezvous endpoint, and exchanges NAT diagnostics after handshake | `RelayOnly` remains reserved for a future traffic relay backend |
+| `nat_traversal.cpp` | Background worker for port-mapping attempts, STUN/TURN candidate gathering, runtime snapshots, and trickle-signal queues | Uses optional `miniupnpc`, `libpcpnatpmp`, and `libjuice` backends when linked |
+| `enet_transport.cpp` | Owns the actual gameplay socket and sends UDP punch traffic from the ENet port | Implements an autopunch-compatible client locally |
 
-**Features:**
-- IPv6 endpoint support with bracket notation
-- Proton/Wine detection for compatibility
-- Async worker thread for NAT operations
-- Configurable timeouts for gather, connect, and mapping operations
-- Signal queue for ICE candidate/SDP exchange
+**Current backends and limits:**
+
+| Path | Current behavior |
+|------|------------------|
+| UPnP | Optional mapping attempt on the configured listen port via `miniupnpc` |
+| PCP / NAT-PMP | Optional mapping fallback via `libpcpnatpmp`; only attempted when UPnP did not already map the port |
+| STUN | Optional external-endpoint / candidate discovery via `libjuice` |
+| TURN | Optional TURN candidate gathering via `libjuice`; current gameplay traffic does not switch to a TURN-carried relay path |
+| UDP hole punch | Primary gameplay-side reachability assist: the join path starts autopunch rendezvous and sends direct UDP punch bursts from the ENet socket before `enet_host_connect()` |
+| Traffic relay | Not implemented for gameplay sessions; the configured `relay_host:relay_port` is currently treated as an autopunch rendezvous endpoint, not an ENet packet-forwarding relay |
+| IPv6 | UI/parser and diagnostics can store/format IPv6 text, but the current ENet gameplay path rejects direct IPv6 peer endpoints |
+
+**Port flow today:**
+1. Host creates an ENet host on the configured listen port and, when hole punch is enabled, starts autopunch registration on that same bound port.
+2. Join tries to bind the configured listen port first; if that bind fails, the network thread falls back to an ephemeral ENet port. When hole punch is enabled, it starts autopunch against the rendezvous server and target endpoint, then sends an 8-packet direct burst at 5 ms intervals before `enet_host_connect()`.
+3. If no relay override is configured, the autopunch rendezvous endpoint defaults to `delthas.fr:14763`.
+4. `NatInfo` and `NatTraversalSignal` are exchanged only after the ENet session is connected, so they act as diagnostics / libjuice signaling rather than initial rendezvous.
+
+**Additional behavior:**
+- The NAT worker runs on a dedicated thread and records a live `NatSnapshot` for UI/logging.
+- Wine / Proton runtime hints are detected and surfaced in the snapshot.
+- When `libjuice` is linked, the code creates a helper agent on an ephemeral socket and logs explicitly that ENet still owns gameplay-port punching.
+- Helper queries such as `Nat_ShouldPreferDirect()` and `Nat_HasMappedPort()` expose snapshot state, but the current session-routing code still connects to the explicit target endpoint plus optional autopunch assist.
 
 ### Netplay Menu
 
@@ -383,9 +400,10 @@ MenuRoot -> DirectConnect (Host/Join) -> Session -> CharSel -> Match -> PostMatc
 **Configurable settings** (persisted to `as2_netplay.cfg`):
 - Identity: nickname, listen port
 - Endpoint: remote endpoint, preferred delay, rollback budget/tolerance, connection mode
-- NAT: UPnP, STUN, hole punch, PCP, TURN, IPv6 toggles, server endpoints, credentials, timeouts
+- NAT: UPnP / PCP mapping toggles, STUN / TURN probe endpoints, autopunch relay override, IPv6 parsing toggle, TURN credentials, and NAT timeout / logging settings
 - Spectator: enabled, listen port
 - Palette: transport enabled, remote preview enabled
+- Diagnostics: debug logging toggle for verbose netplay traces
 
 **Auto-connect:** Reads `as2_autoconnect.cfg` for automated testing workflows, progressing through: WaitingForMenu -> WaitingForConnection -> WaitingForCharSel -> SelectingCharacter -> SelectingStage -> WaitingForGameplay -> InMatch -> ConfirmingWinScreen.
 
@@ -805,7 +823,7 @@ In-game overlay (`netplay_hud.cpp`, ~90 lines):
 
 ### Hitbox Viewer
 
-Debug visualization (`hitbox_viewer.cpp`, ~900 lines) derived from game decompilation:
+Debug visualization (`hitbox_viewer.cpp`, ~900 lines) derived from runtime structure analysis:
 
 **Box types rendered:**
 
@@ -1338,20 +1356,21 @@ Additional tracked fields: combo counter, hitstun, blockstun, invincibility stat
 
 ### Dependencies
 
-Run `setup_deps.ps1` to automatically download and set up dependencies, or configure manually:
+The repository expects the following workspace-pinned dependencies. `setup_deps.ps1` can bootstrap the legacy hook/UI/input dependencies (MinHook, SDL3, Dear ImGui); the remaining `lib/` and `third_party/` projects are consumed directly by CMake when present.
 
 | Library | Path | Required | Notes |
 |---------|------|----------|-------|
-| MinHook v1.3.3 | `lib/minhook_src` | Yes | Built from source as static library |
-| SDL3 | `lib/SDL3` | Yes | Dynamic (DLL) |
-| ImGui v1.91.9 | `lib/imgui` | Yes | Built as static library |
-| ENet | `lib/enet` | Yes | Built as static library |
-| GekkoNet | `lib/GekkoNet` | Yes | Rollback library |
-| libjuice | `third_party/libjuice` | No | STUN/TURN NAT traversal |
-| miniupnpc | `third_party/miniupnp_suite/miniupnpc` | No | UPnP NAT traversal |
-| libpcpnatpmp | `third_party/libpcpnatpmp/lib` | No | PCP/NAT-PMP fallback |
+| [MinHook](https://github.com/TsudaKageyu/minhook) | `lib/minhook_src` | Yes | Built from source as a static library for runtime hooks |
+| [SDL3](https://github.com/libsdl-org/SDL) | `lib/SDL3` | Yes | Dynamic input runtime; `SDL3.dll` ships next to the game |
+| [Dear ImGui](https://github.com/ocornut/imgui) | `lib/imgui` | Yes | Built as a static library for the overlay and harness UI |
+| [ENet](https://github.com/lsalzman/enet) | `lib/enet` | Yes | Built as a static library for UDP transport, reliability, channels, RTT/loss stats |
+| [GekkoNet](https://github.com/HeatXD/GekkoNet) | `lib/GekkoNet` | Yes | Built as a static library for gameplay rollback, prediction, and rollback events |
+| [libjuice](https://github.com/paullouisageneau/libjuice) | `third_party/libjuice` | Optional | STUN/TURN candidate gathering, trickle signaling, and NAT diagnostics helper |
+| [miniupnpc](https://github.com/miniupnp/miniupnp) | `third_party/miniupnp_suite/miniupnpc` | Optional | UPnP router port-mapping attempt on the configured listen port |
+| [libpcpnatpmp](https://github.com/libpcp/pcp) | `third_party/libpcpnatpmp/lib` | Optional | PCP/NAT-PMP port-mapping fallback when UPnP is unavailable |
+| [autopunch](https://github.com/delthas/autopunch) | local implementation | Optional runtime path | Autopunch-compatible rendezvous client for gameplay-port UDP punch assist |
 
-NAT traversal libraries are optional; CMake warns and disables those paths when unavailable.
+The NAT libraries are optional build-time integrations; CMake warns and disables the corresponding backend when a library is unavailable. Autopunch is not linked as an external library: the mod implements the client-side rendezvous protocol locally and uses the configured relay endpoint only for punch coordination, not as a gameplay packet-forwarding relay.
 
 ### Configure
 
@@ -1448,7 +1467,7 @@ All training hotkeys (F4, F7-F10, F12, `1`, `2`, Delete) are rebindable from the
 | File | Purpose | Auto-created |
 |------|---------|--------------|
 | `as2_input.cfg` | Input bindings (keyboard + gamepad) | Yes, on first save |
-| `as2_netplay.cfg` | Netplay settings (nickname, ports, delay, NAT, spectator, palette) | Yes, on first use |
+| `as2_netplay.cfg` | Netplay settings (nickname, ports, delay, NAT, spectator, palette, debug logging) | Yes, on first use |
 | `as2_autoconnect.cfg` | Automated testing configuration | No, manual or harness |
 | `as2_practice_hotkeys.cfg` | Rebindable training hotkeys (keyboard + gamepad) | Yes, on first rebind |
 | `mods/mods.ini` | Mod loader configuration | Yes, on first launch |
@@ -1599,6 +1618,18 @@ mod/
     testing/                    autoconnect_harness.h, harness_shared_memory.h, scripted_input_runner.h, test_scenarios.h
     ui/                         All UI headers
 
+  lib/                          Workspace-pinned required dependencies
+    GekkoNet/                     Rollback engine SDK
+    enet/                         UDP transport library
+    SDL3/                         Input runtime import library + DLL
+    imgui/                        Dear ImGui source
+    minhook_src/                  MinHook source
+
+  third_party/                  Optional NAT traversal dependencies
+    libjuice/                     STUN/TURN/ICE-style traversal backend
+    libpcpnatpmp/                 PCP/NAT-PMP mapping fallback
+    miniupnp_suite/miniupnpc/     UPnP mapping fallback
+
   tests/                        Unit tests
     standalone_rollback_tests.cpp FPU, RNG, modulo tests
     test_packet_codec.cpp         Packet encode/decode tests
@@ -1614,7 +1645,6 @@ mod/
   build.bat                     Automated build script
   setup_deps.ps1                Dependency downloader
   diagnose_dlls.ps1             DLL troubleshooting script
-  alicesenki2_decomp_refactored.c  Decompiled game reference
 ```
 
 ---

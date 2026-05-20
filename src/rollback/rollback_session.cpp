@@ -56,7 +56,7 @@ struct GekkoState {
     uint32_t rb_frame;             // Rollback-session-relative frame from Gekko
     uint32_t frame_origin_abs;     // Absolute engine frame where rb_frame 0 begins
 
-    // Scattered globals (all outside main blob, verified against decompilation)
+    // Scattered globals (all outside main blob, verified against reverse-engineering notes)
     uint32_t rng_seed;            // TLS _getptd()+0x14 — C runtime rand() state
     uint32_t sim_frame;           // 0x816490 — absolute engine simulation frame (= input_read_idx)
     uint32_t display_frame;       // 0x81635C — absolute engine display frame

@@ -36,6 +36,24 @@ cmake --install build --config Release
 
 Build Win32 only. The original game is 32-bit. `cmake --install` deploys the runtime DLLs into the configured game directory.
 
+## Third-Party Projects
+
+The mod is built on a small set of vendored or workspace-pinned projects:
+
+| Project | Location | Used for |
+|---------|----------|----------|
+| [GekkoNet](https://github.com/HeatXD/GekkoNet) | `lib/GekkoNet` | Gameplay rollback session, prediction, and rollback event flow |
+| [ENet](https://github.com/lsalzman/enet) | `lib/enet` | UDP transport, channels, reliability, RTT/loss stats |
+| [SDL3](https://github.com/libsdl-org/SDL) | `lib/SDL3` | Keyboard/gamepad input runtime (`SDL3.dll` ships next to the game) |
+| [Dear ImGui](https://github.com/ocornut/imgui) | `lib/imgui` | In-game overlay, debug UI, test harness UI |
+| [MinHook](https://github.com/TsudaKageyu/minhook) | `lib/minhook_src` | Runtime API and game-function hooks |
+| [libjuice](https://github.com/paullouisageneau/libjuice) | `third_party/libjuice` | STUN/TURN/ICE-style NAT traversal support |
+| [miniupnpc](https://github.com/miniupnp/miniupnp) | `third_party/miniupnp_suite/miniupnpc` | UPnP router port mapping |
+| [libpcpnatpmp](https://github.com/libpcp/pcp) | `third_party/libpcpnatpmp` | PCP/NAT-PMP router mapping fallback |
+| [autopunch](https://github.com/delthas/autopunch) | local implementation | UDP rendezvous and hole-punch behavior compatible with the public autopunch relay protocol |
+
+Autopunch is not linked as an external library; the mod implements the relevant client-side rendezvous behavior directly and logs the configured relay endpoint for diagnostics.
+
 ## Key Binds
 
 Core:

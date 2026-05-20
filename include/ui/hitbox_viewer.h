@@ -1,7 +1,7 @@
 /**
  * Alice Senki 2 — Hitbox / Hurtbox / Extended Hurtbox / Collision Viewer
  *
- * Derived entirely from decompilation of Entity_UpdateHitDetection,
+ * Derived from reverse-engineering notes for Entity_UpdateHitDetection,
  * Entity_UpdateGrabAlignment, Entity_UpdateDamageApplication,
  * Entity_UpdateThrowInteraction, Entity_ResolveAttackCollision,
  * Entity_ResolveBodyCollision, Entity_UpdateSummonHitDetection,

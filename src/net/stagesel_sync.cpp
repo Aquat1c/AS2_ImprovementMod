@@ -11,7 +11,7 @@
  * Merge: OR all inputs, cancel opposing directions (Left+Right → 0, Up+Down → 0).
  * Merged input goes to P1 slot; P2 is zeroed.
  *
- * Source-of-truth: decompilation of sub_5C0B20 (stage select grid handler).
+ * Source-of-truth: reverse-engineering notes for sub_5C0B20 (stage select grid handler).
  */
 
 #include "net/stagesel_sync.h"

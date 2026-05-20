@@ -50,7 +50,7 @@ int        s_playFrame = 0;
 
 int8_t ReadP2Facing(void) {
     uint8_t raw = ReadMemory<uint8_t>(ADDR_P2_ENTITY_BASE + ENTITY_OFF_FACING);
-    // Convention: 0 = facing right, 1 = facing left (from decomp)
+    // Convention: 0 = facing right, 1 = facing left
     return (raw == 0) ? 1 : -1;
 }
 
