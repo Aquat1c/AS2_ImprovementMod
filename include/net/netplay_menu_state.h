@@ -150,6 +150,7 @@ struct MenuSnapshot {
     int           connected_spectators;
     bool          palette_sync_enabled;
     bool          remote_palette_preview_enabled;
+    bool          debug_logging_enabled;
     char          spectator_status[128];
     char          palette_status[128];
 

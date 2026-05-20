@@ -579,30 +579,20 @@ static void UpdateStatusText() {
 static void NotePacketSent(uint8_t channel, PacketType type,
                            size_t payloadLen, bool reliable,
                            const char* context) {
+    (void)channel;
+    (void)type;
+    (void)reliable;
+    (void)context;
     s_stats.bytes_sent += sizeof(PacketType) + payloadLen;
     RememberLiveStats();
-    Rollback::NetplayLog_Verbose("SESSION", -1,
-        "SEND %s ch=%u type=%s payload=%zu total=%zu reliable=%d state=%s",
-        context ? context : "packet",
-        channel,
-        PacketTypeName(type),
-        payloadLen,
-        sizeof(PacketType) + payloadLen,
-        reliable ? 1 : 0,
-        SessionStateName(s_state));
 }
 
 static void NotePacketReceived(uint8_t channel, PacketType type, size_t payloadLen) {
+    (void)channel;
+    (void)type;
     s_stats.packets_received++;
     s_stats.bytes_received += sizeof(PacketType) + payloadLen;
     RememberLiveStats();
-    Rollback::NetplayLog_Verbose("SESSION", -1,
-        "RECV ch=%u type=%s payload=%zu total=%zu state=%s",
-        channel,
-        PacketTypeName(type),
-        payloadLen,
-        sizeof(PacketType) + payloadLen,
-        SessionStateName(s_state));
 }
 
 static uint32_t NextSessionToken() {
@@ -1162,23 +1152,7 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
         default:
             // Forward to external callback
             if (s_packetCallback) {
-                Rollback::NetplayLog_Write("SESSION", -1,
-                    "Dispatching packet to callback: cb=0x%llX type=%s ch=%u payload=%zu state=%s role=%s peer=0x%llX",
-                    (unsigned long long)(uintptr_t)s_packetCallback,
-                    PacketTypeName(type),
-                    channelID,
-                    payloadLen,
-                    SessionStateName(s_state),
-                    SessionRoleName(s_role),
-                    (unsigned long long)peerToken);
-                Rollback::NetplayLog_Flush();
                 s_packetCallback(type, payload, payloadLen);
-                Rollback::NetplayLog_Write("SESSION", -1,
-                    "Callback returned: cb=0x%llX type=%s ch=%u",
-                    (unsigned long long)(uintptr_t)s_packetCallback,
-                    PacketTypeName(type),
-                    channelID);
-                Rollback::NetplayLog_Flush();
             } else {
                 if (!DeferControlPacket(channelID, type, payload, payloadLen)) {
                     Rollback::NetplayLog_Write("SESSION", -1,

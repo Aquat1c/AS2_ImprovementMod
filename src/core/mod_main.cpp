@@ -73,7 +73,7 @@ static ModConfig g_config = {
     1,      // inputDisplayMode
     false,  // showHitboxes
     false,  // showFrameData
-    true,   // verboseLogging
+    false,  // verboseLogging
     8,      // rollbackFrames (unused, kept for compat)
     0       // inputDelay    (unused, kept for compat)
 };
@@ -607,7 +607,7 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
     timeBeginPeriod(1);
 
     LOG_INFO("========================================");
-    LOG_INFO("Alice Senki 2 - Mod v0.4");
+    LOG_INFO("Alice Senki 2 - Mod v0.5");
     LOG_INFO("Build: %s %s", __DATE__, __TIME__);
     LOG_INFO("========================================");
     LOG_INFO("Game module: 0x%p", gameModule);

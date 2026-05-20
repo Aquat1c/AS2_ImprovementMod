@@ -655,7 +655,8 @@ static void RenderSettingsCategoryMenu(const NetMenu::MenuSnapshot* snap, uint8_
     RenderRow(y, "Player", "Name and gameplay", snap->selected_index == 0, true, alpha); y += kRowStep;
     RenderRow(y, "Network", "Routing and servers", snap->selected_index == 1, true, alpha); y += kRowStep;
     RenderRow(y, "Watch", "Spectator and palettes", snap->selected_index == 2, true, alpha); y += kRowStep;
-    RenderRow(y, "Back", "Online menu", snap->selected_index == 3, true, alpha);
+    RenderRow(y, "Diagnostics", "Debug logs", snap->selected_index == 3, true, alpha); y += kRowStep;
+    RenderRow(y, "Back", "Online menu", snap->selected_index == 4, true, alpha);
 }
 
 static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
@@ -700,9 +701,9 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
         if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::RelayEndpoint) {
             FormatEditBufferWithCursor(relayVal, sizeof(relayVal), snap->text_edit_buffer, snap->text_cursor_pos);
         } else if (snap->relay_endpoint[0]) {
-            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "%s", snap->relay_endpoint);
+            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "Custom relay");
         } else {
-            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "(default delthas.fr:14763)");
+            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "Default relay");
         }
         RenderRow(y, "Punch Relay", relayVal, snap->selected_index == 5, true, alpha); y += kRowStep;
 
@@ -732,6 +733,11 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
         RenderRow(y, "Preview Remote", snap->remote_palette_preview_enabled ? "< On > see opponent" : "< Off > see opponent", snap->selected_index == 3, true, alpha); y += kRowStep;
 
         RenderRow(y, "Back", "Settings", snap->selected_index == 4, true, alpha);
+        break;
+    }
+    case NetMenu::SettingsCategory::Diagnostics: {
+        RenderRow(y, "Debug Logging", snap->debug_logging_enabled ? "< On > detailed logs" : "< Off > key events only", snap->selected_index == 0, true, alpha); y += kRowStep;
+        RenderRow(y, "Back", "Settings", snap->selected_index == 1, true, alpha);
         break;
     }
     default:
@@ -1048,6 +1054,7 @@ static const char* GetHeaderTitle(const NetMenu::MenuSnapshot* snap) {
                 case NetMenu::SettingsCategory::Identity:    return "Player";
                 case NetMenu::SettingsCategory::Endpoint:    return "Network";
                 case NetMenu::SettingsCategory::SessionMatch: return "Watch";
+                case NetMenu::SettingsCategory::Diagnostics:  return "Diagnostics";
                 default: return "Settings";
             }
         case NetMenu::MenuState::DisconnectError:
@@ -1075,6 +1082,7 @@ static const char* GetHeaderSubtitle(const NetMenu::MenuSnapshot* snap) {
                 case NetMenu::SettingsCategory::Identity:    return "Name and gameplay tuning";
                 case NetMenu::SettingsCategory::Endpoint:    return "Routing and server addresses";
                 case NetMenu::SettingsCategory::SessionMatch: return "Spectator and palette options";
+                case NetMenu::SettingsCategory::Diagnostics:  return "Logging controls";
                 default: return "Adjust settings";
             }
         case NetMenu::MenuState::Connecting:          return "Connecting to room";

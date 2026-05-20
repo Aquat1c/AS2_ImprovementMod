@@ -13,6 +13,7 @@
  */
 
 #include "ui/netplay_hud.h"
+#include "core/game_state.h"
 #include "core/mod_main.h"
 
 #include "imgui.h"
@@ -174,10 +175,12 @@ void NetplayHud_Render() {
     const float nickMargin = W * kNickMarginXRatio;
 
     // --- TOP: Nickname pills below HP bar area ---
-    DrawNickPill(dl, hud.p1_name, kP1Bg,
-                 nickMargin, nickY, false);               // left-aligned
-    DrawNickPill(dl, hud.p2_name, kP2Bg,
-                 W - nickMargin, nickY, true);             // right-aligned
+    if (GetGameMode() == MODE_MATCH) {
+        DrawNickPill(dl, hud.p1_name, kP1Bg,
+                     nickMargin, nickY, false);               // left-aligned
+        DrawNickPill(dl, hud.p2_name, kP2Bg,
+                     W - nickMargin, nickY, true);             // right-aligned
+    }
 
     // --- BOTTOM: Connection stats or spectator status ---
     {

@@ -69,6 +69,8 @@ static DWORD             s_lastRemoteInputTime = 0;
 static DWORD             s_lastResendTime = 0;
 static DWORD             s_lastTargetedResendTime = 0;
 static DWORD             s_lastRingWindowPressureLogTime = 0;
+static DWORD             s_lastRemoteFrameTraceLogTime = 0;
+static bool              s_remoteFrameTraceLogTimeValid = false;
 static DWORD             s_lastDelayBumpRequestTime = 0;
 static DWORD             s_waitingForCurrentFrameSince = 0;
 static DWORD             s_lastPressureSampleTime = 0;
@@ -133,6 +135,18 @@ static DWORD NowMs() {
     }
 #endif
     return GetTickCount();
+}
+
+static bool ShouldLogRemoteFrameTrace(uint32_t frame, DWORD now) {
+    if (frame < 5 || (frame % 120u) == 0u) {
+        if (!s_remoteFrameTraceLogTimeValid ||
+            (now - s_lastRemoteFrameTraceLogTime) >= 250) {
+            s_lastRemoteFrameTraceLogTime = now;
+            s_remoteFrameTraceLogTimeValid = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 static uint16_t ComputeJitterBumpFrames(float varianceMs) {
@@ -254,6 +268,8 @@ static void ClearPhaseInputState() {
     s_lastResendTime = 0;
     s_lastTargetedResendTime = 0;
     s_lastRingWindowPressureLogTime = 0;
+    s_lastRemoteFrameTraceLogTime = 0;
+    s_remoteFrameTraceLogTimeValid = false;
     s_lastDelayBumpRequestTime = 0;
     s_timedOut = false;
     memset(s_localInputs, 0, sizeof(s_localInputs));
@@ -586,17 +602,20 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         FrontendInputSync_RequestRecovery("frontend packet carried invalid input redundancy");
         return;
     }
+    const DWORD now = NowMs();
     if (ackFrame > s_remoteAckFrame) {
         s_remoteAckFrame = ackFrame;
     }
     if (frame < s_consumeFrame) {
-        Rollback::NetplayLog_Verbose(
-            "FRONTEND", -1,
-            "Ignored stale remote frame input older than consume point: type=%s frame=%u consume=%u ack=%u",
-            PacketTypeName(type),
-            frame,
-            s_consumeFrame,
-            ackFrame);
+        if (ShouldLogRemoteFrameTrace(frame, now)) {
+            Rollback::NetplayLog_Verbose(
+                "FRONTEND", -1,
+                "Ignored stale remote frame input older than consume point: type=%s frame=%u consume=%u ack=%u",
+                PacketTypeName(type),
+                frame,
+                s_consumeFrame,
+                ackFrame);
+        }
         return;
     }
 
@@ -627,7 +646,6 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     if (frame > s_remoteLatestFrame) {
         s_remoteLatestFrame = frame;
     }
-    const DWORD now = NowMs();
     if (acceptedAny || futureFramesIgnored > 0) {
         s_lastRemoteInputTime = now;
         s_receivedRemoteInputThisPhase = true;
@@ -690,7 +708,8 @@ static void HandleRemoteFrameInput(uint32_t epochId,
             "remote frontend input beyond retain window");
     }
 
-    if (!acceptedAny && frame <= previousRemoteLatest) {
+    const bool sampleFrameTrace = ShouldLogRemoteFrameTrace(frame, now);
+    if (!acceptedAny && frame <= previousRemoteLatest && sampleFrameTrace) {
         Rollback::NetplayLog_Verbose(
             "FRONTEND", -1,
             "Ignored duplicate/out-of-order remote frame input: type=%s epoch=%u phase=%s frame=%u ack=%u consume=%u remoteLatest=%u",
@@ -701,7 +720,7 @@ static void HandleRemoteFrameInput(uint32_t epochId,
             ackFrame,
             s_consumeFrame,
             previousRemoteLatest);
-    } else if (acceptedAny && frame < previousRemoteLatest) {
+    } else if (acceptedAny && frame < previousRemoteLatest && sampleFrameTrace) {
         Rollback::NetplayLog_Verbose(
             "FRONTEND", -1,
             "Accepted out-of-order remote frame history fill: type=%s epoch=%u phase=%s frame=%u ack=%u new=%d consume=%u remoteLatest=%u",
@@ -715,18 +734,21 @@ static void HandleRemoteFrameInput(uint32_t epochId,
             previousRemoteLatest);
     }
 
-    Rollback::NetplayLog_Verbose(
-        "FRONTEND", -1,
-        "Remote frame input: type=%s epoch=%u phase=%s frame=%u ack=%u count=%u new=%d consume=%u remoteLatest=%u",
-        PacketTypeName(type),
-        epochId,
-        FrontendSyncPhaseName(s_phase),
-        frame,
-        ackFrame,
-        inputCount,
-        newFramesApplied,
-        s_consumeFrame,
-        s_remoteLatestFrame);
+    if (sampleFrameTrace && (acceptedAny || futureFramesIgnored > 0)) {
+        Rollback::NetplayLog_Verbose(
+            "FRONTEND", -1,
+            "Remote frame input sample: type=%s epoch=%u phase=%s frame=%u ack=%u count=%u new=%d consume=%u remoteLatest=%u ignored_future=%d",
+            PacketTypeName(type),
+            epochId,
+            FrontendSyncPhaseName(s_phase),
+            frame,
+            ackFrame,
+            inputCount,
+            newFramesApplied,
+            s_consumeFrame,
+            s_remoteLatestFrame,
+            futureFramesIgnored);
+    }
 }
 
 } // anonymous namespace

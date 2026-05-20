@@ -29,6 +29,7 @@
 #include "rollback/online_wiring.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
+#include "core/mod_main.h"
 #include "input/input_system.h"
 #include "testing/autoconnect_harness.h"
 #include "ui/log_window.h"
@@ -76,6 +77,7 @@ static char          s_textEditBuffer[96] = "";
 static int           s_textCursorPos      = 0;   // Cursor position within text edit buffer
 static bool          s_textEditPrevKeyDown[256] = {};
 static bool          s_textEditPrevKeyInitialized = false;
+static bool          s_prevCopyAddressKeyDown = false;
 static char          s_localNickname[64]  = "Player";
 static uint16_t      s_listenPort         = 10700;
 static char          s_remoteEndpoint[96] = "127.0.0.1:10700";
@@ -103,6 +105,7 @@ static bool          s_spectatorsEnabled = true;
 static uint16_t      s_spectatorListenPort = 10701;
 static bool          s_paletteSyncEnabled = true;
 static bool          s_remotePalettePreviewEnabled = false;
+static bool          s_debugLoggingEnabled = false;
 static bool          s_joinSpectatorProbeActive = false;
 static char          s_joinSpectatorFailureReason[128] = "";
 static char          s_joinSpectatorProbeEndpoint[96] = "";
@@ -142,6 +145,7 @@ static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg);
 static void ApplyNatSettingsToService(const char* reason);
 static bool ParseEndpoint(const char* str, char* outHost, size_t hostCap,
                           uint16_t* outPort, bool allowIPv6);
+static void ApplyDebugLoggingSetting(const char* reason);
 
 static const char* FriendlyConnectPreferenceLabel(Net::ConnectPreference pref) {
     switch (pref) {
@@ -218,6 +222,7 @@ static const char* AutoConnectStateName(AutoConnectState state) {
 // ============================================================================
 
 static void SaveSettings() {
+    s_debugLoggingEnabled = GetVerboseLogging();
     FILE* f = nullptr;
     if (fopen_s(&f, kConfigFile, "w") != 0 || !f) {
         LOG_NETPLAY(LOG_WARNING, "[NetMenu] Failed to save settings to %s", kConfigFile);
@@ -251,6 +256,7 @@ static void SaveSettings() {
     fprintf(f, "spectator_port=%u\n", s_spectatorListenPort);
     fprintf(f, "palette_sync=%d\n", s_paletteSyncEnabled ? 1 : 0);
     fprintf(f, "remote_palette_preview=%d\n", s_remotePalettePreviewEnabled ? 1 : 0);
+    fprintf(f, "debug_logging=%d\n", s_debugLoggingEnabled ? 1 : 0);
     fclose(f);
     LOG_NETPLAY(LOG_DEBUG, "[NetMenu] Settings saved to %s", kConfigFile);
 }
@@ -348,6 +354,9 @@ static void LoadSettings() {
             s_paletteSyncEnabled = (atoi(val) != 0);
         } else if (_stricmp(key, "remote_palette_preview") == 0) {
             s_remotePalettePreviewEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "debug_logging") == 0 ||
+                   _stricmp(key, "verbose_logging") == 0) {
+            s_debugLoggingEnabled = (atoi(val) != 0);
         }
     }
 
@@ -376,6 +385,14 @@ static void LoadSettings() {
         s_natConnectTimeoutMs,
         s_natMappingTimeoutMs,
         (unsigned)s_natLogVerbosity);
+}
+
+static void ApplyDebugLoggingSetting(const char* reason) {
+    SetVerboseLogging(s_debugLoggingEnabled);
+    LOG_NETPLAY(LOG_INFO,
+        "[NetMenu] Applied debug logging setting (%s): enabled=%d",
+        reason ? reason : "unspecified",
+        s_debugLoggingEnabled ? 1 : 0);
 }
 
 static void ApplyDelaySettingsToPolicy(const char* reason) {
@@ -623,7 +640,7 @@ static bool NormalizeWideCharForField(TextEditField field, wchar_t* ch) {
     return *ch >= 0x20 && *ch != 0x7F;
 }
 
-static bool IsTextEditWindowFocused() {
+static bool IsProcessForegroundWindow() {
     const HWND foreground = GetForegroundWindow();
     if (!foreground) {
         return false;
@@ -632,6 +649,14 @@ static bool IsTextEditWindowFocused() {
     DWORD foregroundPid = 0;
     GetWindowThreadProcessId(foreground, &foregroundPid);
     return foregroundPid == GetCurrentProcessId();
+}
+
+static bool IsTextEditWindowFocused() {
+    return IsProcessForegroundWindow();
+}
+
+static bool IsCopyAddressKeyDown() {
+    return (GetAsyncKeyState('C') & 0x8000) != 0;
 }
 
 static void BuildAsyncKeyboardStateSnapshot(BYTE* keyState, size_t keyStateCount) {
@@ -2013,6 +2038,7 @@ static void ClearTextEditState() {
 static void ResetMenuInputState() {
     s_selectedIndex = 0;
     s_waitForNeutral = true;
+    s_prevCopyAddressKeyDown = false;
     ClearTextEditState();
     InputSystem_ResetRepeatState(0);
 }
@@ -2363,12 +2389,13 @@ static int ItemCount(MenuState st) {
         case MenuState::SpectateEntry:       return 4; // Connect, Discover LAN, Endpoint, Back
         case MenuState::SpectatorConnecting: return 1; // Cancel
         case MenuState::SpectatorConnected:  return 1; // Disconnect
-        case MenuState::SettingsCategoryMenu: return 4; // Player, Network, Watch, Back
+        case MenuState::SettingsCategoryMenu: return 5; // Player, Network, Watch, Diagnostics, Back
         case MenuState::SettingsEntry: {
             switch (s_settingsCategory) {
                 case SettingsCategory::Identity:     return 5; // Name, Delay, Rollback, Bias, Back
                 case SettingsCategory::Endpoint:     return 8; // Route, UPnP, STUN, Hole, IPv6, Relay, STUN srv, Back
                 case SettingsCategory::SessionMatch: return 5; // Watchers, Port, PalSync, PalPreview, Back
+                case SettingsCategory::Diagnostics:  return 2; // Debug logging, Back
                 default: return 5;
             }
         }
@@ -2412,6 +2439,11 @@ static int SettingGlobalId() {
                 case 1: return 12;  // Watch Port
                 case 2: return 13;  // Sync Palettes
                 case 3: return 14;  // Preview Remote
+                default: return -1; // Back
+            }
+        case SettingsCategory::Diagnostics:
+            switch (s_selectedIndex) {
+                case 0: return 15;  // Debug Logging
                 default: return -1; // Back
             }
         default: return -1;
@@ -2516,7 +2548,7 @@ static void FinishTextEdit(bool commit) {
             if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
                 CopyText(s_relayEndpoint, sizeof(s_relayEndpoint), s_textEditBuffer);
                 LOG_NETPLAY(LOG_INFO, "[NetMenu] Punch relay endpoint set to: %s", s_relayEndpoint);
-                SetStatus("Punch relay: %s", s_relayEndpoint);
+                SetStatus("Punch relay set to custom server.");
             } else {
                 SetStatus("Enter a valid punch relay address.");
             }
@@ -2927,9 +2959,8 @@ static void SyncSpectatorClientState() {
 static void HandleNavigationInput() {
     // C key: copy your address to clipboard (in states where it's relevant)
     {
-        static bool s_prevCDown = false;
-        bool cDown = (GetAsyncKeyState('C') & 0x8000) != 0;
-        if (cDown && !s_prevCDown) {
+        bool cDown = IsCopyAddressKeyDown();
+        if (cDown && !s_prevCopyAddressKeyDown) {
             if (s_state == MenuState::HostEntry ||
                 s_state == MenuState::Connecting ||
                 s_state == MenuState::Handshake ||
@@ -2940,7 +2971,7 @@ static void HandleNavigationInput() {
                 }
             }
         }
-        s_prevCDown = cDown;
+        s_prevCopyAddressKeyDown = cDown;
     }
 
     if (IsActionPromptOpen()) {
@@ -3140,6 +3171,11 @@ static void HandleNavigationInput() {
                 changed = true;
                 paletteChanged = true;
                 SetStatus("Remote palette preview: %s", EnabledStateLabel(s_remotePalettePreviewEnabled));
+            } else if (gid == 15) {
+                s_debugLoggingEnabled = GetVerboseLogging();
+                s_debugLoggingEnabled = !s_debugLoggingEnabled;
+                changed = true;
+                SetStatus("Debug logging: %s", EnabledStateLabel(s_debugLoggingEnabled));
             }
 
             if (changed) {
@@ -3152,6 +3188,9 @@ static void HandleNavigationInput() {
                 }
                 if (paletteChanged) {
                     ApplyPaletteSettingsToRuntime("settings navigation");
+                }
+                if (gid == 15) {
+                    ApplyDebugLoggingSetting("settings navigation");
                 }
                 SaveSettings();
             }
@@ -3434,6 +3473,10 @@ static void ActivateCurrentSelection() {
                 s_settingsCategory = SettingsCategory::SessionMatch;
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SettingsEntry, "open watch settings");
+            } else if (s_selectedIndex == 3) {
+                s_settingsCategory = SettingsCategory::Diagnostics;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "open diagnostics settings");
             } else {
                 // Back to main menu
                 s_selectedIndex = 0;
@@ -3592,6 +3635,7 @@ void Init() {
     ClearActionPrompt("init");
     s_idleSpectatorPromptDeferred = false;
     LoadSettings();
+    ApplyDebugLoggingSetting("menu init");
     ApplyDelaySettingsToPolicy("menu init");
     ApplyNatSettingsToService("menu init");
     ApplySpectatorSettingsToRuntime("menu init");
@@ -3674,11 +3718,21 @@ void FrameUpdate() {
         }
     }
 
+    if (!IsProcessForegroundWindow()) {
+        s_waitForNeutral = true;
+        s_prevCopyAddressKeyDown = false;
+        ResetTextEditKeyState();
+        InputSystem_ResetRepeatState(0);
+        return;
+    }
+
     // Wait for all inputs to be released before processing
     if (s_waitForNeutral) {
         uint16_t held = InputSystem_GetInput(0);
-        if ((held & (INPUT_ANY_DIR | INPUT_A | INPUT_B | INPUT_START | INPUT_SELECT)) == 0) {
+        if ((held & (INPUT_ANY_DIR | INPUT_A | INPUT_B | INPUT_START | INPUT_SELECT)) == 0 &&
+            !IsCopyAddressKeyDown()) {
             s_waitForNeutral = false;
+            s_prevCopyAddressKeyDown = false;
             InputSystem_ResetRepeatState(0);
         }
         return;
@@ -3797,6 +3851,7 @@ void GetSnapshot(MenuSnapshot* out) {
     out->spectator_listen_port = s_spectatorListenPort;
     out->palette_sync_enabled = s_paletteSyncEnabled;
     out->remote_palette_preview_enabled = s_remotePalettePreviewEnabled;
+    out->debug_logging_enabled = GetVerboseLogging();
 
     Net::NatSnapshot natSnap{};
     Net::Nat_GetSnapshot(&natSnap);
@@ -3818,7 +3873,6 @@ void GetSnapshot(MenuSnapshot* out) {
         endpointShort);
     CopyText(out->nat_status, sizeof(out->nat_status), natStatus);
 
-    const char* punchRelayText = s_relayEndpoint[0] ? s_relayEndpoint : "delthas.fr:14763";
     _snprintf_s(out->nat_route_status, sizeof(out->nat_route_status), _TRUNCATE,
         "%s, %s",
         FriendlyConnectPreferenceLabel(s_connectPreference),
@@ -3830,19 +3884,19 @@ void GetSnapshot(MenuSnapshot* out) {
         natSnap.mapped_port,
         natSnap.pcp_mapped_port);
     _snprintf_s(out->nat_punch_status, sizeof(out->nat_punch_status), _TRUNCATE,
-        "%s via %s",
+        "%s%s",
         s_holePunchEnabled ? "On" : "Off",
-        punchRelayText);
+        s_relayEndpoint[0] ? ", custom relay" : ", default relay");
     _snprintf_s(out->nat_stun_status, sizeof(out->nat_stun_status), _TRUNCATE,
         "%s%s%s",
         Net::StunStatusName(natSnap.stun_status),
         endpointShort[0] && endpointShort[0] != '-' ? " " : "",
         endpointShort[0] && endpointShort[0] != '-' ? endpointShort : "");
     _snprintf_s(out->spectator_punch_status, sizeof(out->spectator_punch_status), _TRUNCATE,
-        "%s, watch port %u, relay %s",
+        "%s, watch port %u%s",
         s_holePunchEnabled ? "Punch on" : "Punch off",
         s_spectatorListenPort,
-        punchRelayText);
+        s_relayEndpoint[0] ? ", custom relay" : ", default relay");
 
     Net::DelayPolicySnapshot delaySnap{};
     Net::DelayPolicy_GetSnapshot(&delaySnap);

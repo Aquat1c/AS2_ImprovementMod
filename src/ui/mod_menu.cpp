@@ -398,14 +398,14 @@ static void TabAdvancedDebug() {
 static void TabLog() {
     // Verbose logging toggle
     bool verbose = GetVerboseLogging();
-    if (ImGui::Checkbox("Verbose Logging", &verbose)) {
+    if (ImGui::Checkbox("Netplay Debug Logging", &verbose)) {
         SetVerboseLogging(verbose);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Enable detailed input/status logging.\n"
-                          "Disable to reduce log spam.");
+        ImGui::SetTooltip("Enable detailed netplay diagnostics.\n"
+                          "Errors and key session events are always logged.");
     }
     ImGui::Separator();
     

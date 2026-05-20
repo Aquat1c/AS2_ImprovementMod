@@ -305,13 +305,6 @@ static void WorkerThreadMain() {
                             std::lock_guard<std::mutex> statsLock(s_statsMutex);
                             s_stats.last_outbound_packet_tick_ms = GetTickCount();
                         }
-                        Rollback::NetplayLog_Verbose("NTHREAD", -1,
-                            "Outbound packet sent on worker: token=%u ch=%u type=%s payload=%zu reliable=%d",
-                            cmd.session_token,
-                            cmd.channel,
-                            PacketTypeName(cmd.packet_type),
-                            cmd.payload_len,
-                            cmd.reliable ? 1 : 0);
                     }
                     break;
                 }
@@ -411,13 +404,6 @@ static void WorkerThreadMain() {
                     if (out.packet_len > 0 && ev.packet->data) {
                         memcpy(out.packet_data, ev.packet->data, out.packet_len);
                     }
-                    Rollback::NetplayLog_Verbose("NTHREAD", -1,
-                        "Inbound packet received on worker: token=%u peer=0x%llX ch=%u len=%zu tick=%lu",
-                        activeSessionToken,
-                        (unsigned long long)out.peer_token,
-                        out.channel_id,
-                        out.packet_len,
-                        (unsigned long)out.transport_tick_ms);
                     PushNetworkEvent(out);
 
                     enet_packet_destroy(ev.packet);
@@ -615,15 +601,6 @@ bool NetworkThread_SendPacket(uint32_t session_token, uint8_t channel,
     }
 
     const bool ok = EnqueueCommand(cmd);
-    if (ok) {
-        Rollback::NetplayLog_Verbose("NTHREAD", -1,
-            "Queued outbound packet: token=%u ch=%u type=%s payload=%zu reliable=%d",
-            session_token,
-            channel,
-            PacketTypeName(type),
-            payload_len,
-            reliable ? 1 : 0);
-    }
     return ok;
 }
 
