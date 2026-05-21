@@ -2141,6 +2141,31 @@ static void OpenDisconnectError(const char* why) {
 // Session state sync
 // ============================================================================
 
+static bool ShouldRecoverHiddenSessionLoss(const Net::SessionSnapshot& snap) {
+    if (MenuVisible() || s_state == MenuState::DisconnectError) {
+        return false;
+    }
+
+    const bool pregameActive = Net::PregameSync_GetPhase() != Net::PregamePhase::Idle;
+    const bool matchOwned = Net::MatchLifecycle_IsMatchOwned();
+    if (!pregameActive && !matchOwned) {
+        return false;
+    }
+
+    return snap.state == Net::SessionState::Failed ||
+           snap.state == Net::SessionState::Idle;
+}
+
+static const char* HiddenSessionLossReason(const Net::SessionSnapshot& snap) {
+    if (snap.error_text[0]) {
+        return snap.error_text;
+    }
+    if (Net::MatchLifecycle_IsMatchOwned()) {
+        return "Session lost during online match.";
+    }
+    return "Session lost during pre-game sync.";
+}
+
 static void SyncSessionState() {
     // Always drain session events on the game thread.
     // The ENet transport itself is serviced independently on the network worker.
@@ -2148,6 +2173,16 @@ static void SyncSessionState() {
 
     Net::SessionSnapshot snap{};
     Net::Session_GetSnapshot(&snap);
+
+    if (ShouldRecoverHiddenSessionLoss(snap)) {
+        const char* reason = HiddenSessionLossReason(snap);
+        LOG_NETPLAY(LOG_WARNING,
+            "[NetMenu] Hidden netplay flow lost session; forcing recovery: state=%s reason='%s'",
+            Net::SessionStateName(snap.state),
+            reason ? reason : "?");
+        OpenDisconnectError(reason);
+        return;
+    }
 
     // Map session state to menu state when menu is active
     if (!MenuVisible()) return;

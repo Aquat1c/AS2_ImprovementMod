@@ -19,6 +19,7 @@
 #include "patches/hook_installer.h"
 #include "patches/filesystem_patch.h"
 #include "patches/palette_asset_hook.h"
+#include "patches/charsel_palette_select.h"
 #include "patches/tick_hooks.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/savestate.h"
@@ -733,6 +734,7 @@ __declspec(dllexport) void ModOnFrame() {
     Net::Session_Update();
     Net::NetplayPaletteRuntime_FrameUpdate();
     PaletteAssetHook_FrameUpdate();
+    Net::CharSelPaletteSelect_FrameUpdate();
 
     // Process savestate hotkeys (F5 save, F6 load)
     Savestate_ProcessHotkeys();

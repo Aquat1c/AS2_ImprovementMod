@@ -72,9 +72,26 @@ static void LogBoundaryState(const char* label) {
 }
 
 static void ClearInputResidue() {
+    static const uint8_t zeroInputBuffer[INPUT_BUFFER_SIZE] = {};
+    static const uint8_t zeroInputState[INPUT_STATE_SIZE] = {};
+
+    const bool p1InputBufferCleared =
+        WriteMemoryBlockSafe((void*)ADDR_P1_INPUT_BUFFER, zeroInputBuffer, sizeof(zeroInputBuffer));
+    const bool p2InputBufferCleared =
+        WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_BUFFER, zeroInputBuffer, sizeof(zeroInputBuffer));
+    const bool p1InputStateCleared =
+        WriteMemoryBlockSafe((void*)ADDR_P1_INPUT_STATE, zeroInputState, sizeof(zeroInputState));
+    const bool p2InputStateCleared =
+        WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_STATE, zeroInputState, sizeof(zeroInputState));
+
     Rollback::NetplayLog_Write(
         "REMATCH", -1,
-        "Clearing input residue: overrideP1/P2, netplayP1/P2, repeat-state, pause-block");
+        "Clearing input residue: game_buffers=%d/%d game_states=%d/%d "
+        "overrideP1/P2, netplayP1/P2, repeat-state, pause-block",
+        p1InputBufferCleared ? 1 : 0,
+        p2InputBufferCleared ? 1 : 0,
+        p1InputStateCleared ? 1 : 0,
+        p2InputStateCleared ? 1 : 0);
 
     InputSystem_ClearOverride(0);
     InputSystem_ClearOverride(1);

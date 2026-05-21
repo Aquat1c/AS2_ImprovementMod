@@ -1192,6 +1192,24 @@ bool CharSelPaletteSelect_Install() {
     return true;
 }
 
+void CharSelPaletteSelect_FrameUpdate() {
+    if (GetGameMode() == MODE_CHARSEL) {
+        return;
+    }
+
+    if (s_blockOfflineFrontend) {
+        Rollback::NetplayLog_Write(
+            "CHARPAL", -1,
+            "Cleared offline frontend block after leaving CharSel: mode=%u",
+            GetGameMode());
+    }
+    s_blockOfflineFrontend = false;
+
+    if (s_frontendActive) {
+        DeactivateFrontend();
+    }
+}
+
 void CharSelPaletteSelect_OnCharSelBegin(bool netplay, uint8_t localGameSlot) {
     BeginFrontend(netplay, localGameSlot);
 }

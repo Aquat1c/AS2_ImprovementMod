@@ -26,6 +26,7 @@
 #include "net/session_types.h"
 #include "net/protocol.h"
 #include "net/match_lifecycle.h"
+#include "net/netplay_menu_controller.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "input/input_system.h"
@@ -98,8 +99,8 @@ void PauseHandler_FrameUpdate() {
         s_remoteQuit = false;
         s_wasQuit = true;
 
-        LOG_NETPLAY(LOG_INFO, "[PauseHandler] Remote peer quit — cancelling session");
-        Session_Cancel();
+        LOG_NETPLAY(LOG_INFO, "[PauseHandler] Remote peer quit — forcing disconnect recovery");
+        NetMenu::HandleDisconnection("Remote player quit from pause menu.");
         return;
     }
 

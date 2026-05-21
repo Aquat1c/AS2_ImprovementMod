@@ -18,6 +18,7 @@
 namespace Net {
 
 bool CharSelPaletteSelect_Install();
+void CharSelPaletteSelect_FrameUpdate();
 
 void CharSelPaletteSelect_OnCharSelBegin(bool netplay, uint8_t local_game_slot);
 void CharSelPaletteSelect_EndFrontend();

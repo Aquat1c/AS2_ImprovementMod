@@ -5,6 +5,7 @@
 #include "core/mod_main.h"
 #include "input/input_system.h"
 #include "net/netplay_palette_runtime.h"
+#include "net/mode_ownership.h"
 #include "net/player_side_mapping.h"
 #include "net/session_manager.h"
 #include "patches/memory_utils.h"
@@ -220,6 +221,8 @@ static std::string WideToGameText(const std::wstring& text);
 static bool IsReplayExtension(const fs::path& path);
 static bool IsReplayMenuContext();
 static bool IsReplayMenuSelectContext();
+static void DeactivateReplayMatch(const char* reason);
+static bool ExitReplayPlaybackToReplayMenu(const char* reason);
 static void RenderReplayBrowserHud();
 static bool ReadReplayMetadata(const fs::path& path, ReplayFileMetadata* outMetadata);
 static bool ShouldRenameNetplayReplaySave(const Net::SessionSnapshot& session);
@@ -1626,7 +1629,7 @@ static void ChangeSpeed(int delta) {
     LOG_INFO("[Replay] Speed set to %.2fx", kSpeedSteps[s_speedIndex]);
 }
 
-static void HandleMatchHotkeys() {
+static bool HandleMatchHotkeys() {
     const bool shiftDown = KeyDown(VK_SHIFT);
 
     if (ConsumeEdge(kHotkeyToggleHud, &s_toggleHudKeyWasDown)) {
@@ -1684,8 +1687,14 @@ static void HandleMatchHotkeys() {
     }
 
     if (ConsumeEdge(kHotkeyTakeoverExit, &s_takeoverExitKeyWasDown)) {
-        ExitTakeover();
+        if (s_takeoverMode != TakeoverMode::None) {
+            ExitTakeover();
+        } else {
+            return ExitReplayPlaybackToReplayMenu("Exited replay playback.");
+        }
     }
+
+    return false;
 }
 
 static void TransitionReplayMenu(uint32_t resultValue) {
@@ -1918,6 +1927,27 @@ static void DeactivateReplayMatch(const char* reason) {
     ResetMatchHotkeyEdges();
 }
 
+static bool ExitReplayPlaybackToReplayMenu(const char* reason) {
+    if (!s_replayMatchActive && !IsReplayMatchContext()) {
+        return false;
+    }
+
+    LOG_INFO("[Replay] Exit to replay menu requested (%s): mode=%u sub=%u frame=%d",
+        reason ? reason : "no reason",
+        GetGameMode(),
+        GetSubstate(),
+        s_currentFrame);
+
+    DeactivateReplayMatch(reason ? reason : "exit to replay menu");
+    s_replayLaunchPending = false;
+    ResetLoadedReplayPaletteState();
+    ResetBrowserState();
+    ResetMatchHotkeyEdges();
+    ResetMenuHotkeyEdges();
+    ModeOwnership::CallOriginalSetGameMode(MODE_REPLAY_SELECT, 1);
+    return true;
+}
+
 static void RenderReplayMatchHud() {
     if (!s_replayMatchActive || !s_replayHudVisible) {
         return;
@@ -1950,9 +1980,9 @@ static void RenderReplayMatchHud() {
         }
     }
 
-    snprintf(lines[3], sizeof(lines[3]), "Bksl Pause  ] Fwd  [ Back  Shift+[ Rewind");
-    snprintf(lines[4], sizeof(lines[4]), "+/- Speed  1 P1  2 P2  0 Exit  Ins HUD");
-    snprintf(lines[5], sizeof(lines[5]), "Press takeover key again to restart.");
+    snprintf(lines[3], sizeof(lines[3]), "0 Replay Menu  Bksl Pause  ] Fwd  [ Back");
+    snprintf(lines[4], sizeof(lines[4]), "Shift+[ Rewind  +/- Speed  Ins HUD");
+    snprintf(lines[5], sizeof(lines[5]), "1/2 Takeover or retry  0 exits takeover first");
     lines[6][0] = '\0';
     lines[7][0] = '\0';
 
@@ -2417,7 +2447,7 @@ void ReplayRuntime_Init() {
     ResetMatchHotkeyEdges();
     ResetMenuHotkeyEdges();
     s_initialized = true;
-    LOG_INFO("[Replay] Runtime initialized (Bksl pause, ] step, [ back, Shift+[ rewind, Insert HUD, 1/2 takeover)");
+    LOG_INFO("[Replay] Runtime initialized (0 replay menu, Bksl pause, ] step, [ back, Shift+[ rewind, Insert HUD, 1/2 takeover)");
 }
 
 void ReplayRuntime_Shutdown() {
@@ -2449,7 +2479,9 @@ void ReplayRuntime_FrameUpdate() {
     }
 
     UpdateObservedFrame();
-    HandleMatchHotkeys();
+    if (HandleMatchHotkeys()) {
+        return;
+    }
     ApplySpeedScale();
     ClearInjectedInputsOnly();
 }

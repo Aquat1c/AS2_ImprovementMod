@@ -640,6 +640,7 @@ void MatchBootstrap_BeginConfigExchange(const LockedMatchConfig* config) {
     if (!config) return;
 
     BaselineSync_Reset();
+    s_logTickCounter = 0;
     s_isHost = (Session_GetRole() == SessionRole::Host);
 
     // Host always uses its own config.
@@ -731,6 +732,7 @@ void MatchBootstrap_Abort() {
     Savestate_ClearRollbackBaseline("bootstrap abort");
     s_phase = BootPhase::Idle;
     s_error[0] = '\0';
+    s_logTickCounter = 0;
     s_configSent = false;
     s_configReceived = false;
     s_configAgreed = false;

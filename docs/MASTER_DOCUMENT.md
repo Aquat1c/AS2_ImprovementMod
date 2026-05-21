@@ -887,6 +887,7 @@ The replay runtime (`replay_runtime.cpp`) extends both replay browsing and repla
 
 | Key | Action |
 |-----|--------|
+| Esc | Exit replay playback or browser and return to the netplay menu |
 | Bksl | Pause / unpause replay playback |
 | ] | Step forward |
 | [ | Step backward |
@@ -1448,6 +1449,7 @@ If the game directory already contains a third-party `d3d9.dll`, back it up befo
 | F10 | Start / stop macro recording (dummy side) | Training mode |
 | Delete | Play / stop current macro slot | Training mode |
 | F12 | Cycle to next macro slot | Training mode |
+| Esc | Exit replay playback or browser and return to the netplay menu | Replay |
 | Bksl | Pause / unpause replay playback | Replay |
 | `[` | Step backward one frame | Replay, while paused |
 | `]` | Step forward one frame | Replay, while paused |

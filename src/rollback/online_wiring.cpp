@@ -813,6 +813,29 @@ static void StopRollbackSession(const char* reason) {
     LOG_INFO("[OnlineWiring] Rollback session ended: %s", reason ? reason : "unknown");
 }
 
+static bool DisconnectNeedsBoundaryCleanup() {
+    Net::MatchLifecycleSnapshot lifecycle{};
+    Net::MatchLifecycle_GetSnapshot(&lifecycle);
+
+    const Net::PregamePhase pregamePhase = Net::PregameSync_GetPhase();
+    const uint32_t mode = GetGameMode();
+
+    return s_rollbackStarted ||
+           s_rollbackActive ||
+           s_gameplayActive ||
+           s_liveReleaseArmed ||
+           s_rollbackBeginPending ||
+           s_frameOriginAbs >= 0 ||
+           s_baselineCRC != 0 ||
+           s_configHash != 0 ||
+           lifecycle.active ||
+           pregamePhase != Net::PregamePhase::Idle ||
+           mode == MODE_CHARSEL ||
+           mode == MODE_PREMATCH_INTRO ||
+           mode == MODE_MATCH ||
+           mode == MODE_WINSCREEN;
+}
+
 // ============================================================================
 // Phase Transition Logging
 // ============================================================================
@@ -1333,13 +1356,55 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     NetplayLog_Write("DISCONNECT", s_rollbackActive ? RollbackSession_GetCurrentFrame() : -1,
         "=== DISCONNECT: %s ===", reason ? reason : "unknown");
 
+    const bool boundaryCleanupNeeded = DisconnectNeedsBoundaryCleanup();
+
     if (s_rollbackActive) {
         StopRollbackSession(reason ? reason : "disconnect");
     }
 
+    if (boundaryCleanupNeeded) {
+        NetplayLog_Write("DISCONNECT", -1,
+            "Running forced match-boundary cleanup for disconnect: mode=%u pregame=%s lifecycle=%s "
+            "started=%d active=%d live_release=%d pending=%d baseline=0x%08X config=0x%08X",
+            GetGameMode(),
+            Net::PregamePhaseName(Net::PregameSync_GetPhase()),
+            Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+            s_rollbackStarted ? 1 : 0,
+            s_rollbackActive ? 1 : 0,
+            s_liveReleaseArmed ? 1 : 0,
+            s_rollbackBeginPending ? 1 : 0,
+            s_baselineCRC,
+            s_configHash);
+        RematchCleanup_PrepareForNextMatch(reason ? reason : "disconnect");
+    } else {
+        NetplayLog_Write("DISCONNECT", -1,
+            "Skipping forced match-boundary cleanup; disconnect occurred before match ownership");
+    }
+
+    if (Net::PregameSync_GetPhase() != Net::PregamePhase::Idle) {
+        NetplayLog_Write("DISCONNECT", -1,
+            "Aborting pregame/bootstrap state during disconnect cleanup: phase=%s",
+            Net::PregamePhaseName(Net::PregameSync_GetPhase()));
+        Net::PregameSync_Abort(reason ? reason : "disconnect");
+    }
+
+    s_rollbackStarted = false;
+    s_rollbackActive = false;
+    s_gameplayActive = false;
     s_liveReleaseArmed = false;
     s_rollbackBeginPending = false;
     s_frameOriginAbs = -1;
+    s_baselineCRC = 0;
+    s_configHash = 0;
+    s_handoffDelay = 0;
+    s_handoffBudget = 0;
+    s_remoteInputsReceived = 0;
+    s_packetsDispatched = 0;
+    s_backgroundPollCount = 0;
+    s_backgroundPollFailures = 0;
+    s_lastLifecyclePhase = Net::MatchLifecyclePhase::Inactive;
+    s_lastActiveDelay = -1;
+    s_lastRollbackBudget = -1;
     Net::NetplayPacing_ResetSession("disconnect");
     Net::WinScreenSync_Abort();
     Net::FrontendInputSync_AbortEpoch(reason ? reason : "disconnect");

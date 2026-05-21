@@ -70,6 +70,7 @@ Training mode:
 
 Replay mode:
 
+- `Esc`: Exit replay playback or the replay browser and return to the netplay menu
 - `Bksl`: Pause or unpause replay playback
 - `[` / `]`: Step backward or forward while paused
 - `Shift+[`: Rewind replay

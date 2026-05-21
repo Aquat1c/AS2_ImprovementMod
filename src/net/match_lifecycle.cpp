@@ -10,6 +10,7 @@
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/mode_ownership.h"
+#include "net/netplay_menu_controller.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "rollback/netplay_log.h"
@@ -478,7 +479,7 @@ void MatchLifecycle_FrameUpdate() {
             s_phase != MatchLifecyclePhase::ReturningToMenu) {
             LOG_NETPLAY(LOG_WARNING, "[MatchLife] Session lost during %s",
                 MatchLifecyclePhaseName(s_phase));
-            MatchLifecycle_OnDisconnect("Session lost during match");
+            NetMenu::HandleDisconnection("Session lost during match");
             return;
         }
     }

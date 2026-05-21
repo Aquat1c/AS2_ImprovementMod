@@ -1042,7 +1042,7 @@ void PregameSync_FrameUpdate() {
     // Check session validity
     if (!IsSessionValid()) {
         if (s_phase != PregamePhase::Error) {
-            PregameSync_Abort("Session lost during pre-game sync");
+            NetMenu::HandleDisconnection("Session lost during pre-game sync");
         }
         return;
     }
@@ -1103,6 +1103,8 @@ bool PregameSync_Begin() {
     Session_SetPacketCallback(OnPregamePacket);
 
     // Reset all tracking state
+    s_logTickCounter = 0;
+    s_charselLogCounter = 0;
     s_configAgreed = false;
     s_configHash = 0;
     LockedMatchConfig_Clear(&s_lockedConfig);
@@ -1170,6 +1172,8 @@ void PregameSync_Abort(const char* reason) {
     s_haveSyncRoundOption = false;
     s_lastAnnounceSendTime = 0;
     s_lastConfirmSendTime = 0;
+    s_logTickCounter = 0;
+    s_charselLogCounter = 0;
     NetplayPaletteRuntime_OnDisconnect(reason ? reason : "pregame abort");
 }
 

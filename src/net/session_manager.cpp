@@ -104,6 +104,10 @@ static bool IsCompatibilityDisconnectData(uint32_t data) {
     return data == static_cast<uint32_t>(DisconnectReason::VersionMismatch);
 }
 
+static bool IsUserCancelDisconnectData(uint32_t data) {
+    return data == static_cast<uint32_t>(DisconnectReason::UserCancel);
+}
+
 static bool HasUsefulStats(const ConnectionStats& stats) {
     return stats.rtt_ms > 0.0f ||
            stats.rtt_variance_ms > 0.0f ||
@@ -990,6 +994,14 @@ static void OnTransportDisconnect(uintptr_t peerToken, uint32_t data, DWORD tran
         return;
     }
 
+    if (IsUserCancelDisconnectData(data) &&
+        s_state != SessionState::Idle &&
+        s_state != SessionState::Failed &&
+        s_state != SessionState::Disconnecting) {
+        SetError("Remote canceled the session");
+        return;
+    }
+
     if ((s_state == SessionState::Connecting || s_state == SessionState::Handshaking) &&
         TryRelayFallback("transport-disconnect")) {
         LOG_INFO("[Session] Direct connect dropped; retrying via relay fallback");
@@ -1143,9 +1155,7 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
                 NetworkThread_ClearQueues(s_activeSessionToken);
             }
             s_peerToken = 0;
-            GameSettingsSync_RestoreLocalSession(reason);
-            Nat_StopServices();
-            ResetState();
+            SetError(reason && reason[0] ? reason : "Remote disconnected");
             break;
         }
 
@@ -1686,7 +1696,10 @@ void Session_Cancel() {
         strncpy(dp.message, "Session canceled", sizeof(dp.message) - 1);
         dp.message[sizeof(dp.message) - 1] = '\0';
         QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect, &dp, sizeof(dp), true, "cancel");
-        NetworkThread_RequestDisconnect(cancelToken, 0, false);
+        NetworkThread_RequestDisconnect(
+            cancelToken,
+            static_cast<uint32_t>(DisconnectReason::UserCancel),
+            false);
     }
 
     if (cancelToken != 0) {
