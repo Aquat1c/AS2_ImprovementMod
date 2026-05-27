@@ -20,18 +20,96 @@
 #include "patches/memory_utils.h"
 #include "patches/input_sync_hooks.h"
 #include "rollback/netplay_log.h"
+#include "rollback/owner_diagnostics.h"
 #include "rollback/rollback_debug.h"
 #include "core/as2_constants.h"
 #include "core/game_state.h"
 #include "ui/log_window.h"
 
+#include <string.h>
+
 namespace {
 
 constexpr size_t kEffectStateBytes = EFFECT_MAX_SLOTS * EFFECT_ENTRY_SIZE;
 constexpr size_t kSummonStateBytes = SUMMON_MAX_SLOTS * SUMMON_ENTRY_SIZE;
+constexpr size_t kFrontendSafeInputBufferClearSize = ADDR_P1_INPUT_STATE - ADDR_P1_INPUT_BUFFER;
+constexpr size_t kUnsafeInputTailSize =
+    INPUT_BUFFER_SIZE - kFrontendSafeInputBufferClearSize - INPUT_STATE_SIZE;
+constexpr uintptr_t kP1UnsafeInputTailStart = ADDR_P1_INPUT_STATE + INPUT_STATE_SIZE;
+constexpr uintptr_t kP2UnsafeInputTailStart = ADDR_P2_INPUT_STATE + INPUT_STATE_SIZE;
 
 static_assert(kEffectStateBytes == (ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY),
     "Effect array size should span exactly to summon array");
+static_assert(kFrontendSafeInputBufferClearSize == 56,
+    "Frontend-safe input clear must stop before shared/CharSel/player data");
+static_assert(ADDR_P2_INPUT_STATE - ADDR_P2_INPUT_BUFFER == kFrontendSafeInputBufferClearSize,
+    "P2 frontend-safe clear size must match P1");
+static_assert(INPUT_STATE_SIZE == 20,
+    "Input state size changed; verify frontend cleanup");
+static_assert(kFrontendSafeInputBufferClearSize < INPUT_BUFFER_SIZE,
+    "Frontend-safe clear must be smaller than the full match input buffer span");
+static_assert(kUnsafeInputTailSize == 132,
+    "Unsafe input tail size should cover the bytes the old 208-byte clear would have corrupted");
+
+struct InputTailSnapshot {
+    bool p1_readable;
+    bool p2_readable;
+    uint32_t p1_crc;
+    uint32_t p2_crc;
+    uint8_t p1[kUnsafeInputTailSize];
+    uint8_t p2[kUnsafeInputTailSize];
+};
+
+static uint32_t CaptureTailCrc(uintptr_t addr,
+                               uint8_t* out,
+                               size_t size,
+                               bool* outReadable) {
+    const bool readable = CopyMemorySafe(out, reinterpret_cast<const void*>(addr), size);
+    if (outReadable) {
+        *outReadable = readable;
+    }
+    return readable ? CalcCRC32(out, size) : 0;
+}
+
+static InputTailSnapshot CaptureInputTailSnapshot() {
+    InputTailSnapshot snap{};
+    snap.p1_crc = CaptureTailCrc(
+        kP1UnsafeInputTailStart,
+        snap.p1,
+        sizeof(snap.p1),
+        &snap.p1_readable);
+    snap.p2_crc = CaptureTailCrc(
+        kP2UnsafeInputTailStart,
+        snap.p2,
+        sizeof(snap.p2),
+        &snap.p2_readable);
+    return snap;
+}
+
+static bool TailChanged(const InputTailSnapshot& before,
+                        const InputTailSnapshot& after,
+                        int player) {
+    const bool beforeReadable = (player == 0) ? before.p1_readable : before.p2_readable;
+    const bool afterReadable = (player == 0) ? after.p1_readable : after.p2_readable;
+    if (!beforeReadable || !afterReadable) {
+        return false;
+    }
+
+    const uint8_t* beforeBytes = (player == 0) ? before.p1 : before.p2;
+    const uint8_t* afterBytes = (player == 0) ? after.p1 : after.p2;
+    return memcmp(beforeBytes, afterBytes, kUnsafeInputTailSize) != 0;
+}
+
+static void LogOwnerAndTail(const char* label, const InputTailSnapshot& tail) {
+    Rollback::OwnerDiag_LogSnapshot(
+        label,
+        Rollback::OwnerDiag_Capture(),
+        true,
+        tail.p1_crc,
+        tail.p2_crc,
+        tail.p1_readable,
+        tail.p2_readable);
+}
 
 static void LogBoundaryState(const char* label) {
     Net::SessionSnapshot session{};
@@ -72,7 +150,10 @@ static void LogBoundaryState(const char* label) {
 }
 
 static void ClearInputResidue() {
-    static const uint8_t zeroInputBuffer[INPUT_BUFFER_SIZE] = {};
+    const InputTailSnapshot beforeTail = CaptureInputTailSnapshot();
+    LogOwnerAndTail("before_cleanup", beforeTail);
+
+    static const uint8_t zeroInputBuffer[kFrontendSafeInputBufferClearSize] = {};
     static const uint8_t zeroInputState[INPUT_STATE_SIZE] = {};
 
     const bool p1InputBufferCleared =
@@ -86,12 +167,15 @@ static void ClearInputResidue() {
 
     Rollback::NetplayLog_Write(
         "REMATCH", -1,
-        "Clearing input residue: game_buffers=%d/%d game_states=%d/%d "
-        "overrideP1/P2, netplayP1/P2, repeat-state, pause-block",
+        "ClearInputResidue frontend_safe bytes=%u states=%u p1Buf=%d p2Buf=%d "
+        "p1State=%d p2State=%d full_clear=0 unsafe_tail_bytes=%u",
+        (unsigned)sizeof(zeroInputBuffer),
+        (unsigned)sizeof(zeroInputState),
         p1InputBufferCleared ? 1 : 0,
         p2InputBufferCleared ? 1 : 0,
         p1InputStateCleared ? 1 : 0,
-        p2InputStateCleared ? 1 : 0);
+        p2InputStateCleared ? 1 : 0,
+        (unsigned)kUnsafeInputTailSize);
 
     InputSystem_ClearOverride(0);
     InputSystem_ClearOverride(1);
@@ -105,6 +189,32 @@ static void ClearInputResidue() {
             "Clearing stale control swap at rematch boundary");
     }
     InputSystem_SetControlSwap(false);
+
+    const InputTailSnapshot afterTail = CaptureInputTailSnapshot();
+    LogOwnerAndTail("after_cleanup", afterTail);
+
+    const bool p1TailChanged = TailChanged(beforeTail, afterTail, 0);
+    const bool p2TailChanged = TailChanged(beforeTail, afterTail, 1);
+    Rollback::NetplayLog_Write(
+        "OWNERCHK", -1,
+        "tail_guard after_cleanup p1_changed=%d p2_changed=%d p1_crc=0x%08X->0x%08X "
+        "p2_crc=0x%08X->0x%08X safe_clear_bytes=%u old_full_clear_bytes=%u",
+        p1TailChanged ? 1 : 0,
+        p2TailChanged ? 1 : 0,
+        beforeTail.p1_crc,
+        afterTail.p1_crc,
+        beforeTail.p2_crc,
+        afterTail.p2_crc,
+        (unsigned)kFrontendSafeInputBufferClearSize,
+        (unsigned)INPUT_BUFFER_SIZE);
+
+    if (p1TailChanged || p2TailChanged) {
+        Rollback::NetplayLog_Write(
+            "OWNERCHK", -1,
+            "ERROR rematch cleanup changed unsafe input tail bytes: p1_changed=%d p2_changed=%d",
+            p1TailChanged ? 1 : 0,
+            p2TailChanged ? 1 : 0);
+    }
 }
 
 static void ClearMatchVolatileResidue() {
@@ -132,6 +242,7 @@ void RematchCleanup_PrepareForNextMatch(const char* reason) {
         "REMATCH", -1,
         "=== NEXT MATCH CLEANUP BEGIN: reason=%s ===",
         reason ? reason : "unspecified");
+    Rollback::OwnerDiag_Log("rematch_cleanup_begin");
     LogBoundaryState("BeforeCleanup");
 
     if (Net::WinScreenSync_IsActive()) {
@@ -179,6 +290,7 @@ void RematchCleanup_PrepareForNextMatch(const char* reason) {
     ClearInputResidue();
 
     LogBoundaryState("AfterCleanup");
+    Rollback::OwnerDiag_Log("rematch_cleanup_end");
     Rollback::NetplayLog_Write("REMATCH", -1,
         "=== NEXT MATCH CLEANUP END ===");
     Rollback::NetplayLog_Flush();

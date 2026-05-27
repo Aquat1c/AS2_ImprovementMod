@@ -79,6 +79,8 @@
 #define ADDR_ENTITY_INIT        (GAME_BASE + 0x09E050)  // sub_49E050
 #define ADDR_CAN_ACT_SET        (GAME_BASE + 0x09E040)  // sub_49E040
 #define ADDR_COMBO_TRACKING     (GAME_BASE + 0x09E8F0)  // sub_49E8F0
+#define ADDR_ENTITY_SET_ACTION_RESET (GAME_BASE + 0x09F440)  // sub_49F440
+#define ADDR_ENTITY_RESET_HIT_DATA   ADDR_ENTITY_RESET       // sub_49E720
 
 // Entity checksum function
 #define ADDR_ENTITY_GET_CHECKSUM (GAME_BASE + 0x09EE60)  // sub_49EE60
@@ -523,6 +525,17 @@
 // Box system offsets
 #define ENTITY_OFF_BOX_FLAGS    0x0674  // +1652, 24 bytes
 #define ENTITY_OFF_NATIVE_ACTIONABLE 0x0676 // +1654, user-verified live actionable flag (1=actionable, 0=inactionable)
+#define ENTITY_OFF_RENDER_FLASH_FLAG     0x01B4  // +436, BYTE, extra flash/afterimage draw flag
+#define ENTITY_OFF_RENDER_TINT_STATE     0x01B8  // +440, DWORD, 1 disables extra tint pass in sub_4C6B60
+#define ENTITY_OFF_RENDER_TINT_TIMER     0x01BC  // +444, DWORD
+#define ENTITY_OFF_RENDER_MAIN_SPRITE    0x0818  // +2072, DWORD, main sprite/texture index
+#define ENTITY_OFF_RENDER_GROUP          0x081C  // +2076, DWORD, render group/mode
+#define ENTITY_OFF_RENDER_OVERLAY_SPRITE 0x0820  // +2080, DWORD, -1 or overlay sprite index
+#define ENTITY_OFF_RENDER_OVERLAY_ORDER  0x0824  // +2084, BYTE, overlay draw order flag
+#define ENTITY_OFF_RENDER_OVERLAY_X      0x0826  // +2086, WORD
+#define ENTITY_OFF_RENDER_OVERLAY_Y      0x0828  // +2088, WORD
+#define ENTITY_OFF_RENDER_OVERLAY_BLEND  0x082C  // +2092, DWORD
+#define ENTITY_OFF_RENDER_OVERLAY_ALPHA  0x0830  // +2096, BYTE
 #define ENTITY_OFF_ANIM_INDEX   0x1004  // +4100, DWORD
 #define ENTITY_OFF_ANIM_DATA    0x1008  // +4104, animation data array
 #define ENTITY_OFF_BOX_ARRAY    0xA33F  // +41791, box processing array

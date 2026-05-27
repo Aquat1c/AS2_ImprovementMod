@@ -164,7 +164,10 @@ static bool ClearVanillaDInputJoyState(int joyIndex, const char* reason) {
                                          kZeroJoyState,
                                          sizeof(kZeroJoyState));
 
-    if ((s_dinputJoyRefreshLogCount < 16 || !ok) && reason) {
+    const bool verboseInputLog = ModConfig_VerboseLogging() || Rollback::NetplayLog_IsVerbose();
+    if (((verboseInputLog && s_dinputJoyRefreshLogCount < 16) ||
+         s_dinputJoyRefreshLogCount < 2 ||
+         !ok) && reason) {
         LOG_INFO("[InputHook] Cleared vanilla DInput joy state idx=%d base=0x%08X bytes=%u buttonsOff=0x%X ok=%d reason=%s",
                  joyIndex,
                  (unsigned)joyBase,
@@ -931,7 +934,9 @@ int __cdecl Hook_JoystickState(int playerID) {
 
         if (playerIndex < 0) {
             g_inputDebug.lastFinalResult = 0;
-            if (s_joystickUnknownLogCount < 16) {
+            const bool verboseInputLog = ModConfig_VerboseLogging() || Rollback::NetplayLog_IsVerbose();
+            if ((verboseInputLog && s_joystickUnknownLogCount < 16) ||
+                s_joystickUnknownLogCount < 4) {
                 LOG_INFO("[InputHook] JoystickState SDL ignored unmapped playerID=%d baseJoyID=%d p1JoyID=%d p2JoyID=%d",
                          playerID,
                          baseJoyID,
@@ -967,7 +972,9 @@ int __cdecl Hook_JoystickState(int playerID) {
             g_inputDebug.lastInjectedJoyInput = gameInput;
         }
         
-        if (s_joystickStateLogCount < 24) {
+        const bool verboseInputLog = ModConfig_VerboseLogging() || Rollback::NetplayLog_IsVerbose();
+        if ((verboseInputLog && s_joystickStateLogCount < 24) ||
+            s_joystickStateLogCount < 4) {
             LOG_INFO("[InputHook] JoystickState SDL playerID=%d baseJoyID=%d p1JoyID=%d p2JoyID=%d mappedP%d sdl=0x%04X game=0x%04X",
                      playerID,
                      baseJoyID,

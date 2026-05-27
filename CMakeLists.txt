@@ -301,6 +301,7 @@ set(ROLLBACK_HEADERS
     include/rollback/rollback_debug.h
     include/rollback/desync_dump.h
     include/rollback/netplay_log.h
+    include/rollback/owner_diagnostics.h
     include/rollback/stress_hooks.h
     include/rollback/online_wiring.h
     include/rollback/rematch_cleanup.h

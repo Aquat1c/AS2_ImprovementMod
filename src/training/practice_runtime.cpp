@@ -11,6 +11,7 @@
 #include "input_system.h"
 #include "as2_constants.h"
 #include "log_window.h"
+#include "rollback/netplay_log.h"
 #include "rollback/rollback_session.h"
 
 #include <stdint.h>
@@ -44,6 +45,10 @@ static const int kJumpHoldFrames = 3;
 static const int kTriggerCount = 5;
 static const uint32_t kInvalidFrame = 0xFFFFFFFFu;
 static const int16_t kStageCenterX = 8000;
+static const int kTrainingNeutralAction = 22;
+static const int kTrainingNeutralSprite = 25;
+static const int kTrainingNeutralRenderGroup = 3;
+static const uint16_t kTrainingNeutralAnimIndex = 0x20;
 
 enum PracticeTabId {
     PRACTICE_TAB_OVERVIEW = 0,
@@ -276,6 +281,23 @@ struct PlayerSnapshot {
     uint16_t comboCount;
 };
 
+struct TrainingRenderState {
+    uint32_t actionId;
+    uint32_t mainSprite;
+    uint32_t renderGroup;
+    uint32_t overlaySprite;
+    uint8_t overlayOrder;
+    int16_t overlayX;
+    int16_t overlayY;
+    uint32_t overlayBlend;
+    uint8_t overlayAlpha;
+    uint8_t flashFlag;
+    uint32_t tintState;
+    uint32_t tintTimer;
+    uint32_t animIndex;
+    bool plausible;
+};
+
 struct ScriptRuntime {
     bool active;
     bool inputStartedLogged;
@@ -336,6 +358,7 @@ static ComboTracker s_comboTrackers[kPracticePlayerCount] = {};
 static bool s_ownedOverrideActive[kPracticePlayerCount] = {};
 static uint16_t s_lastOwnedOverrideInput[kPracticePlayerCount] = {};
 static uint32_t s_lastObservedSimFrame = kInvalidFrame;
+static uint32_t s_lastNeutralResetFrame[kPracticePlayerCount] = { kInvalidFrame, kInvalidFrame };
 
 // Trigger status overlay tracking — which trigger last fired and on what frame
 static int      s_lastFiredTriggerId    = -1;
@@ -889,6 +912,17 @@ static void ResetPracticeTransientRuntime(bool clearEditors) {
     }
 }
 
+static void ClearPracticeRuntimeAfterPositionReset(const char* reason) {
+    ResetPracticeTransientRuntime(false);
+    Rollback::NetplayLog_Write(
+        "TRAINRESET", -1,
+        "runtime_cleared reason=%s frame=%u",
+        reason ? reason : "position_reset",
+        ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER));
+    LOG_INFO("[TRAINRESET] runtime_cleared reason=%s",
+             reason ? reason : "position_reset");
+}
+
 static bool TriggerTargetIncludesPlayer(int target, int player) {
     if (target == TRIGGER_TARGET_BOTH) {
         return true;
@@ -920,37 +954,213 @@ static void ZeroPlayerMotion(uintptr_t entityBase) {
     WriteMemory<int16_t>(entityBase + ENTITY_OFF_Y_ACCEL, 0);
 }
 
-static void ResetPlayerActionForPositionSet(uintptr_t entityBase) {
+using EntitySetActionResetFn = int (__cdecl *)(int actionId, void* entity);
+using EntityResetHitDataFn = int (__cdecl *)(int entity);
+using EffectSetParamsFn = int (__cdecl *)(int entity, int sprite, int renderGroup, uint16_t animIndex);
+
+static bool IsPlausibleMainSprite(uint32_t sprite) {
+    return sprite < 1024;
+}
+
+static bool IsPlausibleOverlaySprite(uint32_t sprite) {
+    return sprite == 0xFFFFFFFFu || sprite < 1024;
+}
+
+static bool IsPlausibleAnimIndex(uint32_t animIndex) {
+    return animIndex < 4096;
+}
+
+static TrainingRenderState ReadTrainingRenderState(uintptr_t entityBase) {
+    TrainingRenderState state{};
+    if (!entityBase) {
+        return state;
+    }
+
+    state.actionId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID);
+    state.mainSprite = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_MAIN_SPRITE);
+    state.renderGroup = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_GROUP);
+    state.overlaySprite = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_OVERLAY_SPRITE);
+    state.overlayOrder = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_RENDER_OVERLAY_ORDER);
+    state.overlayX = ReadMemory<int16_t>(entityBase + ENTITY_OFF_RENDER_OVERLAY_X);
+    state.overlayY = ReadMemory<int16_t>(entityBase + ENTITY_OFF_RENDER_OVERLAY_Y);
+    state.overlayBlend = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_OVERLAY_BLEND);
+    state.overlayAlpha = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_RENDER_OVERLAY_ALPHA);
+    state.flashFlag = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_RENDER_FLASH_FLAG);
+    state.tintState = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_TINT_STATE);
+    state.tintTimer = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_TINT_TIMER);
+    state.animIndex = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ANIM_INDEX);
+    state.plausible =
+        IsPlausibleMainSprite(state.mainSprite) &&
+        IsPlausibleOverlaySprite(state.overlaySprite) &&
+        IsPlausibleAnimIndex(state.animIndex);
+    return state;
+}
+
+static bool CallEntitySetActionReset(uintptr_t entityBase, int actionId) {
+    __try {
+        reinterpret_cast<EntitySetActionResetFn>(ADDR_ENTITY_SET_ACTION_RESET)(
+            actionId,
+            reinterpret_cast<void*>(entityBase));
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool CallEntityResetHitData(uintptr_t entityBase) {
+    __try {
+        reinterpret_cast<EntityResetHitDataFn>(ADDR_ENTITY_RESET_HIT_DATA)(
+            static_cast<int>(entityBase));
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool CallEffectSetParams(uintptr_t entityBase,
+                                int sprite,
+                                int renderGroup,
+                                uint16_t animIndex) {
+    __try {
+        reinterpret_cast<EffectSetParamsFn>(ADDR_EFFECT_SET_PARAMS)(
+            static_cast<int>(entityBase),
+            sprite,
+            renderGroup,
+            animIndex);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void LogTrainingRenderState(const char* prefix,
+                                   int player,
+                                   uintptr_t entityBase,
+                                   const TrainingRenderState& state) {
+    Rollback::NetplayLog_Write(
+        "TRAINRESET", -1,
+        "%s p=%s entity=0x%08X action=%u main=%u group=%u overlay=0x%08X "
+        "order=%u overlay_xy=(%d,%d) blend=0x%08X alpha=%u flash=%u tint=%u/%u "
+        "anim=%u plausible=%d",
+        prefix ? prefix : "state",
+        SideLabel(player),
+        (unsigned)entityBase,
+        state.actionId,
+        state.mainSprite,
+        state.renderGroup,
+        state.overlaySprite,
+        state.overlayOrder,
+        (int)state.overlayX,
+        (int)state.overlayY,
+        state.overlayBlend,
+        state.overlayAlpha,
+        state.flashFlag,
+        state.tintState,
+        state.tintTimer,
+        state.animIndex,
+        state.plausible ? 1 : 0);
+}
+
+static bool NormalizeTrainingRenderFields(uintptr_t entityBase) {
+    const bool effectParamsSet = CallEffectSetParams(
+        entityBase,
+        kTrainingNeutralSprite,
+        kTrainingNeutralRenderGroup,
+        kTrainingNeutralAnimIndex);
+
+    // sub_4C3ED0 intentionally preserves +0x081C when renderGroup == 3, so
+    // write the known standing group explicitly for position-reset recovery.
+    const bool groupSet =
+        WriteMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_GROUP, kTrainingNeutralRenderGroup);
+    const bool flashCleared =
+        WriteMemory<uint8_t>(entityBase + ENTITY_OFF_RENDER_FLASH_FLAG, 0);
+    const bool tintSet =
+        WriteMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_TINT_STATE, 1);
+    const bool tintTimerCleared =
+        WriteMemory<uint32_t>(entityBase + ENTITY_OFF_RENDER_TINT_TIMER, 0);
+    return effectParamsSet && groupSet && flashCleared && tintSet && tintTimerCleared;
+}
+
+static void ResetPlayerToTrainingNeutral(int player, uintptr_t entityBase, const char* reason) {
     if (!entityBase) {
         return;
     }
 
-    // Action state — force to standing idle (2), reset phase/frame counters.
-    // Offsets are the same ones the hitbox viewer reads for live display.
-    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID,    2);
-    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_PHASE, 0);
-    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_FRAME, 0);
+    const uint32_t simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    if (player >= 0 && player < kPracticePlayerCount &&
+        s_lastNeutralResetFrame[player] == simFrame) {
+        Rollback::NetplayLog_Write(
+            "TRAINRESET", -1,
+            "coalesced p=%s frame=%u reason=%s entity=0x%08X",
+            SideLabel(player),
+            simFrame,
+            reason ? reason : "unknown",
+            (unsigned)entityBase);
+        return;
+    }
+    if (player >= 0 && player < kPracticePlayerCount) {
+        s_lastNeutralResetFrame[player] = simFrame;
+    }
 
-    // Attack markers
-    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_ATTACK_STATE, 0);
-    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_ATTACK_TYPE,  0);
+    const TrainingRenderState before = ReadTrainingRenderState(entityBase);
+    if (!before.plausible) {
+        LOG_WARN("[TRAINRESET] pre_bad_render_state p=%s entity=0x%08X main=0x%08X overlay=0x%08X anim=0x%08X",
+                 SideLabel(player),
+                 (unsigned)entityBase,
+                 before.mainSprite,
+                 before.overlaySprite,
+                 before.animIndex);
+    }
+    LogTrainingRenderState("begin", player, entityBase, before);
 
-    // Hit / clash / max-hit blocks
-    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_HIT_ACTIVE,       0);
-    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_CLASH_RANK,       0);
-    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_A,      0);
-    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_B,      0);
-    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_C,      0);
-    WriteMemory<int16_t> (entityBase + ENTITY_OFF_CLASH_RAW_D,      0);
-    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_CLASH_ID,         0);
-    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_A,    0);
-    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_B,    0);
-    WriteMemory<uint16_t>(entityBase + ENTITY_OFF_MAX_HIT_RAW_C,    0);
-    WriteMemory<int16_t> (entityBase + ENTITY_OFF_MAX_HIT_RAW_D,    0);
-    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ID,       0);
-    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_MAX_HIT_ACTIVE,   0);
-    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_HIT_MARKER_1948,  0);
-    WriteMemory<uint8_t> (entityBase + ENTITY_OFF_HIT_MARKER_1949,  0);
+    const bool actionReset = CallEntitySetActionReset(entityBase, kTrainingNeutralAction);
+    const bool hitReset = CallEntityResetHitData(entityBase);
+    const bool renderNorm = NormalizeTrainingRenderFields(entityBase);
+
+    WriteMemory<uint8_t>(entityBase + ENTITY_OFF_ATTACK_STATE, 0);
+    WriteMemory<uint32_t>(entityBase + ENTITY_OFF_ATTACK_TYPE, 0);
+    WriteMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_ACTIVE, 0);
+    ZeroPlayerMotion(entityBase);
+
+    const TrainingRenderState after = ReadTrainingRenderState(entityBase);
+    Rollback::NetplayLog_Write(
+        "TRAINRESET", -1,
+        "vanilla_reset p=%s frame=%u reason=%s entity=0x%08X action=%d action_reset=%d hit_reset=%d render_norm=%d",
+        SideLabel(player),
+        simFrame,
+        reason ? reason : "unknown",
+        (unsigned)entityBase,
+        kTrainingNeutralAction,
+        actionReset ? 1 : 0,
+        hitReset ? 1 : 0,
+        renderNorm ? 1 : 0);
+    LogTrainingRenderState("end", player, entityBase, after);
+
+    LOG_INFO("[TRAINRESET] neutral_reset reason=%s p=%s entity=0x%08X action=%u->%u "
+             "main=%u->%u overlay=0x%08X->0x%08X anim=%u->%u plausible=%d",
+             reason ? reason : "unknown",
+             SideLabel(player),
+             (unsigned)entityBase,
+             before.actionId,
+             after.actionId,
+             before.mainSprite,
+             after.mainSprite,
+             before.overlaySprite,
+             after.overlaySprite,
+             before.animIndex,
+             after.animIndex,
+             after.plausible ? 1 : 0);
+
+    if (!actionReset || !hitReset || !renderNorm || !after.plausible) {
+        Rollback::NetplayLog_Write(
+            "TRAINRESET", -1,
+            "ERROR neutral_reset incomplete p=%s action_reset=%d hit_reset=%d render_norm=%d plausible=%d",
+            SideLabel(player),
+            actionReset ? 1 : 0,
+            hitReset ? 1 : 0,
+            renderNorm ? 1 : 0,
+            after.plausible ? 1 : 0);
+    }
 }
 
 static void WritePlayerHpFields(uintptr_t entityBase, int hp) {
@@ -978,6 +1188,8 @@ static void WritePlayerValues(int player, const PlayerValueEditor& editor, const
     const int16_t appliedY = canApplyPosition ? ClampS16(editor.y) : before.y;
     const bool positionChanged = canApplyPosition &&
         (appliedX != before.x || appliedY != before.y);
+    const uint32_t simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    const TrainingRenderState renderBefore = ReadTrainingRenderState(before.base);
 
     WritePlayerHpFields(before.base, ClampInt(editor.hp, 0, hpCap));
     WriteMemory<uint16_t>(before.base + ENTITY_OFF_METER, ClampU16(editor.meter, kMeterMax));
@@ -987,9 +1199,10 @@ static void WritePlayerValues(int player, const PlayerValueEditor& editor, const
         WriteMemory<int16_t>(before.base + ENTITY_OFF_Y_POS, appliedY);
         ZeroPlayerMotion(before.base);
         if (positionChanged) {
-            ResetPlayerActionForPositionSet(before.base);
+            ResetPlayerToTrainingNeutral(player, before.base, reason ? reason : "value_position");
         }
     }
+    const TrainingRenderState renderAfter = ReadTrainingRenderState(before.base);
 
     LOG_INFO("[Practice] %s value apply (%s): HP %u->%u Meter %u->%u Guard %u->%u Pos (%d,%d)->(%d,%d)",
              SideLabel(player),
@@ -1004,6 +1217,24 @@ static void WritePlayerValues(int player, const PlayerValueEditor& editor, const
              before.y,
              (int)appliedX,
              (int)appliedY);
+
+    if (positionChanged) {
+        Rollback::NetplayLog_Write(
+            "TRAINRESET", -1,
+            "value_position frame=%u reason=%s p=%s act=%u->%u spr=%u/0x%08X->%u/0x%08X anim=%u->%u",
+            simFrame,
+            reason ? reason : "value_position",
+            SideLabel(player),
+            renderBefore.actionId,
+            renderAfter.actionId,
+            renderBefore.mainSprite,
+            renderBefore.overlaySprite,
+            renderAfter.mainSprite,
+            renderAfter.overlaySprite,
+            renderBefore.animIndex,
+            renderAfter.animIndex);
+        ClearPracticeRuntimeAfterPositionReset(reason ? reason : "value_position");
+    }
 }
 
 static void CopySnapshotToEditor(int player, const PlayerSnapshot& snapshot) {
@@ -1131,8 +1362,29 @@ static bool ApplyPositionData(const int16_t x[kPracticePlayerCount],
         return false;
     }
 
+    const uint32_t simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    uintptr_t bases[kPracticePlayerCount] = {};
+    TrainingRenderState before[kPracticePlayerCount] = {};
     for (int player = 0; player < kPracticePlayerCount; ++player) {
-        const uintptr_t entityBase = GetEntityBase(player);
+        bases[player] = GetEntityBase(player);
+        before[player] = ReadTrainingRenderState(bases[player]);
+    }
+    Rollback::NetplayLog_Write(
+        "TRAINRESET", -1,
+        "begin frame=%u reason=position_set p1_act=%u p1_spr=%u/0x%08X p1_anim=%u "
+        "p2_act=%u p2_spr=%u/0x%08X p2_anim=%u",
+        simFrame,
+        before[0].actionId,
+        before[0].mainSprite,
+        before[0].overlaySprite,
+        before[0].animIndex,
+        before[1].actionId,
+        before[1].mainSprite,
+        before[1].overlaySprite,
+        before[1].animIndex);
+
+    for (int player = 0; player < kPracticePlayerCount; ++player) {
+        const uintptr_t entityBase = bases[player];
         if (!entityBase) {
             continue;
         }
@@ -1141,14 +1393,33 @@ static bool ApplyPositionData(const int16_t x[kPracticePlayerCount],
         WriteMemory<int16_t>(entityBase + ENTITY_OFF_Y_POS, y[player]);
         WriteMemory<uint8_t>(entityBase + ENTITY_OFF_FACING, facing[player]);
         ZeroPlayerMotion(entityBase);
-        ResetPlayerActionForPositionSet(entityBase);
+        ResetPlayerToTrainingNeutral(player, entityBase, "position_set");
     }
+
+    const TrainingRenderState afterP1 = ReadTrainingRenderState(bases[0]);
+    const TrainingRenderState afterP2 = ReadTrainingRenderState(bases[1]);
+    Rollback::NetplayLog_Write(
+        "TRAINRESET", -1,
+        "end frame=%u reason=position_set p1_act=%u p1_spr=%u/0x%08X p1_anim=%u plausible=%d "
+        "p2_act=%u p2_spr=%u/0x%08X p2_anim=%u plausible=%d",
+        simFrame,
+        afterP1.actionId,
+        afterP1.mainSprite,
+        afterP1.overlaySprite,
+        afterP1.animIndex,
+        afterP1.plausible ? 1 : 0,
+        afterP2.actionId,
+        afterP2.mainSprite,
+        afterP2.overlaySprite,
+        afterP2.animIndex,
+        afterP2.plausible ? 1 : 0);
 
     UpdateScrollForPositions(x[0], x[1]);
 
     FrameAdvantage_CancelCalculation();
     FrameAdvantage_ClearDisplay();
     RefreshValueEditorsFromLiveState();
+    ClearPracticeRuntimeAfterPositionReset("position_set");
     return true;
 }
 
@@ -1204,6 +1475,23 @@ static void SwapPlayerPositions(const PlayerSnapshot snapshots[kPracticePlayerCo
         return;
     }
 
+    const uint32_t simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+    const TrainingRenderState beforeP1 = ReadTrainingRenderState(snapshots[0].base);
+    const TrainingRenderState beforeP2 = ReadTrainingRenderState(snapshots[1].base);
+    Rollback::NetplayLog_Write(
+        "TRAINRESET", -1,
+        "begin frame=%u reason=position_swap p1_act=%u p1_spr=%u/0x%08X p1_anim=%u "
+        "p2_act=%u p2_spr=%u/0x%08X p2_anim=%u",
+        simFrame,
+        beforeP1.actionId,
+        beforeP1.mainSprite,
+        beforeP1.overlaySprite,
+        beforeP1.animIndex,
+        beforeP2.actionId,
+        beforeP2.mainSprite,
+        beforeP2.overlaySprite,
+        beforeP2.animIndex);
+
     LOG_INFO("[Practice] Swap positions: P1 (%d,%d) <-> P2 (%d,%d)",
              snapshots[0].x,
              snapshots[0].y,
@@ -1215,11 +1503,29 @@ static void SwapPlayerPositions(const PlayerSnapshot snapshots[kPracticePlayerCo
     WriteMemory<int16_t>(snapshots[1].base + ENTITY_OFF_Y_POS, snapshots[1].y);
     ZeroPlayerMotion(snapshots[0].base);
     ZeroPlayerMotion(snapshots[1].base);
-    ResetPlayerActionForPositionSet(snapshots[0].base);
-    ResetPlayerActionForPositionSet(snapshots[1].base);
+    ResetPlayerToTrainingNeutral(0, snapshots[0].base, "position_swap");
+    ResetPlayerToTrainingNeutral(1, snapshots[1].base, "position_swap");
     // Swap preserves the midpoint, so the same scroll center is still correct.
     UpdateScrollForPositions(snapshots[0].x, snapshots[1].x);
     RefreshValueEditorsFromLiveState();
+    const TrainingRenderState afterP1 = ReadTrainingRenderState(snapshots[0].base);
+    const TrainingRenderState afterP2 = ReadTrainingRenderState(snapshots[1].base);
+    Rollback::NetplayLog_Write(
+        "TRAINRESET", -1,
+        "end frame=%u reason=position_swap p1_act=%u p1_spr=%u/0x%08X p1_anim=%u plausible=%d "
+        "p2_act=%u p2_spr=%u/0x%08X p2_anim=%u plausible=%d",
+        simFrame,
+        afterP1.actionId,
+        afterP1.mainSprite,
+        afterP1.overlaySprite,
+        afterP1.animIndex,
+        afterP1.plausible ? 1 : 0,
+        afterP2.actionId,
+        afterP2.mainSprite,
+        afterP2.overlaySprite,
+        afterP2.animIndex,
+        afterP2.plausible ? 1 : 0);
+    ClearPracticeRuntimeAfterPositionReset("position_swap");
 }
 
 static uint16_t ForwardMask(const PlayerSnapshot& snapshot) {

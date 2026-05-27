@@ -1691,6 +1691,16 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
             DWORD entBase = (p == 0) ? p1Entity : p2Entity;
             len += snprintf(msg + len, sizeof(msg) - len, "  P%d (0x%08X):", p + 1, entBase);
             __try {
+                BYTE  owner      = *(BYTE*)(entBase + 0x0000);
+                DWORD actionId   = *(DWORD*)(entBase + 0x044C);
+                DWORD mainSprite = *(DWORD*)(entBase + 0x0818);
+                DWORD renderGrp  = *(DWORD*)(entBase + 0x081C);
+                DWORD overlay    = *(DWORD*)(entBase + 0x0820);
+                BYTE  ovOrder    = *(BYTE*)(entBase + 0x0824);
+                short ovX        = *(short*)(entBase + 0x0826);
+                short ovY        = *(short*)(entBase + 0x0828);
+                DWORD ovBlend    = *(DWORD*)(entBase + 0x082C);
+                BYTE  ovAlpha    = *(BYTE*)(entBase + 0x0830);
                 DWORD animIdx    = *(DWORD*)(entBase + 0x1004);
                 DWORD animFrames = *(DWORD*)(entBase + 0x100C);
                 BYTE  atkState   = *(BYTE*)(entBase + 0x6C8);
@@ -1699,7 +1709,19 @@ LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
                 short posX       = *(short*)(entBase + 0xB8);
                 short posY       = *(short*)(entBase + 0xBA);
                 len += snprintf(msg + len, sizeof(msg) - len,
-                    " animIdx=%u/%u atk=%d type=0x%X hit=%d pos=(%d,%d)\n",
+                    " owner=%u action=%u main=%u group=%u overlay=0x%08X order=%u "
+                    "ovPos=(%d,%d) blend=0x%08X alpha=%u animIdx=%u/%u "
+                    "atk=%d type=0x%X hit=%d pos=(%d,%d)\n",
+                    owner,
+                    actionId,
+                    mainSprite,
+                    renderGrp,
+                    overlay,
+                    ovOrder,
+                    (int)ovX,
+                    (int)ovY,
+                    ovBlend,
+                    ovAlpha,
                     animIdx, animFrames, atkState, atkType, hitActive,
                     (int)posX, (int)posY);
             } __except(EXCEPTION_EXECUTE_HANDLER) {

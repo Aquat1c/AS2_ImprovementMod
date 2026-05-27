@@ -29,6 +29,7 @@
 #include "patches/memory_utils.h"
 #include "rollback/online_wiring.h"
 #include "rollback/netplay_log.h"
+#include "rollback/owner_diagnostics.h"
 #include "ui/log_window.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1133,6 +1134,7 @@ bool PregameSync_Begin() {
         s_sessionId,
         (uint16_t)FrontendInputSync_ComputeDelayProposal(),
         "pregame begin");
+    Rollback::OwnerDiag_Log("pregame_begin");
 
     // Start with initial session sync (announce → exchange → confirmed → charsel)
     SetStatusFmt("Synchronizing session...");

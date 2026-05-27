@@ -14,6 +14,7 @@
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "rollback/netplay_log.h"
+#include "rollback/owner_diagnostics.h"
 #include "ui/log_window.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -518,6 +519,7 @@ void MatchLifecycle_OnMatchEnter() {
     if (!s_initialized) return;
 
     LOG_NETPLAY(LOG_INFO, "[MatchLife] Match entered (PregameSync handoff)");
+    Rollback::OwnerDiag_Log("match_start");
     s_matchOwned = true;
     s_error[0] = '\0';
     s_postMatchIntent = PostMatchIntent::None;
