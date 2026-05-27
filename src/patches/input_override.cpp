@@ -2190,19 +2190,40 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 startupReleased,
                 stallThreshold);
             if (pacingAction != Net::NetplayPacingAction::None) {
+                Net::NetplayPacing_OnHoldSample(
+                    preTelemetry,
+                    rollbackPhase,
+                    startupReleased,
+                    pacingAction);
                 Net::NetplayPacingSnapshot pacingSnap{};
                 Net::NetplayPacing_GetSnapshot(&pacingSnap);
-                if (pacingSnap.stall_frame_count <= 5 ||
-                    (pacingSnap.stall_frame_count % 120) == 0) {
+                const int holdCount =
+                    pacingAction == Net::NetplayPacingAction::SoftHold
+                        ? pacingSnap.soft_hold_count
+                        : (pacingAction == Net::NetplayPacingAction::HardHold
+                            ? pacingSnap.hard_hold_count
+                            : pacingSnap.stall_frame_count);
+                const int holdThreshold =
+                    pacingAction == Net::NetplayPacingAction::SoftHold
+                        ? pacingSnap.soft_threshold
+                        : (pacingAction == Net::NetplayPacingAction::HardHold
+                            ? pacingSnap.hard_threshold
+                            : pacingSnap.stall_threshold);
+                if (holdCount <= 5 || (holdCount % 120) == 0) {
                     Rollback::NetplayLog_Write(
                         "STALL", currentFrame,
-                        "Holding gameplay: rb_current=%d rb_remote=%d gap=%d threshold=%d phase=%s count=%d",
+                        "Holding gameplay: rb_current=%d rb_remote=%d action=%s raw_gap=%d debt=%d remote_eff=%d threshold=%d phase=%s count=%d class=%s pressure=%.2f",
                         currentFrame,
                         preTelemetry.rb_frame_last_remote_received,
-                        pacingSnap.stall_gap,
-                        pacingSnap.stall_threshold,
+                        Net::NetplayPacingActionName(pacingAction),
+                        pacingSnap.raw_remote_gap,
+                        pacingSnap.prediction_debt,
+                        pacingSnap.effective_remote_delay,
+                        holdThreshold,
                         Net::MatchRollbackPhaseName(rollbackPhase),
-                        pacingSnap.stall_frame_count);
+                        holdCount,
+                        Net::NetQualityName(pacingSnap.quality),
+                        pacingSnap.pressure);
                 }
                 InputSyncHooks_SetTimesyncFreeze(true);
                 Net::Session_Update();
@@ -3145,6 +3166,9 @@ void GetTimesyncDebugInfo(TimesyncDebugInfo* out) {
     Net::NetplayPacing_GetSnapshot(&pacingSnap);
     out->frames_ahead = pacingSnap.frames_ahead;
     out->rate_adjust_ms = pacingSnap.filtered_adjust_ms;
-    out->stall_frame_count = pacingSnap.stall_frame_count;
-    out->stalled = pacingSnap.stall_active;
+    out->stall_frame_count =
+        pacingSnap.stall_frame_count + pacingSnap.soft_hold_count + pacingSnap.hard_hold_count;
+    out->stalled = pacingSnap.stall_active ||
+                   pacingSnap.soft_hold_active ||
+                   pacingSnap.hard_hold_active;
 }

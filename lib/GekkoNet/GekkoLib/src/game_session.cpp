@@ -143,10 +143,16 @@ GekkoGameEvent** Gekko::GameSession::UpdateSession(i32* count)
         AddDisconnectedPlayerInputs();
 
         // check if we need to rollback
-        HandleRollback();
+        if (!HandleRollback()) {
+            *count = _game_events.Count();
+            return _game_events.Data();
+        }
 
         // check if we need to save the confirmed frame
-        HandleSavingConfirmedFrame();
+        if (!HandleSavingConfirmedFrame()) {
+            *count = _game_events.Count();
+            return _game_events.Data();
+        }
 
         // send a healthcheck if applicable
         SendSessionHealthCheck();
@@ -210,6 +216,11 @@ void Gekko::GameSession::NetworkStats(i32 player, GekkoNetworkStats* stats)
                 stats->last_ping = actor->stats.LastRTT();
                 stats->jitter = actor->stats.CalculateJitter();
                 stats->avg_ping = actor->stats.CalculateAvgRTT();
+                stats->rtt_p90 = actor->stats.CalculateRTTPercentile(0.90f);
+                stats->rtt_p95 = actor->stats.CalculateRTTPercentile(0.95f);
+                stats->jitter_p95 = actor->stats.CalculateJitterPercentile(0.95f);
+                stats->packet_loss_ewma = 0.0f;
+                stats->loss_burst_max = 0;
                 return;
             }
         }
@@ -246,11 +257,11 @@ i32 Gekko::GameSession::MinReceivedFrame()
     return _sync.GetMinReceivedFrame();
 }
 
-void Gekko::GameSession::HandleSavingConfirmedFrame()
+bool Gekko::GameSession::HandleSavingConfirmedFrame()
 {
 	if (IsLockstepActive() || !_config.limited_saving ||
         IsPlayingLocally()) {
-		return;
+		return true;
 	}
 
 	const Frame confirmed_frame = _sync.GetMinReceivedFrame();
@@ -258,11 +269,12 @@ void Gekko::GameSession::HandleSavingConfirmedFrame()
 	const Frame diff = current - (_last_saved_frame + 1);
 
 	if (diff <= _config.input_prediction_window) {
-		return;
+		return true;
 	}
 
 	assert(_last_saved_frame < confirmed_frame);
 
+    const Frame original_saved_frame = _last_saved_frame;
 	const Frame sync_frame = _last_saved_frame;
 	const Frame frame_to_save = std::min(current - 1, confirmed_frame);
 
@@ -271,7 +283,16 @@ void Gekko::GameSession::HandleSavingConfirmedFrame()
 	_sync.IncrementFrame();
 
 	for (Frame frame = sync_frame + 1; frame < current; frame++) {
-        _game_events.AddAdvanceEvent(_sync, true);
+        if (!_game_events.AddAdvanceEvent(_sync, true)) {
+            LOG_GEKKO_WARN("[Gekko][GameSession] Abort confirmed-frame replay: missing inputs frame=%d current=%d sync=%d",
+                           frame,
+                           current,
+                           sync_frame);
+            _sync.SetCurrentFrame(current);
+            _last_saved_frame = original_saved_frame;
+            _game_events.Clear();
+            return false;
+        }
 		if (frame == frame_to_save) {
             _game_events.AddSaveEvent(_sync, _storage, &_last_saved_frame);
 		}
@@ -280,6 +301,7 @@ void Gekko::GameSession::HandleSavingConfirmedFrame()
 
 	// make sure that we are back where we started.
 	assert(_sync.GetCurrentFrame() == current);
+    return true;
 }
 
 void Gekko::GameSession::SendSessionHealthCheck()
@@ -378,7 +400,7 @@ void Gekko::GameSession::SendSpectatorInputs()
 	}
 }
 
-void Gekko::GameSession::HandleRollback()
+bool Gekko::GameSession::HandleRollback()
 {
 	Frame current = _sync.GetCurrentFrame();
 	if (_last_saved_frame == GameInput::NULL_FRAME - 1) {
@@ -388,7 +410,7 @@ void Gekko::GameSession::HandleRollback()
 	}
 
 	if (IsLockstepActive() || IsPlayingLocally()) {
-        return;
+        return true;
     }
 
 	current = _sync.GetCurrentFrame();
@@ -396,9 +418,10 @@ void Gekko::GameSession::HandleRollback()
 
 	// dont allow rollbacks starting before the null frame
     if (min == GameInput::NULL_FRAME) {
-        return;
+        return true;
     }
 
+    const Frame original_saved_frame = _last_saved_frame;
 	const Frame sync_frame = _config.limited_saving ? _last_saved_frame : min - 1;
 	const Frame frame_to_save = std::min(current - 1, min);
 
@@ -408,7 +431,17 @@ void Gekko::GameSession::HandleRollback()
 	_sync.IncrementFrame();
 
 	for (Frame frame = sync_frame + 1; frame < current; frame++) {
-        _game_events.AddAdvanceEvent(_sync, true);
+        if (!_game_events.AddAdvanceEvent(_sync, true)) {
+            LOG_GEKKO_WARN("[Gekko][GameSession] Abort rollback replay: missing inputs frame=%d current=%d min_bad=%d sync=%d",
+                           frame,
+                           current,
+                           min,
+                           sync_frame);
+            _sync.SetCurrentFrame(current);
+            _last_saved_frame = original_saved_frame;
+            _game_events.Clear();
+            return false;
+        }
 		if (!_config.limited_saving || frame == frame_to_save) {
             _game_events.AddSaveEvent(_sync, _storage, &_last_saved_frame);
 		}
@@ -420,6 +453,7 @@ void Gekko::GameSession::HandleRollback()
 
 	// make sure that we are back where we started.
 	assert(_sync.GetCurrentFrame() == current);
+    return true;
 }
 
 void Gekko::GameSession::Poll()

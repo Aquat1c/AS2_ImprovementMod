@@ -114,6 +114,8 @@ struct PeerInfo {
     uint16_t listen_port;
     bool     round_count_valid;
     uint8_t  round_count;
+    bool     frame_timing_valid;
+    uint8_t  frame_timing_mode;
 };
 
 // ============================================================================

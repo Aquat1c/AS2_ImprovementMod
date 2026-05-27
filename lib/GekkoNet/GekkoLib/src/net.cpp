@@ -1,7 +1,9 @@
 #include "gekko_types.h"
 #include "net.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <iostream>
 
 u32 Gekko::NetAddress::GetSize()
@@ -78,6 +80,43 @@ float Gekko::NetStats::CalculateAvgRTT()
 
     float avg_rtt = sum / rtt.size();
     return avg_rtt;
+}
+
+float Gekko::NetStats::CalculateRTTPercentile(float p)
+{
+    if (rtt.empty()) {
+        return 0.f;
+    }
+
+    auto sorted = rtt;
+    std::sort(sorted.begin(), sorted.end());
+
+    const float clamped = std::max(0.f, std::min(1.f, p));
+    const size_t idx = clamped <= 0.f
+        ? 0
+        : (size_t)std::ceil(clamped * (float)sorted.size()) - 1;
+    return (float)sorted[std::min(idx, sorted.size() - 1)];
+}
+
+float Gekko::NetStats::CalculateJitterPercentile(float p)
+{
+    if (rtt.size() < 2) {
+        return 0.f;
+    }
+
+    std::vector<float> deltas;
+    deltas.reserve(rtt.size() - 1);
+    for (i32 i = 1; i < rtt.size(); ++i) {
+        deltas.push_back(std::abs((float)rtt[i] - (float)rtt[i - 1]));
+    }
+
+    std::sort(deltas.begin(), deltas.end());
+
+    const float clamped = std::max(0.f, std::min(1.f, p));
+    const size_t idx = clamped <= 0.f
+        ? 0
+        : (size_t)std::ceil(clamped * (float)deltas.size()) - 1;
+    return deltas[std::min(idx, deltas.size() - 1)];
 }
 
 void Gekko::NetStats::AddRTT(u16 rtt_ms)

@@ -115,7 +115,9 @@ f32 Gekko::StressSession::FramesAhead()
 
 void Gekko::StressSession::NetworkStats(i32 player, GekkoNetworkStats* stats)
 {
-    // no stats for now.
+    if (stats) {
+        *stats = GekkoNetworkStats{};
+    }
 }
 
 void Gekko::StressSession::NetworkPoll()

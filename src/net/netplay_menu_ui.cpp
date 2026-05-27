@@ -526,6 +526,36 @@ static const char* ConnectModeLabel(int mode) {
     }
 }
 
+static const char* FrameTimingLabel(int mode) {
+    switch (mode) {
+        case 0: return "58.8 FPS";
+        case 1: return "60.0 FPS";
+        default: return "Unknown";
+    }
+}
+
+static void FormatFrameTimingInfo(const NetMenu::MenuSnapshot* snap,
+                                  char* out,
+                                  size_t outSize) {
+    if (!out || outSize == 0) {
+        return;
+    }
+
+    const char* local = FrameTimingLabel(snap ? snap->local_frame_timing_mode : -1);
+    if (snap && snap->remote_frame_timing_valid) {
+        const char* remote = FrameTimingLabel(snap->remote_frame_timing_mode);
+        if (snap->frame_timing_session_locked) {
+            _snprintf_s(out, outSize, _TRUNCATE, "%s locked, peer announced %s", local, remote);
+        } else {
+            _snprintf_s(out, outSize, _TRUNCATE, "%s local, peer %s", local, remote);
+        }
+    } else {
+        _snprintf_s(out, outSize, _TRUNCATE, "%s%s",
+            local,
+            (snap && snap->frame_timing_session_locked) ? " locked" : "");
+    }
+}
+
 // ============================================================================
 // Menu page rendering
 // ============================================================================
@@ -684,17 +714,17 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
         _snprintf_s(tolVal, sizeof(tolVal), _TRUNCATE, "< %d > smoothness bias", snap->rollback_tolerance);
         RenderRow(y, "Stability Bias", tolVal, snap->selected_index == 3, true, alpha); y += kRowStep;
 
-        const bool expertDelayMode = snap->gameplay_delay_mode == 1;
+        const bool perPlayerDelayMode = snap->gameplay_delay_mode == 1;
         RenderRow(y,
             "Delay mode",
-            expertDelayMode ? "< Asymmetric expert >" : "< Shared safe > recommended",
+            perPlayerDelayMode ? "< Per-player > default" : "< Shared max >",
             snap->selected_index == 4,
             true,
             alpha);
         y += kRowStep;
 
-        if (expertDelayMode) {
-            RenderInfoLine(y, "Warning", "Opponent delay affects your rollback", alpha);
+        if (!perPlayerDelayMode) {
+            RenderInfoLine(y, "Shared", "Both peers use the higher delay", alpha);
             y += kInfoStep;
         }
 
@@ -867,6 +897,12 @@ static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha, i
         RenderInfoLine(y, "Ping", pingBuf, alpha);
         y += kInfoStep;
     }
+    {
+        char fpsBuf[96];
+        FormatFrameTimingInfo(snap, fpsBuf, sizeof(fpsBuf));
+        RenderInfoLine(y, "FPS", fpsBuf, alpha);
+        y += kInfoStep;
+    }
     RenderInfoLine(y, "Route", snap->nat_route_status, alpha);
     y += kInfoStep;
     RenderInfoLine(y, "Mapping", snap->nat_mapping_status, alpha);
@@ -951,9 +987,15 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
     }
     RenderInfoLine(y,
         "Delay Mode",
-        snap->gameplay_delay_mode == 1 ? "Asymmetric expert" : "Shared safe",
+        snap->gameplay_delay_mode == 1 ? "Per-player" : "Shared max",
         alpha);
     y += kInfoStep;
+    {
+        char fpsBuf[96];
+        FormatFrameTimingInfo(snap, fpsBuf, sizeof(fpsBuf));
+        RenderInfoLine(y, "FPS", fpsBuf, alpha);
+        y += kInfoStep;
+    }
     if (snap->current_rounds_label[0]) {
         RenderInfoLine(y, "Rounds", snap->current_rounds_label, alpha);
         y += kInfoStep;

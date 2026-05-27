@@ -1254,29 +1254,43 @@ void Gekko::AdvantageHistory::Init()
 {
 	_local_frame_adv = 0;
     _remote_frame_adv = 0;
+    _written_count = 0;
 	std::memset(_local, 0, HISTORY_SIZE * sizeof(i8));
 	std::memset(_remote, 0, HISTORY_SIZE * sizeof(i8));
+    std::memset(_written, 0, HISTORY_SIZE * sizeof(bool));
 }
 
 void Gekko::AdvantageHistory::Update(Frame frame)
 {
 	const u32 update_frame = std::max(frame, 0);
-	_local[update_frame % HISTORY_SIZE] = _local_frame_adv;
-	_remote[update_frame % HISTORY_SIZE] = _remote_frame_adv;
+    const u32 slot = update_frame % HISTORY_SIZE;
+	_local[slot] = _local_frame_adv;
+	_remote[slot] = _remote_frame_adv;
+    if (!_written[slot]) {
+        _written[slot] = true;
+        _written_count = std::min(_written_count + 1, HISTORY_SIZE);
+    }
 }
 
 f32 Gekko::AdvantageHistory::GetAverageAdvantage()
 {
+    if (_written_count <= 0) {
+        return 0.f;
+    }
+
 	f32 sum_local = 0.f;
 	f32 sum_remote = 0.f;
 
 	for (i32 i = 0; i < HISTORY_SIZE; i++) {
+        if (!_written[i]) {
+            continue;
+        }
 		sum_local += _local[i];
 		sum_remote += _remote[i];
 	}
 
-	f32 avg_local = sum_local / HISTORY_SIZE;
-	f32 avg_remote = sum_remote / HISTORY_SIZE;
+	f32 avg_local = sum_local / _written_count;
+	f32 avg_remote = sum_remote / _written_count;
 
 	// return the frames ahead (halved: each peer corrects its share of the gap)
 	return (avg_local - avg_remote) / 2.f;

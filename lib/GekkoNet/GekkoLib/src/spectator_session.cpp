@@ -133,6 +133,11 @@ void Gekko::SpectatorSession::NetworkStats(i32 player, GekkoNetworkStats* stats)
             stats->last_ping = actor->stats.LastRTT();
             stats->jitter = actor->stats.CalculateJitter();
             stats->avg_ping = actor->stats.CalculateAvgRTT();
+            stats->rtt_p90 = actor->stats.CalculateRTTPercentile(0.90f);
+            stats->rtt_p95 = actor->stats.CalculateRTTPercentile(0.95f);
+            stats->jitter_p95 = actor->stats.CalculateJitterPercentile(0.95f);
+            stats->packet_loss_ewma = 0.0f;
+            stats->loss_burst_max = 0;
             return;
         }
     }

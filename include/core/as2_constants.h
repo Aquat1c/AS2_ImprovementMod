@@ -22,7 +22,7 @@
 // Critical Function Addresses (from disassembly analysis)
 // ============================================================================
 
-// Main game loop - runs at 60fps, handles mode switching
+// Main game loop - vanilla limiter waits for integer 17ms (~58.8fps), handles mode switching
 #define ADDR_MAIN_LOOP          (GAME_BASE + 0x1D2AC0)  // sub_5D2AC0
 
 // Match mode handler (case 8 in main loop)

@@ -272,6 +272,12 @@ static int32_t        s_cachedConfirmedRbFrame = -1;
 static int32_t        s_cachedLastRemoteReceivedRbFrame = -1;
 static float          s_cachedAvgPing = 0.0f;
 static float          s_cachedJitter = 0.0f;
+static float          s_cachedLastPing = 0.0f;
+static float          s_cachedRttP90 = 0.0f;
+static float          s_cachedRttP95 = 0.0f;
+static float          s_cachedJitterP95 = 0.0f;
+static float          s_cachedPacketLossEwma = 0.0f;
+static int32_t        s_cachedLossBurstMax = 0;
 static bool           s_loggedFirstSaveEvent = false;
 static bool           s_loggedFirstLoadEvent = false;
 static bool           s_loggedFirstAdvanceEvent = false;
@@ -341,6 +347,12 @@ static void RefreshCachedNetworkTelemetry(bool includeFramesAhead) {
         s_cachedLastRemoteReceivedRbFrame = -1;
         s_cachedAvgPing = 0.0f;
         s_cachedJitter = 0.0f;
+        s_cachedLastPing = 0.0f;
+        s_cachedRttP90 = 0.0f;
+        s_cachedRttP95 = 0.0f;
+        s_cachedJitterP95 = 0.0f;
+        s_cachedPacketLossEwma = 0.0f;
+        s_cachedLossBurstMax = 0;
         return;
     }
 
@@ -357,9 +369,21 @@ static void RefreshCachedNetworkTelemetry(bool includeFramesAhead) {
         gekko_network_stats(s_session, s_remoteHandle, &stats);
         s_cachedAvgPing = stats.avg_ping;
         s_cachedJitter = stats.jitter;
+        s_cachedLastPing = (float)stats.last_ping;
+        s_cachedRttP90 = stats.rtt_p90;
+        s_cachedRttP95 = stats.rtt_p95;
+        s_cachedJitterP95 = stats.jitter_p95;
+        s_cachedPacketLossEwma = stats.packet_loss_ewma;
+        s_cachedLossBurstMax = stats.loss_burst_max;
     } else {
         s_cachedAvgPing = 0.0f;
         s_cachedJitter = 0.0f;
+        s_cachedLastPing = 0.0f;
+        s_cachedRttP90 = 0.0f;
+        s_cachedRttP95 = 0.0f;
+        s_cachedJitterP95 = 0.0f;
+        s_cachedPacketLossEwma = 0.0f;
+        s_cachedLossBurstMax = 0;
     }
 }
 
@@ -964,6 +988,12 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_cachedLastRemoteReceivedRbFrame = -1;
     s_cachedAvgPing = 0.0f;
     s_cachedJitter = 0.0f;
+    s_cachedLastPing = 0.0f;
+    s_cachedRttP90 = 0.0f;
+    s_cachedRttP95 = 0.0f;
+    s_cachedJitterP95 = 0.0f;
+    s_cachedPacketLossEwma = 0.0f;
+    s_cachedLossBurstMax = 0;
     s_loggedFirstSaveEvent = false;
     s_loggedFirstLoadEvent = false;
     s_loggedFirstAdvanceEvent = false;
@@ -1084,6 +1114,12 @@ void RollbackSession_End() {
     s_cachedLastRemoteReceivedRbFrame = -1;
     s_cachedAvgPing = 0.0f;
     s_cachedJitter = 0.0f;
+    s_cachedLastPing = 0.0f;
+    s_cachedRttP90 = 0.0f;
+    s_cachedRttP95 = 0.0f;
+    s_cachedJitterP95 = 0.0f;
+    s_cachedPacketLossEwma = 0.0f;
+    s_cachedLossBurstMax = 0;
     s_frameOriginAbs = 0;
     s_currentRbFrame = 0;
     s_lastSavedRbFrame = -1;
@@ -1498,6 +1534,16 @@ void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
     out->rb_frame_current = currentRbFrame;
     out->rb_frame_last_confirmed = s_cachedConfirmedRbFrame;
     out->rb_frame_last_remote_received = s_cachedLastRemoteReceivedRbFrame;
+    out->rb_frame_remote_contiguous = s_cachedLastRemoteReceivedRbFrame;
+    out->raw_remote_gap = s_cachedLastRemoteReceivedRbFrame >= 0
+        ? currentRbFrame - s_cachedLastRemoteReceivedRbFrame
+        : 0;
+    if (out->raw_remote_gap < 0) {
+        out->raw_remote_gap = 0;
+    }
+    out->effective_remote_delay = Net::DelayPolicy_GetEffectiveRemoteDelay();
+    out->prediction_debt = (std::max)(0, out->raw_remote_gap - out->effective_remote_delay);
+    out->rollback_budget = s_rollbackBudget;
     out->game_abs_frame_current = RbFrameToGameAbsFrame(currentRbFrame);
     out->frame_origin_abs = s_frameOriginAbs;
     out->rollback_count = s_totalRollbacks;
@@ -1519,6 +1565,14 @@ void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
     out->frames_ahead = framesAhead;
     out->gekko_avg_ping = s_cachedAvgPing;
     out->gekko_jitter = s_cachedJitter;
+    out->rtt_last_ms = s_cachedLastPing;
+    out->rtt_avg_ms = s_cachedAvgPing;
+    out->rtt_p90_ms = s_cachedRttP90;
+    out->rtt_p95_ms = s_cachedRttP95;
+    out->jitter_avg_ms = s_cachedJitter;
+    out->jitter_p95_ms = s_cachedJitterP95;
+    out->packet_loss_ewma = s_cachedPacketLossEwma;
+    out->loss_burst_max = s_cachedLossBurstMax;
 }
 
 // ============================================================================

@@ -2,12 +2,13 @@
  * Alice Senki 2 - Delay Policy Implementation
  *
  * Rollback-first recommendation model with a jitter guard:
- *   guarded = (avg_ping_ms / 2 + rtt_variance_ms) / 16.667
+ *   guarded = (avg_ping_ms / 2 + jitter_guard_ms) / (1000/60)
  *   delay   = max(0, ceil(guarded) - target_prediction_frames)
  *   max_rb  = max(4, ceil(guarded) - delay + 2)
  *
- * Shared-safe mode is the default: both peers apply the larger visible delay.
- * Asymmetric expert mode preserves the older local-only behavior.
+ * Per-player delay is the default: each peer applies its own visible delay.
+ * Shared-safe mode is an opt-in compatibility path that forces both peers to
+ * the larger visible delay.
  */
 
 #include "net/delay_policy.h"
@@ -31,7 +32,7 @@ static int   s_rollbackToleranceK       = ROLLBACK_TOLERANCE_DEFAULT;
 
 static int   s_remoteAnnouncedDelay     = 0;
 static int   s_remoteAnnouncedMaxRb     = ROLLBACK_BUDGET_DEFAULT;
-static GameplayDelayMode s_gameplayDelayMode = GameplayDelayMode::SharedSafe;
+static GameplayDelayMode s_gameplayDelayMode = GameplayDelayMode::AsymmetricExpert;
 static int   s_resolvedVisibleLocalDelay = DELAY_DEFAULT_PREF;
 static int   s_resolvedVisibleRemoteDelay = DELAY_DEFAULT_PREF;
 static int   s_effectiveLocalDelay      = DELAY_DEFAULT_PREF + kHiddenGameplayDelayFloor;
@@ -42,6 +43,9 @@ static int   s_stallThreshold           = ROLLBACK_BUDGET_DEFAULT;
 
 static float s_avgPingMs                = 0.0f;
 static float s_lastVarianceMs           = 0.0f;
+static float s_rttP90Ms                 = 0.0f;
+static float s_rttP95Ms                 = 0.0f;
+static float s_jitterP95Ms              = 0.0f;
 static float s_oneWayFrames             = 0.0f;
 static bool  s_measurementValid         = false;
 static int   s_recommendedDelay         = 0;
@@ -66,13 +70,20 @@ static int ClampTolerance(int value) {
 }
 
 static void RecomputeRecommendations() {
-    const float guardedOneWayFrames =
-        ((s_avgPingMs * 0.5f) + (std::max)(0.0f, s_lastVarianceMs)) / FRAME_TIME_MS;
-    s_oneWayFrames = guardedOneWayFrames;
+    const bool havePercentiles = s_rttP90Ms > 0.0f || s_rttP95Ms > 0.0f;
+    const float rttForDelay = s_rttP90Ms > 0.0f ? s_rttP90Ms : s_avgPingMs;
+    const float p95 = s_rttP95Ms > 0.0f
+        ? s_rttP95Ms
+        : (havePercentiles ? rttForDelay : s_avgPingMs + (std::max)(0.0f, s_lastVarianceMs));
+    const float jitterGuardFrames = (std::clamp)(
+        ((p95 - s_avgPingMs) * 0.5f) / FRAME_TIME_MS,
+        0.0f,
+        2.0f);
+    const float protectedOneWayFrames = ((rttForDelay * 0.5f) / FRAME_TIME_MS) + jitterGuardFrames;
+    s_oneWayFrames = protectedOneWayFrames;
 
-    constexpr int targetPredictionFrames = 2;
-    const int ceilFrames = (int)ceilf(guardedOneWayFrames);
-    const int delay = (std::max)(0, ceilFrames - targetPredictionFrames);
+    const int ceilFrames = (int)ceilf(protectedOneWayFrames);
+    const int delay = (std::max)(0, ceilFrames - s_rollbackToleranceK);
     const int maxRollback = (std::max)(ROLLBACK_BUDGET_MIN, ceilFrames - delay + 2);
 
     s_recommendedDelay = ClampDelay(delay);
@@ -105,7 +116,7 @@ static void LogGameplayDelayState(const char* reason) {
         (std::max)(0.0f, s_oneWayFrames - (float)s_resolvedVisibleRemoteDelay);
     const float remotePredictsLocal =
         (std::max)(0.0f, s_oneWayFrames - (float)s_resolvedVisibleLocalDelay);
-    const bool expert = s_gameplayDelayMode == GameplayDelayMode::AsymmetricExpert;
+    const bool shared = s_gameplayDelayMode == GameplayDelayMode::SharedSafe;
 
     LOG_INFO(
         "[DelayPolicy] %s: policy=%s local_cfg=%d remote_cfg=%d resolved_local=%d resolved_remote=%d local_eff=%d remote_eff=%d max_rb=%d protection_window=%d stall_threshold=%d%s",
@@ -120,11 +131,11 @@ static void LogGameplayDelayState(const char* reason) {
         s_rollbackBudget,
         s_connectionProtectionWindow,
         s_stallThreshold,
-        expert ? " WARNING=asymmetric_delay" : "");
+        shared ? " shared_max=1" : "");
 
     Rollback::NetplayLog_Write(
         "DELAY", -1,
-        "DELAYMAP policy=%s local_cfg=%d remote_cfg=%d resolved_local=%d resolved_remote=%d local_eff=%d remote_eff=%d rtt_avg=%.1f rtt_var=%.1f one_way_guarded=%.2f recommend=%d max_rb=%d protection_window=%d stall_threshold=%d local_predicts_remote=%.1f remote_predicts_local=%.1f%s reason=%s",
+        "DELAYMAP policy=%s local_cfg=%d remote_cfg=%d resolved_local=%d resolved_remote=%d local_eff=%d remote_eff=%d rtt_avg=%.1f rtt_var=%.1f rtt_p90=%.1f rtt_p95=%.1f jitter95=%.1f one_way_guarded=%.2f recommend=%d max_rb=%d protection_window=%d stall_threshold=%d local_predicts_remote=%.1f remote_predicts_local=%.1f%s reason=%s",
         GameplayDelayModeName(s_gameplayDelayMode),
         s_configuredDelay,
         s_remoteAnnouncedDelay,
@@ -134,6 +145,9 @@ static void LogGameplayDelayState(const char* reason) {
         s_effectiveRemoteDelay,
         s_avgPingMs,
         s_lastVarianceMs,
+        s_rttP90Ms,
+        s_rttP95Ms,
+        s_jitterP95Ms,
         s_oneWayFrames,
         s_recommendedDelay,
         s_recommendedMaxRollback,
@@ -141,7 +155,7 @@ static void LogGameplayDelayState(const char* reason) {
         s_stallThreshold,
         localPredictsRemote,
         remotePredictsLocal,
-        expert ? " WARNING=asymmetric_delay" : "",
+        shared ? " shared_max=1" : "",
         reason ? reason : "delay state");
 }
 
@@ -155,21 +169,27 @@ static void LogRecommendationUpdate(int prevDelay,
     }
 
     LOG_INFO(
-        "[DelayPolicy] Recommendations: ping=%.1fms variance=%.1fms jitter=%.2ff guarded_one_way=%.2ff target_pred=2 delay=%d max_rb=%d",
+        "[DelayPolicy] Recommendations: ping=%.1fms p90=%.1fms p95=%.1fms variance=%.1fms jitter95=%.1fms guarded_one_way=%.2ff tolerance=%d delay=%d max_rb=%d",
         s_avgPingMs,
+        s_rttP90Ms,
+        s_rttP95Ms,
         s_lastVarianceMs,
-        s_lastVarianceMs / FRAME_TIME_MS,
+        s_jitterP95Ms,
         s_oneWayFrames,
+        s_rollbackToleranceK,
         s_recommendedDelay,
         s_recommendedMaxRollback);
 
     Rollback::NetplayLog_Write(
         "DELAY", -1,
-        "Recommendations updated: ping=%.1fms variance=%.1fms jitter=%.2ff guarded_one_way=%.2ff target_pred=2 delay=%d max_rb=%d",
+        "Recommendations updated: ping=%.1fms p90=%.1fms p95=%.1fms variance=%.1fms jitter95=%.1fms guarded_one_way=%.2ff tolerance=%d delay=%d max_rb=%d",
         s_avgPingMs,
+        s_rttP90Ms,
+        s_rttP95Ms,
         s_lastVarianceMs,
-        s_lastVarianceMs / FRAME_TIME_MS,
+        s_jitterP95Ms,
         s_oneWayFrames,
+        s_rollbackToleranceK,
         s_recommendedDelay,
         s_recommendedMaxRollback);
 }
@@ -179,11 +199,14 @@ static void LogRecommendationUpdate(int prevDelay,
 void DelayPolicy_Init() {
     s_avgPingMs = 0.0f;
     s_lastVarianceMs = 0.0f;
+    s_rttP90Ms = 0.0f;
+    s_rttP95Ms = 0.0f;
+    s_jitterP95Ms = 0.0f;
     s_oneWayFrames = 0.0f;
     s_measurementValid = false;
     s_remoteAnnouncedDelay = 0;
     s_remoteAnnouncedMaxRb = ROLLBACK_BUDGET_DEFAULT;
-    s_gameplayDelayMode = GameplayDelayMode::SharedSafe;
+    s_gameplayDelayMode = GameplayDelayMode::AsymmetricExpert;
     s_rollbackCurrentDelay = -1;
     s_rollbackSynced = false;
     RecomputeRecommendations();
@@ -214,7 +237,11 @@ void DelayPolicy_FrameUpdate() {
         Rollback::RollbackTimesyncTelemetry telemetry{};
         Rollback::RollbackSession_GetTimesyncTelemetry(&telemetry);
         if (telemetry.gekko_avg_ping > 0.0f) {
-            DelayPolicy_UpdateFromStats(telemetry.gekko_avg_ping);
+            DelayPolicy_UpdateNetworkMeasurement(telemetry.gekko_avg_ping,
+                                                 telemetry.gekko_jitter,
+                                                 telemetry.rtt_p90_ms,
+                                                 telemetry.rtt_p95_ms,
+                                                 telemetry.jitter_p95_ms);
             return;
         }
     }
@@ -227,11 +254,18 @@ void DelayPolicy_FrameUpdate() {
 }
 
 void DelayPolicy_UpdateMeasurement(float rtt_ms, float rtt_variance_ms) {
-    s_lastVarianceMs = rtt_variance_ms;
-    DelayPolicy_UpdateFromStats(rtt_ms);
+    DelayPolicy_UpdateNetworkMeasurement(rtt_ms, rtt_variance_ms, 0.0f, 0.0f, 0.0f);
 }
 
 void DelayPolicy_UpdateFromStats(float avg_ping_ms) {
+    DelayPolicy_UpdateNetworkMeasurement(avg_ping_ms, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+void DelayPolicy_UpdateNetworkMeasurement(float avg_ping_ms,
+                                          float rtt_variance_ms,
+                                          float rtt_p90_ms,
+                                          float rtt_p95_ms,
+                                          float jitter_p95_ms) {
     if (!s_initialized) {
         return;
     }
@@ -245,6 +279,10 @@ void DelayPolicy_UpdateFromStats(float avg_ping_ms) {
     const float prevPing = s_avgPingMs;
 
     s_avgPingMs = avg_ping_ms;
+    s_lastVarianceMs = (std::max)(0.0f, rtt_variance_ms);
+    s_rttP90Ms = (std::max)(0.0f, rtt_p90_ms);
+    s_rttP95Ms = (std::max)(0.0f, rtt_p95_ms);
+    s_jitterP95Ms = (std::max)(0.0f, jitter_p95_ms);
     s_measurementValid = true;
     RecomputeRecommendations();
     LogRecommendationUpdate(prevDelay, prevRollback, prevPing);
@@ -266,6 +304,9 @@ void DelayPolicy_GetMeasurement(NetworkMeasurement* out) {
     memset(out, 0, sizeof(*out));
     out->avg_ping_ms = s_avgPingMs;
     out->rtt_variance_ms = s_lastVarianceMs;
+    out->rtt_p90_ms = s_rttP90Ms;
+    out->rtt_p95_ms = s_rttP95Ms;
+    out->jitter_p95_ms = s_jitterP95Ms;
     out->one_way_frames = s_oneWayFrames;
     out->jitter_frames = s_lastVarianceMs / FRAME_TIME_MS;
     out->recommended_delay = s_recommendedDelay;
@@ -341,7 +382,7 @@ int DelayPolicy_GetRollbackToleranceK() {
 void DelayPolicy_SetGameplayDelayMode(GameplayDelayMode mode) {
     if (mode != GameplayDelayMode::SharedSafe &&
         mode != GameplayDelayMode::AsymmetricExpert) {
-        mode = GameplayDelayMode::SharedSafe;
+        mode = GameplayDelayMode::AsymmetricExpert;
     }
     if (s_gameplayDelayMode == mode) {
         return;
@@ -440,6 +481,9 @@ void DelayPolicy_OnRollbackApplied(int delay_value) {
 void DelayPolicy_ResetSession() {
     s_avgPingMs = 0.0f;
     s_lastVarianceMs = 0.0f;
+    s_rttP90Ms = 0.0f;
+    s_rttP95Ms = 0.0f;
+    s_jitterP95Ms = 0.0f;
     s_oneWayFrames = 0.0f;
     s_measurementValid = false;
     s_remoteAnnouncedDelay = 0;
@@ -484,6 +528,9 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
     out->stall_threshold = s_stallThreshold;
     out->measured_avg_ping_ms = s_avgPingMs;
     out->measured_rtt_variance_ms = s_lastVarianceMs;
+    out->measured_rtt_p90_ms = s_rttP90Ms;
+    out->measured_rtt_p95_ms = s_rttP95Ms;
+    out->measured_jitter_p95_ms = s_jitterP95Ms;
     out->measured_one_way_frames = s_oneWayFrames;
     out->measured_jitter_frames = s_lastVarianceMs / FRAME_TIME_MS;
     out->measurement_valid = s_measurementValid;

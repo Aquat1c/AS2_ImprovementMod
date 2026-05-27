@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 15;
+constexpr uint16_t PROTOCOL_VERSION = 16;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -102,6 +102,32 @@ enum class PacketType : uint16_t {
     SyncTrace       = 35,   // Synchronized diagnostics trace, debug channel
 };
 
+enum class FrameTimingMode : uint8_t {
+    Vanilla58_8 = 0,  // Native 17ms limiter, about 58.8235 fps
+    Proper60    = 1,  // 17ms limiter corrected to 1000/60 cadence
+};
+
+inline bool FrameTimingMode_IsValid(uint8_t value) {
+    return value == (uint8_t)FrameTimingMode::Vanilla58_8 ||
+           value == (uint8_t)FrameTimingMode::Proper60;
+}
+
+inline const char* FrameTimingModeName(FrameTimingMode mode) {
+    switch (mode) {
+        case FrameTimingMode::Vanilla58_8: return "vanilla_58_8";
+        case FrameTimingMode::Proper60:    return "proper_60";
+        default:                           return "unknown";
+    }
+}
+
+inline const char* FrameTimingModeDisplayName(FrameTimingMode mode) {
+    switch (mode) {
+        case FrameTimingMode::Vanilla58_8: return "58.8 FPS";
+        case FrameTimingMode::Proper60:    return "60.0 FPS";
+        default:                           return "Unknown";
+    }
+}
+
 // ============================================================================
 // Wire Payloads
 // ============================================================================
@@ -114,7 +140,7 @@ struct HelloPayload {
     char     nickname[64];       // Null-terminated UTF-8 nickname
     uint16_t listen_port;        // Port this peer is listening on
     uint8_t  round_count;        // Sender's current vanilla round option 0..2
-    uint8_t  _pad;
+    uint8_t  frame_timing_mode;  // Net::FrameTimingMode
 };
 
 struct HelloAckPayload {
@@ -123,7 +149,7 @@ struct HelloAckPayload {
     char     nickname[64];
     uint16_t listen_port;
     uint8_t  round_count;        // Sender's current vanilla round option 0..2
-    uint8_t  _pad;
+    uint8_t  frame_timing_mode;  // Host-authoritative Net::FrameTimingMode
 };
 
 struct DisconnectPayload {
@@ -344,7 +370,7 @@ struct ConfigExchangePayload {
     uint8_t  my_input_delay;     // Sender's local gameplay input delay
     uint8_t  my_max_rollback;    // Sender's input prediction window / max rollback
     uint8_t  gameplay_delay_mode; // Net::GameplayDelayMode
-    uint8_t  _delay_reserved;
+    uint8_t  frame_timing_mode;  // Host-authoritative Net::FrameTimingMode
 };
 
 struct ConfigAckPayload {
@@ -354,7 +380,7 @@ struct ConfigAckPayload {
     uint8_t  my_input_delay;     // Sender's local gameplay input delay
     uint8_t  my_max_rollback;    // Sender's input prediction window / max rollback
     uint8_t  gameplay_delay_mode; // Net::GameplayDelayMode
-    uint8_t  _delay_reserved;
+    uint8_t  frame_timing_mode;  // Sender's effective Net::FrameTimingMode
 };
 
 struct LoadBarrierPayload {

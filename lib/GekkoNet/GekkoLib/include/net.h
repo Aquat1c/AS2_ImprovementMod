@@ -144,6 +144,8 @@ namespace Gekko {
         void AddRTT(u16 rtt_ms);
         void UpdateBandwidth();
         float CalculateJitter();
+        float CalculateRTTPercentile(float p);
+        float CalculateJitterPercentile(float p);
         float CalculateAvgRTT();
         u32 LastRTT();
     };

@@ -174,6 +174,11 @@ typedef struct GekkoNetworkStats {
     unsigned short last_ping;
     float avg_ping;
     float jitter;
+    float rtt_p90;
+    float rtt_p95;
+    float jitter_p95;
+    float packet_loss_ewma;
+    int loss_burst_max;
 } GekkoNetworkStats;
 
 // Public Facing API

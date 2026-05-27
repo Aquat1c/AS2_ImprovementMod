@@ -14,6 +14,7 @@
 #include "core/as2_constants.h"
 #include "net/locked_match_config.h"
 #include "patches/memory_utils.h"
+#include "patches/tick_hooks.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
@@ -370,6 +371,10 @@ static bool SavePersistentSettings(const char* reason) {
         "; Alice Senki 2 rollback mod settings\r\n"
         "; Friendly values are safe to edit. Raw blocks preserve vanilla settings we do not name yet.\r\n"
         "\r\n"
+        "[ModSettings]\r\n"
+        "; proper_60fps: 1 corrects the native 17ms limiter to 60.000fps; 0 keeps vanilla ~58.8fps\r\n"
+        "proper_60fps=%d\r\n"
+        "\r\n"
         "[GameSettings]\r\n"
         "; difficulty: 0=easy, 1=normal, 2=hard\r\n"
         "difficulty=%u\r\n"
@@ -391,6 +396,7 @@ static bool SavePersistentSettings(const char* reason) {
         "[RawSettings]\r\n"
         "settings_block_a=%s\r\n"
         "settings_block_b=%s\r\n",
+        TickHooks_GetFrameLimiter60FpsPreferenceEnabled() ? 1 : 0,
         ReadMemory<uint8_t>(kGameOptionDifficulty),
         GameSettingsSync_RoundsToWin(s_persistedRoundOption),
         ReadMemory<uint8_t>(ADDR_STAGESEL_ENABLE),

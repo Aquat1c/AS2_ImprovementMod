@@ -198,6 +198,10 @@ struct MenuSnapshot {
     int           recommended_max_rollback;
     int           stall_threshold;
     bool          stall_warning;
+    int           local_frame_timing_mode;
+    int           remote_frame_timing_mode;
+    bool          remote_frame_timing_valid;
+    bool          frame_timing_session_locked;
     int           current_rounds_to_win;
     char          current_rounds_label[32];
 

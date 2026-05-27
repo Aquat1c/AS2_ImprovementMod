@@ -31,6 +31,7 @@
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "core/mod_main.h"
+#include "patches/tick_hooks.h"
 #include "input/input_system.h"
 #include "testing/autoconnect_harness.h"
 #include "ui/log_window.h"
@@ -86,7 +87,7 @@ static char          s_spectatorEndpoint[96] = "127.0.0.1:10701";
 static int           s_preferredDelay     = 0;
 static int           s_rollbackBudget     = 7;  // Max rollback frames
 static int           s_rollbackTolerance  = Net::ROLLBACK_TOLERANCE_DEFAULT;
-static Net::GameplayDelayMode s_gameplayDelayMode = Net::GameplayDelayMode::SharedSafe;
+static Net::GameplayDelayMode s_gameplayDelayMode = Net::GameplayDelayMode::AsymmetricExpert;
 static Net::ConnectPreference s_connectPreference = Net::ConnectPreference::AutoDirectThenRelay;
 static bool          s_upnpEnabled        = true;
 static bool          s_stunEnabled        = true;
@@ -2220,10 +2221,12 @@ static void SyncSessionState() {
                 LOG_NETPLAY(LOG_INFO, "[NetMenu] Session connected — opening config screen");
                 s_activeBranch = RootBranch::DirectPlay;
                 TransitionTo(MenuState::ConnectedSession, "session connected");
+                SetStatus("%s", snap.status_text[0] ? snap.status_text : "Session connected.");
                 s_selectedIndex = 0;
             } else if (s_state != MenuState::ConnectedSession && s_state != MenuState::CharSelTransition) {
                 s_activeBranch = RootBranch::DirectPlay;
                 TransitionTo(MenuState::ConnectedSession, "session connected");
+                SetStatus("%s", snap.status_text[0] ? snap.status_text : "Session connected.");
                 s_selectedIndex = 0;
             }
             break;
@@ -3230,15 +3233,15 @@ static void HandleNavigationInput() {
                 SetStatus("Debug logging: %s", EnabledStateLabel(s_debugLoggingEnabled));
             } else if (gid == 16) {
                 s_gameplayDelayMode =
-                    s_gameplayDelayMode == Net::GameplayDelayMode::SharedSafe
-                        ? Net::GameplayDelayMode::AsymmetricExpert
-                        : Net::GameplayDelayMode::SharedSafe;
+                    s_gameplayDelayMode == Net::GameplayDelayMode::AsymmetricExpert
+                        ? Net::GameplayDelayMode::SharedSafe
+                        : Net::GameplayDelayMode::AsymmetricExpert;
                 Net::DelayPolicy_SetGameplayDelayMode(s_gameplayDelayMode);
                 changed = true;
                 SetStatus("Delay mode: %s",
                     s_gameplayDelayMode == Net::GameplayDelayMode::SharedSafe
-                        ? "Shared safe"
-                        : "Asymmetric expert");
+                        ? "Shared max"
+                        : "Per-player");
             }
 
             if (changed) {
@@ -4030,10 +4033,14 @@ void GetSnapshot(MenuSnapshot* out) {
     if (sessionSnap.active) {
         CopyText(out->peer_nickname, sizeof(out->peer_nickname), sessionSnap.remote_peer.nickname);
         out->rtt_ms = delaySnap.measurement_valid ? delaySnap.measured_avg_ping_ms
-                                                  : sessionSnap.stats.rtt_ms;
+                                                   : sessionSnap.stats.rtt_ms;
         out->is_host = (sessionSnap.role == Net::SessionRole::Host);
         out->local_accepted  = sessionSnap.local_ready;
         out->remote_accepted = sessionSnap.remote_ready;
+        if (sessionSnap.remote_peer.frame_timing_valid) {
+            out->remote_frame_timing_valid = true;
+            out->remote_frame_timing_mode = sessionSnap.remote_peer.frame_timing_mode;
+        }
     }
 
     // Active delay from delay policy
@@ -4046,6 +4053,10 @@ void GetSnapshot(MenuSnapshot* out) {
     out->recommended_delay = delaySnap.recommended_delay;
     out->recommended_max_rollback = delaySnap.recommended_max_rollback;
     out->stall_threshold = delaySnap.stall_threshold;
+    out->local_frame_timing_mode = IsFrameLimiter60FpsPatchEnabled()
+        ? (int)Net::FrameTimingMode::Proper60
+        : (int)Net::FrameTimingMode::Vanilla58_8;
+    out->frame_timing_session_locked = TickHooks_IsFrameLimiter60FpsSessionOverrideActive();
 
     const int expectedDepth =
         (std::max)(0,

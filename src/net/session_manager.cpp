@@ -10,6 +10,7 @@
 #include "net/nat_traversal.h"
 #include "net/game_settings_sync.h"
 #include "patches/memory_utils.h"
+#include "patches/tick_hooks.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
 
@@ -96,6 +97,7 @@ static void SetError(const char* msg) {
     LOG_ERROR("[Session] Error: %s", msg);
     Rollback::NetplayLog_Write("SESSION", -1, "ERROR: %s", msg);
     GameSettingsSync_RestoreLocalSession(msg ? msg : "session error");
+    TickHooks_ClearFrameLimiter60FpsSessionOverride(msg ? msg : "session error");
     Nat_StopServices();
     SetState(SessionState::Failed);
 }
@@ -116,6 +118,16 @@ static bool HasUsefulStats(const ConnectionStats& stats) {
            stats.packets_lost != 0 ||
            stats.bytes_sent != 0 ||
            stats.bytes_received != 0;
+}
+
+static FrameTimingMode LocalFrameTimingMode() {
+    return IsFrameLimiter60FpsPatchEnabled()
+        ? FrameTimingMode::Proper60
+        : FrameTimingMode::Vanilla58_8;
+}
+
+static bool FrameTimingModeEnabled(FrameTimingMode mode) {
+    return mode == FrameTimingMode::Proper60;
 }
 
 static void ClearStatsForNewSession() {
@@ -164,6 +176,7 @@ static void RequestCompatibilityDisconnect(const char* packetName,
 }
 
 static void ResetState() {
+    TickHooks_ClearFrameLimiter60FpsSessionOverride("session reset");
     s_state = SessionState::Idle;
     s_role  = SessionRole::None;
     memset(&s_remotePeer, 0, sizeof(s_remotePeer));
@@ -383,18 +396,24 @@ static bool ProcessHandshakeIdentity(const char* packetName,
                                      const char* nickname,
                                      size_t nicknameLen,
                                      uint16_t listenPort,
-                                     uint8_t advertisedRoundOption) {
+                                     uint8_t advertisedRoundOption,
+                                     uint8_t advertisedFrameTimingMode) {
     char remoteNickname[sizeof(s_remotePeer.nickname) + 1] = {};
     CopyHandshakeNickname(nickname, nicknameLen, remoteNickname, sizeof(remoteNickname));
     const uint8_t normalizedRoundOption = GameSettingsSync_NormalizeRoundOption(
         advertisedRoundOption,
         packetName ? packetName : "handshake");
 
-    LOG_INFO("[Session] Received %s (nick=%s, ver=%u, hash=0x%08X, port=%u, rounds=%u)",
+    const bool validFrameTiming = FrameTimingMode_IsValid(advertisedFrameTimingMode);
+    const FrameTimingMode remoteFrameTiming = validFrameTiming
+        ? (FrameTimingMode)advertisedFrameTimingMode
+        : FrameTimingMode::Vanilla58_8;
+
+    LOG_INFO("[Session] Received %s (nick=%s, ver=%u, hash=0x%08X, port=%u, rounds=%u, fps=%s)",
              packetName, remoteNickname, protocolVersion, buildHash, listenPort,
-             normalizedRoundOption);
+             normalizedRoundOption, validFrameTiming ? FrameTimingModeDisplayName(remoteFrameTiming) : "invalid");
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Received %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d local_ver=%u local_hash=0x%08X state=%s role=%s",
+        "Received %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s raw=%u local_timing=%s local_ver=%u local_hash=0x%08X state=%s role=%s",
         packetName,
         remoteNickname,
         protocolVersion,
@@ -402,6 +421,9 @@ static bool ProcessHandshakeIdentity(const char* packetName,
         listenPort,
         normalizedRoundOption,
         GameSettingsSync_RoundsToWin(normalizedRoundOption),
+        validFrameTiming ? FrameTimingModeName(remoteFrameTiming) : "invalid",
+        advertisedFrameTimingMode,
+        FrameTimingModeName(LocalFrameTimingMode()),
         PROTOCOL_VERSION,
         s_config.build_hash,
         SessionStateName(s_state),
@@ -451,12 +473,33 @@ static bool ProcessHandshakeIdentity(const char* packetName,
         return false;
     }
 
+    if (!validFrameTiming) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Rejecting %s from nick=%s: invalid frame timing mode=%u",
+            packetName,
+            remoteNickname,
+            advertisedFrameTimingMode);
+        RequestCompatibilityDisconnect(
+            packetName,
+            remoteNickname,
+            protocolVersion,
+            buildHash,
+            "invalid frame timing mode");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Invalid frame timing mode from peer: %u",
+                 advertisedFrameTimingMode);
+        SetError(msg);
+        return false;
+    }
+
     s_remotePeer.valid = true;
     s_remotePeer.protocol_version = protocolVersion;
     s_remotePeer.build_hash = buildHash;
     s_remotePeer.listen_port = listenPort;
     s_remotePeer.round_count_valid = true;
     s_remotePeer.round_count = normalizedRoundOption;
+    s_remotePeer.frame_timing_valid = true;
+    s_remotePeer.frame_timing_mode = advertisedFrameTimingMode;
     memset(s_remotePeer.nickname, 0, sizeof(s_remotePeer.nickname));
     strncpy_s(s_remotePeer.nickname, sizeof(s_remotePeer.nickname), remoteNickname, _TRUNCATE);
 
@@ -466,14 +509,16 @@ static bool ProcessHandshakeIdentity(const char* packetName,
              s_remotePeer.protocol_version,
              s_remotePeer.build_hash);
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Accepted %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d",
+        "Accepted %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s local_timing=%s",
         packetName,
         s_remotePeer.nickname,
         s_remotePeer.protocol_version,
         s_remotePeer.build_hash,
         s_remotePeer.listen_port,
         s_remotePeer.round_count,
-        GameSettingsSync_RoundsToWin(s_remotePeer.round_count));
+        GameSettingsSync_RoundsToWin(s_remotePeer.round_count),
+        FrameTimingModeName(remoteFrameTiming),
+        FrameTimingModeName(LocalFrameTimingMode()));
     return true;
 }
 
@@ -565,11 +610,14 @@ static void UpdateStatusText() {
                      SessionRoleName(s_role));
             break;
         case SessionState::Connected:
-            snprintf(s_statusText, sizeof(s_statusText), "Connected to %s (RTT: %.0fms)",
-                     s_remotePeer.nickname, s_stats.rtt_ms);
+            snprintf(s_statusText, sizeof(s_statusText), "Connected to %s (RTT: %.0fms, FPS: %s)",
+                     s_remotePeer.nickname,
+                     s_stats.rtt_ms,
+                     FrameTimingModeDisplayName(LocalFrameTimingMode()));
             break;
         case SessionState::Ready:
-            snprintf(s_statusText, sizeof(s_statusText), "Ready (both peers)");
+            snprintf(s_statusText, sizeof(s_statusText), "Ready (both peers, FPS: %s)",
+                     FrameTimingModeDisplayName(LocalFrameTimingMode()));
             break;
         case SessionState::Disconnecting:
             snprintf(s_statusText, sizeof(s_statusText), "Disconnecting...");
@@ -852,6 +900,7 @@ static void SendHello() {
     hello.build_hash = s_config.build_hash;
     hello.listen_port = s_config.listen_port;
     hello.round_count = GameSettingsSync_ReadRoundOption();
+    hello.frame_timing_mode = (uint8_t)LocalFrameTimingMode();
     memset(hello.nickname, 0, sizeof(hello.nickname));
     strncpy(hello.nickname, s_config.nickname, sizeof(hello.nickname) - 1);
 
@@ -860,16 +909,18 @@ static void SendHello() {
         SetError("Failed to send Hello");
         return;
     }
-    LOG_INFO("[Session] Sent Hello (nick=%s, ver=%u, hash=0x%08X, rounds=%u)",
-             hello.nickname, hello.protocol_version, hello.build_hash, hello.round_count);
+    LOG_INFO("[Session] Sent Hello (nick=%s, ver=%u, hash=0x%08X, rounds=%u, fps=%s)",
+             hello.nickname, hello.protocol_version, hello.build_hash, hello.round_count,
+             FrameTimingModeDisplayName((FrameTimingMode)hello.frame_timing_mode));
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Sent Hello: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d",
+        "Sent Hello: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s",
         hello.nickname,
         hello.protocol_version,
         hello.build_hash,
         hello.listen_port,
         hello.round_count,
-        GameSettingsSync_RoundsToWin(hello.round_count));
+        GameSettingsSync_RoundsToWin(hello.round_count),
+        FrameTimingModeName((FrameTimingMode)hello.frame_timing_mode));
 }
 
 static void SendHelloAck() {
@@ -878,6 +929,7 @@ static void SendHelloAck() {
     ack.build_hash = s_config.build_hash;
     ack.listen_port = s_config.listen_port;
     ack.round_count = GameSettingsSync_ReadRoundOption();
+    ack.frame_timing_mode = (uint8_t)LocalFrameTimingMode();
     memset(ack.nickname, 0, sizeof(ack.nickname));
     strncpy(ack.nickname, s_config.nickname, sizeof(ack.nickname) - 1);
 
@@ -886,15 +938,18 @@ static void SendHelloAck() {
         SetError("Failed to send HelloAck");
         return;
     }
-    LOG_INFO("[Session] Sent HelloAck (rounds=%u)", ack.round_count);
+    LOG_INFO("[Session] Sent HelloAck (rounds=%u, fps=%s)",
+             ack.round_count,
+             FrameTimingModeDisplayName((FrameTimingMode)ack.frame_timing_mode));
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Sent HelloAck: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d",
+        "Sent HelloAck: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s",
         ack.nickname,
         ack.protocol_version,
         ack.build_hash,
         ack.listen_port,
         ack.round_count,
-        GameSettingsSync_RoundsToWin(ack.round_count));
+        GameSettingsSync_RoundsToWin(ack.round_count),
+        FrameTimingModeName((FrameTimingMode)ack.frame_timing_mode));
 }
 
 static bool ProcessHelloPayload(const void* payload, size_t len) {
@@ -915,7 +970,8 @@ static bool ProcessHelloPayload(const void* payload, size_t len) {
         hello->nickname,
         sizeof(hello->nickname),
         hello->listen_port,
-        hello->round_count);
+        hello->round_count,
+        hello->frame_timing_mode);
 }
 
 static bool ProcessHelloAckPayload(const void* payload, size_t len) {
@@ -936,9 +992,18 @@ static bool ProcessHelloAckPayload(const void* payload, size_t len) {
         ack->nickname,
         sizeof(ack->nickname),
         ack->listen_port,
-        ack->round_count);
+        ack->round_count,
+        ack->frame_timing_mode);
     if (accepted && s_role == SessionRole::Join) {
+        const FrameTimingMode hostTiming = (FrameTimingMode)ack->frame_timing_mode;
+        TickHooks_SetFrameLimiter60FpsSessionOverride(
+            FrameTimingModeEnabled(hostTiming),
+            "host hello-ack timing");
         GameSettingsSync_ApplyRoundOption(ack->round_count, "host hello-ack");
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Join aligned FPS timing to host: timing=%s display=%s",
+            FrameTimingModeName(hostTiming),
+            FrameTimingModeDisplayName(hostTiming));
     }
     return accepted;
 }
@@ -1435,6 +1500,9 @@ bool Session_StartHost(const SessionConfig* config) {
         return false;
     }
     s_role = SessionRole::Host;
+    TickHooks_SetFrameLimiter60FpsSessionOverride(
+        TickHooks_GetFrameLimiter60FpsPreferenceEnabled(),
+        "start host timing lock");
     GameSettingsSync_BeginNetplaySession("start host");
 
     char plannedPunchRelayHost[96] = {};
@@ -1444,7 +1512,8 @@ bool Session_StartHost(const SessionConfig* config) {
     Rollback::NetplayLog_Write("SESSION", -1,
         "StartHost: listen_port=%u nick=%s hash=0x%08X connect_timeout=%u handshake_timeout=%u "
         "upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d ipv6=%d pref_direct=%d "
-        "backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d punch_relay=%s:%u",
+        "backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d punch_relay=%s:%u "
+        "frame_timing=%s",
         s_config.listen_port,
         s_config.nickname,
         s_config.build_hash,
@@ -1463,7 +1532,8 @@ bool Session_StartHost(const SessionConfig* config) {
         Nat_IsHolePunchBackendAvailable() ? 1 : 0,
         Nat_IsTurnBackendAvailable() ? 1 : 0,
         plannedPunchRelayHost,
-        (unsigned)plannedPunchRelayPort);
+        (unsigned)plannedPunchRelayPort,
+        FrameTimingModeName(LocalFrameTimingMode()));
 
     NatRuntimeConfig natCfg{};
     NatRuntimeConfig_SetDefaults(&natCfg);
@@ -1529,6 +1599,9 @@ bool Session_StartJoin(const SessionConfig* config) {
         return false;
     }
     s_role = SessionRole::Join;
+    TickHooks_SetFrameLimiter60FpsSessionOverride(
+        TickHooks_GetFrameLimiter60FpsPreferenceEnabled(),
+        "start join pending host timing");
     GameSettingsSync_BeginNetplaySession("start join");
 
     const bool relayConfigured = HasTrafficRelayConfigured(&s_config);
@@ -1541,7 +1614,7 @@ bool Session_StartJoin(const SessionConfig* config) {
         "StartJoin: target=%s:%u relay=%s:%u mode=%s nick=%s hash=0x%08X "
         "connect_timeout=%u handshake_timeout=%u upnp=%d pcp=%d stun=%d hole_punch=%d turn=%d "
         "ipv6=%d pref_direct=%d backend_upnp=%d backend_pcp=%d backend_stun=%d backend_hole=%d backend_turn=%d "
-        "punch_relay=%s:%u traffic_relay=%d",
+        "punch_relay=%s:%u traffic_relay=%d frame_timing=%s",
         s_config.target_host,
         s_config.target_port,
         s_config.nat.relay_host,
@@ -1565,7 +1638,8 @@ bool Session_StartJoin(const SessionConfig* config) {
         Nat_IsTurnBackendAvailable() ? 1 : 0,
         plannedPunchRelayHost,
         (unsigned)plannedPunchRelayPort,
-        relayConfigured ? 1 : 0);
+        relayConfigured ? 1 : 0,
+        FrameTimingModeName(LocalFrameTimingMode()));
 
     NatRuntimeConfig natCfg{};
     NatRuntimeConfig_SetDefaults(&natCfg);

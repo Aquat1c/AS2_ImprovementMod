@@ -1,16 +1,17 @@
 /**
  * Alice Senki 2 - Delay Policy
  *
- * Asymmetric local-delay policy for rollback gameplay.
+ * Per-player delay policy for rollback gameplay, with an optional shared-max
+ * compatibility mode for users who want both peers forced to the same delay.
  *
  * Each peer owns:
  *   - its local input delay
  *   - its max rollback budget
  *   - its rollback-tolerance preference for recommendations
  *
- * During config exchange, each peer announces only its local delay and
- * max rollback. The remote values are stored locally for diagnostics and
- * stall-threshold computation; gameplay no longer negotiates a shared delay.
+ * During config exchange, each peer announces its local delay, max rollback,
+ * and delay mode. The default keeps local/remote visible delays asymmetric.
+ * Shared-safe mode resolves both peers to the larger visible delay.
  */
 
 #pragma once
@@ -35,7 +36,7 @@ constexpr int ROLLBACK_TOLERANCE_MIN   = 0;
 constexpr int ROLLBACK_TOLERANCE_MAX   = 4;
 constexpr int ROLLBACK_TOLERANCE_DEFAULT = 2;
 
-constexpr float FRAME_TIME_MS          = 16.667f;
+constexpr float FRAME_TIME_MS          = 1000.0f / 60.0f;
 constexpr int kHiddenGameplayDelayFloor = 1;
 
 enum class GameplayDelayMode : uint8_t {
@@ -62,6 +63,9 @@ inline bool GameplayDelayMode_IsValid(uint8_t mode) {
 struct NetworkMeasurement {
     float    avg_ping_ms;
     float    rtt_variance_ms;
+    float    rtt_p90_ms;
+    float    rtt_p95_ms;
+    float    jitter_p95_ms;
     float    one_way_frames;
     float    jitter_frames;
     int      recommended_delay;
@@ -96,6 +100,9 @@ struct DelayPolicySnapshot {
 
     float    measured_avg_ping_ms;
     float    measured_rtt_variance_ms;
+    float    measured_rtt_p90_ms;
+    float    measured_rtt_p95_ms;
+    float    measured_jitter_p95_ms;
     float    measured_one_way_frames;
     float    measured_jitter_frames;
     bool     measurement_valid;
@@ -118,6 +125,11 @@ void DelayPolicy_ResetSession();
 // ============================================================================
 
 void DelayPolicy_UpdateMeasurement(float rtt_ms, float rtt_variance_ms);
+void DelayPolicy_UpdateNetworkMeasurement(float avg_ping_ms,
+                                          float rtt_variance_ms,
+                                          float rtt_p90_ms,
+                                          float rtt_p95_ms,
+                                          float jitter_p95_ms);
 void DelayPolicy_UpdateFromStats(float avg_ping_ms);
 int  DelayPolicy_ComputeRecommendedDelay();
 int  DelayPolicy_ComputeRecommendedMaxRollback();

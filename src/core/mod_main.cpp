@@ -454,6 +454,10 @@ static void DeferredInit() {
     }
     LogInitStep("InputSystem_Init", "END");
 
+    LogInitStep("TickHooks_LoadSettings", "BEGIN");
+    TickHooks_LoadSettings();
+    LogInitStep("TickHooks_LoadSettings", "END");
+
     LogInitStep("InstallHooks", "BEGIN");
     if (!InstallHooks()) {
         LOG_ERROR("Failed to install hooks!");

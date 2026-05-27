@@ -80,9 +80,9 @@ namespace Gekko {
 
 		void SendSpectatorInputs();
 
-		void HandleRollback();
+		bool HandleRollback();
 
-		void HandleSavingConfirmedFrame();
+		bool HandleSavingConfirmedFrame();
 
         void SendSessionHealthCheck();
 

@@ -356,16 +356,47 @@ static void TabAdvancedDebug() {
     }
 
     if (ImGui::CollapsingHeader("Timing")) {
+        bool proper60 = IsFrameLimiter60FpsPatchEnabled();
+        const bool fpsLocked = TickHooks_IsFrameLimiter60FpsSessionOverrideActive();
+        if (fpsLocked) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Checkbox("Correct 17ms limiter to 60 FPS", &proper60)) {
+            SetFrameLimiter60FpsPatchEnabled(proper60);
+            TickHooks_SaveSettings();
+        }
+        if (fpsLocked) {
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("(session locked)");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("The native limiter waits for 17ms (~58.8 FPS).\n"
+                              "This applies a %.2fx tick correction so that 17 game-ms take 16.67 real-ms.\n"
+                              "During netplay, the host's FPS mode is locked for both peers.",
+                              GetFrameLimiter60FpsCorrectionScale());
+        }
+
         float globalScale = GetGlobalTickScale();
+        if (fpsLocked) {
+            ImGui::BeginDisabled();
+        }
         if (ImGui::SliderFloat("Global Tick Scale", &globalScale, 0.25f, 8.0f, "%.2fx")) {
             SetGlobalTickScale(globalScale);
+        }
+        if (fpsLocked) {
+            ImGui::EndDisabled();
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Scales the game tick source used by the main-loop frame limiter.\n"
-                              "1.00x = normal. >1.00x makes the game run faster.");
+                              "1.00x = normal. >1.00x makes the game run faster.\n"
+                              "Locked to 1.00x during netplay so peers do not drift.");
         }
+        ImGui::TextDisabled("Effective tick scale: %.3fx", GetEffectiveTickScale());
     }
 
     if (ImGui::CollapsingHeader("Input Debug")) {

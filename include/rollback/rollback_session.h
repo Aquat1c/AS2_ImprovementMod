@@ -158,6 +158,11 @@ struct RollbackTimesyncTelemetry {
     int32_t  rb_frame_current;
     int32_t  rb_frame_last_confirmed;
     int32_t  rb_frame_last_remote_received;
+    int32_t  rb_frame_remote_contiguous;
+    int32_t  raw_remote_gap;
+    int32_t  effective_remote_delay;
+    int32_t  prediction_debt;
+    int32_t  rollback_budget;
     int32_t  game_abs_frame_current;
     int32_t  frame_origin_abs;
     int32_t  rollback_count;
@@ -167,6 +172,14 @@ struct RollbackTimesyncTelemetry {
     float    frames_ahead;
     float    gekko_avg_ping;
     float    gekko_jitter;
+    float    rtt_last_ms;
+    float    rtt_avg_ms;
+    float    rtt_p90_ms;
+    float    rtt_p95_ms;
+    float    jitter_avg_ms;
+    float    jitter_p95_ms;
+    float    packet_loss_ewma;
+    int32_t  loss_burst_max;
 };
 
 /// Lightweight runtime telemetry for pacing/timesync logic.

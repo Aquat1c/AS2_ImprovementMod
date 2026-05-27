@@ -54,6 +54,10 @@ namespace Gekko {
 		i8 _local[HISTORY_SIZE];
 
 		i8 _remote[HISTORY_SIZE];
+
+        bool _written[HISTORY_SIZE];
+
+        i32 _written_count;
 	};
 
 	class Player
