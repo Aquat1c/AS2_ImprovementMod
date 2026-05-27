@@ -67,6 +67,7 @@ static Net::CharSelFrameInputPayload MakeFrameInput(uint32_t epochId,
                                                     uint16_t input) {
     Net::CharSelFrameInputPayload payload{};
     payload.epoch_id = epochId;
+    payload.phase_serial = Net::FrontendInputSync_GetPhaseSerial();
     payload.phase = (uint16_t)phase;
     payload.frame = frame;
     payload.ack_frame = 0;
@@ -80,6 +81,7 @@ static Net::WinScreenFrameInputPayload MakeWinScreenFrameInput(uint32_t epochId,
                                                                uint16_t input) {
     Net::WinScreenFrameInputPayload payload{};
     payload.epoch_id = epochId;
+    payload.phase_serial = Net::FrontendInputSync_GetPhaseSerial();
     payload.phase = (uint16_t)Net::FrontendSyncPhase::WinScreen;
     payload.frame = frame;
     payload.ack_frame = 0;
@@ -132,7 +134,7 @@ static void TestJitterAwareProposalAndSharedNegotiation() {
     Net::DelayPolicy_UpdateMeasurement(18.0f, 0.0f);
     const int stableProposal = Net::FrontendInputSync_ComputeDelayProposal();
 
-    Net::DelayPolicy_UpdateMeasurement(18.0f, 20.0f);
+    Net::DelayPolicy_UpdateMeasurement(18.0f, 40.0f);
     const int jitteryProposal = Net::FrontendInputSync_ComputeDelayProposal();
 
     TEST_CHECK(jitteryProposal > stableProposal,
@@ -156,7 +158,7 @@ static void TestJitterPressureTriggersIncreaseOnlyDelayBump() {
     Net::FrontendInputSync_CaptureLocalInput(0);
     ClearSentPackets();
 
-    Net::DelayPolicy_UpdateMeasurement(18.0f, 20.0f);
+    Net::DelayPolicy_UpdateMeasurement(18.0f, 40.0f);
     Net::FrontendInputSync_Test_SetClockMs(350);
     Net::FrontendInputSync_HasInputsForCurrentFrame();
     Net::FrontendInputSync_Test_SetClockMs(600);
@@ -347,8 +349,8 @@ static void TestFrontendSendAheadCannotOverwritePeerAckWindow() {
 
     Net::FrontendInputSyncSnapshot snap{};
     Net::FrontendInputSync_GetSnapshot(&snap);
-    TEST_CHECK(snap.local_input_frame <= 551,
-        "frontend send-ahead must stop before overwriting the oldest peer-unacked ring slot");
+    TEST_CHECK(snap.local_input_frame <= snap.consume_id.frame + snap.max_local_lead,
+        "frontend send-ahead must stop at the bounded local lead cap while the current remote frame is blocked");
 
     Net::FrontendInputSync_Test_SetClockMs(1000);
     Net::CharSelFrameInputPayload remote =
@@ -445,6 +447,39 @@ static void TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters() {
         "phase transition should reset only the per-phase remote frame tracking");
 }
 
+static void TestStalePhaseSerialFrontendInputIsIgnored() {
+    ResetSubsystems();
+    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    const uint32_t oldSerial = Net::FrontendInputSync_GetPhaseSerial();
+
+    Net::FrontendInputSync_BeginInputPhase(Net::FrontendSyncPhase::CharSel,
+        Net::PacketType::CharSelFrameInput,
+        "same phase serial rollover test");
+    TEST_CHECK(Net::FrontendInputSync_GetPhaseSerial() != oldSerial,
+        "starting a new frontend phase instance should allocate a new phase serial");
+
+    Net::FrontendInputSync_CaptureLocalInput(0);
+
+    Net::CharSelFrameInputPayload stale =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0x0040);
+    stale.phase_serial = oldSerial;
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&stale);
+    TEST_CHECK(!Net::FrontendInputSync_HasInputsForCurrentFrame(),
+        "same-epoch same-phase input with an old phase serial should be ignored");
+
+    Net::CharSelFrameInputPayload current =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0x0080);
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&current);
+
+    uint16_t local = 0;
+    uint16_t remote = 0;
+    TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
+        "current phase-serial input should unblock the frontend frame");
+    TEST_CHECK(remote == 0x0080,
+        "stale phase-serial input must not overwrite current remote input");
+}
+
 static void TestDuplicateFrontendInputAndStageSyncAreIdempotent() {
     ResetSubsystems();
     BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
@@ -469,6 +504,7 @@ static void TestDuplicateFrontendInputAndStageSyncAreIdempotent() {
 
     Net::StageSyncPayload initial{};
     initial.epoch_id = epochId;
+    initial.phase_serial = Net::FrontendInputSync_GetPhaseSerial();
     initial.phase = (uint16_t)Net::FrontendSyncPhase::StageSel;
     initial.frame = 5;
     initial.stage_id = 3;
@@ -516,13 +552,103 @@ static void TestNoLiveDelayDecreaseDuringActivePhase() {
         "frontend delay must not auto-decrease during an active phase");
 }
 
+static void TestGameplayDelaySharedSafeAndExpertModes() {
+    ResetSubsystems();
+
+    Net::DelayPolicy_SetConfiguredDelay(2);
+    Net::DelayPolicy_SetGameplayDelayMode(Net::GameplayDelayMode::SharedSafe);
+
+    Net::DelayNegotiationData remote{};
+    remote.local_input_delay = 0;
+    remote.max_rollback = Net::ROLLBACK_BUDGET_DEFAULT;
+    remote.gameplay_delay_mode = Net::GameplayDelayMode::SharedSafe;
+    Net::DelayPolicy_NegotiateSession(&remote);
+
+    Net::DelayPolicySnapshot snap{};
+    Net::DelayPolicy_GetSnapshot(&snap);
+    TEST_CHECK(snap.active_delay == 2,
+        "shared-safe mode should apply the larger visible delay locally");
+    TEST_CHECK(snap.resolved_visible_remote_delay == 2,
+        "shared-safe mode should resolve the remote visible delay to the shared value");
+    TEST_CHECK(snap.effective_local_delay == 3 && snap.effective_remote_delay == 3,
+        "shared-safe mode should preserve the hidden gameplay floor on both sides");
+
+    Net::DelayPolicy_SetGameplayDelayMode(Net::GameplayDelayMode::AsymmetricExpert);
+    remote.gameplay_delay_mode = Net::GameplayDelayMode::AsymmetricExpert;
+    Net::DelayPolicy_NegotiateSession(&remote);
+    Net::DelayPolicy_GetSnapshot(&snap);
+
+    TEST_CHECK(snap.active_delay == 2,
+        "expert mode should keep the local visible delay as configured");
+    TEST_CHECK(snap.resolved_visible_remote_delay == 0,
+        "expert mode should preserve the peer's announced visible delay");
+    TEST_CHECK(snap.effective_local_delay == 3 && snap.effective_remote_delay == 1,
+        "expert mode should match the older asymmetric effective-delay behavior");
+}
+
+static void TestLocalInputLatchPreservesTapWhileLeadCapped() {
+    ResetSubsystems(100);
+    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+
+    Net::FrontendInputSync_CaptureLocalInput(0);
+    Net::FrontendInputSync_CaptureLocalInput(0);
+    Net::FrontendInputSync_CaptureLocalInput(INPUT_A);
+    Net::FrontendInputSync_CaptureLocalInput(0);
+
+    Net::FrontendInputSyncSnapshot capped{};
+    Net::FrontendInputSync_GetSnapshot(&capped);
+    TEST_CHECK(capped.local_input_frame == capped.consume_id.frame + capped.max_local_lead,
+        "local capture should be capped before testing the input latch");
+
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    Net::CharSelFrameInputPayload remote0 =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0);
+    remote0.ack_frame = 1;
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote0);
+
+    uint16_t local = 0;
+    uint16_t remote = 0;
+    TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
+        "remote frame zero should open one local lead slot");
+
+    Net::FrontendInputSync_CaptureLocalInput(0);
+
+    uint16_t latchedLocal = 0;
+    for (uint32_t frame = 1; frame <= 4; frame++) {
+        Net::CharSelFrameInputPayload remoteFrame =
+            MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, frame, 0);
+        remoteFrame.ack_frame = frame + 1u;
+        Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remoteFrame);
+
+        TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
+            "frontend frames should consume while checking the latched tap");
+        if (frame == 4) {
+            latchedLocal = local;
+        }
+    }
+
+    TEST_CHECK((latchedLocal & INPUT_A) != 0,
+        "a short local tap while capture is capped should be emitted once a lead slot opens");
+}
+
 static void TestFrontendInputPacketsCarrySixteenFramesOfHistory() {
     ResetSubsystems(100);
-    BeginNegotiatedPhase(1, Net::FrontendSyncPhase::CharSel);
+    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
     ClearSentPackets();
 
     for (uint16_t i = 0; i < 20; i++) {
         Net::FrontendInputSync_CaptureLocalInput((uint16_t)(0x100u + i));
+        Net::CharSelFrameInputPayload remote =
+            MakeFrameInput(Net::FrontendInputSync_GetEpochId(),
+                           Net::FrontendSyncPhase::CharSel,
+                           i,
+                           0);
+        remote.ack_frame = (uint32_t)i + 1u;
+        Net::FrontendInputSync_OnRemoteCharSelFrameInput(&remote);
+        uint16_t local = 0;
+        uint16_t remoteInput = 0;
+        TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remoteInput, nullptr),
+            "history setup should keep the frontend queue moving");
     }
 
     const SentPacket* packet = FindLastPacket(Net::PacketType::CharSelFrameInput);
@@ -650,8 +776,11 @@ int main() {
     TestStageMergeOpposingDirectionsAndConfirm();
     TestWinScreenAdvanceWaitsForBothPeers();
     TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters();
+    TestStalePhaseSerialFrontendInputIsIgnored();
     TestDuplicateFrontendInputAndStageSyncAreIdempotent();
     TestNoLiveDelayDecreaseDuringActivePhase();
+    TestGameplayDelaySharedSafeAndExpertModes();
+    TestLocalInputLatchPreservesTapWhileLeadCapped();
     TestFrontendInputPacketsCarrySixteenFramesOfHistory();
 
     Net::FrontendInputSync_Test_ClearClockOverride();

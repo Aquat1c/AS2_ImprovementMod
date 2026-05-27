@@ -27,6 +27,7 @@
 #include "net/game_settings_sync.h"
 #include "rollback/netplay_log.h"
 #include "rollback/online_wiring.h"
+#include "rollback/rematch_cleanup.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "core/mod_main.h"
@@ -85,6 +86,7 @@ static char          s_spectatorEndpoint[96] = "127.0.0.1:10701";
 static int           s_preferredDelay     = 0;
 static int           s_rollbackBudget     = 7;  // Max rollback frames
 static int           s_rollbackTolerance  = Net::ROLLBACK_TOLERANCE_DEFAULT;
+static Net::GameplayDelayMode s_gameplayDelayMode = Net::GameplayDelayMode::SharedSafe;
 static Net::ConnectPreference s_connectPreference = Net::ConnectPreference::AutoDirectThenRelay;
 static bool          s_upnpEnabled        = true;
 static bool          s_stunEnabled        = true;
@@ -236,6 +238,7 @@ static void SaveSettings() {
     fprintf(f, "delay=%d\n", s_preferredDelay);
     fprintf(f, "rollback=%d\n", s_rollbackBudget);
     fprintf(f, "rollback_tolerance=%d\n", s_rollbackTolerance);
+    fprintf(f, "gameplay_delay_mode=%d\n", (int)s_gameplayDelayMode);
     fprintf(f, "connect_mode=%d\n", (int)s_connectPreference);
     fprintf(f, "upnp=%d\n", s_upnpEnabled ? 1 : 0);
     fprintf(f, "stun=%d\n", s_stunEnabled ? 1 : 0);
@@ -305,6 +308,11 @@ static void LoadSettings() {
             if (rk >= Net::ROLLBACK_TOLERANCE_MIN && rk <= Net::ROLLBACK_TOLERANCE_MAX) {
                 s_rollbackTolerance = rk;
             }
+        } else if (_stricmp(key, "gameplay_delay_mode") == 0) {
+            int mode = atoi(val);
+            if (Net::GameplayDelayMode_IsValid((uint8_t)mode)) {
+                s_gameplayDelayMode = (Net::GameplayDelayMode)mode;
+            }
         } else if (_stricmp(key, "connect_mode") == 0) {
             int mode = atoi(val);
             if (mode >= (int)Net::ConnectPreference::AutoDirectThenRelay &&
@@ -362,7 +370,7 @@ static void LoadSettings() {
 
     fclose(f);
     LOG_NETPLAY(LOG_INFO,
-        "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_tol=%d "
+        "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_tol=%d delay_mode=%s "
         "mode=%s upnp=%d pcp=%d stun=%d punch=%d turn=%d ipv6=%d relay='%s' stun_srv='%s' turn_srv='%s' "
         "nat_timeouts=[%u/%u/%u] nat_log=%u",
         s_localNickname,
@@ -371,6 +379,7 @@ static void LoadSettings() {
         s_preferredDelay,
         s_rollbackBudget,
         s_rollbackTolerance,
+        Net::GameplayDelayModeName(s_gameplayDelayMode),
         Net::ConnectPreferenceName(s_connectPreference),
         s_upnpEnabled ? 1 : 0,
         s_pcpFallbackEnabled ? 1 : 0,
@@ -399,13 +408,15 @@ static void ApplyDelaySettingsToPolicy(const char* reason) {
     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
     Net::DelayPolicy_SetRollbackBudget(s_rollbackBudget);
     Net::DelayPolicy_SetRollbackToleranceK(s_rollbackTolerance);
+    Net::DelayPolicy_SetGameplayDelayMode(s_gameplayDelayMode);
 
     LOG_NETPLAY(LOG_INFO,
-        "[NetMenu] Applied delay policy settings (%s): my_delay=%d rb=%d tol=%d active=%d",
+        "[NetMenu] Applied delay policy settings (%s): my_delay=%d rb=%d tol=%d mode=%s active=%d",
         reason ? reason : "unspecified",
         s_preferredDelay,
         s_rollbackBudget,
         s_rollbackTolerance,
+        Net::GameplayDelayModeName(s_gameplayDelayMode),
         Net::DelayPolicy_GetActiveDelay());
 }
 
@@ -2309,6 +2320,11 @@ static bool LaunchNetplayCharSel() {
 
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Launching netplay CharSel (role=%s)", isHost ? "Host" : "Client");
 
+    // A fresh netplay launch can follow practice/offline/previous online play
+    // without process restart. Clear match-owned residue before CharSel so
+    // baseline capture starts from the same canonical scratch state on both peers.
+    Rollback::RematchCleanup_PrepareForNetplayLaunch("netplay charsel launch");
+
     // Do NOT cancel session — keep it alive. Only hide the menu UI.
     HideMenuForLaunch("netplay charsel");
 
@@ -2427,7 +2443,7 @@ static int ItemCount(MenuState st) {
         case MenuState::SettingsCategoryMenu: return 5; // Player, Network, Watch, Diagnostics, Back
         case MenuState::SettingsEntry: {
             switch (s_settingsCategory) {
-                case SettingsCategory::Identity:     return 5; // Name, Delay, Rollback, Bias, Back
+                case SettingsCategory::Identity:     return 6; // Name, Delay, Rollback, Bias, Delay Mode, Back
                 case SettingsCategory::Endpoint:     return 8; // Route, UPnP, STUN, Hole, IPv6, Relay, STUN srv, Back
                 case SettingsCategory::SessionMatch: return 5; // Watchers, Port, PalSync, PalPreview, Back
                 case SettingsCategory::Diagnostics:  return 2; // Debug logging, Back
@@ -2455,6 +2471,7 @@ static int SettingGlobalId() {
                 case 1: return 1;   // Input Delay
                 case 2: return 2;   // Max Rollback
                 case 3: return 3;   // Stability Bias
+                case 4: return 16;  // Gameplay Delay Mode
                 default: return -1; // Back
             }
         case SettingsCategory::Endpoint:
@@ -3211,6 +3228,17 @@ static void HandleNavigationInput() {
                 s_debugLoggingEnabled = !s_debugLoggingEnabled;
                 changed = true;
                 SetStatus("Debug logging: %s", EnabledStateLabel(s_debugLoggingEnabled));
+            } else if (gid == 16) {
+                s_gameplayDelayMode =
+                    s_gameplayDelayMode == Net::GameplayDelayMode::SharedSafe
+                        ? Net::GameplayDelayMode::AsymmetricExpert
+                        : Net::GameplayDelayMode::SharedSafe;
+                Net::DelayPolicy_SetGameplayDelayMode(s_gameplayDelayMode);
+                changed = true;
+                SetStatus("Delay mode: %s",
+                    s_gameplayDelayMode == Net::GameplayDelayMode::SharedSafe
+                        ? "Shared safe"
+                        : "Asymmetric expert");
             }
 
             if (changed) {
@@ -4014,6 +4042,7 @@ void GetSnapshot(MenuSnapshot* out) {
     // Rollback config
     out->rollback_budget = s_rollbackBudget;
     out->rollback_tolerance = s_rollbackTolerance;
+    out->gameplay_delay_mode = (int)s_gameplayDelayMode;
     out->recommended_delay = delaySnap.recommended_delay;
     out->recommended_max_rollback = delaySnap.recommended_max_rollback;
     out->stall_threshold = delaySnap.stall_threshold;

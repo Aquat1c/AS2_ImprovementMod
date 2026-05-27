@@ -196,6 +196,17 @@ static void ClearInputResidue() {
     const bool p1TailChanged = TailChanged(beforeTail, afterTail, 0);
     const bool p2TailChanged = TailChanged(beforeTail, afterTail, 1);
     Rollback::NetplayLog_Write(
+        "REMATCH", -1,
+        "INPUT_TAIL_GUARD %s label=ClearInputResidue p1_crc_before=0x%08X p1_crc_after=0x%08X "
+        "p2_crc_before=0x%08X p2_crc_after=0x%08X safe_clear_bytes=%u old_full_clear_bytes=%u",
+        (p1TailChanged || p2TailChanged) ? "ERROR" : "ok",
+        beforeTail.p1_crc,
+        afterTail.p1_crc,
+        beforeTail.p2_crc,
+        afterTail.p2_crc,
+        (unsigned)kFrontendSafeInputBufferClearSize,
+        (unsigned)INPUT_BUFFER_SIZE);
+    Rollback::NetplayLog_Write(
         "OWNERCHK", -1,
         "tail_guard after_cleanup p1_changed=%d p2_changed=%d p1_crc=0x%08X->0x%08X "
         "p2_crc=0x%08X->0x%08X safe_clear_bytes=%u old_full_clear_bytes=%u",
@@ -237,10 +248,11 @@ static void ClearMatchVolatileResidue() {
 
 namespace Rollback {
 
-void RematchCleanup_PrepareForNextMatch(const char* reason) {
+static void PrepareMatchBoundaryForNextFlow(const char* banner, const char* reason) {
     Rollback::NetplayLog_Write(
         "REMATCH", -1,
-        "=== NEXT MATCH CLEANUP BEGIN: reason=%s ===",
+        "=== %s BEGIN: reason=%s ===",
+        banner ? banner : "MATCH BOUNDARY CLEANUP",
         reason ? reason : "unspecified");
     Rollback::OwnerDiag_Log("rematch_cleanup_begin");
     LogBoundaryState("BeforeCleanup");
@@ -292,12 +304,22 @@ void RematchCleanup_PrepareForNextMatch(const char* reason) {
     LogBoundaryState("AfterCleanup");
     Rollback::OwnerDiag_Log("rematch_cleanup_end");
     Rollback::NetplayLog_Write("REMATCH", -1,
-        "=== NEXT MATCH CLEANUP END ===");
+        "=== %s END ===",
+        banner ? banner : "MATCH BOUNDARY CLEANUP");
     Rollback::NetplayLog_Flush();
 
     LOG_NETPLAY(LOG_INFO,
-        "[RematchCleanup] Prepared next match boundary (%s)",
+        "[RematchCleanup] Prepared match boundary (%s): %s",
+        banner ? banner : "cleanup",
         reason ? reason : "unspecified");
+}
+
+void RematchCleanup_PrepareForNextMatch(const char* reason) {
+    PrepareMatchBoundaryForNextFlow("NEXT MATCH CLEANUP", reason);
+}
+
+void RematchCleanup_PrepareForNetplayLaunch(const char* reason) {
+    PrepareMatchBoundaryForNextFlow("NETPLAY LAUNCH CLEANUP", reason);
 }
 
 } // namespace Rollback

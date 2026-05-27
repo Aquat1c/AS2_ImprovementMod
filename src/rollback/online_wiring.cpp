@@ -693,6 +693,7 @@ static bool TryStartRollbackSession() {
         Net::DelayPolicy_GetEffectiveRemoteDelay(),
         protectionWindow,
         Net::DelayPolicy_GetStallThreshold());
+    Net::DelayPolicy_LogDelayMap("rollback handoff");
 
     // Register gameplay packet callback
     NetplayLog_Write("HANDOFF", interactiveFrame,

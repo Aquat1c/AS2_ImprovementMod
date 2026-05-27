@@ -38,6 +38,23 @@ constexpr int ROLLBACK_TOLERANCE_DEFAULT = 2;
 constexpr float FRAME_TIME_MS          = 16.667f;
 constexpr int kHiddenGameplayDelayFloor = 1;
 
+enum class GameplayDelayMode : uint8_t {
+    SharedSafe = 0,
+    AsymmetricExpert = 1,
+};
+
+inline const char* GameplayDelayModeName(GameplayDelayMode mode) {
+    switch (mode) {
+        case GameplayDelayMode::SharedSafe:       return "shared_safe";
+        case GameplayDelayMode::AsymmetricExpert: return "asymmetric_expert";
+        default:                                  return "unknown";
+    }
+}
+
+inline bool GameplayDelayMode_IsValid(uint8_t mode) {
+    return mode <= (uint8_t)GameplayDelayMode::AsymmetricExpert;
+}
+
 // ============================================================================
 // Measurement / Exchange
 // ============================================================================
@@ -55,16 +72,20 @@ struct NetworkMeasurement {
 struct DelayNegotiationData {
     int      local_input_delay;
     int      max_rollback;
+    GameplayDelayMode gameplay_delay_mode;
 };
 
 struct DelayPolicySnapshot {
     int      configured_delay;
     int      active_delay;
+    int      resolved_visible_local_delay;
+    int      resolved_visible_remote_delay;
     int      effective_local_delay;
     int      effective_remote_delay;
     int      protection_window;
     int      rollback_budget;
     int      rollback_tolerance;
+    GameplayDelayMode gameplay_delay_mode;
 
     int      recommended_delay;
     int      recommended_max_rollback;
@@ -115,6 +136,9 @@ int  DelayPolicy_GetRollbackBudget();
 void DelayPolicy_SetRollbackToleranceK(int tolerance_k);
 int  DelayPolicy_GetRollbackToleranceK();
 
+void DelayPolicy_SetGameplayDelayMode(GameplayDelayMode mode);
+GameplayDelayMode DelayPolicy_GetGameplayDelayMode();
+
 // ============================================================================
 // Config Exchange / Runtime State
 // ============================================================================
@@ -138,5 +162,6 @@ void DelayPolicy_OnRollbackApplied(int delay_value);
 // ============================================================================
 
 void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out);
+void DelayPolicy_LogDelayMap(const char* reason);
 
 } // namespace Net

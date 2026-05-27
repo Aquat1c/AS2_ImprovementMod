@@ -139,6 +139,7 @@ static void ResetRemoteDelayData() {
     memset(&s_remoteDelayData, 0, sizeof(s_remoteDelayData));
     s_remoteDelayData.local_input_delay = DELAY_DEFAULT_PREF;
     s_remoteDelayData.max_rollback = ROLLBACK_BUDGET_DEFAULT;
+    s_remoteDelayData.gameplay_delay_mode = GameplayDelayMode::SharedSafe;
 }
 
 static void CaptureGameplayContext(uint8_t* mode, uint8_t* substate, int32_t* simFrame) {
@@ -192,6 +193,7 @@ static void SendConfig() {
     DelayPolicy_BuildNegotiationData(&delayData);
     payload.my_input_delay = (uint8_t)delayData.local_input_delay;
     payload.my_max_rollback = (uint8_t)delayData.max_rollback;
+    payload.gameplay_delay_mode = (uint8_t)delayData.gameplay_delay_mode;
 
     const bool sent = BarrierProtocol_SendPacket(PacketType::ConfigExchange,
                                                  &payload, sizeof(payload));
@@ -199,20 +201,23 @@ static void SendConfig() {
         LOG_WARN("[MatchBoot] Failed to send ConfigExchange");
         Rollback::NetplayLog_Write(
             "BARRIER", -1,
-            "ERROR: ConfigExchange queue failed: hash=0x%08X my_delay=%d my_max_rb=%d",
+            "ERROR: ConfigExchange queue failed: hash=0x%08X my_delay=%d my_max_rb=%d delay_mode=%s",
             LockedMatchConfig_Hash(&s_config),
             delayData.local_input_delay,
-            delayData.max_rollback);
+            delayData.max_rollback,
+            GameplayDelayModeName(delayData.gameplay_delay_mode));
         return;
     }
 
     s_configSent = true;
     LOG_NETPLAY(LOG_INFO,
-        "[MatchBoot] Sent config (hash=0x%08X rounds_raw=%u rounds_to_win=%d my_delay=%d my_max_rb=%d)",
+        "[MatchBoot] Sent config (hash=0x%08X rounds_raw=%u rounds_to_win=%d my_delay=%d my_max_rb=%d delay_mode=%s)",
         LockedMatchConfig_Hash(&s_config),
         s_config.round_count,
         GameSettingsSync_RoundsToWin(s_config.round_count),
-        delayData.local_input_delay, delayData.max_rollback);
+        delayData.local_input_delay,
+        delayData.max_rollback,
+        GameplayDelayModeName(delayData.gameplay_delay_mode));
 }
 
 static void SendConfigAck(uint32_t hash, bool accepted) {
@@ -225,6 +230,7 @@ static void SendConfigAck(uint32_t hash, bool accepted) {
     DelayPolicy_BuildNegotiationData(&delayData);
     payload.my_input_delay = (uint8_t)delayData.local_input_delay;
     payload.my_max_rollback = (uint8_t)delayData.max_rollback;
+    payload.gameplay_delay_mode = (uint8_t)delayData.gameplay_delay_mode;
 
     const bool sent = BarrierProtocol_SendPacket(PacketType::ConfigAck,
                                                  &payload, sizeof(payload));
@@ -232,17 +238,20 @@ static void SendConfigAck(uint32_t hash, bool accepted) {
         LOG_WARN("[MatchBoot] Failed to send ConfigAck");
         Rollback::NetplayLog_Write(
             "BARRIER", -1,
-            "ERROR: ConfigAck queue failed: hash=0x%08X accepted=%d my_delay=%d my_max_rb=%d",
+            "ERROR: ConfigAck queue failed: hash=0x%08X accepted=%d my_delay=%d my_max_rb=%d delay_mode=%s",
             hash,
             accepted ? 1 : 0,
             delayData.local_input_delay,
-            delayData.max_rollback);
+            delayData.max_rollback,
+            GameplayDelayModeName(delayData.gameplay_delay_mode));
         return;
     }
 
-    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent ConfigAck: hash=0x%08X accepted=%d my_delay=%d my_max_rb=%d",
+    LOG_NETPLAY(LOG_INFO, "[MatchBoot] Sent ConfigAck: hash=0x%08X accepted=%d my_delay=%d my_max_rb=%d delay_mode=%s",
         hash, accepted ? 1 : 0,
-        delayData.local_input_delay, delayData.max_rollback);
+        delayData.local_input_delay,
+        delayData.max_rollback,
+        GameplayDelayModeName(delayData.gameplay_delay_mode));
 }
 
 static void SendLoadBarrier() {
@@ -413,10 +422,11 @@ static void UpdateConfigExchange() {
             DelayPolicy_NegotiateSession(&s_remoteDelayData);
         }
         LOG_NETPLAY(LOG_INFO,
-            "[MatchBoot] Join accepted early config (hash=0x%08X rounds_raw=%u rounds_to_win=%d remote_delay=%d stall_threshold=%d)",
+            "[MatchBoot] Join accepted early config (hash=0x%08X rounds_raw=%u rounds_to_win=%d delay_mode=%s remote_delay=%d stall_threshold=%d)",
             hash,
             s_config.round_count,
             GameSettingsSync_RoundsToWin(s_config.round_count),
+            GameplayDelayModeName(DelayPolicy_GetGameplayDelayMode()),
             DelayPolicy_GetRemoteAnnouncedDelay(),
             DelayPolicy_GetStallThreshold());
     }
@@ -788,6 +798,15 @@ void MatchBootstrap_FrameUpdate() {
 void MatchBootstrap_OnConfigExchange(const ConfigExchangePayload* p) {
     if (!p) return;
 
+    if (!GameplayDelayMode_IsValid(p->gameplay_delay_mode)) {
+        SetError("Unknown gameplay delay mode from host: %u", p->gameplay_delay_mode);
+        LOG_NETPLAY(LOG_WARNING,
+            "[MatchBoot] Rejected ConfigExchange with unknown gameplay delay mode=%u",
+            p->gameplay_delay_mode);
+        return;
+    }
+    const GameplayDelayMode remoteDelayMode = (GameplayDelayMode)p->gameplay_delay_mode;
+
     // Build a LockedMatchConfig from the payload
     LockedMatchConfig received{};
     LockedMatchConfig_Clear(&received);
@@ -827,9 +846,13 @@ void MatchBootstrap_OnConfigExchange(const ConfigExchangePayload* p) {
         // Store host's delay negotiation data
         s_remoteDelayData.local_input_delay = p->my_input_delay;
         s_remoteDelayData.max_rollback = p->my_max_rollback;
+        s_remoteDelayData.gameplay_delay_mode = remoteDelayMode;
         s_remoteDelayReceived = true;
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join received host config: remote_delay=%d remote_max_rb=%d",
-            p->my_input_delay, p->my_max_rollback);
+        DelayPolicy_SetGameplayDelayMode(remoteDelayMode);
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Join received host config: remote_delay=%d remote_max_rb=%d delay_mode=%s",
+            p->my_input_delay,
+            p->my_max_rollback,
+            GameplayDelayModeName(remoteDelayMode));
 
         // Only agree+ack if we are already in ConfigExchange phase.
         // If we haven't entered yet, UpdateConfigExchange will handle it.
@@ -850,22 +873,45 @@ void MatchBootstrap_OnConfigAck(const ConfigAckPayload* p) {
 
     uint32_t localHash = LockedMatchConfig_Hash(&s_config);
 
+    if (!GameplayDelayMode_IsValid(p->gameplay_delay_mode)) {
+        SetError("Unknown gameplay delay mode from peer: %u", p->gameplay_delay_mode);
+        LOG_NETPLAY(LOG_WARNING,
+            "[MatchBoot] Rejected ConfigAck with unknown gameplay delay mode=%u",
+            p->gameplay_delay_mode);
+        return;
+    }
+    const GameplayDelayMode remoteDelayMode = (GameplayDelayMode)p->gameplay_delay_mode;
+    if (remoteDelayMode != DelayPolicy_GetGameplayDelayMode()) {
+        SetError("Gameplay delay mode mismatch: local=%s remote=%s",
+            GameplayDelayModeName(DelayPolicy_GetGameplayDelayMode()),
+            GameplayDelayModeName(remoteDelayMode));
+        LOG_NETPLAY(LOG_WARNING,
+            "[MatchBoot] Rejected ConfigAck with mismatched delay mode: local=%s remote=%s",
+            GameplayDelayModeName(DelayPolicy_GetGameplayDelayMode()),
+            GameplayDelayModeName(remoteDelayMode));
+        return;
+    }
+
     if (p->accepted && p->config_hash == localHash) {
         // Store join's delay negotiation data
         s_remoteDelayData.local_input_delay = p->my_input_delay;
         s_remoteDelayData.max_rollback = p->my_max_rollback;
+        s_remoteDelayData.gameplay_delay_mode = remoteDelayMode;
         s_remoteDelayReceived = true;
-        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Host received join config: remote_delay=%d remote_max_rb=%d",
-            p->my_input_delay, p->my_max_rollback);
+        LOG_NETPLAY(LOG_INFO, "[MatchBoot] Host received join config: remote_delay=%d remote_max_rb=%d delay_mode=%s",
+            p->my_input_delay,
+            p->my_max_rollback,
+            GameplayDelayModeName(remoteDelayMode));
 
         s_configAgreed = true;
         DelayPolicy_NegotiateSession(&s_remoteDelayData);
         LOG_NETPLAY(LOG_INFO,
-            "[MatchBoot] Config agreed (hash=0x%08X phase=%u rounds_raw=%u rounds_to_win=%d local_delay=%d local_max_rb=%d remote_delay=%d remote_max_rb=%d stall_threshold=%d)",
+            "[MatchBoot] Config agreed (hash=0x%08X phase=%u rounds_raw=%u rounds_to_win=%d delay_mode=%s local_delay=%d local_max_rb=%d remote_delay=%d remote_max_rb=%d stall_threshold=%d)",
             localHash,
             (unsigned)s_phase,
             s_config.round_count,
             GameSettingsSync_RoundsToWin(s_config.round_count),
+            GameplayDelayModeName(remoteDelayMode),
             DelayPolicy_GetConfiguredDelay(),
             DelayPolicy_GetRollbackBudget(),
             DelayPolicy_GetRemoteAnnouncedDelay(),

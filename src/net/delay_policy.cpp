@@ -1,14 +1,13 @@
 /**
  * Alice Senki 2 - Delay Policy Implementation
  *
- * Rollback-first recommendation model:
- *   L      = avg_ping_ms / 2 / 16.667
- *   delay  = max(0, ceil(L) - K)
- *   max_rb = max(4, ceil(L) - delay + 2)
+ * Rollback-first recommendation model with a jitter guard:
+ *   guarded = (avg_ping_ms / 2 + rtt_variance_ms) / 16.667
+ *   delay   = max(0, ceil(guarded) - target_prediction_frames)
+ *   max_rb  = max(4, ceil(guarded) - delay + 2)
  *
- * Gameplay delay is asymmetric: each peer applies only its own configured
- * local delay. Remote-announced values are stored only for diagnostics and
- * local stall-threshold computation.
+ * Shared-safe mode is the default: both peers apply the larger visible delay.
+ * Asymmetric expert mode preserves the older local-only behavior.
  */
 
 #include "net/delay_policy.h"
@@ -32,6 +31,9 @@ static int   s_rollbackToleranceK       = ROLLBACK_TOLERANCE_DEFAULT;
 
 static int   s_remoteAnnouncedDelay     = 0;
 static int   s_remoteAnnouncedMaxRb     = ROLLBACK_BUDGET_DEFAULT;
+static GameplayDelayMode s_gameplayDelayMode = GameplayDelayMode::SharedSafe;
+static int   s_resolvedVisibleLocalDelay = DELAY_DEFAULT_PREF;
+static int   s_resolvedVisibleRemoteDelay = DELAY_DEFAULT_PREF;
 static int   s_effectiveLocalDelay      = DELAY_DEFAULT_PREF + kHiddenGameplayDelayFloor;
 static int   s_effectiveRemoteDelay     = kHiddenGameplayDelayFloor;
 static int   s_connectionProtectionWindow =
@@ -64,12 +66,13 @@ static int ClampTolerance(int value) {
 }
 
 static void RecomputeRecommendations() {
-    const float halfRoundTripFrames = (s_avgPingMs * 0.5f) / FRAME_TIME_MS;
-    s_oneWayFrames = halfRoundTripFrames;
+    const float guardedOneWayFrames =
+        ((s_avgPingMs * 0.5f) + (std::max)(0.0f, s_lastVarianceMs)) / FRAME_TIME_MS;
+    s_oneWayFrames = guardedOneWayFrames;
 
-    const int floorFrames = (int)floorf(halfRoundTripFrames);
-    const int ceilFrames = (int)ceilf(halfRoundTripFrames);
-    const int delay = (std::max)(0, floorFrames - s_rollbackToleranceK);
+    constexpr int targetPredictionFrames = 2;
+    const int ceilFrames = (int)ceilf(guardedOneWayFrames);
+    const int delay = (std::max)(0, ceilFrames - targetPredictionFrames);
     const int maxRollback = (std::max)(ROLLBACK_BUDGET_MIN, ceilFrames - delay + 2);
 
     s_recommendedDelay = ClampDelay(delay);
@@ -77,38 +80,69 @@ static void RecomputeRecommendations() {
 }
 
 static void RecomputeDerivedLocalState() {
-    s_activeDelay = ClampDelay(s_configuredDelay);
-    s_effectiveLocalDelay = s_activeDelay + kHiddenGameplayDelayFloor;
-    s_effectiveRemoteDelay = s_remoteAnnouncedDelay + kHiddenGameplayDelayFloor;
+    const int localConfigured = ClampDelay(s_configuredDelay);
+    const int remoteAnnounced = ClampDelay(s_remoteAnnouncedDelay);
+
+    if (s_gameplayDelayMode == GameplayDelayMode::SharedSafe) {
+        const int shared = ClampDelay((std::max)(localConfigured, remoteAnnounced));
+        s_activeDelay = shared;
+        s_resolvedVisibleLocalDelay = shared;
+        s_resolvedVisibleRemoteDelay = shared;
+    } else {
+        s_activeDelay = localConfigured;
+        s_resolvedVisibleLocalDelay = localConfigured;
+        s_resolvedVisibleRemoteDelay = remoteAnnounced;
+    }
+
+    s_effectiveLocalDelay = s_resolvedVisibleLocalDelay + kHiddenGameplayDelayFloor;
+    s_effectiveRemoteDelay = s_resolvedVisibleRemoteDelay + kHiddenGameplayDelayFloor;
     s_connectionProtectionWindow = s_effectiveLocalDelay + s_rollbackBudget;
     s_stallThreshold = s_effectiveRemoteDelay + s_rollbackBudget;
 }
 
 static void LogGameplayDelayState(const char* reason) {
+    const float localPredictsRemote =
+        (std::max)(0.0f, s_oneWayFrames - (float)s_resolvedVisibleRemoteDelay);
+    const float remotePredictsLocal =
+        (std::max)(0.0f, s_oneWayFrames - (float)s_resolvedVisibleLocalDelay);
+    const bool expert = s_gameplayDelayMode == GameplayDelayMode::AsymmetricExpert;
+
     LOG_INFO(
-        "[DelayPolicy] %s: visible=%d hidden_floor=%d effective=%d remote_visible=%d remote_effective=%d max_rb=%d protection_window=%d stall_threshold=%d",
+        "[DelayPolicy] %s: policy=%s local_cfg=%d remote_cfg=%d resolved_local=%d resolved_remote=%d local_eff=%d remote_eff=%d max_rb=%d protection_window=%d stall_threshold=%d%s",
         reason ? reason : "delay state",
-        s_activeDelay,
-        kHiddenGameplayDelayFloor,
-        s_effectiveLocalDelay,
+        GameplayDelayModeName(s_gameplayDelayMode),
+        s_configuredDelay,
         s_remoteAnnouncedDelay,
+        s_resolvedVisibleLocalDelay,
+        s_resolvedVisibleRemoteDelay,
+        s_effectiveLocalDelay,
         s_effectiveRemoteDelay,
         s_rollbackBudget,
         s_connectionProtectionWindow,
-        s_stallThreshold);
+        s_stallThreshold,
+        expert ? " WARNING=asymmetric_delay" : "");
 
     Rollback::NetplayLog_Write(
         "DELAY", -1,
-        "%s: visible_input_delay=%d hidden_floor=%d effective_input_delay=%d remote_visible_delay=%d remote_effective_delay=%d max_rollback=%d protection_window=%d stall_threshold=%d",
-        reason ? reason : "delay state",
-        s_activeDelay,
-        kHiddenGameplayDelayFloor,
-        s_effectiveLocalDelay,
+        "DELAYMAP policy=%s local_cfg=%d remote_cfg=%d resolved_local=%d resolved_remote=%d local_eff=%d remote_eff=%d rtt_avg=%.1f rtt_var=%.1f one_way_guarded=%.2f recommend=%d max_rb=%d protection_window=%d stall_threshold=%d local_predicts_remote=%.1f remote_predicts_local=%.1f%s reason=%s",
+        GameplayDelayModeName(s_gameplayDelayMode),
+        s_configuredDelay,
         s_remoteAnnouncedDelay,
+        s_resolvedVisibleLocalDelay,
+        s_resolvedVisibleRemoteDelay,
+        s_effectiveLocalDelay,
         s_effectiveRemoteDelay,
-        s_rollbackBudget,
+        s_avgPingMs,
+        s_lastVarianceMs,
+        s_oneWayFrames,
+        s_recommendedDelay,
+        s_recommendedMaxRollback,
         s_connectionProtectionWindow,
-        s_stallThreshold);
+        s_stallThreshold,
+        localPredictsRemote,
+        remotePredictsLocal,
+        expert ? " WARNING=asymmetric_delay" : "",
+        reason ? reason : "delay state");
 }
 
 static void LogRecommendationUpdate(int prevDelay,
@@ -121,23 +155,21 @@ static void LogRecommendationUpdate(int prevDelay,
     }
 
     LOG_INFO(
-        "[DelayPolicy] Recommendations: ping=%.1fms variance=%.1fms jitter=%.2ff one_way=%.2ff K=%d delay=%d max_rb=%d",
+        "[DelayPolicy] Recommendations: ping=%.1fms variance=%.1fms jitter=%.2ff guarded_one_way=%.2ff target_pred=2 delay=%d max_rb=%d",
         s_avgPingMs,
         s_lastVarianceMs,
         s_lastVarianceMs / FRAME_TIME_MS,
         s_oneWayFrames,
-        s_rollbackToleranceK,
         s_recommendedDelay,
         s_recommendedMaxRollback);
 
     Rollback::NetplayLog_Write(
         "DELAY", -1,
-        "Recommendations updated: ping=%.1fms variance=%.1fms jitter=%.2ff one_way=%.2ff K=%d delay=%d max_rb=%d",
+        "Recommendations updated: ping=%.1fms variance=%.1fms jitter=%.2ff guarded_one_way=%.2ff target_pred=2 delay=%d max_rb=%d",
         s_avgPingMs,
         s_lastVarianceMs,
         s_lastVarianceMs / FRAME_TIME_MS,
         s_oneWayFrames,
-        s_rollbackToleranceK,
         s_recommendedDelay,
         s_recommendedMaxRollback);
 }
@@ -151,6 +183,7 @@ void DelayPolicy_Init() {
     s_measurementValid = false;
     s_remoteAnnouncedDelay = 0;
     s_remoteAnnouncedMaxRb = ROLLBACK_BUDGET_DEFAULT;
+    s_gameplayDelayMode = GameplayDelayMode::SharedSafe;
     s_rollbackCurrentDelay = -1;
     s_rollbackSynced = false;
     RecomputeRecommendations();
@@ -252,6 +285,7 @@ void DelayPolicy_SetConfiguredDelay(int delay) {
     s_rollbackSynced = false;
 
     LOG_INFO("[DelayPolicy] Input delay: %d -> %d", prev, s_configuredDelay);
+    LogGameplayDelayState("local delay changed");
 }
 
 int DelayPolicy_GetConfiguredDelay() {
@@ -275,6 +309,7 @@ void DelayPolicy_SetRollbackBudget(int frames) {
         s_effectiveLocalDelay,
         s_connectionProtectionWindow,
         s_stallThreshold);
+    LogGameplayDelayState("rollback budget changed");
 }
 
 int DelayPolicy_GetRollbackBudget() {
@@ -303,6 +338,30 @@ int DelayPolicy_GetRollbackToleranceK() {
     return s_rollbackToleranceK;
 }
 
+void DelayPolicy_SetGameplayDelayMode(GameplayDelayMode mode) {
+    if (mode != GameplayDelayMode::SharedSafe &&
+        mode != GameplayDelayMode::AsymmetricExpert) {
+        mode = GameplayDelayMode::SharedSafe;
+    }
+    if (s_gameplayDelayMode == mode) {
+        return;
+    }
+
+    const GameplayDelayMode prev = s_gameplayDelayMode;
+    s_gameplayDelayMode = mode;
+    RecomputeDerivedLocalState();
+    s_rollbackSynced = false;
+
+    LOG_INFO("[DelayPolicy] Gameplay delay mode: %s -> %s",
+             GameplayDelayModeName(prev),
+             GameplayDelayModeName(s_gameplayDelayMode));
+    LogGameplayDelayState("gameplay delay mode changed");
+}
+
+GameplayDelayMode DelayPolicy_GetGameplayDelayMode() {
+    return s_gameplayDelayMode;
+}
+
 void DelayPolicy_BuildNegotiationData(DelayNegotiationData* out) {
     if (!out) {
         return;
@@ -310,6 +369,7 @@ void DelayPolicy_BuildNegotiationData(DelayNegotiationData* out) {
 
     out->local_input_delay = s_configuredDelay;
     out->max_rollback = s_rollbackBudget;
+    out->gameplay_delay_mode = s_gameplayDelayMode;
 }
 
 void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
@@ -319,13 +379,19 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
 
     s_remoteAnnouncedDelay = ClampDelay(remote->local_input_delay);
     s_remoteAnnouncedMaxRb = ClampRollback(remote->max_rollback);
+    if (remote->gameplay_delay_mode == GameplayDelayMode::SharedSafe ||
+        remote->gameplay_delay_mode == GameplayDelayMode::AsymmetricExpert) {
+        s_gameplayDelayMode = remote->gameplay_delay_mode;
+    }
     RecomputeDerivedLocalState();
 
     LOG_INFO(
-        "[DelayPolicy] Remote config received: remote_delay=%d remote_max_rb=%d local_delay=%d effective_delay=%d local_max_rb=%d protection_window=%d stall_threshold=%d",
+        "[DelayPolicy] Remote config received: policy=%s remote_delay=%d remote_max_rb=%d local_delay=%d resolved_delay=%d effective_delay=%d local_max_rb=%d protection_window=%d stall_threshold=%d",
+        GameplayDelayModeName(s_gameplayDelayMode),
         s_remoteAnnouncedDelay,
         s_remoteAnnouncedMaxRb,
         s_configuredDelay,
+        s_resolvedVisibleLocalDelay,
         s_effectiveLocalDelay,
         s_rollbackBudget,
         s_connectionProtectionWindow,
@@ -378,6 +444,8 @@ void DelayPolicy_ResetSession() {
     s_measurementValid = false;
     s_remoteAnnouncedDelay = 0;
     s_remoteAnnouncedMaxRb = ROLLBACK_BUDGET_DEFAULT;
+    s_resolvedVisibleLocalDelay = ClampDelay(s_configuredDelay);
+    s_resolvedVisibleRemoteDelay = DELAY_DEFAULT_PREF;
     s_rollbackCurrentDelay = -1;
     s_rollbackSynced = false;
     RecomputeRecommendations();
@@ -401,11 +469,14 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
     memset(out, 0, sizeof(*out));
     out->configured_delay = s_configuredDelay;
     out->active_delay = s_activeDelay;
+    out->resolved_visible_local_delay = s_resolvedVisibleLocalDelay;
+    out->resolved_visible_remote_delay = s_resolvedVisibleRemoteDelay;
     out->effective_local_delay = s_effectiveLocalDelay;
     out->effective_remote_delay = s_effectiveRemoteDelay;
     out->protection_window = s_connectionProtectionWindow;
     out->rollback_budget = s_rollbackBudget;
     out->rollback_tolerance = s_rollbackToleranceK;
+    out->gameplay_delay_mode = s_gameplayDelayMode;
     out->recommended_delay = s_recommendedDelay;
     out->recommended_max_rollback = s_recommendedMaxRollback;
     out->remote_announced_delay = s_remoteAnnouncedDelay;
@@ -418,6 +489,10 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
     out->measurement_valid = s_measurementValid;
     out->rollback_synced = s_rollbackSynced;
     out->rollback_current_delay = s_rollbackCurrentDelay;
+}
+
+void DelayPolicy_LogDelayMap(const char* reason) {
+    LogGameplayDelayState(reason);
 }
 
 } // namespace Net

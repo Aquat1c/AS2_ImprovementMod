@@ -684,7 +684,21 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
         _snprintf_s(tolVal, sizeof(tolVal), _TRUNCATE, "< %d > smoothness bias", snap->rollback_tolerance);
         RenderRow(y, "Stability Bias", tolVal, snap->selected_index == 3, true, alpha); y += kRowStep;
 
-        RenderRow(y, "Back", "Settings", snap->selected_index == 4, true, alpha);
+        const bool expertDelayMode = snap->gameplay_delay_mode == 1;
+        RenderRow(y,
+            "Delay mode",
+            expertDelayMode ? "< Asymmetric expert >" : "< Shared safe > recommended",
+            snap->selected_index == 4,
+            true,
+            alpha);
+        y += kRowStep;
+
+        if (expertDelayMode) {
+            RenderInfoLine(y, "Warning", "Opponent delay affects your rollback", alpha);
+            y += kInfoStep;
+        }
+
+        RenderRow(y, "Back", "Settings", snap->selected_index == 5, true, alpha);
         break;
     }
     case NetMenu::SettingsCategory::Endpoint: {
@@ -935,6 +949,11 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
         RenderInfoLine(y, "Stall", stallBuf, alpha);
         y += kInfoStep;
     }
+    RenderInfoLine(y,
+        "Delay Mode",
+        snap->gameplay_delay_mode == 1 ? "Asymmetric expert" : "Shared safe",
+        alpha);
+    y += kInfoStep;
     if (snap->current_rounds_label[0]) {
         RenderInfoLine(y, "Rounds", snap->current_rounds_label, alpha);
         y += kInfoStep;

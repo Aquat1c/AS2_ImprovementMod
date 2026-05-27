@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 14;
+constexpr uint16_t PROTOCOL_VERSION = 15;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -242,6 +242,7 @@ struct SyncConfirmPayload {
 
 struct FrontendPhaseBarrierPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase (current phase)
     uint16_t next_phase;         // Net::FrontendSyncPhase (next phase)
     uint32_t last_completed_frame; // Sender's final frame index for the completed phase
@@ -251,6 +252,7 @@ struct FrontendPhaseBarrierPayload {
 
 struct FrontendBoundaryDigestPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase
     uint8_t  digest_kind;        // Net::FrontendDigestKind
     uint8_t  substate;           // Native substate for diagnostics
@@ -300,6 +302,7 @@ struct CharSelInputPayload {
 
 struct CharSelLockPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase (must be CharSel)
     uint8_t  character_id;       // Resolved character ID from grid table
     uint8_t  palette;            // Final palette
@@ -309,6 +312,7 @@ struct CharSelLockPayload {
 
 struct StageSyncPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase (must be StageSel)
     uint16_t frame;              // Sender's current phase frame
     uint8_t  stage_id;           // Sender's currently resolved stage ID
@@ -339,8 +343,8 @@ struct ConfigExchangePayload {
     // Local rollback configuration announcement
     uint8_t  my_input_delay;     // Sender's local gameplay input delay
     uint8_t  my_max_rollback;    // Sender's input prediction window / max rollback
-    uint8_t  _delay_pad0;
-    uint8_t  _delay_pad1;
+    uint8_t  gameplay_delay_mode; // Net::GameplayDelayMode
+    uint8_t  _delay_reserved;
 };
 
 struct ConfigAckPayload {
@@ -349,8 +353,8 @@ struct ConfigAckPayload {
     // Local rollback configuration announcement
     uint8_t  my_input_delay;     // Sender's local gameplay input delay
     uint8_t  my_max_rollback;    // Sender's input prediction window / max rollback
-    uint8_t  _delay_pad0;
-    uint8_t  _delay_pad1;
+    uint8_t  gameplay_delay_mode; // Net::GameplayDelayMode
+    uint8_t  _delay_reserved;
 };
 
 struct LoadBarrierPayload {
@@ -429,6 +433,7 @@ struct GekkoReadyPayload {
 
 struct CharSelFrameInputPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase (CharSel or StageSel)
     uint16_t _phase_pad;
     uint32_t frame;              // Lockstep frame number
@@ -440,6 +445,7 @@ struct CharSelFrameInputPayload {
 
 struct WinScreenFrameInputPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase (WinScreen)
     uint16_t _phase_pad;
     uint32_t frame;              // Lockstep frame number
@@ -486,6 +492,7 @@ struct PaletteAckPayload {
 
 struct DelayChangeReqPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase
     uint16_t new_delay;          // Requested shared frontend delay
     uint32_t apply_from_frame;   // Apply point inside the phase timeline
@@ -495,6 +502,7 @@ struct DelayChangeReqPayload {
 
 struct DelayChangeAckPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
     uint16_t phase;              // Net::FrontendSyncPhase
     uint16_t acked_delay;        // Accepted shared frontend delay
     uint32_t apply_from_frame;   // Apply point inside the phase timeline
@@ -528,7 +536,7 @@ static_assert(sizeof(SyncAnnouncePayload) == 8,
     "SyncAnnouncePayload wire size must remain stable");
 static_assert(sizeof(SyncConfirmPayload) == 12,
     "SyncConfirmPayload wire size must remain stable");
-static_assert(sizeof(StageSyncPayload) == 20,
+static_assert(sizeof(StageSyncPayload) == 24,
     "StageSyncPayload wire size must remain stable");
 static_assert(sizeof(PacketType) + sizeof(SyncTracePayload) <= MAX_PACKET_SIZE,
     "SyncTracePayload must fit inside one transport packet");

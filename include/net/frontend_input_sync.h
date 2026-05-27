@@ -92,9 +92,12 @@ struct FrontendInputSyncSnapshot {
     bool              input_phase_active;
     SessionRole       role;
     FrontendSyncPhase phase;
+    uint32_t          phase_serial;
     FrontendFrameId   consume_id;
     uint32_t          local_input_frame;
     uint32_t          remote_latest_frame;
+    uint32_t          remote_contiguous_frame_exclusive;
+    uint32_t          max_local_lead;
     uint16_t          local_delay_proposal;
     uint16_t          remote_delay_proposal;
     uint16_t          shared_delay;
@@ -146,6 +149,8 @@ uint32_t FrontendInputSync_GetConsumeFrame();
 uint32_t FrontendInputSync_GetLocalInputFrame();
 uint32_t FrontendInputSync_GetRemoteLatestFrame();
 uint32_t FrontendInputSync_GetRemoteAckFrame();
+uint32_t FrontendInputSync_GetRemoteContiguousFrameExclusive();
+uint32_t FrontendInputSync_GetPhaseSerial();
 
 void FrontendInputSync_FrameUpdate();
 void FrontendInputSync_CaptureLocalInput(uint16_t packedInput);
@@ -156,6 +161,7 @@ void FrontendInputSync_OnRemoteCharSelFrameInput(const CharSelFrameInputPayload*
 void FrontendInputSync_OnRemoteWinScreenFrameInput(const WinScreenFrameInputPayload* p);
 
 bool FrontendInputSync_IsCurrentEpochPhase(uint32_t epochId, uint16_t phase, PacketType type, const char* context);
+bool FrontendInputSync_IsCurrentEpochPhaseSerial(uint32_t epochId, uint16_t phase, uint32_t phaseSerial, PacketType type, const char* context);
 void FrontendInputSync_SendPhaseBarrier(FrontendSyncPhase nextPhase, uint8_t reasonCode, const char* reason);
 void FrontendInputSync_OnRemotePhaseBarrier(const FrontendPhaseBarrierPayload* p);
 bool FrontendInputSync_IsPhaseBarrierSatisfied(FrontendSyncPhase nextPhase);

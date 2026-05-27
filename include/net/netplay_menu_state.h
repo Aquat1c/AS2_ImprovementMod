@@ -193,6 +193,7 @@ struct MenuSnapshot {
     int           active_delay;
     int           rollback_budget;
     int           rollback_tolerance;
+    int           gameplay_delay_mode;
     int           recommended_delay;
     int           recommended_max_rollback;
     int           stall_threshold;

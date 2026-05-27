@@ -7,7 +7,6 @@ out/
 .github
 docs/*
 !docs/MASTER_DOCUMENT.md
-lib/
 
 # Logs / temp
 logs.txt

@@ -14,4 +14,8 @@ namespace Rollback {
 /// The session itself remains alive.
 void RematchCleanup_PrepareForNextMatch(const char* reason);
 
+/// Clears match-scoped leftovers before launching a fresh netplay CharSel flow.
+/// This covers the "played offline/practice first, then start netplay" path.
+void RematchCleanup_PrepareForNetplayLaunch(const char* reason);
+
 } // namespace Rollback
