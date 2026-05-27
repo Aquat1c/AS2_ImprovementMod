@@ -127,6 +127,40 @@ void Gekko::NetStats::AddRTT(u16 rtt_ms)
     }
 }
 
+void Gekko::NetStats::RecordInputDelivery(u32 input_slots,
+                                          u32 accepted_inputs,
+                                          u32 duplicate_inputs,
+                                          u32 gap_inputs,
+                                          u32 gap_before_frames,
+                                          u32 gap_after_frames)
+{
+    const u32 observed = input_slots > 0
+        ? input_slots
+        : accepted_inputs + duplicate_inputs + gap_inputs;
+    if (observed == 0 && gap_before_frames == 0 && gap_after_frames == 0) {
+        return;
+    }
+
+    const float gap_sample = observed > 0
+        ? std::min(1.0f, (float)gap_inputs / (float)observed)
+        : 1.0f;
+    packet_loss_ewma = packet_loss_ewma * 0.95f + gap_sample * 0.05f;
+
+    const bool blocked_contiguous_frontier =
+        gap_inputs > 0 || gap_after_frames > 0 || gap_before_frames > 0;
+    if (blocked_contiguous_frontier) {
+        const int burst_units = (int)std::max<u32>(1, std::max(gap_inputs, gap_after_frames));
+        loss_burst_current = std::max(loss_burst_current + 1, burst_units);
+        loss_burst_max = std::max(loss_burst_max, loss_burst_current);
+    } else {
+        loss_burst_current = 0;
+        if (loss_burst_max > 0) {
+            loss_burst_max--;
+        }
+        packet_loss_ewma *= 0.98f;
+    }
+}
+
 void Gekko::NetStats::UpdateBandwidth()
 {
     using namespace std::chrono;

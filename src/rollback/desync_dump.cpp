@@ -401,6 +401,10 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
         fprintf(f, "  Effect Array  (0x%08X, %5zu B): 0x%08X\n",
                 (uint32_t)ADDR_EFFECT_ARRAY, effectSize,
                 CalcCRC32((const void*)ADDR_EFFECT_ARRAY, effectSize));
+        fprintf(f, "  Effect Index  (0x%08X, %5u B): 0x%08X value=%u\n",
+                (uint32_t)ADDR_EFFECT_INDEX, 4u,
+                CalcCRC32((const void*)ADDR_EFFECT_INDEX, sizeof(uint32_t)),
+                ReadMemory<uint32_t>(ADDR_EFFECT_INDEX));
         fprintf(f, "  Summon Array  (0x%08X, %5zu B): 0x%08X\n",
                 (uint32_t)ADDR_SUMMON_ARRAY, summonSize,
                 CalcCRC32((const void*)ADDR_SUMMON_ARRAY, summonSize));
@@ -435,6 +439,7 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
     fprintf(f, "  sub_state_timer:    %u\n", ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER));
     fprintf(f, "  game_type:          %u\n", ReadMemory<uint32_t>(ADDR_GAME_TYPE));
     fprintf(f, "  match_phase_timer:  %u\n", ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER));
+    fprintf(f, "  effect_index:       %u\n", ReadMemory<uint32_t>(ADDR_EFFECT_INDEX));
     fprintf(f, "  read_idx:           %u\n", ReadMemory<uint32_t>(ADDR_INPUT_READ_IDX));
     fprintf(f, "  write_idx:          %u\n", ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX));
     fprintf(f, "  host_timeout_ctr:   %u\n", ReadMemory<uint32_t>(ADDR_HOST_TIMEOUT_CTR));

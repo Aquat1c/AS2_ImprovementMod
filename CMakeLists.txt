@@ -306,7 +306,10 @@ set(ROLLBACK_HEADERS
     include/rollback/rollback_debug.h
     include/rollback/desync_dump.h
     include/rollback/netplay_log.h
+    include/rollback/rollback_audio.h
+    include/rollback/rollback_combo_fx.h
     include/rollback/owner_diagnostics.h
+    include/rollback/rollback_status_fx.h
     include/rollback/stress_hooks.h
     include/rollback/online_wiring.h
     include/rollback/rematch_cleanup.h
@@ -419,6 +422,9 @@ set(ROLLBACK_SOURCES
     src/rollback/rollback_debug.cpp
     src/rollback/desync_dump.cpp
     src/rollback/netplay_log.cpp
+    src/rollback/rollback_audio.cpp
+    src/rollback/rollback_combo_fx.cpp
+    src/rollback/rollback_status_fx.cpp
     src/rollback/stress_hooks.cpp
     src/rollback/online_wiring.cpp
     src/rollback/rematch_cleanup.cpp

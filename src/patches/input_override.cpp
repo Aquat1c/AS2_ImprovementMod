@@ -308,8 +308,8 @@ void InputOverride_EnsureDInputKeyboardCooperativeLevel(const char* reason) {
 
 static bool ClearVanillaShellHotkeySuppression() {
     int* suppressFlag = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_SUPPRESS_FLAG);
-    HHOOK* auxHookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_AUX_HOOK);
     HHOOK* hookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_MSG_HOOK);
+    int* loadedFlag = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_LOADED_FLAG);
     HMODULE* hookModule = reinterpret_cast<HMODULE*>(ADDR_SHELL_HOTKEY_HOOK_MODULE);
     int* tempDllOwned = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_TEMP_DLL_OWNED);
     char* tempDllPath = reinterpret_cast<char*>(ADDR_SHELL_HOTKEY_TEMP_DLL_PATH);
@@ -321,15 +321,14 @@ static bool ClearVanillaShellHotkeySuppression() {
         changed = true;
     }
 
-    if (*auxHookHandle) {
-        UnhookWindowsHookEx(*auxHookHandle);
-        *auxHookHandle = nullptr;
-        changed = true;
-    }
-
     if (*hookHandle) {
         UnhookWindowsHookEx(*hookHandle);
         *hookHandle = nullptr;
+        changed = true;
+    }
+
+    if (*loadedFlag != 0) {
+        *loadedFlag = 0;
         changed = true;
     }
 
@@ -353,17 +352,17 @@ static bool ClearVanillaShellHotkeySuppression() {
 
 static void LogVanillaShellHotkeyState(const char* reason) {
     int* suppressFlag = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_SUPPRESS_FLAG);
-    HHOOK* auxHookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_AUX_HOOK);
     HHOOK* hookHandle = reinterpret_cast<HHOOK*>(ADDR_SHELL_HOTKEY_MSG_HOOK);
+    int* loadedFlag = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_LOADED_FLAG);
     HMODULE* hookModule = reinterpret_cast<HMODULE*>(ADDR_SHELL_HOTKEY_HOOK_MODULE);
     int* tempDllOwned = reinterpret_cast<int*>(ADDR_SHELL_HOTKEY_TEMP_DLL_OWNED);
     char* tempDllPath = reinterpret_cast<char*>(ADDR_SHELL_HOTKEY_TEMP_DLL_PATH);
 
-    LOG_INFO("[Input] Shell hotkey state (%s): suppress=%d aux=0x%p msg=0x%p module=0x%p owned=%d path='%s' fg=0x%p active=0x%p focus=0x%p",
+    LOG_INFO("[Input] Shell hotkey state (%s): suppress=%d msg=0x%p loaded=%d module=0x%p owned=%d path='%s' fg=0x%p active=0x%p focus=0x%p",
              reason ? reason : "unknown",
              *suppressFlag,
-             *auxHookHandle,
              *hookHandle,
+             *loadedFlag,
              *hookModule,
              *tempDllOwned,
              tempDllPath,

@@ -8,6 +8,9 @@
 #include "patches/charsel_palette_select.h"
 #include "patches/charsel_select_actions.h"
 #include "replay/replay_runtime.h"
+#include "rollback/rollback_audio.h"
+#include "rollback/rollback_combo_fx.h"
+#include "rollback/rollback_status_fx.h"
 #include "training/practice_tools.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -174,6 +177,62 @@ bool InstallHooks() {
         return false;
     }
     LOG_INFO("Hooked sub_5625E0 (input dispatcher - charsel lockstep)");
+
+    // --- Rollback presentation sidecar hooks ---
+    // These are non-fatal: audio/status/combo presentation remains playable
+    // without them, but the logs become much less useful.
+
+    LOG_INFO("ADDR_SE_PLAY = 0x%08X (sub_4C3C00)", ADDR_SE_PLAY);
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_SE_PLAY),
+            reinterpret_cast<void*>(&Rollback::Hook_SE_Play),
+            reinterpret_cast<void**>(&Rollback::g_origSEPlay));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook SE_Play! Status: %d (rollback audio disabled)", status);
+    } else {
+        LOG_INFO("Hooked sub_4C3C00 (SE_Play - rollback-aware audio journal)");
+    }
+
+    LOG_INFO("ADDR_EFFECT_SPAWN = 0x%08X (sub_4A92C0 Effect_Enqueue)", ADDR_EFFECT_SPAWN);
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_EFFECT_SPAWN),
+            reinterpret_cast<void*>(&Rollback::Hook_Effect_Enqueue),
+            reinterpret_cast<void**>(&Rollback::g_origEffectEnqueue));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook Effect_Enqueue! Status: %d (status FX logs disabled)", status);
+    } else {
+        LOG_INFO("Hooked sub_4A92C0 (Effect_Enqueue - rollback status FX journal)");
+    }
+
+    struct PresentationHookEntry {
+        uintptr_t target;
+        void* detour;
+        void** original;
+        const char* name;
+    };
+
+    PresentationHookEntry presentationHooks[] = {
+        { ADDR_MATCH_UPDATE_COMBO_TIMERS,      (void*)&Rollback::Hook_Match_UpdateComboTimers,      (void**)&Rollback::g_origMatchUpdateComboTimers,      "Match_UpdateComboTimers" },
+        { ADDR_ENTITY_UPDATE_COMBO_STATS,      (void*)&Rollback::Hook_Entity_UpdateComboStats,      (void**)&Rollback::g_origEntityUpdateComboStats,      "Entity_UpdateComboStats" },
+        { ADDR_ENTITY_UPDATE_COMBO_STAT_1243,  (void*)&Rollback::Hook_Entity_UpdateComboStat_1243,  (void**)&Rollback::g_origEntityUpdateComboStat1243,  "Entity_UpdateComboStat_1243" },
+        { ADDR_ENTITY_EFFECT_SLOTS_ADD,        (void*)&Rollback::Hook_EffectSlots_Add,              (void**)&Rollback::g_origEffectSlotsAdd,              "EffectSlots_Add" },
+        { ADDR_ENTITY_EFFECT_SET_PARAMS1,      (void*)&Rollback::Hook_Effect_SetParams1,            (void**)&Rollback::g_origEffectSetParams1,            "Effect_SetParams1" },
+        { ADDR_ENTITY_EFFECT_SET_PARAMS2,      (void*)&Rollback::Hook_Effect_SetParams2,            (void**)&Rollback::g_origEffectSetParams2,            "Effect_SetParams2" },
+    };
+
+    for (auto& h : presentationHooks) {
+        status = MH_CreateHook(reinterpret_cast<void*>(h.target), h.detour, h.original);
+        if (status != MH_OK) {
+            LOG_WARN("Failed to hook %s @ 0x%08X! Status: %d (combo FX diagnostics degraded)",
+                     h.name,
+                     (unsigned)h.target,
+                     status);
+        } else {
+            LOG_INFO("Hooked %s @ 0x%08X (rollback combo FX diagnostics)",
+                     h.name,
+                     (unsigned)h.target);
+        }
+    }
     
     // --- Locale hooks ---
     

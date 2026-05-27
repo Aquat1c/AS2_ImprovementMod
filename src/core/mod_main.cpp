@@ -26,6 +26,9 @@
 #include "rollback/rollback_session.h"
 #include "rollback/rollback_debug.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rollback_audio.h"
+#include "rollback/rollback_combo_fx.h"
+#include "rollback/rollback_status_fx.h"
 #include "rollback/stress_hooks.h"
 #include "rollback/online_wiring.h"
 #include "net/spectator_runtime.h"
@@ -551,6 +554,15 @@ static void DeferredInit() {
     Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
     Rollback::NetplayLog_SetVerbose(g_config.verboseLogging);
     LogInitStep("NetplayLog_Init", "END");
+    LogInitStep("RollbackAudio_Init", "BEGIN");
+    Rollback::RollbackAudio_Init();
+    LogInitStep("RollbackAudio_Init", "END");
+    LogInitStep("RollbackStatusFx_Init", "BEGIN");
+    Rollback::RollbackStatusFx_Init();
+    LogInitStep("RollbackStatusFx_Init", "END");
+    LogInitStep("RollbackComboFx_Init", "BEGIN");
+    Rollback::RollbackComboFx_Init();
+    LogInitStep("RollbackComboFx_Init", "END");
     LogInitStep("SyncTrace_Init", "BEGIN");
     Net::SyncTrace_Init();
     LogInitStep("SyncTrace_Init", "END");
@@ -658,6 +670,9 @@ __declspec(dllexport) void ModShutdown() {
         SIR_Shutdown();
         Rollback::OnlineWiring_Shutdown();
         Net::SyncTrace_Shutdown();
+        Rollback::RollbackComboFx_Shutdown();
+        Rollback::RollbackStatusFx_Shutdown();
+        Rollback::RollbackAudio_Shutdown();
         Rollback::NetplayLog_Shutdown();
         Rollback::RollbackDebug_Shutdown();
         Rollback::RollbackSession_Shutdown();

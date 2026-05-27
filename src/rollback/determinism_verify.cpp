@@ -127,7 +127,14 @@ static inline void EnforceFpuState() {
 
 static uint32_t ComputeGameStateChecksum() {
     __try {
-        return CalcCRC32((const void*)DETVER_STATE_START, DETVER_STATE_SIZE);
+        struct ChecksumParts {
+            uint32_t main_crc;
+            uint32_t effect_index;
+        } parts{};
+
+        parts.main_crc = CalcCRC32((const void*)DETVER_STATE_START, DETVER_STATE_SIZE);
+        parts.effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
+        return CalcCRC32(&parts, sizeof(parts));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0xDEADDEAD;
     }

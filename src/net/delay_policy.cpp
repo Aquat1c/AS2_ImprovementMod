@@ -16,7 +16,6 @@
 #include "net/session_manager.h"
 #include "rollback/rollback_session.h"
 #include "rollback/netplay_log.h"
-#include "ui/log_window.h"
 
 #include <algorithm>
 #include <math.h>
@@ -118,7 +117,8 @@ static void LogGameplayDelayState(const char* reason) {
         (std::max)(0.0f, s_oneWayFrames - (float)s_resolvedVisibleLocalDelay);
     const bool shared = s_gameplayDelayMode == GameplayDelayMode::SharedSafe;
 
-    LOG_INFO(
+    Rollback::NetplayLog_Write(
+        "DELAY", -1,
         "[DelayPolicy] %s: policy=%s local_cfg=%d remote_cfg=%d resolved_local=%d resolved_remote=%d local_eff=%d remote_eff=%d max_rb=%d protection_window=%d stall_threshold=%d%s",
         reason ? reason : "delay state",
         GameplayDelayModeName(s_gameplayDelayMode),
@@ -168,7 +168,8 @@ static void LogRecommendationUpdate(int prevDelay,
         return;
     }
 
-    LOG_INFO(
+    Rollback::NetplayLog_Write(
+        "DELAY", -1,
         "[DelayPolicy] Recommendations: ping=%.1fms p90=%.1fms p95=%.1fms variance=%.1fms jitter95=%.1fms guarded_one_way=%.2ff tolerance=%d delay=%d max_rb=%d",
         s_avgPingMs,
         s_rttP90Ms,
@@ -213,7 +214,8 @@ void DelayPolicy_Init() {
     RecomputeDerivedLocalState();
     s_initialized = true;
 
-    LOG_INFO(
+    Rollback::NetplayLog_Write(
+        "DELAY", -1,
         "[DelayPolicy] Initialized: delay=%d effective=%d max_rb=%d tolerance=%d protection_window=%d stall_threshold=%d",
         s_configuredDelay,
         s_effectiveLocalDelay,
@@ -225,7 +227,7 @@ void DelayPolicy_Init() {
 
 void DelayPolicy_Shutdown() {
     s_initialized = false;
-    LOG_INFO("[DelayPolicy] Shutdown");
+    Rollback::NetplayLog_Write("DELAY", -1, "[DelayPolicy] Shutdown");
 }
 
 void DelayPolicy_FrameUpdate() {
@@ -325,7 +327,8 @@ void DelayPolicy_SetConfiguredDelay(int delay) {
     RecomputeDerivedLocalState();
     s_rollbackSynced = false;
 
-    LOG_INFO("[DelayPolicy] Input delay: %d -> %d", prev, s_configuredDelay);
+    Rollback::NetplayLog_Write("DELAY", -1,
+        "[DelayPolicy] Input delay: %d -> %d", prev, s_configuredDelay);
     LogGameplayDelayState("local delay changed");
 }
 
@@ -343,7 +346,8 @@ void DelayPolicy_SetRollbackBudget(int frames) {
     s_rollbackBudget = clamped;
     RecomputeDerivedLocalState();
 
-    LOG_INFO(
+    Rollback::NetplayLog_Write(
+        "DELAY", -1,
         "[DelayPolicy] Max rollback: %d -> %d (effective=%d protection_window=%d stall_threshold=%d)",
         prev,
         s_rollbackBudget,
@@ -370,8 +374,9 @@ void DelayPolicy_SetRollbackToleranceK(int tolerance_k) {
     const int prevRollback = s_recommendedMaxRollback;
     RecomputeRecommendations();
 
-    LOG_INFO("[DelayPolicy] RB bias (rollback_tolerance K): %d -> %d (delay=%d max_rb=%d)",
-             prev, s_rollbackToleranceK, s_recommendedDelay, s_recommendedMaxRollback);
+    Rollback::NetplayLog_Write("DELAY", -1,
+        "[DelayPolicy] RB bias (rollback_tolerance K): %d -> %d (delay=%d max_rb=%d)",
+        prev, s_rollbackToleranceK, s_recommendedDelay, s_recommendedMaxRollback);
     LogRecommendationUpdate(prevDelay, prevRollback, s_avgPingMs);
 }
 
@@ -393,9 +398,10 @@ void DelayPolicy_SetGameplayDelayMode(GameplayDelayMode mode) {
     RecomputeDerivedLocalState();
     s_rollbackSynced = false;
 
-    LOG_INFO("[DelayPolicy] Gameplay delay mode: %s -> %s",
-             GameplayDelayModeName(prev),
-             GameplayDelayModeName(s_gameplayDelayMode));
+    Rollback::NetplayLog_Write("DELAY", -1,
+        "[DelayPolicy] Gameplay delay mode: %s -> %s",
+        GameplayDelayModeName(prev),
+        GameplayDelayModeName(s_gameplayDelayMode));
     LogGameplayDelayState("gameplay delay mode changed");
 }
 
@@ -426,7 +432,8 @@ void DelayPolicy_NegotiateSession(const DelayNegotiationData* remote) {
     }
     RecomputeDerivedLocalState();
 
-    LOG_INFO(
+    Rollback::NetplayLog_Write(
+        "DELAY", -1,
         "[DelayPolicy] Remote config received: policy=%s remote_delay=%d remote_max_rb=%d local_delay=%d resolved_delay=%d effective_delay=%d local_max_rb=%d protection_window=%d stall_threshold=%d",
         GameplayDelayModeName(s_gameplayDelayMode),
         s_remoteAnnouncedDelay,
@@ -495,7 +502,8 @@ void DelayPolicy_ResetSession() {
     RecomputeRecommendations();
     RecomputeDerivedLocalState();
 
-    LOG_INFO(
+    Rollback::NetplayLog_Write(
+        "DELAY", -1,
         "[DelayPolicy] Session reset: delay=%d effective=%d max_rb=%d tolerance=%d protection_window=%d stall_threshold=%d",
         s_configuredDelay,
         s_effectiveLocalDelay,

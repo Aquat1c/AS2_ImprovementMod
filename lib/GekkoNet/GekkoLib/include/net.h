@@ -126,7 +126,7 @@ namespace Gekko {
         static const u64 SYNC_MSG_DELAY = 200;
         static const u64 NET_CHECK_DELAY = 500;
         static const u64 INPUT_RETRY_INTERVAL = 50;
-        static const u32 RTT_HISTORY_SIZE = 10;
+        static const u32 RTT_HISTORY_SIZE = 32;
 
         Frame last_acked_frame = -1;
         u64 last_sent_sync_message = 0;
@@ -140,8 +140,17 @@ namespace Gekko {
         u64 last_bandwidth_update = 0;
 
         std::vector<u16> rtt;
+        float packet_loss_ewma = 0.0f;
+        int loss_burst_current = 0;
+        int loss_burst_max = 0;
 
         void AddRTT(u16 rtt_ms);
+        void RecordInputDelivery(u32 input_slots,
+                                 u32 accepted_inputs,
+                                 u32 duplicate_inputs,
+                                 u32 gap_inputs,
+                                 u32 gap_before_frames,
+                                 u32 gap_after_frames);
         void UpdateBandwidth();
         float CalculateJitter();
         float CalculateRTTPercentile(float p);

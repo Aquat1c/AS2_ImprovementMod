@@ -277,8 +277,8 @@
 // On NT-family Windows the game installs an external message hook DLL and on
 // older Win9x it uses SPI_SETSCREENSAVERRUNNING; both are gated by this flag.
 #define ADDR_SHELL_HOTKEY_SUPPRESS_FLAG  0x9E5B74
-#define ADDR_SHELL_HOTKEY_AUX_HOOK       0x9E5B78
 #define ADDR_SHELL_HOTKEY_MSG_HOOK       0x9E5B7C
+#define ADDR_SHELL_HOTKEY_LOADED_FLAG    0x9E5B80
 #define ADDR_SHELL_HOTKEY_HOOK_MODULE    0x9E5C8C
 #define ADDR_SHELL_HOTKEY_TEMP_DLL_PATH  0x9E5B84
 #define ADDR_SHELL_HOTKEY_TEMP_DLL_OWNED 0x9E5C88
@@ -441,6 +441,13 @@
 #define ADDR_SUMMON_SPAWN       (GAME_BASE + 0x0BE100)  // sub_4BE100 - Spawn summon
 #define ADDR_SUMMON_UPDATE      (GAME_BASE + 0x0BE3E0)  // sub_4BE3E0 - Update summons
 
+#define ADDR_ENTITY_UPDATE_COMBO_STATS     (GAME_BASE + 0x09EC00)  // sub_49EC00 - Entity_UpdateComboStats
+#define ADDR_ENTITY_UPDATE_COMBO_STAT_1243 (GAME_BASE + 0x09EC90)  // sub_49EC90 - Entity_UpdateComboStat_1243
+#define ADDR_ENTITY_EFFECT_ARRAY_INIT      (GAME_BASE + 0x0C3E90)  // sub_4C3E90 - EffectArray_Init
+#define ADDR_ENTITY_EFFECT_SET_PARAMS1     (GAME_BASE + 0x0C3ED0)  // sub_4C3ED0 - Effect_SetParams1
+#define ADDR_ENTITY_EFFECT_SET_PARAMS2     (GAME_BASE + 0x0C3F30)  // sub_4C3F30 - Effect_SetParams2
+#define ADDR_ENTITY_EFFECT_SLOTS_ADD       (GAME_BASE + 0x0C3FB0)  // sub_4C3FB0 - EffectSlots_Add
+
 // Effect types (common ones from switch in sub_4A9330)
 #define EFFECT_TYPE_STANDARD_30F    0x01  // 30 frame lifetime
 #define EFFECT_TYPE_STANDARD_45F    0x02  // 45 frame lifetime
@@ -521,6 +528,19 @@
 #define ENTITY_OFF_COMBO_SCALE2 0x04D7  // +1239, BYTE — combo multiplier 2
 #define ENTITY_OFF_COMBO_SCALE3 0x04D9  // +1241, BYTE — combo multiplier 3
 #define ENTITY_OFF_COMBO_SCALE4 0x04DB  // +1243, BYTE — combo special stat
+
+// Combo / hit-reaction presentation fields. These are deterministic entity-local
+// state and should be snapshotted/logged, not cleared as baseline residue.
+#define ENTITY_OFF_HIT_REACTION_RESET_FLAG 0x07B8
+#define ENTITY_OFF_HIT_REACTION_TYPE       0x07BC
+#define ENTITY_OFF_HIT_REACTION_CLASS      0x07C0
+#define ENTITY_OFF_HIT_REACTION_SHOWN_FLAG 0x07C4
+#define ENTITY_OFF_HIT_REACTION_ANIM_TIMER 0x07C5
+#define ENTITY_OFF_HIT_REACTION_LIFE_TIMER 0x07C6
+#define ENTITY_OFF_HIT_REACTION_KEEP_FLAG  0x07C7
+#define ENTITY_OFF_ATTACHED_FX_SLOTS       0x07F0
+#define ENTITY_ATTACHED_FX_SLOTS_SIZE      0x0028
+#define ENTITY_RENDER_OVERLAY_FIELDS_SIZE  0x0019
 
 // Box system offsets
 #define ENTITY_OFF_BOX_FLAGS    0x0674  // +1652, 24 bytes

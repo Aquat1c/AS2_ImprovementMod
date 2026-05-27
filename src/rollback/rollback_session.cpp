@@ -14,6 +14,9 @@
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rollback_audio.h"
+#include "rollback/rollback_combo_fx.h"
+#include "rollback/rollback_status_fx.h"
 #include "net/spectator_runtime.h"
 #include "net/session_manager.h"
 #include "net/match_lifecycle.h"
@@ -66,6 +69,7 @@ struct GekkoState {
     uint32_t game_type;           // 0x816410 — gameplay type (arcade/vs/netplay)
     uint32_t match_phase_timer;   // 0x816370 — intro fade countdown
     uint32_t input_write_idx;     // 0x816498 — input write index
+    uint32_t effect_index;        // 0x76C5E8 — global Effect_Enqueue write cursor
 
     // FPU control state — critical for floating-point determinism
     uint16_t fpu_cw;              // x87 floating-point control word
@@ -77,7 +81,7 @@ struct GekkoState {
     //           round timer, P1 entity, P2 entity, summons, hitboxes
     uint8_t  main_state[GS_MAIN_SIZE];
 
-    // Pre-match gap: 12 bytes at 0x76C5EC (effect index, render state)
+    // Pre-match gap: 12 bytes at 0x76C5EC (render state immediately after effect cursor)
     uint8_t  pre_match_gap[GS_PRE_MATCH_SIZE];
 
     // Per-player input buffers: 208 bytes each (held, previous, just-pressed, etc.)
@@ -85,6 +89,28 @@ struct GekkoState {
     uint8_t  input_p2[GS_INPUT_SIZE];  // 0x8E9F32
 };
 #pragma pack(pop)
+
+static uint32_t ComputeStateChecksum(uint32_t mainCrc, uint32_t effectIndex) {
+    struct ChecksumParts {
+        uint32_t main_crc;
+        uint32_t effect_index;
+    } parts{};
+
+    parts.main_crc = mainCrc;
+    parts.effect_index = effectIndex;
+    return CalcCRC32(&parts, sizeof(parts));
+}
+
+static uint32_t ComputeLiveStateChecksum() {
+    __try {
+        const uint32_t mainCrc = CalcCRC32(
+            (const void*)ADDR_MATCH_BASE,
+            (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+        return ComputeStateChecksum(mainCrc, ReadMemory<uint32_t>(ADDR_EFFECT_INDEX));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0xDEADDEAD;
+    }
+}
 
 // ============================================================================
 // GekkoNet Packet Receive Buffer
@@ -440,6 +466,7 @@ static bool CaptureState(GekkoState* state) {
     state->game_type         = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
     state->match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
     state->input_write_idx   = ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX);
+    state->effect_index      = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
 
     // FPU state — capture x87 control word and MXCSR for float determinism
     state->fpu_cw = 0;
@@ -512,6 +539,7 @@ static bool RestoreState(const GekkoState* state) {
     WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, state->substate_timer);
     WriteMemory<uint32_t>(ADDR_GAME_TYPE, state->game_type);
     WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, state->match_phase_timer);
+    WriteMemory<uint32_t>(ADDR_EFFECT_INDEX, state->effect_index);
     // Note: ADDR_INPUT_READ_IDX == ADDR_SIM_FRAME_COUNTER (0x816490).
     // Already restored via sim_frame above. Only write_idx is separate.
     WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, state->input_write_idx);
@@ -581,7 +609,8 @@ static void HandleSaveEvent(GekkoGameEvent* ev) {
 
     // Compute checksums for desync detection — full state for GekkoNet,
     // and per-section hashes for diagnostic logging
-    uint32_t fullChecksum = CalcCRC32(state->main_state, GS_MAIN_SIZE);
+    const uint32_t mainChecksum = CalcCRC32(state->main_state, GS_MAIN_SIZE);
+    const uint32_t fullChecksum = ComputeStateChecksum(mainChecksum, state->effect_index);
     *ev->data.save.checksum = fullChecksum;
 
     s_lastSavedRbFrame = rbFrame;
@@ -591,8 +620,8 @@ static void HandleSaveEvent(GekkoGameEvent* ev) {
     uint32_t inputHash = CalcCRC32(state->input_p1, GS_INPUT_SIZE)
                        ^ CalcCRC32(state->input_p2, GS_INPUT_SIZE);
     NetplayLog_Write("GEKKO", rbFrame,
-        "SAVE: rb_frame=%d game_abs_frame=%d origin_abs=%d full=0x%08X inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
-        rbFrame, gameAbsFrame, s_frameOriginAbs, fullChecksum, inputHash, state->rng_seed,
+        "SAVE: rb_frame=%d game_abs_frame=%d origin_abs=%d full=0x%08X main=0x%08X effect_idx=%u inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
+        rbFrame, gameAbsFrame, s_frameOriginAbs, fullChecksum, mainChecksum, state->effect_index, inputHash, state->rng_seed,
         state->game_mode, state->substate, state->substate_timer,
         state->fpu_cw, state->mxcsr);
     if (!s_loggedFirstSaveEvent) {
@@ -604,6 +633,7 @@ static void HandleSaveEvent(GekkoGameEvent* ev) {
             state->sim_frame,
             s_frameOriginAbs);
     }
+    RollbackComboFx_OnGekkoSave(rbFrame, gameAbsFrame);
 }
 
 static void HandleLoadEvent(GekkoGameEvent* ev) {
@@ -643,11 +673,12 @@ static void HandleLoadEvent(GekkoGameEvent* ev) {
     s_loadEventCount++;
 
     uint32_t mainHash = CalcCRC32(state->main_state, GS_MAIN_SIZE);
+    uint32_t fullHash = ComputeStateChecksum(mainHash, state->effect_index);
     uint32_t inputHash = CalcCRC32(state->input_p1, GS_INPUT_SIZE)
                        ^ CalcCRC32(state->input_p2, GS_INPUT_SIZE);
     NetplayLog_Write("GEKKO", rbFrame,
-        "LOAD: rb_frame=%d game_abs_frame=%d origin_abs=%d full=0x%08X inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
-        rbFrame, expectedGameAbsFrame, s_frameOriginAbs, mainHash, inputHash, state->rng_seed,
+        "LOAD: rb_frame=%d game_abs_frame=%d origin_abs=%d full=0x%08X main=0x%08X effect_idx=%u inp=0x%08X rng=0x%08X mode=%u sub=%u/%u fpu=0x%04X/%08X",
+        rbFrame, expectedGameAbsFrame, s_frameOriginAbs, fullHash, mainHash, state->effect_index, inputHash, state->rng_seed,
         state->game_mode, state->substate, state->substate_timer,
         state->fpu_cw, state->mxcsr);
     if (!s_loggedFirstLoadEvent) {
@@ -659,6 +690,9 @@ static void HandleLoadEvent(GekkoGameEvent* ev) {
             ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER),
             s_frameOriginAbs);
     }
+    RollbackAudio_OnGekkoLoad(rbFrame, expectedGameAbsFrame);
+    RollbackStatusFx_OnGekkoLoad(rbFrame, expectedGameAbsFrame);
+    RollbackComboFx_OnGekkoLoad(rbFrame, expectedGameAbsFrame);
 }
 
 // Rollback sequence tracking (shared across calls)
@@ -688,6 +722,9 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
 
     // Gekko advance events are rb_frame-domain; engine memory must stay absolute.
     WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, (uint32_t)gameAbsFrame);
+    RollbackAudio_OnAdvanceBegin(rbFrame, gameAbsFrame, rolling_back);
+    RollbackStatusFx_OnAdvanceBegin(rbFrame, gameAbsFrame, rolling_back);
+    RollbackComboFx_OnAdvanceBegin(rbFrame, gameAbsFrame, rolling_back);
 
     // Store for GetAdvanceInputs (read by input_override.cpp for normal frames)
     s_advP1 = raw_p1;
@@ -1034,6 +1071,9 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
 
     // Suppress pause during rollback gameplay
     InputSystem_SetPauseBlocked(true);
+    RollbackAudio_OnSessionBegin(s_rollbackBudget);
+    RollbackStatusFx_OnSessionBegin(s_rollbackBudget);
+    RollbackComboFx_OnSessionBegin(s_rollbackBudget);
 
     const char* localRole = (s_localPlayer == 0) ? "P1" : "P2";
     const int visibleDelay = Net::DelayPolicy_GetActiveDelay();
@@ -1083,6 +1123,12 @@ void RollbackSession_End() {
         s_frameOriginAbs,
         s_saveEventCount, s_loadEventCount, s_advanceEventCount,
         s_totalRollbacks, s_maxRollbackDepth, s_localInputsSent, s_remoteInputsRecv);
+    const char* sidecarEndReason = s_sessionBroken && s_sessionError[0]
+        ? s_sessionError
+        : "RollbackSession_End";
+    RollbackComboFx_OnSessionEnd(sidecarEndReason);
+    RollbackStatusFx_OnSessionEnd(sidecarEndReason);
+    RollbackAudio_OnSessionEnd(sidecarEndReason);
 
     // Destroy GekkoNet session
     if (s_session) {
@@ -1321,6 +1367,12 @@ EventResult RollbackSession_ProcessNextEvent() {
     // No more events
     const bool hadEvents = s_eventCount > 0;
     const int processedEventCount = s_eventCount;
+    if (hadEvents) {
+        const int32_t gameAbsFrame = CurrentGameAbsFrame();
+        RollbackAudio_OnGekkoBatchEnd(s_currentRbFrame, gameAbsFrame);
+        RollbackStatusFx_OnGekkoBatchEnd(s_currentRbFrame, gameAbsFrame);
+        RollbackComboFx_OnGekkoBatchEnd(s_currentRbFrame, gameAbsFrame);
+    }
     s_frameStarted = false;
     s_rollingBack = false;
     s_events = nullptr;
@@ -1401,6 +1453,9 @@ bool RollbackSession_DrainPendingNonAdvanceEvents() {
     }
 
     s_frameStarted = false;
+    RollbackAudio_OnGekkoBatchEnd(s_currentRbFrame, CurrentGameAbsFrame());
+    RollbackStatusFx_OnGekkoBatchEnd(s_currentRbFrame, CurrentGameAbsFrame());
+    RollbackComboFx_OnGekkoBatchEnd(s_currentRbFrame, CurrentGameAbsFrame());
     s_rollingBack = false;
     s_events = nullptr;
     s_eventCount = 0;
@@ -1635,13 +1690,7 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
 
     // Checksums
     out->baseline_checksum = s_baselineChecksum;
-    __try {
-        out->current_checksum = CalcCRC32(
-            (const void*)ADDR_MATCH_BASE,
-            (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        out->current_checksum = 0xDEADDEAD;
-    }
+    out->current_checksum = ComputeLiveStateChecksum();
 
     // IO counts
     out->local_inputs_sent = s_localInputsSent;

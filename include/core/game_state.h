@@ -655,7 +655,7 @@
 #define ADDR_MATCH_SHIFT_INPUT          0x0049DA10  // Match_ShiftInputState
 #define ADDR_MATCH_UPDATE_STATE_FLAGS   0x0049DBB0  // Match_UpdateStateFlags
 #define ADDR_MATCH_UPDATE_INPUT_TIMERS  0x0049DBE0  // Match_UpdateInputTimers
-#define ADDR_MATCH_UPDATE_COMBO_TIMERS  0x0049DC50  // Match_UpdateComboTimers
+#define ADDR_MATCH_UPDATE_COMBO_TIMERS  0x0049DE20  // Match_UpdateComboTimers
 #define ADDR_MATCH_UPDATE_STUN_TIMERS   0x0049DCE0  // Match_UpdateStunTimers
 
 // Entity update chain

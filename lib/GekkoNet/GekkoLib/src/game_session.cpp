@@ -219,8 +219,8 @@ void Gekko::GameSession::NetworkStats(i32 player, GekkoNetworkStats* stats)
                 stats->rtt_p90 = actor->stats.CalculateRTTPercentile(0.90f);
                 stats->rtt_p95 = actor->stats.CalculateRTTPercentile(0.95f);
                 stats->jitter_p95 = actor->stats.CalculateJitterPercentile(0.95f);
-                stats->packet_loss_ewma = 0.0f;
-                stats->loss_burst_max = 0;
+                stats->packet_loss_ewma = actor->stats.packet_loss_ewma;
+                stats->loss_burst_max = actor->stats.loss_burst_max;
                 return;
             }
         }

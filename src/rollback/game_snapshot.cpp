@@ -19,6 +19,17 @@ constexpr uintptr_t kInputP1Start = ADDR_P1_INPUT_BUFFER;
 constexpr uintptr_t kInputP2Start = ADDR_P2_INPUT_BUFFER;
 constexpr size_t kInputSize = GAME_SNAPSHOT_INPUT_SIZE;
 
+uint32_t SnapshotChecksum(const uint8_t* mainState, size_t mainSize, uint32_t effectIndex) {
+    struct ChecksumParts {
+        uint32_t main_crc;
+        uint32_t effect_index;
+    } parts{};
+
+    parts.main_crc = CalcCRC32(mainState, mainSize);
+    parts.effect_index = effectIndex;
+    return CalcCRC32(&parts, sizeof(parts));
+}
+
 } // namespace
 
 void GameSnapshot_Clear(GameSnapshot* snapshot) {
@@ -45,6 +56,7 @@ bool GameSnapshot_Capture(GameSnapshot* snapshot, int32_t frame) {
     snapshot->game_type = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
     snapshot->match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
     snapshot->rng_seed = DetVer_GetRngSeed();
+    snapshot->effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
 
     __try {
         memcpy(snapshot->main_state, (const void*)kMainStart, kMainSize);
@@ -69,7 +81,10 @@ bool GameSnapshot_Capture(GameSnapshot* snapshot, int32_t frame) {
 
     snapshot->input_read_idx = ReadMemory<uint32_t>(ADDR_INPUT_READ_IDX);
     snapshot->input_write_idx = ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX);
-    snapshot->checksum = CalcCRC32(snapshot->main_state, kMainSize);
+    snapshot->checksum = SnapshotChecksum(
+        snapshot->main_state,
+        kMainSize,
+        snapshot->effect_index);
     snapshot->valid = true;
     return true;
 }
@@ -92,6 +107,7 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
     }
 
     DetVer_SetRngSeed(snapshot->rng_seed);
+    WriteMemory<uint32_t>(ADDR_EFFECT_INDEX, snapshot->effect_index);
 
     WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, snapshot->sim_frame);
     WriteMemory<uint32_t>(ADDR_FRAME_COUNTER, snapshot->display_frame);

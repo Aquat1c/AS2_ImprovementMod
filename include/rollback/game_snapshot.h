@@ -27,6 +27,7 @@ struct GameSnapshot {
     uint32_t match_phase_timer;
     uint32_t input_read_idx;
     uint32_t input_write_idx;
+    uint32_t effect_index;
 
     uint8_t main_state[GAME_SNAPSHOT_MAIN_SIZE];
     uint8_t pre_match_gap[GAME_SNAPSHOT_PRE_MATCH_SIZE];

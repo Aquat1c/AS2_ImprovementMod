@@ -41,6 +41,8 @@ namespace Gekko {
 
         Frame GetLastReceivedFrom(Handle player);
 
+        void InvalidatePredictionsAfter(Frame confirmed_frame);
+
         void ClearIncorrectFramesUpTo(Frame clear_limit);
 
 	private:

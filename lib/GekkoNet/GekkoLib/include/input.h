@@ -50,6 +50,8 @@ namespace Gekko {
 
 		Frame GetLastReceivedFrame();
 
+        void InvalidatePredictionsAfter(Frame confirmed_frame);
+
         void ClearIncorrectFrames(Frame clear_limit);
 
 	private:

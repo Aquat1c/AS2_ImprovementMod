@@ -1,5 +1,8 @@
 #include "input.h"
 
+#include "ui/log_window.h"
+
+#include <algorithm>
 #include <cstdlib> 
 #include <cstring>
 
@@ -65,22 +68,14 @@ void Gekko::InputBuffer::AddInput(Frame frame, u8* input)
             // incorrect prediction
             _incorrent_predicted_inputs.push_back(_first_predicted_input);
 
-            // last prediction frame ? add correct input and reset prediction
-            if (_first_predicted_input == _last_predicted_input) {
-                _inputs[idx]->Init(frame, input, _input_size);
-                ResetPrediction();
-            } else {
-
-                // repeat the correct inputs instead of the wrong one.
-                const Frame diff = _last_predicted_input - _first_predicted_input;
-                for (Frame i = 0; i <= diff; i++) {
-                    const Frame pred_frame = _first_predicted_input + i;
-                    _inputs[pred_frame % _buff_size]->Init(pred_frame, input, _input_size);
-                }
-
-                // move along this frame since the previous is verified now.
-                _first_predicted_input++;
-            }
+            const Frame old_last_predicted = _last_predicted_input;
+            _inputs[idx]->Init(frame, input, _input_size);
+            InvalidatePredictionsAfter(frame);
+            ResetPrediction();
+            LOG_GEKKO_WARN("[Gekko][InputBuffer] prediction mismatch frame=%d invalidated_after=%d old_last_predicted=%d",
+                           frame,
+                           frame,
+                           old_last_predicted);
         } else {
 
             // correct prediction
@@ -161,6 +156,19 @@ void Gekko::InputBuffer::ResetPrediction()
 Frame Gekko::InputBuffer::GetLastReceivedFrame()
 {
 	return _last_received_input;
+}
+
+void Gekko::InputBuffer::InvalidatePredictionsAfter(Frame confirmed_frame)
+{
+    if (_last_predicted_input == GameInput::NULL_FRAME ||
+        _last_predicted_input <= confirmed_frame) {
+        return;
+    }
+
+    const Frame first_to_clear = std::max(confirmed_frame + 1, _first_predicted_input);
+    for (Frame frame = first_to_clear; frame <= _last_predicted_input; frame++) {
+        _inputs[frame % _buff_size]->Clear();
+    }
 }
 
 void Gekko::InputBuffer::ClearIncorrectFrames(Frame clear_limit)

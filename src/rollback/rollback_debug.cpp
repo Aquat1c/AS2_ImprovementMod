@@ -77,20 +77,27 @@ static uint32_t ComputeGameplayDigestChecksum() {
     uint32_t p1Entity = 0;
     uint32_t p2Entity = 0;
     uint32_t preMatchGap = 0;
+    uint32_t effectIndex = 0;
     uint32_t rngSeed = 0;
 
     __try {
         p1Entity = CalcCRC32((const void*)ADDR_P1_ENTITY_BASE, ENTITY_SIZE);
         p2Entity = CalcCRC32((const void*)ADDR_P2_ENTITY_BASE, ENTITY_SIZE);
         preMatchGap = CalcCRC32((const void*)ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE);
+        effectIndex = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
         rngSeed = DetVer_GetRngSeed();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0xDEADDEAD;
     }
 
-    // Use gameplay-critical deterministic state only (both entities + RNG + pre-match gap).
+    // Use gameplay-critical deterministic state only (both entities + RNG +
+    // effect cursor + pre-match gap).
     // This avoids false warnings from non-authoritative visual/transient memory regions.
-    return p1Entity ^ Rotl32(p2Entity, 5) ^ Rotl32(preMatchGap, 11) ^ rngSeed;
+    return p1Entity ^
+           Rotl32(p2Entity, 5) ^
+           Rotl32(preMatchGap, 11) ^
+           Rotl32(effectIndex, 17) ^
+           rngSeed;
 }
 
 static void ResetSessionState() {

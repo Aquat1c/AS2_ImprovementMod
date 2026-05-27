@@ -921,6 +921,14 @@ void Gekko::MessageSystem::OnInputs(NetAddress& addr, NetPacket& pkt)
         if (!sender_handles.empty()) {
             peer_handle = sender_handles[0];
         }
+        if (auto peer = GetPlayerByHandle(peer_handle)) {
+            peer->stats.RecordInputDelivery((u32)input_slots,
+                                            accepted_inputs,
+                                            duplicate_inputs,
+                                            gap_inputs,
+                                            gap_before_frames,
+                                            gap_after_frames);
+        }
 
         RecordNetinAggregate(_netin_aggregate_by_peer,
                              TimeSinceEpoch(),
@@ -964,14 +972,20 @@ void Gekko::MessageSystem::OnInputs(NetAddress& addr, NetPacket& pkt)
                 AddInput(recv_frame, handles[i], input, true);
             }
 
-            auto player = GetPlayerByHandle(handles[i]);
-            if (player) {
-                player->stats.last_received_frame = now;
-            }
-
             const u32 gap_after_frames = MissingFramesCoveredByPacket(start_frame,
                                                                       last_packet_frame,
                                                                       input_q.last_added_input);
+            auto player = GetPlayerByHandle(handles[i]);
+            if (player) {
+                player->stats.last_received_frame = now;
+                player->stats.RecordInputDelivery(input_count,
+                                                  accepted_inputs,
+                                                  duplicate_inputs,
+                                                  gap_inputs,
+                                                  gap_before_frames,
+                                                  gap_after_frames);
+            }
+
             RecordNetinAggregate(_netin_aggregate_by_peer,
                                  now,
                                  false,
