@@ -12,6 +12,8 @@ namespace Rollback {
 struct OwnerDiagSnapshot {
     uint8_t p1_owner;
     uint8_t p2_owner;
+    uint32_t p1_context_ptr;
+    uint32_t p2_context_ptr;
     int8_t p1_facing;
     int8_t p2_facing;
     uint32_t p1_entity_char;
@@ -54,8 +56,20 @@ inline uint32_t OwnerDiag_ReadU32(uintptr_t addr, uint32_t fallback = 0xFFFFFFFF
     }
 }
 
+inline uint32_t OwnerDiag_ReadEntityContext(uintptr_t entityBase) {
+    return OwnerDiag_ReadU32(entityBase, 0);
+}
+
+inline uint8_t OwnerDiag_ReadEntityOwner(uintptr_t entityBase) {
+    const uint32_t context = OwnerDiag_ReadEntityContext(entityBase);
+    if (!context) {
+        return 0xFF;
+    }
+    return OwnerDiag_ReadU8(static_cast<uintptr_t>(context), 0xFF);
+}
+
 inline uint32_t OwnerDiag_ReadEntityChar(uintptr_t entityBase) {
-    const uint32_t charData = OwnerDiag_ReadU32(entityBase, 0);
+    const uint32_t charData = OwnerDiag_ReadEntityContext(entityBase);
     if (!charData) {
         return 0xFFFFFFFFu;
     }
@@ -64,8 +78,10 @@ inline uint32_t OwnerDiag_ReadEntityChar(uintptr_t entityBase) {
 
 inline OwnerDiagSnapshot OwnerDiag_Capture() {
     OwnerDiagSnapshot s{};
-    s.p1_owner = OwnerDiag_ReadU8(ADDR_P1_ENTITY_BASE, 0xFF);
-    s.p2_owner = OwnerDiag_ReadU8(ADDR_P2_ENTITY_BASE, 0xFF);
+    s.p1_context_ptr = OwnerDiag_ReadEntityContext(ADDR_P1_ENTITY_BASE);
+    s.p2_context_ptr = OwnerDiag_ReadEntityContext(ADDR_P2_ENTITY_BASE);
+    s.p1_owner = OwnerDiag_ReadEntityOwner(ADDR_P1_ENTITY_BASE);
+    s.p2_owner = OwnerDiag_ReadEntityOwner(ADDR_P2_ENTITY_BASE);
     s.p1_facing = OwnerDiag_ReadI8(ADDR_P1_ENTITY_BASE + ENTITY_OFF_FACING, 0x7F);
     s.p2_facing = OwnerDiag_ReadI8(ADDR_P2_ENTITY_BASE + ENTITY_OFF_FACING, 0x7F);
     s.p1_entity_char = OwnerDiag_ReadEntityChar(ADDR_P1_ENTITY_BASE);
@@ -91,7 +107,7 @@ inline void OwnerDiag_LogSnapshot(const char* label,
     if (includeTailCrc) {
         NetplayLog_Write(
             "OWNERCHK", -1,
-            "%s mode=%u sub=%u p1_owner=%u p2_owner=%u p1_facing=%d p2_facing=%d "
+            "%s mode=%u sub=%u p1_owner=%u p2_owner=%u p1_ctx=0x%08X p2_ctx=0x%08X p1_facing=%d p2_facing=%d "
             "p1_char=%u p2_char=%u p1_sel=%u/%u/%u/%u p2_sel=%u/%u/%u/%u "
             "p1_tail_crc=0x%08X p2_tail_crc=0x%08X tail_read=%d/%d",
             label ? label : "owner-check",
@@ -99,6 +115,8 @@ inline void OwnerDiag_LogSnapshot(const char* label,
             GetSubstate(),
             s.p1_owner,
             s.p2_owner,
+            s.p1_context_ptr,
+            s.p2_context_ptr,
             (int)s.p1_facing,
             (int)s.p2_facing,
             s.p1_entity_char,
@@ -118,13 +136,15 @@ inline void OwnerDiag_LogSnapshot(const char* label,
     } else {
         NetplayLog_Write(
             "OWNERCHK", -1,
-            "%s mode=%u sub=%u p1_owner=%u p2_owner=%u p1_facing=%d p2_facing=%d "
+            "%s mode=%u sub=%u p1_owner=%u p2_owner=%u p1_ctx=0x%08X p2_ctx=0x%08X p1_facing=%d p2_facing=%d "
             "p1_char=%u p2_char=%u p1_sel=%u/%u/%u/%u p2_sel=%u/%u/%u/%u",
             label ? label : "owner-check",
             GetGameMode(),
             GetSubstate(),
             s.p1_owner,
             s.p2_owner,
+            s.p1_context_ptr,
+            s.p2_context_ptr,
             (int)s.p1_facing,
             (int)s.p2_facing,
             s.p1_entity_char,
@@ -142,10 +162,12 @@ inline void OwnerDiag_LogSnapshot(const char* label,
     if (s.p1_owner == s.p2_owner || s.p1_owner > 1 || s.p2_owner > 1) {
         NetplayLog_Write(
             "OWNERCHK", -1,
-            "ERROR suspicious player owner bytes at %s: p1_owner=%u p2_owner=%u",
+            "ERROR suspicious player owner bytes at %s: p1_owner=%u p2_owner=%u p1_ctx=0x%08X p2_ctx=0x%08X",
             label ? label : "owner-check",
             s.p1_owner,
-            s.p2_owner);
+            s.p2_owner,
+            s.p1_context_ptr,
+            s.p2_context_ptr);
     }
 }
 

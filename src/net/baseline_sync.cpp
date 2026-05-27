@@ -45,6 +45,25 @@ constexpr size_t kAgreementEntityAnimDataOffset = 0x1000;
 constexpr size_t kAgreementEntityAnimDataSize = 0x9000;
 constexpr size_t kAgreementEntityCharStateOffset = 0xA000;
 constexpr size_t kAgreementEntityCharStateSize = 0x0660;
+constexpr size_t kEntityInputBankBaseOffset = 0x0008;
+constexpr size_t kEntityInputBankCount = 6;
+constexpr size_t kEntityInputBankWordCount = 14;
+constexpr size_t kEntityInputDerivedFirstWord = 10;
+constexpr size_t kEntityInputDerivedWordCount = 4;
+constexpr size_t kEntityInputBankStrideBytes = kEntityInputBankWordCount * sizeof(uint16_t);
+constexpr size_t kEntityInputDerivedBytesPerBank = kEntityInputDerivedWordCount * sizeof(uint16_t);
+constexpr size_t kEntityInputDerivedMaskedBytes =
+    kEntityInputBankCount * kEntityInputDerivedBytesPerBank;
+
+static_assert(kAgreementEntityStablePrefixSize == ENTITY_COMBAT_END,
+              "baseline entity agreement prefix must match the verified combat-state window");
+static_assert(kEntityInputDerivedMaskedBytes == 48,
+              "expected six 8-byte derived input-cache slices per entity");
+static_assert(kEntityInputBankBaseOffset +
+                  (kEntityInputBankCount - 1) * kEntityInputBankStrideBytes +
+                  (kEntityInputDerivedFirstWord + kEntityInputDerivedWordCount) * sizeof(uint16_t)
+              <= kAgreementEntityStablePrefixSize,
+              "derived input-cache mask must stay inside the agreement prefix");
 
 static uint32_t SafeRegionCRC(uintptr_t address, size_t size) {
     __try {
@@ -70,6 +89,77 @@ static uint32_t BuildHeaderAgreementCRC() {
     return CalcCRC32(stableBytes, sizeof(stableBytes));
 }
 
+static const char* EntityAgreementLabel(uintptr_t entityBase) {
+    if (entityBase == ADDR_P1_ENTITY_BASE) return "P1";
+    if (entityBase == ADDR_P2_ENTITY_BASE) return "P2";
+    return "entity";
+}
+
+static size_t EntityInputDerivedOffset(size_t bank) {
+    return kEntityInputBankBaseOffset +
+           bank * kEntityInputBankStrideBytes +
+           kEntityInputDerivedFirstWord * sizeof(uint16_t);
+}
+
+static uint32_t BuildEntityDerivedInputCacheCRC(const uint8_t* stablePrefix, size_t size) {
+    uint8_t derivedBytes[kEntityInputDerivedMaskedBytes] = {};
+    if (!stablePrefix || size < kAgreementEntityStablePrefixSize) {
+        return CalcCRC32(derivedBytes, sizeof(derivedBytes));
+    }
+
+    for (size_t bank = 0; bank < kEntityInputBankCount; ++bank) {
+        const size_t srcOffset = EntityInputDerivedOffset(bank);
+        const size_t dstOffset = bank * kEntityInputDerivedBytesPerBank;
+        memcpy(derivedBytes + dstOffset,
+               stablePrefix + srcOffset,
+               kEntityInputDerivedBytesPerBank);
+    }
+
+    return CalcCRC32(derivedBytes, sizeof(derivedBytes));
+}
+
+static void NormalizeEntityInputDerivedCache(uint8_t* stablePrefix, size_t size) {
+    if (!stablePrefix || size < kAgreementEntityStablePrefixSize) {
+        return;
+    }
+
+    for (size_t bank = 0; bank < kEntityInputBankCount; ++bank) {
+        memset(stablePrefix + EntityInputDerivedOffset(bank),
+               0,
+               kEntityInputDerivedBytesPerBank);
+    }
+}
+
+static uint32_t BuildEntityStablePrefixAgreementCRC(uintptr_t entityBase) {
+    uint8_t stablePrefix[kAgreementEntityStablePrefixSize] = {};
+    SafeCopyBytes(stablePrefix, entityBase, sizeof(stablePrefix));
+
+    const uint32_t rawPrefixCrc = CalcCRC32(stablePrefix, sizeof(stablePrefix));
+    const uint32_t derivedCacheCrc =
+        BuildEntityDerivedInputCacheCRC(stablePrefix, sizeof(stablePrefix));
+
+    // The game shifts and clears only the first ten words in each entity input
+    // bank during match bootstrap. Words 10-13 are derived caches that are
+    // recomputed by native gameplay after the baseline point, so hash a local
+    // normalized copy instead of clearing live game memory.
+    NormalizeEntityInputDerivedCache(stablePrefix, sizeof(stablePrefix));
+
+    const uint32_t normalizedPrefixCrc = CalcCRC32(stablePrefix, sizeof(stablePrefix));
+    Rollback::NetplayLog_Write(
+        "BASELINE", -1,
+        "Entity agreement normalization: entity=%s base=0x%08X stable_raw=0x%08X stable_norm=0x%08X derived_cache=0x%08X masked_bytes=%u banks=%u bank_words=%u derived_words=%u live_write=0",
+        EntityAgreementLabel(entityBase),
+        (uint32_t)entityBase,
+        rawPrefixCrc,
+        normalizedPrefixCrc,
+        derivedCacheCrc,
+        (unsigned)kEntityInputDerivedMaskedBytes,
+        (unsigned)kEntityInputBankCount,
+        (unsigned)kEntityInputBankWordCount,
+        (unsigned)kEntityInputDerivedWordCount);
+    return normalizedPrefixCrc;
+}
+
 static uint32_t BuildEntityAgreementCRC(uintptr_t entityBase) {
     struct EntityAgreementParts {
         uint32_t stable_prefix_crc;
@@ -80,7 +170,7 @@ static uint32_t BuildEntityAgreementCRC(uintptr_t entityBase) {
     // Exclude the timers/handle window (0x7D0-0x1000) and the large tail
     // region (0xA660-end). Those ranges currently pick up process-local
     // handle/resource allocations during match bootstrap.
-    parts.stable_prefix_crc = SafeRegionCRC(entityBase, kAgreementEntityStablePrefixSize);
+    parts.stable_prefix_crc = BuildEntityStablePrefixAgreementCRC(entityBase);
     parts.anim_data_crc = SafeRegionCRC(entityBase + kAgreementEntityAnimDataOffset,
                                         kAgreementEntityAnimDataSize);
     parts.char_state_crc = SafeRegionCRC(entityBase + kAgreementEntityCharStateOffset,
