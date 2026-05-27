@@ -31,6 +31,7 @@
 #include "net/session_types.h"
 #include "net/protocol.h"
 #include "net/sync_policy.h"
+#include "net/sync_trace.h"
 #include "net/delay_policy.h"
 #include "net/locked_match_config.h"
 #include "net/enet_transport.h"
@@ -302,6 +303,15 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
                 p->rb_frame_confirmed,
                 p->predicted_frames,
                 p->checksum);
+            break;
+        }
+
+        case Net::PacketType::SyncTrace: {
+            if (payloadLen < sizeof(Net::SyncTracePayload)) {
+                LogGameplayPacketAnomaly("Short SyncTrace", type, payloadLen, sizeof(Net::SyncTracePayload));
+                break;
+            }
+            Net::SyncTrace_OnRemoteTrace(static_cast<const Net::SyncTracePayload*>(payload));
             break;
         }
 
@@ -714,6 +724,7 @@ static bool TryStartRollbackSession() {
     // Reset per-match digest history/desync flags so warnings don't leak across
     // rematch/new-session frame-number reuse windows.
     RollbackDebug_ResetSession();
+    Net::SyncTrace_ResetSession("rollback start");
 
     // Enable state digest for desync detection
     RollbackDebug_SetDigestEnabled(true);
@@ -791,6 +802,7 @@ static void StopRollbackSession(const char* reason) {
     // End session through GameplayBridge
     Net::GameplayBridge_EndSession();
     Net::NetplayPacing_ResetSession(reason ? reason : "rollback stop");
+    Net::SyncTrace_ResetSession(reason ? reason : "rollback stop");
     RollbackDebug_SetDigestEnabled(false);
     InputSyncHooks_SetLoadBarrierFreeze(false);
     InputSyncHooks_SetTimesyncFreeze(false);
@@ -1406,6 +1418,7 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
     Net::NetplayPacing_ResetSession("disconnect");
+    Net::SyncTrace_ResetSession(reason ? reason : "disconnect");
     Net::WinScreenSync_Abort();
     Net::FrontendInputSync_AbortEpoch(reason ? reason : "disconnect");
     Net::SpectatorRuntime_OnDisconnect(reason ? reason : "disconnect");
@@ -1461,6 +1474,7 @@ void OnlineWiring_OnRematch() {
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
     Net::NetplayPacing_ResetSession("rematch");
+    Net::SyncTrace_ResetSession("rematch");
     ResetStartupBarrierState("rematch");
     Net::SpectatorRuntime_OnMatchEnd("rematch");
     Net::NetplayPaletteRuntime_OnMatchEnd("rematch");
@@ -1500,6 +1514,7 @@ void OnlineWiring_OnReturnToSession() {
     s_backgroundPollCount = 0;
     s_backgroundPollFailures = 0;
     Net::NetplayPacing_ResetSession("return to session");
+    Net::SyncTrace_ResetSession("return to session");
     ResetStartupBarrierState("return to session");
     Net::SpectatorRuntime_OnMatchEnd("return to session");
     Net::NetplayPaletteRuntime_OnMatchEnd("return to session");

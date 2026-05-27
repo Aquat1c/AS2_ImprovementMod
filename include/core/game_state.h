@@ -821,6 +821,117 @@ static inline bool IsInCharSelInputSync(void) {
            (sub == CHARSEL_SUB_SELECT || sub == CHARSEL_SUB_CONFIRM);
 }
 
+static inline const char* GameModeName(uint32_t mode) {
+    switch (mode) {
+        case MODE_BOOT:           return "Boot";
+        case MODE_TITLE:          return "Title";
+        case MODE_MENU:           return "Menu";
+        case MODE_LOBBY:          return "Lobby";
+        case MODE_REPLAY_SELECT:  return "ReplaySelect";
+        case MODE_CHARSEL:        return "CharSel";
+        case MODE_PREMATCH_INTRO: return "PrematchIntro";
+        case MODE_MATCH:          return "Match";
+        case MODE_WINSCREEN:      return "WinScreen";
+        case MODE_END:            return "End";
+        case MODE_GALLERY:        return "Gallery";
+        case MODE_OPTIONS:        return "Options";
+        case MODE_PALETTE:        return "Palette";
+        default:                  return "UnknownMode";
+    }
+}
+
+static inline const char* MatchSubstateName(uint32_t substate) {
+    switch (substate) {
+        case MATCH_SUB_LOAD_ASSETS: return "LoadAssets";
+        case MATCH_SUB_SETUP:       return "Setup";
+        case MATCH_SUB_INIT:        return "Init";
+        case MATCH_SUB_GAMEPLAY:    return "Gameplay";
+        case MATCH_SUB_PAUSE:       return "Pause";
+        case MATCH_SUB_END:         return "End";
+        default:                    return "UnknownMatchSub";
+    }
+}
+
+static inline const char* CharSelSubstateName(uint32_t substate) {
+    switch (substate) {
+        case CHARSEL_SUB_INIT:              return "Init";
+        case CHARSEL_SUB_FADEIN:            return "FadeIn";
+        case CHARSEL_SUB_SELECT:            return "Select";
+        case CHARSEL_SUB_CANCEL:            return "Cancel";
+        case CHARSEL_SUB_CONFIRM:           return "Confirm";
+        case CHARSEL_SUB_STAGESEL_SLIDE:    return "StageSlide";
+        case CHARSEL_SUB_STAGESEL_ZOOM:     return "StageZoom";
+        case CHARSEL_SUB_STAGESEL_GRID:     return "StageGrid";
+        case CHARSEL_SUB_STAGESEL_CONFIRM:  return "StageConfirm";
+        case CHARSEL_SUB_FADE_OUT:          return "FadeOut";
+        case CHARSEL_SUB_FADE_BACK:         return "FadeBack";
+        case CHARSEL_SUB_MATCHUP_COMMIT:    return "MatchupCommit";
+        case CHARSEL_SUB_BACK_MENU:         return "BackMenu";
+        case CHARSEL_SUB_BACK_LOBBY:        return "BackLobby";
+        case CHARSEL_SUB_TO_MATCH:          return "ToMatch";
+        default:                            return "UnknownCharSelSub";
+    }
+}
+
+static inline const char* NativeSubstateName(uint32_t mode, uint32_t substate) {
+    switch (mode) {
+        case MODE_MATCH:
+            return MatchSubstateName(substate);
+        case MODE_CHARSEL:
+            return CharSelSubstateName(substate);
+        case MODE_LOBBY:
+            switch (substate) {
+                case LOBBY_SUB_INIT:     return "Init";
+                case LOBBY_SUB_FADEIN:   return "FadeIn";
+                case LOBBY_SUB_INTERACT: return "Interact";
+                case LOBBY_SUB_INFO:     return "Info";
+                case LOBBY_SUB_FADEOUT:  return "FadeOut";
+                default:                 return "UnknownLobbySub";
+            }
+        case MODE_OPTIONS:
+            switch (substate) {
+                case OPTIONS_SUB_INIT:      return "Init";
+                case OPTIONS_SUB_FADEIN:    return "FadeIn";
+                case OPTIONS_SUB_MAIN:      return "Main";
+                case OPTIONS_SUB_GAME:      return "Game";
+                case OPTIONS_SUB_SOUND:     return "Sound";
+                case OPTIONS_SUB_DISPLAY:   return "Display";
+                case OPTIONS_SUB_KEYCONFIG: return "KeyConfig";
+                case OPTIONS_SUB_EXIT:      return "Exit";
+                default:                    return "UnknownOptionsSub";
+            }
+        case MODE_GALLERY:
+            switch (substate) {
+                case GALLERY_SUB_INIT:    return "Init";
+                case GALLERY_SUB_FADEIN:  return "FadeIn";
+                case GALLERY_SUB_SELECT:  return "Select";
+                case GALLERY_SUB_DETAIL:  return "Detail";
+                case GALLERY_SUB_FADEOUT: return "FadeOut";
+                default:                  return "UnknownGallerySub";
+            }
+        case MODE_WINSCREEN:
+            switch (substate) {
+                case STORY_SUB_ROUTE:         return "Route";
+                case STORY_SUB_DIALOGUE_INIT: return "DialogueInit";
+                case STORY_SUB_DIALOGUE:      return "Dialogue";
+                case STORY_SUB_DIALOGUE_ADV:  return "DialogueAdvance";
+                case STORY_SUB_DIALOGUE_END:  return "DialogueEnd";
+                case STORY_SUB_EVENT_SETUP:   return "EventSetup";
+                case STORY_SUB_EVENT:         return "Event";
+                case STORY_SUB_EVENT_END:     return "EventEnd";
+                case STORY_SUB_PREMATCH:      return "Prematch";
+                case STORY_SUB_STAGE_INTRO:   return "StageIntro";
+                case STORY_SUB_STAGE:         return "Stage";
+                case STORY_SUB_RESULTS_INIT:  return "ResultsInit";
+                case STORY_SUB_RESULTS:       return "Results";
+                case STORY_SUB_COMPLETE:      return "Complete";
+                default:                      return "StorySequence";
+            }
+        default:
+            return "Substate";
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif

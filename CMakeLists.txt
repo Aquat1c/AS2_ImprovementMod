@@ -17,7 +17,8 @@
 #   - autopunch: https://github.com/delthas/autopunch (protocol-compatible local client behavior)
 
 cmake_minimum_required(VERSION 3.15)
-project(AS2_Rollback VERSION 0.5.0 LANGUAGES C CXX)
+project(AS2_Rollback VERSION 0.6.0 LANGUAGES C CXX)
+set(AS2_MOD_VERSION "0.6-beta")
 
 enable_testing()
 
@@ -289,6 +290,10 @@ set(INPUT_HEADERS
     include/input/input_system.h
 )
 
+set(DIAGNOSTICS_HEADERS
+    include/diagnostics/async_log.h
+)
+
 set(ROLLBACK_HEADERS
     include/rollback/determinism_verify.h
     include/rollback/frame_lineage.h
@@ -341,6 +346,7 @@ set(NET_HEADERS
     include/net/delay_policy.h
     include/net/player_side_mapping.h
     include/net/barrier_protocol.h
+    include/net/sync_trace.h
     include/net/gameplay_bridge.h
 )
 
@@ -397,6 +403,10 @@ set(INPUT_SOURCES
     src/input/input_system.cpp
 )
 
+set(DIAGNOSTICS_SOURCES
+    src/diagnostics/async_log.cpp
+)
+
 set(ROLLBACK_SOURCES
     src/rollback/determinism_verify.cpp
     src/rollback/frame_lineage.cpp
@@ -447,6 +457,7 @@ set(NET_SOURCES
     src/net/delay_policy.cpp
     src/net/player_side_mapping.cpp
     src/net/barrier_protocol.cpp
+    src/net/sync_trace.cpp
     src/net/gameplay_bridge.cpp
     src/net/set_tracker.cpp
 )
@@ -500,11 +511,33 @@ set_target_properties(frontend_sync_tests PROPERTIES
 
 add_test(NAME frontend_sync_tests COMMAND frontend_sync_tests)
 
+add_executable(async_log_tests
+    tests/async_log_tests.cpp
+    src/diagnostics/async_log.cpp
+)
+
+target_include_directories(async_log_tests PRIVATE
+    include
+)
+
+target_compile_definitions(async_log_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(async_log_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME async_log_tests COMMAND async_log_tests)
+
 add_library(as2_rollback SHARED
     ${CORE_HEADERS}
     ${PATCH_HEADERS}
     ${UI_HEADERS}
     ${INPUT_HEADERS}
+    ${DIAGNOSTICS_HEADERS}
     ${ROLLBACK_HEADERS}
     ${NET_HEADERS}
     ${TESTING_HEADERS}
@@ -514,6 +547,7 @@ add_library(as2_rollback SHARED
     ${PATCH_SOURCES}
     ${UI_SOURCES}
     ${INPUT_SOURCES}
+    ${DIAGNOSTICS_SOURCES}
     ${ROLLBACK_SOURCES}
     ${NET_SOURCES}
     ${TESTING_SOURCES}
@@ -532,6 +566,7 @@ target_include_directories(as2_rollback PRIVATE
     include/patches
     include/ui
     include/input
+    include/diagnostics
     include/rollback
     include/testing
     include/training
@@ -748,7 +783,7 @@ endif()
 
 message(STATUS "")
 message(STATUS "=== AS2 Improvement Mod Build Configuration ===")
-message(STATUS "Version: ${PROJECT_VERSION}")
+message(STATUS "Version: ${AS2_MOD_VERSION}")
 message(STATUS "Static Runtime: YES (/MT)")
 message(STATUS "MinHook: ${MINHOOK_DIR} (static)")
 message(STATUS "SDL3: ${SDL3_DIR} (DLL required)")

@@ -13,6 +13,9 @@
  *   - Desync suspicion / checksum mismatch
  *
  * Uses a clear, searchable format with timestamps and frame numbers.
+ * Lines are queued through Diagnostics::AsyncLog so gameplay/front-end hot
+ * paths do not perform FILE I/O. Queue overflow drops log lines and emits
+ * LOGSTATS summaries instead of blocking the game.
  * Supports normal and verbose modes.
  */
 
@@ -70,7 +73,7 @@ void NetplayLog_ValueChange(const char* tag, int32_t frame,
                             int before, int after,
                             const char* reason);
 
-/// Force flush the log file (call on errors or shutdown).
+/// Request an async flush. Shutdown performs a blocking drain.
 void NetplayLog_Flush();
 
 } // namespace Rollback

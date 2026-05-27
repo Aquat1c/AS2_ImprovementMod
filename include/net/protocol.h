@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 13;
+constexpr uint16_t PROTOCOL_VERSION = 14;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -99,6 +99,7 @@ enum class PacketType : uint16_t {
     Pong            = 31,   // Application-level pong
     StateDigest     = 32,   // CRC32 state digest for desync detection
     FrameSyncStatus = 33,   // Lightweight frame-progress telemetry
+    SyncTrace       = 35,   // Synchronized diagnostics trace, debug channel
 };
 
 // ============================================================================
@@ -154,6 +155,69 @@ struct FrameSyncStatusPayload {
     int32_t  rb_frame_confirmed;            // Sender's fully confirmed rollback frame
     int32_t  predicted_frames;              // Sender's outstanding predicted frames
     uint32_t checksum;                      // Sender's current state checksum
+};
+
+enum class SyncTraceDomain : uint8_t {
+    None             = 0,
+    FrontendLockstep = 1,
+    GameplayRollback = 2,
+    LifecycleEvent   = 3,
+};
+
+constexpr uint16_t SYNC_TRACE_FLAG_VALID_STATE_CRC  = 1 << 0;
+constexpr uint16_t SYNC_TRACE_FLAG_VALID_PLAYER_CRC = 1 << 1;
+constexpr uint16_t SYNC_TRACE_FLAG_ROLLBACK_SETTLED = 1 << 2;
+constexpr uint16_t SYNC_TRACE_FLAG_ROLLING_BACK     = 1 << 3;
+constexpr uint16_t SYNC_TRACE_FLAG_PASSIVE_PHASE    = 1 << 4;
+
+struct SyncTracePayload {
+    uint16_t schema;             // start at 1
+    uint16_t flags;              // SYNC_TRACE_FLAG_*
+
+    uint32_t epoch_id;           // frontend epoch, match epoch, or session token
+    uint32_t seq;                // local monotonic trace sequence
+
+    uint8_t  domain;             // SyncTraceDomain
+    uint8_t  sync_mode;          // Net::SyncMode
+    uint8_t  lockstep_context;   // Net::LockstepContext
+    uint8_t  frontend_phase;     // Net::FrontendSyncPhase
+
+    uint8_t  match_lifecycle_phase; // Net::MatchLifecyclePhase
+    uint8_t  rollback_phase;         // Net::MatchRollbackPhase
+    uint8_t  native_mode;            // MODE_*
+    uint8_t  native_substate;        // *_SUB_*
+
+    uint8_t  game_type;
+    uint8_t  local_player;       // 0=P1, 1=P2, 0xFF unknown
+    uint8_t  remote_player;      // 0=P1, 1=P2, 0xFF unknown
+    uint8_t  _pad0;
+
+    int32_t  game_abs_frame;     // absolute engine/sim frame if known, else -1
+    int32_t  rb_frame;           // rollback frame for gameplay, else -1
+    uint32_t frontend_frame;     // lockstep consume frame, else 0
+
+    uint16_t local_input;        // normalized local input for compared frame
+    uint16_t remote_input;       // normalized remote input for compared frame
+
+    uint32_t local_input_frame;  // frontend local head or rb input head
+    uint32_t remote_latest_frame;// frontend remote latest or rb remote received
+    uint32_t consume_frame;      // frontend consume frame or rb current frame
+    uint32_t remote_ack_frame;   // frontend ack or rb confirmed frame
+
+    uint8_t  local_visible_delay;
+    uint8_t  remote_visible_delay;
+    uint8_t  local_effective_delay;
+    uint8_t  remote_effective_delay;
+
+    uint8_t  rollback_budget;
+    uint8_t  predicted_frames;
+    uint8_t  last_rollback_depth;
+    uint8_t  max_rollback_depth;
+
+    uint32_t state_crc;          // normalized phase-specific CRC
+    uint32_t p1_crc;             // optional; 0 if not captured
+    uint32_t p2_crc;             // optional; 0 if not captured
+    uint32_t rng_seed;           // 0 if unavailable
 };
 
 // Initial session sync payloads
@@ -466,6 +530,8 @@ static_assert(sizeof(SyncConfirmPayload) == 12,
     "SyncConfirmPayload wire size must remain stable");
 static_assert(sizeof(StageSyncPayload) == 20,
     "StageSyncPayload wire size must remain stable");
+static_assert(sizeof(PacketType) + sizeof(SyncTracePayload) <= MAX_PACKET_SIZE,
+    "SyncTracePayload must fit inside one transport packet");
 
 // NatInfoPayload flags
 constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;
@@ -482,6 +548,16 @@ constexpr uint8_t NAT_INFO_EX_FLAG_PCP_ENABLED    = 1 << 1;
 // ============================================================================
 // Helpers
 // ============================================================================
+
+inline const char* SyncTraceDomainName(SyncTraceDomain domain) {
+    switch (domain) {
+        case SyncTraceDomain::None:             return "None";
+        case SyncTraceDomain::FrontendLockstep: return "FrontendLockstep";
+        case SyncTraceDomain::GameplayRollback: return "GameplayRollback";
+        case SyncTraceDomain::LifecycleEvent:   return "LifecycleEvent";
+        default:                                return "Unknown";
+    }
+}
 
 inline const char* PacketTypeName(PacketType type) {
     switch (type) {
@@ -522,6 +598,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::Pong:           return "Pong";
         case PacketType::StateDigest:    return "StateDigest";
         case PacketType::FrameSyncStatus:return "FrameSyncStatus";
+        case PacketType::SyncTrace:      return "SyncTrace";
         default:                         return "Unknown";
     }
 }

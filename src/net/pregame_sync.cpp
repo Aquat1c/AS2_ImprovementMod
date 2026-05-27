@@ -19,6 +19,7 @@
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/protocol.h"
+#include "net/sync_trace.h"
 #include "net/mode_ownership.h"
 #include "net/netplay_menu_controller.h"
 #include "net/game_settings_sync.h"
@@ -492,6 +493,14 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
                 NetplayPaletteRuntime_OnRemoteAck(static_cast<const PaletteAckPayload*>(payload));
             } else {
                 LogPregamePacketAnomaly("Short PaletteAck", type, payloadLen, sizeof(PaletteAckPayload));
+            }
+            break;
+
+        case PacketType::SyncTrace:
+            if (payloadLen >= sizeof(SyncTracePayload)) {
+                SyncTrace_OnRemoteTrace(static_cast<const SyncTracePayload*>(payload));
+            } else {
+                LogPregamePacketAnomaly("Short SyncTrace", type, payloadLen, sizeof(SyncTracePayload));
             }
             break;
 

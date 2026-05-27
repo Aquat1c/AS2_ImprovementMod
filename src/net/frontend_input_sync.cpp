@@ -2,6 +2,9 @@
 
 #include "net/barrier_protocol.h"
 #include "net/delay_policy.h"
+#if !defined(AS2_FRONTEND_SYNC_TESTING)
+#include "net/sync_trace.h"
+#endif
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
@@ -1077,13 +1080,23 @@ bool FrontendInputSync_ConsumeCurrentFrame(uint16_t* outLocal,
     MaybeApplyPendingDelay();
 
     const int idx = (int)(s_consumeFrame & FRONTEND_RING_MASK);
+    const uint32_t consumedFrame = s_consumeFrame;
     *outLocal = s_localInputs[idx];
     *outRemote = s_remoteInputs[idx];
     if (outFrameId) {
         outFrameId->epoch_id = s_epochId;
         outFrameId->phase = (uint16_t)s_phase;
-        outFrameId->frame = (uint16_t)s_consumeFrame;
+        outFrameId->frame = (uint16_t)consumedFrame;
     }
+
+#if !defined(AS2_FRONTEND_SYNC_TESTING)
+    SyncTrace_OnFrontendFrameConsumed(
+        s_epochId,
+        s_phase,
+        consumedFrame,
+        *outLocal,
+        *outRemote);
+#endif
 
     s_hasRemoteInput[idx] = false;
     s_consumeFrame++;

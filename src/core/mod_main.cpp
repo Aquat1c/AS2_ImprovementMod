@@ -39,6 +39,7 @@
 #include "net/pregame_sync.h"
 #include "net/match_lifecycle.h"
 #include "net/sync_policy.h"
+#include "net/sync_trace.h"
 #include "net/delay_policy.h"
 #include "net/game_settings_sync.h"
 #include "net/gameplay_bridge.h"
@@ -546,6 +547,9 @@ static void DeferredInit() {
     Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
     Rollback::NetplayLog_SetVerbose(g_config.verboseLogging);
     LogInitStep("NetplayLog_Init", "END");
+    LogInitStep("SyncTrace_Init", "BEGIN");
+    Net::SyncTrace_Init();
+    LogInitStep("SyncTrace_Init", "END");
     LogInitStep("OnlineWiring_Init", "BEGIN");
     Rollback::OnlineWiring_Init();
     LogInitStep("OnlineWiring_Init", "END");
@@ -608,7 +612,7 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
     timeBeginPeriod(1);
 
     LOG_INFO("========================================");
-    LOG_INFO("Alice Senki 2 - Mod v0.5");
+    LOG_INFO("Alice Senki 2 - Mod 0.6-beta");
     LOG_INFO("Build: %s %s", __DATE__, __TIME__);
     LOG_INFO("========================================");
     LOG_INFO("Game module: 0x%p", gameModule);
@@ -649,6 +653,7 @@ __declspec(dllexport) void ModShutdown() {
         PracticeTools_Shutdown();
         SIR_Shutdown();
         Rollback::OnlineWiring_Shutdown();
+        Net::SyncTrace_Shutdown();
         Rollback::NetplayLog_Shutdown();
         Rollback::RollbackDebug_Shutdown();
         Rollback::RollbackSession_Shutdown();
@@ -762,6 +767,7 @@ __declspec(dllexport) void ModOnFrame() {
         Net::GameplayBridge_FrameUpdate();
         Rollback::RollbackDebug_FrameUpdate();
     }
+    Net::SyncTrace_FrameUpdate();
 
     // Log when SDL input changes
     static uint16_t prevSdlP1 = 0;

@@ -104,6 +104,7 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         case PacketType::Ping:
         case PacketType::Pong:
         case PacketType::StateDigest:
+        case PacketType::SyncTrace:
             return false;
 
         default:
@@ -122,6 +123,7 @@ inline uint8_t BarrierProtocol_GetChannel(PacketType type) {
         case PacketType::Ping:
         case PacketType::Pong:
         case PacketType::StateDigest:
+        case PacketType::SyncTrace:
             return CHANNEL_DEBUG;
 
         // Startup gameplay-entry barrier — control channel, same as GameplayStart
