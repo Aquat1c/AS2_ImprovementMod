@@ -24,15 +24,101 @@ static bool s_isHost = false;
 static bool s_advanceGateReleased = false;
 
 constexpr uint16_t WINSCREEN_ADVANCE_MASK = (uint16_t)(INPUT_A | INPUT_C | INPUT_START);
+constexpr int PENDING_WINSCREEN_FRAME_INPUTS = 64;
+
+static WinScreenFrameInputPayload s_pendingRemoteFrames[PENDING_WINSCREEN_FRAME_INPUTS] = {};
+static int s_pendingRemoteFrameCount = 0;
+static uint32_t s_pendingRemoteFrameDropped = 0;
 
 static bool IsAdvanceIntent(uint16_t packedInput) {
     return (packedInput & WINSCREEN_ADVANCE_MASK) != 0;
 }
 
-static void ResetState() {
+static void ResetRuntimeState() {
     s_active = false;
     s_isHost = false;
     s_advanceGateReleased = false;
+}
+
+static void ClearPendingRemoteFrames() {
+    s_pendingRemoteFrameCount = 0;
+    s_pendingRemoteFrameDropped = 0;
+}
+
+static void ResetState() {
+    ResetRuntimeState();
+    ClearPendingRemoteFrames();
+}
+
+static bool IsPendingCandidate(const WinScreenFrameInputPayload* p) {
+    if (!p || s_active || !s_initialized) {
+        return false;
+    }
+    if (GetGameMode() != MODE_WINSCREEN) {
+        return false;
+    }
+    if (p->phase != (uint16_t)FrontendSyncPhase::WinScreen) {
+        return false;
+    }
+    return true;
+}
+
+static void StorePendingRemoteFrame(const WinScreenFrameInputPayload* p) {
+    if (!p) {
+        return;
+    }
+    if (s_pendingRemoteFrameCount >= PENDING_WINSCREEN_FRAME_INPUTS) {
+        for (int i = 1; i < PENDING_WINSCREEN_FRAME_INPUTS; ++i) {
+            s_pendingRemoteFrames[i - 1] = s_pendingRemoteFrames[i];
+        }
+        s_pendingRemoteFrameCount = PENDING_WINSCREEN_FRAME_INPUTS - 1;
+        s_pendingRemoteFrameDropped++;
+    }
+
+    s_pendingRemoteFrames[s_pendingRemoteFrameCount++] = *p;
+    if (s_pendingRemoteFrameCount <= 4 || (s_pendingRemoteFrameCount % 16) == 0) {
+        Rollback::NetplayLog_Write(
+            "WINLOCK", -1,
+            "Buffered early win-screen frame input: epoch=%u serial=%u frame=%u count=%u buffered=%d dropped=%u",
+            p->epoch_id,
+            p->phase_serial,
+            p->frame,
+            p->input_count,
+            s_pendingRemoteFrameCount,
+            s_pendingRemoteFrameDropped);
+    }
+}
+
+static void DrainPendingRemoteFrames() {
+    if (s_pendingRemoteFrameCount <= 0) {
+        return;
+    }
+
+    int replayed = 0;
+    int discarded = 0;
+    const uint32_t epoch = FrontendInputSync_GetEpochId();
+    const uint32_t serial = FrontendInputSync_GetPhaseSerial();
+    for (int i = 0; i < s_pendingRemoteFrameCount; ++i) {
+        const WinScreenFrameInputPayload& p = s_pendingRemoteFrames[i];
+        if (p.epoch_id == epoch &&
+            p.phase_serial == serial &&
+            p.phase == (uint16_t)FrontendSyncPhase::WinScreen) {
+            FrontendInputSync_OnRemoteWinScreenFrameInput(&p);
+            replayed++;
+        } else {
+            discarded++;
+        }
+    }
+
+    Rollback::NetplayLog_Write(
+        "WINLOCK", -1,
+        "Drained early win-screen frame inputs: replayed=%d discarded=%d dropped=%u epoch=%u serial=%u",
+        replayed,
+        discarded,
+        s_pendingRemoteFrameDropped,
+        epoch,
+        serial);
+    ClearPendingRemoteFrames();
 }
 
 } // anonymous namespace
@@ -65,13 +151,14 @@ void WinScreenSync_Begin() {
         return;
     }
 
-    ResetState();
+    ResetRuntimeState();
     s_active = true;
     s_isHost = (Session_GetRole() == SessionRole::Host);
     FrontendInputSync_BeginInputPhase(
         FrontendSyncPhase::WinScreen,
         PacketType::WinScreenFrameInput,
         "winscreen begin");
+    DrainPendingRemoteFrames();
 
     Rollback::NetplayLog_Write(
         "WINLOCK", -1,
@@ -129,9 +216,6 @@ void WinScreenSync_CaptureLocalInput(uint16_t packedInput) {
     if (!s_active) {
         return;
     }
-    if (IsAdvanceIntent(packedInput)) {
-        FrontendInputSync_ReportLocalAdvanceIntent(1);
-    }
     FrontendInputSync_CaptureLocalInput(packedInput);
 }
 
@@ -150,15 +234,26 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         return false;
     }
 
-    if (IsAdvanceIntent(remoteInput)) {
+    const bool localAdvance = IsAdvanceIntent(localInput);
+    const bool remoteAdvance = IsAdvanceIntent(remoteInput);
+    if (localAdvance) {
+        FrontendInputSync_ReportLocalAdvanceIntent(1);
+    }
+    if (remoteAdvance) {
         FrontendInputSync_ReportRemoteAdvanceIntent(1);
     }
 
-    if (!FrontendInputSync_BothAdvanceObserved()) {
-        if (IsAdvanceIntent(localInput) || IsAdvanceIntent(remoteInput)) {
+    const bool releaseRequested =
+        s_advanceGateReleased ||
+        localAdvance ||
+        remoteAdvance ||
+        FrontendInputSync_RemoteAdvanceObserved();
+
+    if (!releaseRequested) {
+        if (localAdvance || remoteAdvance) {
             Rollback::NetplayLog_Verbose(
                 "WINLOCK", -1,
-                "Holding win-screen advance until both peers confirm: local_adv=%d remote_adv=%d",
+                "Holding win-screen advance: local_adv=%d remote_adv=%d",
                 FrontendInputSync_LocalAdvanceObserved() ? 1 : 0,
                 FrontendInputSync_RemoteAdvanceObserved() ? 1 : 0);
         }
@@ -169,7 +264,10 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
             s_advanceGateReleased = true;
             Rollback::NetplayLog_Write(
                 "WINLOCK", -1,
-                "Win-screen advance gate released: local_adv=1 remote_adv=1");
+                "Win-screen advance gate released: local_adv=%d remote_adv=%d requester=%s",
+                FrontendInputSync_LocalAdvanceObserved() ? 1 : 0,
+                FrontendInputSync_RemoteAdvanceObserved() ? 1 : 0,
+                localAdvance ? "local" : (remoteAdvance ? "remote" : "legacy"));
         }
         localInput = (uint16_t)(localInput | INPUT_A);
         remoteInput = (uint16_t)(remoteInput | INPUT_A);
@@ -210,6 +308,10 @@ uint32_t WinScreenSync_GetRemoteLatestFrame() {
 }
 
 void WinScreenSync_OnRemoteFrameInput(const WinScreenFrameInputPayload* p) {
+    if (IsPendingCandidate(p)) {
+        StorePendingRemoteFrame(p);
+        return;
+    }
     FrontendInputSync_OnRemoteWinScreenFrameInput(p);
 }
 

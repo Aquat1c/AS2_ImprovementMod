@@ -383,7 +383,7 @@ static void TestStageMergeOpposingDirectionsAndConfirm() {
         "same-frame stage confirm should remain deterministic when both peers press confirm");
 }
 
-static void TestWinScreenAdvanceWaitsForBothPeers() {
+static void TestWinScreenAdvanceReleasesFromEitherPeer() {
     ResetSubsystems();
     BeginNegotiatedWinScreen(2);
 
@@ -399,22 +399,22 @@ static void TestWinScreenAdvanceWaitsForBothPeers() {
         "winscreen frame should be ready after local and remote inputs arrive");
     TEST_CHECK(Net::WinScreenSync_ConsumeCurrentFrame(&p1, &p2),
         "winscreen frame should consume deterministically");
-    TEST_CHECK(((p1 | p2) & (INPUT_A | INPUT_C | INPUT_START)) == 0,
-        "a single peer's winscreen advance should be suppressed until both peers confirm");
+    TEST_CHECK((p1 & INPUT_A) != 0 && (p2 & INPUT_A) != 0,
+        "a remote winscreen advance should release a synchronized confirm pulse for both game slots");
     TEST_CHECK(!Net::WinScreenSync_LocalConfirmed() && Net::WinScreenSync_RemoteConfirmed(),
-        "remote advance should be remembered while local advance is still pending");
+        "remote advance should be remembered without requiring local advance");
 
-    Net::WinScreenSync_CaptureLocalInput(INPUT_A);
+    Net::WinScreenSync_CaptureLocalInput(0);
     Net::WinScreenFrameInputPayload remoteHold =
         MakeWinScreenFrameInput(epochId, 1, 0);
     Net::WinScreenSync_OnRemoteFrameInput(&remoteHold);
 
     TEST_CHECK(Net::WinScreenSync_ConsumeCurrentFrame(&p1, &p2),
-        "winscreen should consume the release frame once both peers have confirmed");
+        "winscreen should keep consuming after the advance gate has released");
     TEST_CHECK((p1 & INPUT_A) != 0 && (p2 & INPUT_A) != 0,
-        "once both peers confirm, winscreen should emit a synchronized confirm pulse");
-    TEST_CHECK(Net::WinScreenSync_BothConfirmed(),
-        "winscreen should remember that both peers confirmed");
+        "released winscreen should keep confirm held until native Mode 9 exits");
+    TEST_CHECK(Net::WinScreenSync_RemoteConfirmed() && !Net::WinScreenSync_BothConfirmed(),
+        "winscreen should record the actual peer that requested the skip");
 }
 
 static void TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters() {
@@ -774,7 +774,7 @@ int main() {
     TestConsumedLocalFrontendInputRemainsResendableUntilAcked();
     TestFrontendSendAheadCannotOverwritePeerAckWindow();
     TestStageMergeOpposingDirectionsAndConfirm();
-    TestWinScreenAdvanceWaitsForBothPeers();
+    TestWinScreenAdvanceReleasesFromEitherPeer();
     TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters();
     TestStalePhaseSerialFrontendInputIsIgnored();
     TestDuplicateFrontendInputAndStageSyncAreIdempotent();

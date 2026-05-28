@@ -2,6 +2,8 @@
 
 A comprehensive runtime modification for Alice Senki 2, a doujin 2D fighting game. This mod adds rollback-based online netplay, a modern SDL3 input system, an ImGui debug overlay, training mode tools, a spectator system, custom palette support, NAT-aware connection setup (port mapping, external-endpoint probing, and UDP punch assist), and an extensible mod loader. Built entirely as a DLL proxy stack that requires no modifications to the original game executable.
 
+**0.6 branch note:** this document describes the live 0.6 architecture. Older planning notes may still mention shared-safe delay as the default, a 200ms Gekko resend interval, or the legacy `resimulation.cpp` path as the live rollback engine. Those references are historical; the current branch uses per-player/asymmetric gameplay delay by default, 50ms Gekko input retry, event-driven Gekko rollback replay, and a host-authoritative FPS timing mode.
+
 ---
 
 ## Table of Contents
@@ -158,10 +160,11 @@ ModOnGameExit()           -- Log exit
 | Session management | Complete | ENet transport, handshake, connection stats, graceful disconnect |
 | Pre-game sync | Complete | Character select lockstep, stage select merge, config exchange, baseline agreement |
 | Match bootstrap | Complete | Config negotiation, load barrier, baseline CRC verification, gameplay handoff |
-| Rollback engine | Complete | GekkoNet integration, savestate ring buffer, resimulation, prediction |
+| Rollback engine | Complete | GekkoNet integration, event-driven savestate load/save/advance replay, prediction correction |
 | Determinism tools | Complete | RNG hooking, FPU capture, A/B comparison, per-frame checksum, desync dump |
-| Delay negotiation | Complete | RTT-based recommendation, configurable visible delay, hidden delay floor |
-| Adaptive pacing | Complete | Frame-rate scaling to smooth rollback jitter |
+| Delay negotiation | Complete | RTT/p90 recommendation, configurable visible delay, hidden delay floor, per-player default delay mode with shared-max opt-in |
+| Frame timing sync | Complete | Optional 17ms-to-60fps limiter correction, enabled by default and host-authoritative during netplay |
+| Adaptive pacing | Complete | Tick-slew plus prediction-debt soft/hard/stall holds, with net-quality classification and telemetry |
 | NAT traversal | Partial | Optional UPnP + PCP/NAT-PMP mapping, libjuice STUN/TURN diagnostics/signaling, and autopunch-compatible UDP punch assist; gameplay traffic relay and direct IPv6 peer transport are not implemented yet |
 | Spectator system | Complete | Server + client + local playback, frame archive, palette propagation, relay/LAN discovery, fast-forward/hard-sync |
 | Netplay menu | Complete | Full in-game menu for hosting, joining, spectating, settings |
@@ -187,7 +190,7 @@ Idle -> Connecting -> Handshaking -> Connected -> Ready -> Disconnecting -> Idle
 
 **Roles:** Host or Join (client).
 
-**Handshake:** Uses `Hello`/`HelloAck` packets carrying protocol version, an exact local mod build fingerprint, and nickname (24 bytes max). Protocol or build mismatches trigger immediate disconnect before gameplay setup.
+**Handshake:** Uses `Hello`/`HelloAck` packets carrying protocol version, an exact local mod build fingerprint, nickname (64 bytes max), round-count option, and local frame-timing mode. Protocol or build mismatches trigger immediate disconnect before gameplay setup. Joiners adopt the host's frame-timing mode so both clients run the same 58.8fps vanilla cadence or corrected 60.0fps cadence during the session.
 
 **Deferred packets:** Up to 64 control packets are buffered before the packet callback is registered, then flushed on registration.
 
@@ -195,7 +198,7 @@ Idle -> Connecting -> Handshaking -> Connected -> Ready -> Disconnecting -> Idle
 
 ### Protocol
 
-Defined in `protocol.h` (457 lines). Protocol version 6 with 40+ packet types.
+Defined in `protocol.h`. Protocol version 16 with 40+ packet types.
 
 **Wire format:**
 - Max packet size: 1200 bytes (MTU-friendly)
@@ -221,8 +224,8 @@ Defined in `protocol.h` (457 lines). Protocol version 6 with 40+ packet types.
 - **Debug:** Ping, Pong, StateDigest, FrameSyncStatus
 
 **Key payloads:**
-- `HelloPayload`: Protocol version, exact local mod build fingerprint (uint32), nickname[64], listen port
-- `ConfigExchangePayload`: Character IDs, palettes, stage, round count, time limit, RNG seed, session seed, delay/rollback configuration
+- `HelloPayload`: Protocol version, exact local mod build fingerprint (uint32), nickname[64], listen port, round count, frame-timing mode
+- `ConfigExchangePayload`: Character IDs, palettes, stage, round count, time limit, RNG seed, session seed, delay/rollback configuration, frame-timing mode
 - `BaselineDigestPayload`: CRC32 of baseline savestate for agreement verification
 - `BaselineBreakdownPayload`: Per-region CRCs (main, header, context, effects, summons, entities, input buffers) for mismatch diagnosis
 - `CharSelFrameInputPayload`: Frame number, ack frame, 8-slot input history with redundancy for packet loss recovery
@@ -247,18 +250,19 @@ Each phase dispatches incoming packets through `OnPregamePacket()`, which routes
 
 ### Character Select Lockstep
 
-Character select (`charsel_sync.cpp`, 765 lines) uses non-blocking lockstep synchronization:
+Character select uses the shared frontend lockstep backend:
 
 - **Ring buffer:** 512-frame circular buffer for local and remote inputs
 - **Input redundancy:** Each packet carries 8 previous frames for packet loss recovery
-- **Input delay:** 2-10 frames, computed from RTT on first capture (clamped)
+- **Input delay:** frontend-specific delay negotiated from RTT/jitter and clamped separately from gameplay rollback delay
+- **Lead cap:** local capture is bounded to the consume frame plus effective frontend delay plus a small extra margin, preventing the old hundreds-of-frames send-ahead queue debt
+- **Phase serial:** packets are scoped by epoch, phase, and monotonically increasing phase serial so stale packets from an earlier char select/stage select/win screen instance are rejected
 - **Timeout:** 10 seconds without new remote input
 - **Resend interval:** 100ms periodic retransmission while waiting
 
 The lockstep model:
 - Three frame counters: `consumeFrame` (both sides have data), `localInputFrame` (latest local), `remoteLatestFrame` (latest remote)
 - Host maps to P1, client maps to P2
-- Send-ahead cap prevents buffering more than half the ring size ahead of consume
 - Character locks and stage selections are sent as separate reliable packets
 
 ### Stage Select Sync
@@ -280,7 +284,7 @@ The match bootstrap (`match_bootstrap.cpp`) manages the transition from pre-game
 Idle -> ConfigExchange -> Loading -> Baseline -> Ready -> Done
 ```
 
-**Config exchange:** Both peers exchange `ConfigExchangePayload` containing character IDs, palettes, stage, round count, time limit, RNG seed, and delay/rollback settings. Agreement is verified by CRC32 hash.
+**Config exchange:** Both peers exchange `ConfigExchangePayload` containing character IDs, palettes, stage, round count, time limit, RNG seed, delay/rollback settings, and frame-timing mode. Agreement is verified by CRC32 hash. The joiner aligns to the host's FPS timing mode before gameplay.
 
 **Load barrier:** Both peers report when they've reached Mode 8 (match mode). A 30-second timeout prevents indefinite waiting. The game loop continues running (for rendering) but frame advancement is frozen.
 
@@ -290,22 +294,28 @@ Idle -> ConfigExchange -> Loading -> Baseline -> Ready -> Done
 
 ### Delay Policy and Negotiation
 
-The delay policy (`delay_policy.cpp`, 416 lines) manages input delay and rollback budget:
+The delay policy manages input delay and rollback budget:
 
 **Constants:**
-- Default visible delay: 0 frames (user-configurable 0-15)
-- Hidden gameplay delay floor: 2 frames (always-on, invisible to the user)
+- Default visible delay: 0 frames (user-configurable within the current delay range)
+- Hidden gameplay delay floor: 1 frame (always-on, invisible to the user)
 - Default rollback budget: 7 frames
-- Default rollback tolerance (K): 1
+- Default rollback tolerance (K): 2
 
 **Recommendation model:**
 ```
-L = avg_ping_ms / 2 / 16.667       (one-way latency in frames)
-delay = max(0, floor(L) - K)       (recommended visible delay)
-max_rb = max(4, ceil(L) - delay + 2)  (recommended max rollback)
+protected = p90_or_avg_one_way_frames + bounded_p95_jitter_guard
+delay     = max(0, ceil(protected) - K)
+max_rb    = max(4, ceil(protected) - delay + 2)
 ```
 
-**Effective delay** = configured visible delay + hidden floor (2). Both peers exchange their delay configuration during the ConfigExchange phase.
+**Effective delay** = resolved visible delay + hidden floor (1). Both peers exchange their visible delay, rollback budget, delay mode, and frame-timing mode during the ConfigExchange phase.
+
+**Delay modes:**
+- `AsymmetricExpert` is the default and matches most rollback references: each peer's configured local delay protects the remote peer from predicting that player's inputs.
+- `SharedSafe` is an opt-in compatibility mode that resolves both visible delays to the larger value.
+
+The logs include `DELAYMAP` / `ASYMDELAY` fields for local-vs-remote prediction exposure so mismatched delay choices are visible instead of implicit.
 
 **Derived thresholds:**
 - Connection protection window = effective local delay + rollback budget
@@ -318,7 +328,7 @@ The sync policy (`sync_policy.cpp`, 309 lines) classifies the current game state
 | Sync Mode | When | Description |
 |-----------|------|-------------|
 | Lockstep | CharSel sub 2/4, StageSel sub 7/8, Mode 9 (winscreen), Pause | Both peers step together frame-by-frame |
-| Rollback | Mode 8 sub 3 (playable gameplay) | Full rollback with prediction and resimulation |
+| Rollback | Mode 8 sub 3 (playable gameplay) | Full Gekko rollback with prediction, savestate restore, and replayed advance events |
 | Passive | Mode 7 (pre-match intro), Mode 8 subs 0-2/5, transitions | No sync needed, local progression only |
 
 **Confirm arm logic** prevents double-confirm from held buttons:
@@ -330,16 +340,18 @@ The sync policy (`sync_policy.cpp`, 309 lines) classifies the current game state
 
 ### Win Screen Sync
 
-Win screen sync (`winscreen_sync.cpp`, 447 lines) mirrors the character select lockstep model for Mode 9:
+Win screen sync uses the same frontend lockstep backend for Mode 9:
 
 - Ring buffer: 512 frames, 1-6 frame delay, 8-frame redundancy
-- Advance detection: Checks A, C, or START button for win screen confirmation
-- Both-confirmed tracking: Both peers must confirm before proceeding
+- Early remote packet buffer: handles packets that arrive while one side has entered Mode 9 but the local lockstep phase has not begun yet
+- Advance detection: checks A, C, or START on the consumed lockstep frame
+- Skip release: either peer's advance intent releases a synchronized confirm pulse for both P1/P2 on the same consumed frame, avoiding the old "both peers must press" delay
 - Timeout: 10 seconds, resend interval: 100ms
+- Diagnostics: `WINLOCK` logs for begin/abort, early buffering, draining, and skip release
 
 ### Netplay Pacing
 
-Adaptive frame-pacing (`netplay_pacing.cpp`, 313 lines) smooths out rollback jitter by dynamically adjusting the game's tick rate:
+Adaptive frame-pacing smooths rollback jitter by dynamically adjusting tick rate and holding only when input debt makes prediction unsafe:
 
 **Controller parameters:**
 - Base frame time: 16.6667ms (60fps)
@@ -349,7 +361,7 @@ Adaptive frame-pacing (`netplay_pacing.cpp`, 313 lines) smooths out rollback jit
 - EMA alpha: 0.12 (smoothing factor)
 - Scale bounds: 0.94x - 1.06x
 
-**Stall detection:** When the gap between local and remote frames exceeds the stall threshold, the pacing controller returns a `StallHold` action to freeze the local simulation until the remote catches up.
+**Prediction-debt holds:** `NetQuality` profiles classify RTT/jitter/loss and set soft/hard debt thresholds. The controller can return `SoftHold`, `HardHold`, or emergency `StallHold`; hold samples are logged with `PACEDECIDE`, `DEBT`, `NETCLASS`, and `PACE`.
 
 ### NAT Traversal
 
@@ -459,7 +471,7 @@ Tracks match wins/losses per session (`set_tracker.cpp`, 113 lines). Records res
 
 ### Rollback Session
 
-The rollback session (`rollback_session.cpp`, ~850 lines) manages the GekkoNet rollback library integration:
+The rollback session manages the GekkoNet rollback library integration:
 
 **Configuration:**
 - Local/remote player assignment
@@ -468,8 +480,8 @@ The rollback session (`rollback_session.cpp`, ~850 lines) manages the GekkoNet r
 - Frame origin for absolute-to-relative conversion
 
 **Two-phase frame processing:**
-1. `RollbackSession_BeginFrame(localInput)` -- Feed local input to GekkoNet
-2. `RollbackSession_ProcessNextEvent()` -- Iterate GekkoNet events (Advance, Done, Error)
+1. `RollbackSession_BeginFrame(localInput)` -- Feed local input to GekkoNet.
+2. `RollbackSession_ProcessNextEvent()` -- Iterate GekkoNet events (`Save`, `Load`, `Advance`, `Done`, `Error`) and dispatch them to AS2.
 
 **GekkoNet bridge:**
 - State capture/restore callbacks for savestate integration
@@ -477,7 +489,9 @@ The rollback session (`rollback_session.cpp`, ~850 lines) manages the GekkoNet r
 - Serialized game state (`GekkoState`) with explicit frame metadata and CRC
 - FPU state capture (x87 control word + MXCSR) for floating-point determinism
 
-**Telemetry:** `RollbackSessionSnapshot` provides complete session telemetry including frame state, rollback stats, and network metrics. Lightweight `RollbackTimesyncTelemetry` for pacing decisions avoids expensive state CRC computation.
+**Replay atomicity:** Gekko rollback replay aborts if an advance event cannot assemble inputs. In that case the replay batch is cleared, the current frame is restored, and incorrect-prediction markers are not cleared. This prevents partial replays from masking a bad prediction.
+
+**Telemetry:** `RollbackSessionSnapshot` provides complete session telemetry including frame state, rollback stats, network metrics, presentation sidecar status, and pacing inputs. Lightweight `RollbackTimesyncTelemetry` feeds pacing decisions without expensive state CRC computation.
 
 ### Savestate System
 
@@ -487,7 +501,7 @@ Manual savestate system (`savestate.cpp`, ~400 lines) for offline testing and de
 
 **State regions captured (~260KB total):**
 - Main contiguous region: `0x76C5F8..0x7AB880` (259KB) -- match base through P2 entity end
-- Pre-match gap (12 bytes): effect index, audio channel, render state
+- Explicit match globals including effect index and adjacent pre-match gap bytes
 - Scattered globals: RNG seed, frame counters, mode/substate, input write indices
 - Input buffers: 208 bytes per player (held/previous/just-pressed state)
 - Metadata: frame number, checksum, RNG seed, game mode, substate
@@ -496,14 +510,12 @@ FPU state is captured for diagnostics but not restored by default.
 
 ### Resimulation
 
-The resimulation engine (`resimulation.cpp`, ~1100 lines) executes rollback:
+`resimulation.cpp` is a legacy/local resimulation helper retained for diagnostics and historical tests. The live online rollback path is Gekko-driven: `rollback_session.cpp` handles Gekko `Load`/`Save`/`Advance` events, restores a `GekkoState`, and advances the native Mode 8 handler for replay frames.
 
-**State history:** Ring buffer of 32 slots, each ~254KB (~4MB total heap allocation). Captures full game state with metadata.
-
-**Rollback flow:**
-1. `StateHistory_LoadFrame(rollback_frame)` -- Restore the earliest mispredicted frame
-2. `Resim_Execute(rollback_frame, target_frame)` -- Resimulate forward calling the game's Mode 8 handler per frame
-3. Side-effect suppression flag (`Resim_IsResimulating()`) checked by audio and debug systems during resim
+The active replay side-effect controls live in rollback session sidecars:
+- `rollback_audio.cpp` journals/suppresses gameplay sound effects during replay and emits corrected audio once frames settle.
+- `rollback_status_fx.cpp` tracks status/combo/effect presentation candidates so visual cleanup can be implemented with runtime evidence instead of blind suppression.
+- `rollback_combo_fx.cpp` logs combo/hit-reaction/attached-FX presentation state while filtering ordinary render-parameter animation churn from normal log level.
 
 ### Input Timeline
 
@@ -647,12 +659,14 @@ Vanilla netplay suppression (`input_sync_hooks.cpp`, 304 lines) intercepts 5 gam
 
 ### Tick Hooks
 
-Time scaling (`tick_hooks.cpp`, 136 lines) wraps `timeGetTime()`:
+Time scaling wraps `timeGetTime()`:
 
 - Maintains virtual time with scale factor
 - Smooth slew toward target scale (max 0.35% change per frame)
 - Supports manual scale (0.1x - 32x) and netplay pacing scale simultaneously
-- Effective scale = manual * netplay
+- Optional native limiter correction: `proper_60fps=1` in `as2_rollback_settings.ini` scales the game's integer 17ms wait to a true 60.000fps cadence; disabled mode preserves vanilla ~58.8fps timing
+- During netplay, the host's frame-timing mode is authoritative and manual tick scale is locked to 1.00x to prevent peer drift
+- Effective scale = manual * netplay pacing * 60fps correction
 - State struct: `NetplayTickState` (initialized, last_real_tick_ms, virtual_tick_ms, current_scale, target_scale, pacing_active)
 
 ### Filesystem Patch
@@ -1125,23 +1139,13 @@ Automated netplay testing (`autoconnect_harness.cpp`, ~600 lines):
 
 ### Unit Tests
 
-Three test suites (`tests/`):
+Focused test binaries (`tests/`):
 
-**standalone_rollback_tests.cpp:**
-- FPU state preservation (x87 CW, MXCSR, exception masks, precision/rounding modes)
-- Rapid 1000-cycle stability tests
-- Ring buffer modulo correctness (`-1 % 16 -> 15`)
-- MSVC LCG RNG determinism, seed save/restore, visual/simulation independence
-- SEH-based crash validation (proves old fsave/frstor caused ACCESS_VIOLATION)
+- `frontend_sync_tests`: frontend delay negotiation, local lead cap, stale phase serial rejection, stage select merge behavior, and win-screen either-peer skip release.
+- `async_log_tests`: detached log writer routing and flush rendezvous.
+- `gekko_input_tests`: Gekko input prediction correction, future-prediction invalidation after mismatch, and correct-prediction non-rollback behavior.
 
-**test_packet_codec.cpp:**
-- Round-trip encode/decode
-- Truncation and corruption detection
-- CRC determinism and differentiation
-- Max/oversized payload handling
-- All packet type coverage
-
-**test_runner_main.cpp:** Orchestrator linking all tests with pass/fail reporting.
+The older standalone rollback/packet-codec test sources remain in `tests/` as historical references, but the CMake targets are currently focused on the three binaries above.
 
 ### Test Harness Launcher
 
@@ -1547,10 +1551,10 @@ mod/
       match_bootstrap.cpp         Config/load/baseline negotiation (300+ lines)
       match_lifecycle.cpp         14-phase match state machine (649 lines)
       mode_ownership.cpp          Vanilla menu/socket interception (495 lines)
-      delay_policy.cpp            RTT-based delay negotiation (416 lines)
+      delay_policy.cpp            RTT/p90 delay negotiation + per-player/shared-max modes
       sync_policy.cpp             Sync mode classification (309 lines)
       gameplay_bridge.cpp         GekkoNet rollback bridge (186 lines)
-      netplay_pacing.cpp          Adaptive frame-rate controller (313 lines)
+      netplay_pacing.cpp          Adaptive tick-slew and prediction-debt hold controller
       nat_traversal.cpp           UPnP/STUN/PCP/TURN/hole-punch (250+ lines)
       netplay_menu_controller.cpp Menu state machine + config persistence
       netplay_menu_ui.cpp         DXLib-based menu rendering
@@ -1559,7 +1563,7 @@ mod/
       netplay_palette_storage.cpp Palette file I/O
       pause_handler.cpp           Pause-quit detection (171 lines)
       player_side_mapping.cpp     Network role to game slot mapping (101 lines)
-      winscreen_sync.cpp          Win screen lockstep (447 lines)
+      winscreen_sync.cpp          Win screen lockstep, early packet buffering, either-peer skip release
       set_tracker.cpp             Win/loss tracking (113 lines)
       locked_match_config.cpp     Config hash/compare (40 lines)
       baseline_sync.cpp           Baseline CRC verification (558 lines)
@@ -1573,16 +1577,16 @@ mod/
       replay_runtime.cpp          Replay runtime, HUD, seek, takeover
 
     rollback/                   Rollback engine and diagnostics
-      rollback_session.cpp        GekkoNet session management (~850 lines)
+      rollback_session.cpp        GekkoNet session management, event replay, sidecar telemetry
       savestate.cpp               Manual F5/F6 savestates (~400 lines)
-      resimulation.cpp            State history + rollback execution (~1100 lines)
+      resimulation.cpp            Legacy/local resimulation helpers; not the live online rollback path
       input_timeline.cpp          Per-frame input tracking (~290 lines)
       prediction.cpp              Remote input prediction (~110 lines)
       frame_lineage.cpp           Frame number conversion (~15 lines)
       determinism_verify.cpp      RNG/FPU/checksum verification (~730 lines)
       rollback_debug.cpp          Digest comparison + desync detection (~750 lines)
       desync_dump.cpp             Post-mortem state dump (~800 lines)
-      online_wiring.cpp           Net packet serialization (~1200+ lines)
+      online_wiring.cpp           Rollback startup and AS2/Gekko wiring
       netplay_log.cpp             Structured rollback logging (~220 lines)
       rematch_cleanup.cpp         Between-match reset (~145 lines)
       stress_hooks.cpp            Network stress testing (~180 lines)
@@ -1633,9 +1637,11 @@ mod/
     miniupnp_suite/miniupnpc/     UPnP mapping fallback
 
   tests/                        Unit tests
-    standalone_rollback_tests.cpp FPU, RNG, modulo tests
-    test_packet_codec.cpp         Packet encode/decode tests
-    test_runner_main.cpp          Test orchestrator
+    frontend_sync_tests.cpp       Frontend lockstep + win-screen tests
+    async_log_tests.cpp           Detached logging tests
+    gekko_input_tests.cpp         Gekko prediction invalidation tests
+    standalone_rollback_tests.cpp Historical FPU/RNG/modulo tests
+    test_packet_codec.cpp         Historical packet encode/decode tests
 
   tools/
     test_harness_launcher.cpp     Two-instance dashboard executable
@@ -1643,7 +1649,7 @@ mod/
   docs/
     MASTER_DOCUMENT.md          Primary long-form technical reference
 
-  CMakeLists.txt                Build configuration (4 targets, 7+ libraries)
+  CMakeLists.txt                Build configuration
   build.bat                     Automated build script
   setup_deps.ps1                Dependency downloader
   diagnose_dlls.ps1             DLL troubleshooting script

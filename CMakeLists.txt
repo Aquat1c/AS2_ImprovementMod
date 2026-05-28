@@ -538,6 +538,28 @@ set_target_properties(async_log_tests PROPERTIES
 
 add_test(NAME async_log_tests COMMAND async_log_tests)
 
+add_executable(gekko_input_tests
+    tests/gekko_input_tests.cpp
+    lib/GekkoNet/GekkoLib/src/input.cpp
+)
+
+target_include_directories(gekko_input_tests PRIVATE
+    include
+    lib/GekkoNet/GekkoLib/include
+)
+
+target_compile_definitions(gekko_input_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(gekko_input_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME gekko_input_tests COMMAND gekko_input_tests)
+
 add_library(as2_rollback SHARED
     ${CORE_HEADERS}
     ${PATCH_HEADERS}

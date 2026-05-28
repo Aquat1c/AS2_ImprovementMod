@@ -73,18 +73,26 @@ static ComboSnapshot CaptureEntity(uintptr_t base) {
     return s;
 }
 
-static bool SnapshotChanged(const ComboSnapshot& a, const ComboSnapshot& b) {
-    return memcmp(&a, &b, sizeof(a)) != 0;
+static bool PresentationStateChanged(const ComboSnapshot& a, const ComboSnapshot& b) {
+    return a.display_combo != b.display_combo ||
+           a.scale1 != b.scale1 ||
+           a.scale2 != b.scale2 ||
+           a.scale3 != b.scale3 ||
+           a.scale4 != b.scale4 ||
+           a.reset_flag != b.reset_flag ||
+           a.reaction_type != b.reaction_type ||
+           a.reaction_class != b.reaction_class ||
+           a.shown_flag != b.shown_flag ||
+           a.anim_timer != b.anim_timer ||
+           a.life_timer != b.life_timer ||
+           a.keep_flag != b.keep_flag ||
+           a.attached_crc != b.attached_crc;
 }
 
 static int EntitySide(uintptr_t entity) {
     if (entity == ADDR_P1_ENTITY_BASE) return 0;
     if (entity == ADDR_P2_ENTITY_BASE) return 1;
     return 2;
-}
-
-static bool IsKnownEntity(uintptr_t entity) {
-    return EntitySide(entity) != 2;
 }
 
 static void LogSnapshot(const char* phase, int32_t rb_frame, int32_t game_abs_frame) {
@@ -111,7 +119,7 @@ static void LogEntityTransition(const char* tag,
                                 const ComboSnapshot& before,
                                 const ComboSnapshot& after,
                                 const char* detail) {
-    if (!s_sessionActive || !SnapshotChanged(before, after)) {
+    if (!s_sessionActive || !PresentationStateChanged(before, after)) {
         return;
     }
 
@@ -255,7 +263,8 @@ int __cdecl Hook_Match_UpdateComboTimers(int match) {
     const ComboSnapshot p1After = CaptureEntity(ADDR_P1_ENTITY_BASE);
     const ComboSnapshot p2After = CaptureEntity(ADDR_P2_ENTITY_BASE);
 
-    if (SnapshotChanged(p1Before, p1After) || SnapshotChanged(p2Before, p2After)) {
+    if (PresentationStateChanged(p1Before, p1After) ||
+        PresentationStateChanged(p2Before, p2After)) {
         ++s_timerChangeCount;
         NetplayLog_Write("COMBOFX", s_currentRbFrame,
             "TIMER_DECAY rb=%d game=%d rolling=%d match=0x%08X result=0x%08X",
@@ -339,13 +348,12 @@ int __cdecl Hook_EffectSlots_Add(int entity, int slot_id) {
 
     UpdateContextFromSession();
     const uintptr_t entityBase = (uintptr_t)entity;
-    const bool known = IsKnownEntity(entityBase);
     const ComboSnapshot before = CaptureEntity(entityBase);
     const int result = g_origEffectSlotsAdd(entity, slot_id);
     const ComboSnapshot after = CaptureEntity(entityBase);
 
     ++s_slotAddCount;
-    if (known || SnapshotChanged(before, after)) {
+    if (PresentationStateChanged(before, after)) {
         char detail[64];
         _snprintf_s(detail, sizeof(detail), _TRUNCATE, "slot_id=%d result=%d", slot_id, result);
         LogEntityTransition("ATTACHED_SLOT_ADD", entityBase, before, after, detail);
@@ -363,16 +371,19 @@ int __cdecl Hook_Effect_SetParams1(int entity, int sprite, int group, uint16_t a
     }
 
     UpdateContextFromSession();
-    const uintptr_t entityBase = (uintptr_t)entity;
-    const ComboSnapshot before = CaptureEntity(entityBase);
     const int result = g_origEffectSetParams1(entity, sprite, group, anim);
-    const ComboSnapshot after = CaptureEntity(entityBase);
 
     ++s_setParams1Count;
-    char detail[96];
-    _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-        "sprite=%d group=%d anim=%u", sprite, group, (unsigned)anim);
-    LogEntityTransition("SET_PARAMS1", entityBase, before, after, detail);
+    NetplayLog_Verbose("COMBOFX", s_currentRbFrame,
+        "SET_PARAMS1_COUNT rb=%d game=%d rolling=%d entity=0x%08X sprite=%d group=%d anim=%u count=%u",
+        s_currentRbFrame,
+        s_currentGameAbsFrame,
+        s_currentRollingBack ? 1 : 0,
+        (unsigned)entity,
+        sprite,
+        group,
+        (unsigned)anim,
+        s_setParams1Count);
     return result;
 }
 
@@ -388,22 +399,22 @@ int __cdecl Hook_Effect_SetParams2(int entity, char draw_order, int overlay_spri
     }
 
     UpdateContextFromSession();
-    const uintptr_t entityBase = (uintptr_t)entity;
-    const ComboSnapshot before = CaptureEntity(entityBase);
     const int result = g_origEffectSetParams2(entity, draw_order, overlay_sprite, overlay_x, overlay_y, blend, alpha);
-    const ComboSnapshot after = CaptureEntity(entityBase);
 
     ++s_setParams2Count;
-    char detail[128];
-    _snprintf_s(detail, sizeof(detail), _TRUNCATE,
-        "draw=%d overlay=%d pos=%d/%d blend=%d alpha=%d",
+    NetplayLog_Verbose("COMBOFX", s_currentRbFrame,
+        "SET_PARAMS2_COUNT rb=%d game=%d rolling=%d entity=0x%08X draw=%d overlay=%d pos=%d/%d blend=%d alpha=%d count=%u",
+        s_currentRbFrame,
+        s_currentGameAbsFrame,
+        s_currentRollingBack ? 1 : 0,
+        (unsigned)entity,
         (int)(uint8_t)draw_order,
         overlay_sprite,
         overlay_x,
         overlay_y,
         blend,
-        (int)(uint8_t)alpha);
-    LogEntityTransition("SET_PARAMS2", entityBase, before, after, detail);
+        (int)(uint8_t)alpha,
+        s_setParams2Count);
     return result;
 }
 
