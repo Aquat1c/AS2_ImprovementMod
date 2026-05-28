@@ -21,6 +21,7 @@
 #include "patches/palette_asset_hook.h"
 #include "patches/charsel_palette_select.h"
 #include "patches/tick_hooks.h"
+#include "patches/session_pump_hook.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/savestate.h"
 #include "rollback/rollback_session.h"
@@ -461,6 +462,10 @@ static void DeferredInit() {
     TickHooks_LoadSettings();
     LogInitStep("TickHooks_LoadSettings", "END");
 
+    LogInitStep("InputOverride_LoadSettings", "BEGIN");
+    InputOverride_LoadSettings();
+    LogInitStep("InputOverride_LoadSettings", "END");
+
     LogInitStep("InstallHooks", "BEGIN");
     if (!InstallHooks()) {
         LOG_ERROR("Failed to install hooks!");
@@ -554,6 +559,9 @@ static void DeferredInit() {
     Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
     Rollback::NetplayLog_SetVerbose(g_config.verboseLogging);
     LogInitStep("NetplayLog_Init", "END");
+    LogInitStep("SessionPumpHook_Init", "BEGIN");
+    Net::SessionPumpHook_Init();
+    LogInitStep("SessionPumpHook_Init", "END");
     LogInitStep("RollbackAudio_Init", "BEGIN");
     Rollback::RollbackAudio_Init();
     LogInitStep("RollbackAudio_Init", "END");
@@ -673,6 +681,7 @@ __declspec(dllexport) void ModShutdown() {
         Rollback::RollbackComboFx_Shutdown();
         Rollback::RollbackStatusFx_Shutdown();
         Rollback::RollbackAudio_Shutdown();
+        Net::SessionPumpHook_Shutdown();
         Rollback::NetplayLog_Shutdown();
         Rollback::RollbackDebug_Shutdown();
         Rollback::RollbackSession_Shutdown();

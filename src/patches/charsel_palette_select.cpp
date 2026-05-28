@@ -84,6 +84,12 @@ struct MatchSelection {
     bool    use_custom;
 };
 
+struct PaletteSlotCache {
+    bool    valid;
+    uint8_t base_palette;
+    bool    use_custom;
+};
+
 struct ExternalCustomHint {
     bool    valid;
     uint8_t character_id;
@@ -112,6 +118,7 @@ static bool s_pendingCatalogReceived[2] = {};
 static uint16_t s_pendingCatalogMasks[2][256] = {};
 static FrontendSlotState s_slotState[2] = {};
 static MatchSelection s_matchSelection[2] = {};
+static PaletteSlotCache s_paletteSlotCache[2][256] = {};
 static ExternalCustomHint s_externalCustomHint[2] = {};
 static RandomCharacterScrollState s_randomScroll[2] = {};
 
@@ -520,6 +527,35 @@ static bool IsSameVanillaPaletteLockedByOtherSlot(uint8_t gameSlot,
            other.base_palette == option.base_palette;
 }
 
+static bool ShouldApplyPaletteCacheForInitialSelection(uint8_t gameSlot) {
+    if (gameSlot > 1) {
+        return false;
+    }
+    return !s_frontendNetplay || gameSlot == s_localGameSlot;
+}
+
+static void RememberPaletteSelection(uint8_t gameSlot,
+                                     uint8_t characterId,
+                                     const PaletteOption& option,
+                                     const char* reason) {
+    if (gameSlot > 1) {
+        return;
+    }
+
+    PaletteSlotCache& cache = s_paletteSlotCache[gameSlot][characterId];
+    cache.valid = true;
+    cache.base_palette = option.base_palette;
+    cache.use_custom = option.use_custom;
+
+    Rollback::NetplayLog_Write("CHARPAL", -1,
+        "Palette slot cache remember: slot=P%d char=%u base=%u custom=%d reason=%s",
+        gameSlot + 1,
+        characterId,
+        option.base_palette,
+        option.use_custom ? 1 : 0,
+        reason ? reason : "?");
+}
+
 static uint8_t FindFirstAllowedOptionIndex(uint8_t gameSlot,
                                            uint8_t characterId,
                                            const PaletteOption* options,
@@ -539,6 +575,52 @@ static uint8_t FindFirstAllowedOptionIndex(uint8_t gameSlot,
     return 0;
 }
 
+static bool TryResolveCachedOptionIndex(uint8_t gameSlot,
+                                        uint8_t characterId,
+                                        const PaletteOption* options,
+                                        int count,
+                                        uint8_t* outIndex) {
+    if (!ShouldApplyPaletteCacheForInitialSelection(gameSlot) || !options || !outIndex || count <= 0) {
+        return false;
+    }
+
+    const PaletteSlotCache& cache = s_paletteSlotCache[gameSlot][characterId];
+    if (!cache.valid) {
+        return false;
+    }
+
+    uint8_t cachedIndex = 0;
+    if (!TryFindOptionIndex(options, count, cache.base_palette, cache.use_custom, &cachedIndex) &&
+        !TryFindOptionIndex(options, count, cache.base_palette, false, &cachedIndex)) {
+        Rollback::NetplayLog_Write("CHARPAL", -1,
+            "Palette slot cache skipped: slot=P%d char=%u base=%u custom=%d reason=option unavailable",
+            gameSlot + 1,
+            characterId,
+            cache.base_palette,
+            cache.use_custom ? 1 : 0);
+        return false;
+    }
+
+    if (IsSameVanillaPaletteLockedByOtherSlot(gameSlot, characterId, options[cachedIndex])) {
+        Rollback::NetplayLog_Write("CHARPAL", -1,
+            "Palette slot cache skipped: slot=P%d char=%u base=%u custom=%d reason=netplay duplicate vanilla",
+            gameSlot + 1,
+            characterId,
+            options[cachedIndex].base_palette,
+            options[cachedIndex].use_custom ? 1 : 0);
+        return false;
+    }
+
+    *outIndex = cachedIndex;
+    Rollback::NetplayLog_Write("CHARPAL", -1,
+        "Palette slot cache use: slot=P%d char=%u base=%u custom=%d",
+        gameSlot + 1,
+        characterId,
+        options[cachedIndex].base_palette,
+        options[cachedIndex].use_custom ? 1 : 0);
+    return true;
+}
+
 static uint8_t ResolveInitialOptionIndex(uint8_t gameSlot,
                                          uint8_t characterId,
                                          const PaletteOption* options,
@@ -552,6 +634,10 @@ static uint8_t ResolveInitialOptionIndex(uint8_t gameSlot,
                                                    options[previousIndex])) {
             return previousIndex;
         }
+    }
+    uint8_t cachedIndex = 0;
+    if (TryResolveCachedOptionIndex(gameSlot, characterId, options, count, &cachedIndex)) {
+        return cachedIndex;
     }
     const uint8_t defaultIndex = FindOptionIndex(options, count, 0, false);
     if (!IsSameVanillaPaletteLockedByOtherSlot(gameSlot,
@@ -616,6 +702,7 @@ static void RefreshSlotAfterCatalogChange(uint8_t gameSlot) {
         s_matchSelection[gameSlot].character_id = slotState.character_id;
         s_matchSelection[gameSlot].base_palette = currentOption.base_palette;
         s_matchSelection[gameSlot].use_custom = currentOption.use_custom;
+        RememberPaletteSelection(gameSlot, slotState.character_id, currentOption, "catalog refresh");
     }
 
     MaybeRequestPreviewReload(gameSlot,
@@ -1060,6 +1147,7 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
             s_matchSelection[gameSlot].character_id = slotState.character_id;
             s_matchSelection[gameSlot].base_palette = option.base_palette;
             s_matchSelection[gameSlot].use_custom = option.use_custom;
+            RememberPaletteSelection((uint8_t)gameSlot, slotState.character_id, option, "local lock");
             PlayCharSelSound(ADDR_CHARSEL_CONFIRM_SE);
             Rollback::NetplayLog_Write("CHARPAL", -1,
                 "Palette locked: slot=P%d char=%u base=%u custom=%d",
@@ -1409,6 +1497,7 @@ bool CharSelPaletteSelect_ForceSelectionLocked(uint8_t gameSlot,
     s_matchSelection[gameSlot].character_id = characterId;
     s_matchSelection[gameSlot].base_palette = option.base_palette;
     s_matchSelection[gameSlot].use_custom = option.use_custom;
+    RememberPaletteSelection(gameSlot, characterId, option, "force lock");
     MaybeRequestPreviewReload(gameSlot,
         hadPreviousOption,
         hadPreviousOption ? &previousOption : nullptr,

@@ -58,7 +58,7 @@ set(MINIUPNPC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniupnp_suite/miniup
 set(LIBJUICE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libjuice" CACHE PATH "libjuice directory")
 set(PCPNATPMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpcpnatpmp/lib" CACHE PATH "libpcpnatpmp directory")
 set(ENET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/enet" CACHE PATH "ENet directory")
-set(GAME_DIR "D:/Alice in wonderland ２" CACHE PATH "Game installation directory")
+set(GAME_DIR "D:/Alice in wonderland 2" CACHE PATH "Game installation directory")
 set(TEST_GAME_DIR "" CACHE PATH "Secondary game directory for test harness (optional)")
 
 # ============================================================================
@@ -275,6 +275,8 @@ set(PATCH_HEADERS
     include/patches/palette_asset_hook.h
     include/patches/charsel_palette_select.h
     include/patches/charsel_select_actions.h
+    include/patches/render_guard.h
+    include/patches/session_pump_hook.h
 )
 
 # Dead NETPLAY_HEADERS removed — old src/netplay/ code was moved to old_files/
@@ -361,6 +363,7 @@ set(TESTING_HEADERS
 )
 
 set(TRAINING_HEADERS
+    include/training/action_state_classifier.h
     include/training/frame_advantage.h
     include/training/hotkey_config.h
     include/training/input_macro.h
@@ -387,6 +390,8 @@ set(PATCH_SOURCES
     src/patches/charsel_select_actions.cpp
     src/patches/input_override.cpp
     src/patches/input_sync_hooks.cpp
+    src/patches/render_guard.cpp
+    src/patches/session_pump_hook.cpp
     src/patches/tick_hooks.cpp
     src/patches/hook_installer.cpp
 )
@@ -475,6 +480,7 @@ set(TESTING_SOURCES
 )
 
 set(TRAINING_SOURCES
+    src/training/action_state_classifier.cpp
     src/training/frame_advantage.cpp
     src/training/hotkey_config.cpp
     src/training/input_macro.cpp
@@ -559,6 +565,27 @@ set_target_properties(gekko_input_tests PROPERTIES
 )
 
 add_test(NAME gekko_input_tests COMMAND gekko_input_tests)
+
+add_executable(training_logic_tests
+    tests/frame_advantage_classifier_tests.cpp
+    src/training/action_state_classifier.cpp
+)
+
+target_include_directories(training_logic_tests PRIVATE
+    include
+)
+
+target_compile_definitions(training_logic_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(training_logic_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME training_logic_tests COMMAND training_logic_tests)
 
 add_library(as2_rollback SHARED
     ${CORE_HEADERS}

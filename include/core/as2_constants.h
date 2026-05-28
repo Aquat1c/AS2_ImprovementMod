@@ -27,6 +27,7 @@
 
 // Match mode handler (case 8 in main loop)
 #define ADDR_MATCH_MODE         (GAME_BASE + 0x0C8F60)  // sub_4C8F60
+#define ADDR_ASSET_LOAD_FROM_ARCHIVE     (GAME_BASE + 0x0A5390)  // sub_4A5390 - Asset_LoadFromArchive
 #define ADDR_ASSET_LOAD_ALL_FROM_ARCHIVE (GAME_BASE + 0x14A460)  // Asset_LoadAllFromArchive
 #define ADDR_HANDLE_ALLOC       (GAME_BASE + 0x212DF0)  // sub_612DF0
 #define ADDR_HANDLE_RENDER_BIND (GAME_BASE + 0x2132E0)  // sub_6132E0
@@ -87,6 +88,7 @@
 
 // Sound/effect
 #define ADDR_EFFECT_SET_PARAMS  (GAME_BASE + 0x0C3ED0)  // sub_4C3ED0 — Effect_SetParams1 (entity state writer, NOT sound)
+#define ADDR_MATCH_RENDER_PLAYERS (GAME_BASE + 0x0C6B60) // sub_4C6B60 — match player renderer
 #define ADDR_SE_PLAY            (GAME_BASE + 0x0C3C00)  // sub_4C3C00 — SE_Play (actual sound effect trigger)
 
 // Legacy aliases (kept for backward compatibility / reference)
@@ -438,6 +440,7 @@
 #define ADDR_EFFECT_SPAWN       (GAME_BASE + 0x0A92C0)  // sub_4A92C0 - Spawn effect
 #define ADDR_EFFECT_CLEAR       (GAME_BASE + 0x0A92A0)  // sub_4A92A0 - Clear all effects
 #define ADDR_EFFECT_UPDATE      (GAME_BASE + 0x0A9330)  // sub_4A9330 - Update all effects
+#define ADDR_EFFECT_DRAW        (GAME_BASE + 0x0AB0F0)  // sub_4AB0F0 - Draw global effect queue
 #define ADDR_SUMMON_SPAWN       (GAME_BASE + 0x0BE100)  // sub_4BE100 - Spawn summon
 #define ADDR_SUMMON_UPDATE      (GAME_BASE + 0x0BE3E0)  // sub_4BE3E0 - Update summons
 
@@ -542,9 +545,12 @@
 #define ENTITY_ATTACHED_FX_SLOTS_SIZE      0x0028
 #define ENTITY_RENDER_OVERLAY_FIELDS_SIZE  0x0019
 
-// Box system offsets
-#define ENTITY_OFF_BOX_FLAGS    0x0674  // +1652, 24 bytes
-#define ENTITY_OFF_NATIVE_ACTIONABLE 0x0676 // +1654, user-verified live actionable flag (1=actionable, 0=inactionable)
+// Box / route-flag system offsets. The byte at +0x0676 is a candidate
+// actionability bit, but it lives inside this vanilla 24-byte flag block and
+// must stay audit-only until runtime logs prove its exact semantics.
+#define ENTITY_OFF_BOX_FLAGS 0x0674  // +1652, 24-byte vanilla per-frame flag block
+#define ENTITY_OFF_NATIVE_ACTIONABLE_CANDIDATE 0x0676 // +1654, candidate actionability bit; audit before primary use
+#define ENTITY_OFF_NATIVE_ACTIONABLE ENTITY_OFF_NATIVE_ACTIONABLE_CANDIDATE
 #define ENTITY_OFF_RENDER_FLASH_FLAG     0x01B4  // +436, BYTE, extra flash/afterimage draw flag
 #define ENTITY_OFF_RENDER_TINT_STATE     0x01B8  // +440, DWORD, 1 disables extra tint pass in sub_4C6B60
 #define ENTITY_OFF_RENDER_TINT_TIMER     0x01BC  // +444, DWORD

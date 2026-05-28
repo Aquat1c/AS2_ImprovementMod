@@ -7,6 +7,8 @@
 #include "patches/palette_asset_hook.h"
 #include "patches/charsel_palette_select.h"
 #include "patches/charsel_select_actions.h"
+#include "patches/render_guard.h"
+#include "patches/session_pump_hook.h"
 #include "replay/replay_runtime.h"
 #include "rollback/rollback_audio.h"
 #include "rollback/rollback_combo_fx.h"
@@ -180,7 +182,7 @@ bool InstallHooks() {
 
     // --- Rollback presentation sidecar hooks ---
     // These are non-fatal: audio/status/combo presentation remains playable
-    // without them, but the logs become much less useful.
+    // without them, but rollback-corrected presentation can show stale effects.
 
     LOG_INFO("ADDR_SE_PLAY = 0x%08X (sub_4C3C00)", ADDR_SE_PLAY);
     status = MH_CreateHook(
@@ -199,9 +201,20 @@ bool InstallHooks() {
             reinterpret_cast<void*>(&Rollback::Hook_Effect_Enqueue),
             reinterpret_cast<void**>(&Rollback::g_origEffectEnqueue));
     if (status != MH_OK) {
-        LOG_WARN("Failed to hook Effect_Enqueue! Status: %d (status FX logs disabled)", status);
+        LOG_WARN("Failed to hook Effect_Enqueue! Status: %d (status FX correction disabled)", status);
     } else {
         LOG_INFO("Hooked sub_4A92C0 (Effect_Enqueue - rollback status FX journal)");
+    }
+
+    LOG_INFO("ADDR_EFFECT_DRAW = 0x%08X (sub_4AB0F0 Effect_DrawQueue)", ADDR_EFFECT_DRAW);
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_EFFECT_DRAW),
+            reinterpret_cast<void*>(&Rollback::Hook_Effect_DrawQueue),
+            reinterpret_cast<void**>(&Rollback::g_origEffectDrawQueue));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook Effect_DrawQueue! Status: %d (status FX draw filter disabled)", status);
+    } else {
+        LOG_INFO("Hooked sub_4AB0F0 (Effect_DrawQueue - rollback status FX draw filter)");
     }
 
     struct PresentationHookEntry {
@@ -212,6 +225,7 @@ bool InstallHooks() {
     };
 
     PresentationHookEntry presentationHooks[] = {
+        { ADDR_MATCH_RENDER_PLAYERS,           (void*)&RenderGuard::Hook_MatchRenderPlayers,        (void**)&RenderGuard::g_origMatchRenderPlayers,        "Match_RenderPlayers" },
         { ADDR_MATCH_UPDATE_COMBO_TIMERS,      (void*)&Rollback::Hook_Match_UpdateComboTimers,      (void**)&Rollback::g_origMatchUpdateComboTimers,      "Match_UpdateComboTimers" },
         { ADDR_ENTITY_UPDATE_COMBO_STATS,      (void*)&Rollback::Hook_Entity_UpdateComboStats,      (void**)&Rollback::g_origEntityUpdateComboStats,      "Entity_UpdateComboStats" },
         { ADDR_ENTITY_UPDATE_COMBO_STAT_1243,  (void*)&Rollback::Hook_Entity_UpdateComboStat_1243,  (void**)&Rollback::g_origEntityUpdateComboStat1243,  "Entity_UpdateComboStat_1243" },
@@ -223,15 +237,26 @@ bool InstallHooks() {
     for (auto& h : presentationHooks) {
         status = MH_CreateHook(reinterpret_cast<void*>(h.target), h.detour, h.original);
         if (status != MH_OK) {
-            LOG_WARN("Failed to hook %s @ 0x%08X! Status: %d (combo FX diagnostics degraded)",
+            LOG_WARN("Failed to hook %s @ 0x%08X! Status: %d (combo FX state monitor degraded)",
                      h.name,
                      (unsigned)h.target,
                      status);
         } else {
-            LOG_INFO("Hooked %s @ 0x%08X (rollback combo FX diagnostics)",
+            LOG_INFO("Hooked %s @ 0x%08X (rollback combo FX state monitor)",
                      h.name,
                      (unsigned)h.target);
         }
+    }
+
+    LOG_INFO("ADDR_ASSET_LOAD_FROM_ARCHIVE = 0x%08X (sub_4A5390)", ADDR_ASSET_LOAD_FROM_ARCHIVE);
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_ASSET_LOAD_FROM_ARCHIVE),
+            reinterpret_cast<void*>(&Net::Hook_Asset_LoadFromArchive),
+            reinterpret_cast<void**>(&Net::g_origAssetLoadFromArchive));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook Asset_LoadFromArchive! Status: %d (win-screen stall pump disabled)", status);
+    } else {
+        LOG_INFO("Hooked sub_4A5390 (Asset_LoadFromArchive - session pump during blocking loads)");
     }
     
     // --- Locale hooks ---

@@ -1,5 +1,6 @@
 #include "training/frame_advantage.h"
 
+#include "training/action_state_classifier.h"
 #include "training/practice_tools.h"
 #include "core/game_state.h"
 #include "as2_constants.h"
@@ -40,14 +41,7 @@ enum class InteractionResult : uint8_t {
     Trade,
 };
 
-struct EntitySample {
-    uint32_t actionId = 0;
-    uint8_t attackState = 0;
-    uint8_t hitActive = 0;
-    uint8_t blockstun = 0;
-    uint8_t hitstunDuration = 0;
-    uint16_t knockbackTimer = 0;
-};
+using EntitySample = Training::ActionStateSample;
 
 struct PlayerState {
     EntitySample prev{};
@@ -78,6 +72,7 @@ struct Interaction {
     int32_t frameAdvantage = 0;
     uint32_t lastProgressFrame = kFrameUnset;
     bool defenderLaunched = false;
+    bool defenderWasAirLocked = false;
 };
 
 struct HistoryEntry {
@@ -101,11 +96,16 @@ bool s_initialized = false;
 bool s_enabled = true;
 bool s_roundResetApplied = false;
 bool s_debugLogging = false;
+bool s_actionabilityAuditLogging = false;
 
 // Throttle per-frame sample logging (only log on change)
 uint32_t s_lastLoggedActionId[2] = {};
 uint8_t  s_lastLoggedAttackState[2] = {};
 uint8_t  s_lastLoggedHitActive[2] = {};
+uint32_t s_lastAuditActionId[2] = {};
+uint8_t  s_lastAuditNative[2] = {};
+bool     s_lastAuditMismatch[2] = {};
+bool     s_hasLastAudit[2] = {};
 PlayerState s_players[2]{};
 PendingAttack s_pending[2]{};
 Interaction s_active[2]{};
@@ -122,61 +122,39 @@ constexpr uintptr_t kEntityBases[2] = {
     ADDR_P2_ENTITY_BASE,
 };
 
-bool IsLegacyActionableAction(uint32_t actionId) {
-    // 2=standing, 3=turnaround, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand,
-    // 22=air neutral, 23=landing
-    // 63/66/69=StandProxGuard/CrouchProxGuard/AirProxGuard — cancellable, not blockstun
-    // 106=healing stance cancel — cancelling heal returns to actionable immediately
-    return actionId == 2  || actionId == 3  || actionId == 4  || actionId == 5  ||
-           actionId == 6  || actionId == 7  || actionId == 8  || actionId == 22 ||
-           actionId == 23 ||
-           actionId == 63 || actionId == 66 || actionId == 69;
+Training::ActionabilityResult EvaluateLegacyActionability(const EntitySample& sample,
+                                                          Training::ActionableContext context,
+                                                          bool defenderWasAirLocked = false) {
+    return Training::EvaluateActionability(
+        sample,
+        context,
+        defenderWasAirLocked,
+        Training::ActionabilitySource::LegacyActionId);
 }
 
-bool IsActionable(uint32_t actionId) {
-    return IsLegacyActionableAction(actionId);
+bool IsFree(const EntitySample& sample,
+            Training::ActionableContext context,
+            bool defenderWasAirLocked = false) {
+    return EvaluateLegacyActionability(sample, context, defenderWasAirLocked).actionable;
 }
 
 bool IsBlockstun(uint32_t actionId) {
-    // StandBlockHold/Hit=64/65, CrouchBlockHold/Hit=67/68, AirBlockHold/Hit=70/71.
-    // ProxGuard (63, 66, 69) is cancellable and lives in IsActionable instead.
-    return (actionId == 64 || actionId == 65) ||
-           (actionId == 67 || actionId == 68) ||
-           (actionId == 70 || actionId == 71);
-}
-
-bool IsHitstun(uint32_t actionId) {
-    return actionId == 72 || actionId == 73;
-}
-
-bool IsWakeupNoTech(uint32_t actionId) {
-    return actionId == 74;
-}
-
-bool IsTech(uint32_t actionId) {
-    return actionId >= 78 && actionId <= 82;
-}
-
-bool IsHealing(uint32_t actionId) {
-    // 105=healing active (inactionable, cancellable into 106)
-    // 106=healing stance cancel
-    return actionId == 105 || actionId == 106;
-}
-
-bool IsStunned(uint32_t actionId) {
-    return IsBlockstun(actionId) || IsHitstun(actionId) || IsWakeupNoTech(actionId);
+    return Training::IsBlockstun(actionId);
 }
 
 bool IsDefenderLocked(uint32_t actionId) {
-    return IsBlockstun(actionId) ||
-           IsHitstun(actionId) ||
-           (actionId >= 74 && actionId <= 82);
+    return Training::IsForcedDefenderLock(actionId);
 }
 
-// Knockdown/launch states: untechable wakeup (74), airborne knockdown/fall
-// (75-77), or tech/post-tech recovery (78-82).
 bool IsKnockdownOrLaunch(uint32_t actionId) {
-    return actionId == 74 || (actionId >= 75 && actionId <= 82);
+    return Training::IsKnockdownOrLaunch(actionId);
+}
+
+bool IsAirLockedAction(uint32_t actionId) {
+    return actionId == 70 ||
+           actionId == 71 ||
+           actionId == 73 ||
+           Training::IsKnockdownOrLaunch(actionId);
 }
 
 bool HasAttackPayload(const EntitySample& sample) {
@@ -191,9 +169,15 @@ bool HasLiveHitWindow(const EntitySample& sample) {
 }
 
 bool IsAttackActionCandidate(const EntitySample& sample) {
-    return !IsActionable(sample.actionId) &&
-           !IsDefenderLocked(sample.actionId) &&
-           HasAttackPayload(sample);
+    if (Training::IsForcedDefenderLock(sample.actionId)) {
+        return false;
+    }
+
+    if (sample.attackState == 1) {
+        return true;
+    }
+
+    return HasAttackPayload(sample);
 }
 
 const char* SideLabel(uint8_t side) {
@@ -201,14 +185,7 @@ const char* SideLabel(uint8_t side) {
 }
 
 const char* ActionCategory(uint32_t actionId) {
-    if (IsActionable(actionId)) return "Actionable";
-    if (IsBlockstun(actionId)) return "Blockstun";
-    if (IsHitstun(actionId)) return "Hitstun";
-    if (IsWakeupNoTech(actionId)) return "WakeupNoTech";
-    if (IsTech(actionId)) return "Tech";
-    if (IsKnockdownOrLaunch(actionId)) return "Knockdown";
-    if (IsHealing(actionId)) return "Healing";
-    return "Other";
+    return Training::ActionCategory(actionId);
 }
 
 const char* ResultLabel(InteractionResult r) {
@@ -233,12 +210,84 @@ uint32_t FrameDiff(uint32_t a, uint32_t b) {
 EntitySample ReadEntitySample(uintptr_t entityBase) {
     EntitySample sample{};
     sample.actionId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID);
+    sample.actionPhase = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_PHASE);
+    sample.actionFrame = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_FRAME);
+    sample.nativeActionableCandidate = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_NATIVE_ACTIONABLE);
+    for (int i = 0; i < 24; ++i) {
+        sample.routeOrBoxFlags[i] = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_BOX_FLAGS + i);
+    }
     sample.attackState = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_ATTACK_STATE);
     sample.hitActive = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_ACTIVE);
     sample.blockstun = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_BLOCKSTUN);
     sample.hitstunDuration = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HITSTUN_DURATION);
     sample.knockbackTimer = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_KNOCKBACK_TIMER);
     return sample;
+}
+
+void FormatRouteFlags(const EntitySample& sample, char* out, size_t outSize) {
+    if (!out || outSize == 0) {
+        return;
+    }
+
+    size_t offset = 0;
+    out[0] = '\0';
+    for (int i = 0; i < 24 && offset + 3 < outSize; ++i) {
+        const int written = snprintf(
+            out + offset,
+            outSize - offset,
+            "%02X%s",
+            (unsigned int)sample.routeOrBoxFlags[i],
+            (i == 23) ? "" : " ");
+        if (written <= 0) {
+            break;
+        }
+        offset += (size_t)written;
+    }
+}
+
+void AuditActionability(uint32_t simFrame, int playerIndex, const EntitySample& sample) {
+    if (!s_actionabilityAuditLogging) {
+        return;
+    }
+
+    const Training::ActionabilityResult result = EvaluateLegacyActionability(
+        sample,
+        Training::ActionableContext::AttackerRecovery,
+        false);
+    const bool mismatch = result.legacyActionable != result.nativeCandidate;
+    const bool changed = !s_hasLastAudit[playerIndex] ||
+                         s_lastAuditActionId[playerIndex] != sample.actionId ||
+                         s_lastAuditNative[playerIndex] != sample.nativeActionableCandidate ||
+                         s_lastAuditMismatch[playerIndex] != mismatch;
+    if (!changed) {
+        return;
+    }
+
+    char flags[96];
+    FormatRouteFlags(sample, flags, sizeof(flags));
+    LOG_INFO("[FAACT] frame=%u %s act=%u(%s) phase=%u aframe=%u legacy=%d native676=%d forced=%d contact=%d atk=%u hit=%u bs=%u hs=%u kb=%u reason=%s flags=%s",
+             simFrame,
+             SideLabel((uint8_t)playerIndex),
+             sample.actionId,
+             ActionCategory(sample.actionId),
+             (unsigned int)sample.actionPhase,
+             (unsigned int)sample.actionFrame,
+             result.legacyActionable ? 1 : 0,
+             result.nativeCandidate ? 1 : 0,
+             result.forcedLocked ? 1 : 0,
+             Training::IsContactStartState(sample.actionId) ? 1 : 0,
+             (unsigned int)sample.attackState,
+             (unsigned int)sample.hitActive,
+             (unsigned int)sample.blockstun,
+             (unsigned int)sample.hitstunDuration,
+             (unsigned int)sample.knockbackTimer,
+             mismatch ? "mismatch" : result.reason,
+             flags);
+
+    s_lastAuditActionId[playerIndex] = sample.actionId;
+    s_lastAuditNative[playerIndex] = sample.nativeActionableCandidate;
+    s_lastAuditMismatch[playerIndex] = mismatch;
+    s_hasLastAudit[playerIndex] = true;
 }
 
 void ClearPendingAttack(PendingAttack* pending) {
@@ -330,6 +379,10 @@ void ClearTrackingRuntime(bool clearHistory) {
     s_lastSimFrame = kFrameUnset;
     s_lastDefenderFreeFrame[0] = kFrameUnset;
     s_lastDefenderFreeFrame[1] = kFrameUnset;
+    memset(s_lastAuditActionId, 0, sizeof(s_lastAuditActionId));
+    memset(s_lastAuditNative, 0, sizeof(s_lastAuditNative));
+    memset(s_lastAuditMismatch, 0, sizeof(s_lastAuditMismatch));
+    memset(s_hasLastAudit, 0, sizeof(s_hasLastAudit));
     if (clearHistory) {
         s_historyHead = 0;
         s_historyCount = 0;
@@ -374,10 +427,11 @@ bool HasActiveTracking() {
     return false;
 }
 
-void UpdatePlayerSamples() {
+void UpdatePlayerSamples(uint32_t simFrame) {
     for (int playerIndex = 0; playerIndex < 2; ++playerIndex) {
         PlayerState& player = s_players[playerIndex];
         player.curr = ReadEntitySample(kEntityBases[playerIndex]);
+        AuditActionability(simFrame, playerIndex, player.curr);
 
         // Log on significant state changes (throttled)
         if (s_debugLogging) {
@@ -466,9 +520,19 @@ void RefreshPendingAttack(uint32_t simFrame, int attackerIndex) {
     }
 
     if (pending.simFrame_A_recover == kFrameUnset &&
-        !IsActionable(attacker.prev.actionId) &&
-        IsActionable(attacker.curr.actionId)) {
+        !IsFree(attacker.prev, Training::ActionableContext::AttackerRecovery) &&
+        IsFree(attacker.curr, Training::ActionableContext::AttackerRecovery)) {
         pending.simFrame_A_recover = simFrame;
+        if (s_actionabilityAuditLogging) {
+            LOG_INFO("[FAREC] frame=%u %s role=pending-attacker act=%u phase=%u aframe=%u source=legacy native676=%u A_recover=%u",
+                     simFrame,
+                     SideLabel((uint8_t)attackerIndex),
+                     attacker.curr.actionId,
+                     (unsigned int)attacker.curr.actionPhase,
+                     (unsigned int)attacker.curr.actionFrame,
+                     (unsigned int)attacker.curr.nativeActionableCandidate,
+                     pending.simFrame_A_recover);
+        }
         if (s_debugLogging) {
             LOG_INFO("[FA] %s PENDING attacker recovered: frame=%u (prev_act=%u curr_act=%u)",
                      SideLabel((uint8_t)attackerIndex), simFrame,
@@ -511,6 +575,7 @@ void PromotePendingAttackToInteraction(uint32_t simFrame, int attackerIndex, int
     interaction.defender_actionAtContact = defender.curr.actionId;
     interaction.result = IsBlockstun(defender.curr.actionId) ? InteractionResult::Blocked : InteractionResult::Hit;
     interaction.lastProgressFrame = simFrame;
+    interaction.defenderWasAirLocked = IsAirLockedAction(defender.curr.actionId);
 
     if (s_debugLogging) {
         LOG_INFO("[FA] PROMOTED %s->%s: frame=%u actionId=%u def_act=%u result=%s A_recover=%s hitSeen=%d",
@@ -531,16 +596,26 @@ void PromotePendingAttackToInteraction(uint32_t simFrame, int attackerIndex, int
 void ProcessContactEdges(uint32_t simFrame) {
     for (int defenderIndex = 0; defenderIndex < 2; ++defenderIndex) {
         const PlayerState& defender = s_players[defenderIndex];
-        const bool enteredStun = !IsDefenderLocked(defender.prev.actionId) && IsStunned(defender.curr.actionId);
-        if (!enteredStun) {
+        const bool enteredContact = !Training::IsContactStartState(defender.prev.actionId) &&
+                                    Training::IsContactStartState(defender.curr.actionId);
+        if (!enteredContact) {
             continue;
         }
 
         if (s_debugLogging) {
-            LOG_INFO("[FA] %s ENTERED STUN: frame=%u prev_act=%u(%s) curr_act=%u(%s)",
+            LOG_INFO("[FA] %s ENTERED CONTACT: frame=%u prev_act=%u(%s) curr_act=%u(%s)",
                      SideLabel((uint8_t)defenderIndex), simFrame,
                      defender.prev.actionId, ActionCategory(defender.prev.actionId),
                      defender.curr.actionId, ActionCategory(defender.curr.actionId));
+        }
+        if (s_actionabilityAuditLogging) {
+            LOG_INFO("[FAREC] frame=%u %s role=contact act=%u phase=%u aframe=%u source=contact-state native676=%u",
+                     simFrame,
+                     SideLabel((uint8_t)defenderIndex),
+                     defender.curr.actionId,
+                     (unsigned int)defender.curr.actionPhase,
+                     (unsigned int)defender.curr.actionFrame,
+                     (unsigned int)defender.curr.nativeActionableCandidate);
         }
 
         const int attackerIndex = 1 - defenderIndex;
@@ -585,6 +660,7 @@ void ProcessContactEdges(uint32_t simFrame) {
             existing.defender_actionAtContact = defender.curr.actionId;
             existing.result = IsBlockstun(defender.curr.actionId) ? InteractionResult::Blocked : InteractionResult::Hit;
             existing.defenderLaunched = false;
+            existing.defenderWasAirLocked = existing.defenderWasAirLocked || IsAirLockedAction(defender.curr.actionId);
             existing.lastProgressFrame = simFrame;
             continue;
         }
@@ -636,10 +712,20 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
     const PlayerState& defender = s_players[interaction.defender];
 
     if (interaction.simFrame_A_recover == kFrameUnset &&
-        !IsActionable(attacker.prev.actionId) &&
-        IsActionable(attacker.curr.actionId)) {
+        !IsFree(attacker.prev, Training::ActionableContext::AttackerRecovery) &&
+        IsFree(attacker.curr, Training::ActionableContext::AttackerRecovery)) {
         interaction.simFrame_A_recover = simFrame;
         interaction.lastProgressFrame = simFrame;
+        if (s_actionabilityAuditLogging) {
+            LOG_INFO("[FAREC] frame=%u %s role=attacker act=%u phase=%u aframe=%u source=legacy native676=%u A_recover=%u",
+                     simFrame,
+                     SideLabel(interaction.attacker),
+                     attacker.curr.actionId,
+                     (unsigned int)attacker.curr.actionPhase,
+                     (unsigned int)attacker.curr.actionFrame,
+                     (unsigned int)attacker.curr.nativeActionableCandidate,
+                     interaction.simFrame_A_recover);
+        }
         if (s_debugLogging) {
             LOG_INFO("[FA] %s ATTACKER RECOVERED: frame=%u (act: %u->%u)",
                      SideLabel(interaction.attacker), simFrame,
@@ -653,6 +739,7 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
         !interaction.defenderLaunched &&
         IsKnockdownOrLaunch(defender.curr.actionId)) {
         interaction.defenderLaunched = true;
+        interaction.defenderWasAirLocked = true;
         if (s_debugLogging) {
             LOG_INFO("[FA] %s DEFENDER ENTERED KNOCKDOWN/WAKEUP: frame=%u def_act=%u(%s) - waiting for true recovery",
                      SideLabel(interaction.defender), simFrame,
@@ -667,10 +754,21 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
 
     if (interaction.simFrame_D_recover == kFrameUnset &&
         !IsDefenderLocked(defender.curr.actionId) &&
-        !IsActionable(defender.prev.actionId) &&
-        IsActionable(defender.curr.actionId)) {
+        !IsFree(defender.prev, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked) &&
+        IsFree(defender.curr, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked)) {
         interaction.simFrame_D_recover = simFrame;
         interaction.lastProgressFrame = simFrame;
+        if (s_actionabilityAuditLogging) {
+            LOG_INFO("[FAREC] frame=%u %s role=defender act=%u phase=%u aframe=%u source=legacy native676=%u D_recover=%u airLocked=%d",
+                     simFrame,
+                     SideLabel(interaction.defender),
+                     defender.curr.actionId,
+                     (unsigned int)defender.curr.actionPhase,
+                     (unsigned int)defender.curr.actionFrame,
+                     (unsigned int)defender.curr.nativeActionableCandidate,
+                     interaction.simFrame_D_recover,
+                     interaction.defenderWasAirLocked ? 1 : 0);
+        }
         if (s_debugLogging) {
             LOG_INFO("[FA] %s DEFENDER RECOVERED: frame=%u (act: %u->%u)",
                      SideLabel(interaction.defender), simFrame,
@@ -803,7 +901,7 @@ void FrameAdvantage_OnFrameAdvanced(uint32_t simFrame) {
         return;
     }
 
-    UpdatePlayerSamples();
+    UpdatePlayerSamples(simFrame);
 
     if (!s_players[0].hasPrev || !s_players[1].hasPrev) {
         PrimePreviousSamples();
@@ -888,6 +986,8 @@ void FrameAdvantage_RenderImGui(void) {
     if (s_enabled) {
         ImGui::SameLine();
         ImGui::Checkbox("Debug Log", &s_debugLogging);
+        ImGui::SameLine();
+        ImGui::Checkbox("Audit Actionability", &s_actionabilityAuditLogging);
     }
 
     if (s_enabled && s_historyCount > 0) {
@@ -945,6 +1045,7 @@ void FrameAdvantage_RenderImGui(void) {
                             (ia.simFrame_A_recover == kFrameUnset) ? "unset" : "set",
                             (ia.simFrame_D_recover == kFrameUnset) ? "unset" : "set",
                             ia.defenderLaunched ? 1 : 0);
+                ImGui::Text("    airLocked=%d", ia.defenderWasAirLocked ? 1 : 0);
             }
         }
 

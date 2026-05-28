@@ -5,8 +5,10 @@
 namespace Rollback {
 
 using EffectEnqueue_t = char (__cdecl *)(int effect_id, char type, int16_t x, int16_t y);
+using EffectDrawQueue_t = int (__cdecl *)(int match);
 
 extern EffectEnqueue_t g_origEffectEnqueue;
+extern EffectDrawQueue_t g_origEffectDrawQueue;
 
 void RollbackStatusFx_Init();
 void RollbackStatusFx_Shutdown();
@@ -18,6 +20,7 @@ void RollbackStatusFx_OnAdvanceBegin(int32_t rb_frame, int32_t game_abs_frame, b
 void RollbackStatusFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame);
 
 char __cdecl Hook_Effect_Enqueue(int effect_id, char type, int16_t x, int16_t y);
+int __cdecl Hook_Effect_DrawQueue(int match);
 
 struct RollbackStatusFxSnapshot {
     int32_t committed_count;

@@ -43,6 +43,7 @@ static int32_t s_currentRbFrame = -1;
 static int32_t s_currentGameAbsFrame = -1;
 static bool s_currentRollingBack = false;
 static int32_t s_lastLoadFrame = -999999;
+static int32_t s_lastSummaryFrame = -999999;
 static uint32_t s_sequence = 0;
 static uint16_t s_frameSoundOrdinal[kSoundIdCount] = {};
 static RollbackAudioSnapshot s_stats = {};
@@ -318,6 +319,7 @@ void RollbackAudio_OnSessionBegin(int rollback_budget) {
     s_currentRollingBack = false;
     s_reconcileOpen = false;
     s_lastLoadFrame = -999999;
+    s_lastSummaryFrame = -999999;
     s_sequence = 0;
     memset(s_frameSoundOrdinal, 0, sizeof(s_frameSoundOrdinal));
     memset(&s_stats, 0, sizeof(s_stats));
@@ -444,7 +446,6 @@ void RollbackAudio_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) {
 
     PruneOldEvents(rb_frame);
 
-    static int32_t s_lastSummaryFrame = -999999;
     if (rb_frame - s_lastSummaryFrame >= 120) {
         s_lastSummaryFrame = rb_frame;
         NetplayLog_Write("AUDIO", rb_frame,

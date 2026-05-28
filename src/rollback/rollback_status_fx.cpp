@@ -54,6 +54,10 @@ static int32_t s_currentRbFrame = 0;
 static int32_t s_currentGameAbsFrame = 0;
 static bool s_currentRollingBack = false;
 static RollbackStatusFxSnapshot s_stats = {};
+static uint8_t s_suppressedSlotActive[EFFECT_MAX_SLOTS] = {};
+static uint16_t s_suppressedSlotEffect[EFFECT_MAX_SLOTS] = {};
+static int32_t s_suppressedSlotUntil[EFFECT_MAX_SLOTS] = {};
+static uint32_t s_drawSuppressCount = 0;
 
 static std::vector<StatusFxEvent> s_committed;
 static std::vector<StatusFxEvent> s_pendingPredicted;
@@ -69,6 +73,77 @@ static bool IsSuspectStatusEffectId(int effect_id) {
 
 static bool IsMonitoredStatusFx(int effect_id) {
     return IsPrmStatusMessageId(effect_id) || IsSuspectStatusEffectId(effect_id);
+}
+
+static uint16_t NormalizeEffectSlot(uint16_t slot) {
+    return (uint16_t)(slot % EFFECT_MAX_SLOTS);
+}
+
+static void ClearSuppressedSlots() {
+    memset(s_suppressedSlotActive, 0, sizeof(s_suppressedSlotActive));
+    memset(s_suppressedSlotEffect, 0, sizeof(s_suppressedSlotEffect));
+    memset(s_suppressedSlotUntil, 0, sizeof(s_suppressedSlotUntil));
+}
+
+static void SuppressSlot(uint16_t slot, uint16_t effect_id, int32_t ttl_frames) {
+    if (effect_id == 0 || !IsMonitoredStatusFx(effect_id)) {
+        return;
+    }
+
+    const uint16_t normalized = NormalizeEffectSlot(slot);
+    const int32_t ttl = std::max<int32_t>(1, ttl_frames);
+    s_suppressedSlotActive[normalized] = 1;
+    s_suppressedSlotEffect[normalized] = effect_id;
+    s_suppressedSlotUntil[normalized] = s_currentRbFrame + ttl;
+}
+
+static void SuppressEventSlot(const StatusFxEvent& ev, int32_t ttl_frames) {
+    SuppressSlot(ev.slot_before, ev.effect_id, ttl_frames);
+}
+
+static void ReleaseSlot(uint16_t slot, uint16_t effect_id) {
+    const uint16_t normalized = NormalizeEffectSlot(slot);
+    if (!s_suppressedSlotActive[normalized]) {
+        return;
+    }
+
+    if (effect_id != 0 && s_suppressedSlotEffect[normalized] != effect_id) {
+        return;
+    }
+
+    s_suppressedSlotActive[normalized] = 0;
+    s_suppressedSlotEffect[normalized] = 0;
+    s_suppressedSlotUntil[normalized] = 0;
+}
+
+static void ReleaseEventSlot(const StatusFxEvent& ev) {
+    ReleaseSlot(ev.slot_before, ev.effect_id);
+}
+
+static void PruneSuppressedSlots() {
+    for (int i = 0; i < EFFECT_MAX_SLOTS; ++i) {
+        if (s_suppressedSlotActive[i] && s_suppressedSlotUntil[i] < s_currentRbFrame) {
+            s_suppressedSlotActive[i] = 0;
+            s_suppressedSlotEffect[i] = 0;
+            s_suppressedSlotUntil[i] = 0;
+        }
+    }
+}
+
+static bool IsSlotSuppressed(uint16_t slot, uint16_t effect_id) {
+    const uint16_t normalized = NormalizeEffectSlot(slot);
+    if (!s_suppressedSlotActive[normalized]) {
+        return false;
+    }
+
+    if (s_suppressedSlotUntil[normalized] < s_currentRbFrame) {
+        s_suppressedSlotActive[normalized] = 0;
+        s_suppressedSlotEffect[normalized] = 0;
+        s_suppressedSlotUntil[normalized] = 0;
+        return false;
+    }
+
+    return s_suppressedSlotEffect[normalized] == effect_id;
 }
 
 static uint8_t GuessSideFromPosition(int16_t x, int16_t y) {
@@ -234,6 +309,7 @@ static void RecordStatusFxEvent(int effect_id,
 } // namespace
 
 EffectEnqueue_t g_origEffectEnqueue = nullptr;
+EffectDrawQueue_t g_origEffectDrawQueue = nullptr;
 
 void RollbackStatusFx_Init() {
     if (s_initialized) {
@@ -244,9 +320,11 @@ void RollbackStatusFx_Init() {
     memset(&s_stats, 0, sizeof(s_stats));
     s_stats.last_load_frame = -1;
     s_stats.last_reconcile_frame = -1;
+    ClearSuppressedSlots();
+    s_drawSuppressCount = 0;
     s_initialized = true;
     NetplayLog_Write("STATUSFX", -1,
-        "INIT rollback_budget=%d monitored=166..190,231..239 reserve=%d",
+        "INIT rollback_budget=%d monitored=166..190,231..239 reserve=%d draw_filter=1",
         s_rollbackBudget,
         kDefaultReserve);
 }
@@ -269,13 +347,15 @@ void RollbackStatusFx_OnSessionBegin(int rollback_budget) {
     memset(&s_stats, 0, sizeof(s_stats));
     s_stats.last_load_frame = -1;
     s_stats.last_reconcile_frame = -1;
+    ClearSuppressedSlots();
+    s_drawSuppressCount = 0;
     s_committed.clear();
     s_pendingPredicted.clear();
     s_corrected.clear();
     ReserveVectors();
 
     NetplayLog_Write("STATUSFX", 0,
-        "SESSION BEGIN budget=%d monitored=166..190,231..239",
+        "SESSION BEGIN budget=%d monitored=166..190,231..239 draw_filter=1",
         s_rollbackBudget);
 }
 
@@ -285,7 +365,7 @@ void RollbackStatusFx_OnSessionEnd(const char* reason) {
     }
 
     NetplayLog_Write("STATUSFX", s_currentRbFrame,
-        "SESSION END reason=\"%s\" committed=%d pending=%d corrected=%d normal=%d resim=%d exact=%d shifted=%d corrected_only=%d ghosts=%d unknown_side=%d invalid=%d",
+        "SESSION END reason=\"%s\" committed=%d pending=%d corrected=%d normal=%d resim=%d exact=%d shifted=%d corrected_only=%d ghosts=%d draw_suppressed=%u unknown_side=%d invalid=%d",
         reason ? reason : "unknown",
         (int)s_committed.size(),
         (int)s_pendingPredicted.size(),
@@ -296,6 +376,7 @@ void RollbackStatusFx_OnSessionEnd(const char* reason) {
         s_stats.total_shifted_matches,
         s_stats.total_corrected_only,
         s_stats.total_ghosts,
+        s_drawSuppressCount,
         s_stats.total_unknown_side,
         s_stats.total_invalid_effect_ids);
 
@@ -304,6 +385,8 @@ void RollbackStatusFx_OnSessionEnd(const char* reason) {
     s_committed.clear();
     s_pendingPredicted.clear();
     s_corrected.clear();
+    ClearSuppressedSlots();
+    s_drawSuppressCount = 0;
 }
 
 void RollbackStatusFx_OnGekkoLoad(int32_t load_rb_frame, int32_t load_game_abs_frame) {
@@ -311,11 +394,16 @@ void RollbackStatusFx_OnGekkoLoad(int32_t load_rb_frame, int32_t load_game_abs_f
         return;
     }
 
+    s_currentRbFrame = load_rb_frame;
+    s_currentGameAbsFrame = load_game_abs_frame;
+
     size_t moved = 0;
     for (auto it = s_committed.begin(); it != s_committed.end();) {
         if (it->rb_frame > load_rb_frame) {
-            it->consumed = false;
-            s_pendingPredicted.push_back(*it);
+            StatusFxEvent pending = *it;
+            pending.consumed = false;
+            SuppressEventSlot(pending, s_rollbackBudget + kPruneMarginFrames);
+            s_pendingPredicted.push_back(pending);
             it = s_committed.erase(it);
             ++moved;
         } else {
@@ -385,6 +473,8 @@ void RollbackStatusFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) 
         int idx = FindExactMatch(pred);
         if (idx >= 0) {
             s_corrected[idx].consumed = true;
+            ReleaseEventSlot(pred);
+            ReleaseEventSlot(s_corrected[idx]);
             ++exact;
             ++s_stats.total_exact_matches;
             NetplayLog_Write("STATUSFX", rb_frame,
@@ -403,6 +493,8 @@ void RollbackStatusFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) 
         idx = FindShiftedMatch(pred);
         if (idx >= 0) {
             s_corrected[idx].consumed = true;
+            ReleaseEventSlot(pred);
+            ReleaseEventSlot(s_corrected[idx]);
             ++shifted;
             ++s_stats.total_shifted_matches;
             NetplayLog_Write("STATUSFX", rb_frame,
@@ -421,6 +513,7 @@ void RollbackStatusFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) 
 
         ++ghosts;
         ++s_stats.total_ghosts;
+        SuppressEventSlot(pred, s_rollbackBudget + kPruneMarginFrames);
         NetplayLog_Write("STATUSFX", rb_frame,
             "GHOST PREDICTED pred_rb=%d game=%d mode=%u sub=%u/%u id=%u side=%u type=%u ord=%u x=%d y=%d slot=%u caller=0x%08X",
             pred.rb_frame,
@@ -445,6 +538,7 @@ void RollbackStatusFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) 
 
         ++correctedOnly;
         ++s_stats.total_corrected_only;
+        ReleaseEventSlot(corr);
         NetplayLog_Write("STATUSFX", rb_frame,
             "CORRECTED ONLY corr_rb=%d game=%d mode=%u sub=%u/%u id=%u side=%u type=%u ord=%u x=%d y=%d slot=%u caller=0x%08X",
             corr.rb_frame,
@@ -483,6 +577,7 @@ void RollbackStatusFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) 
     s_inRollbackBatch = false;
     s_stats.last_reconcile_frame = rb_frame;
     TrimOldCommittedEvents();
+    PruneSuppressedSlots();
 }
 
 char __cdecl Hook_Effect_Enqueue(int effect_id, char type, int16_t x, int16_t y) {
@@ -503,9 +598,24 @@ char __cdecl Hook_Effect_Enqueue(int effect_id, char type, int16_t x, int16_t y)
     const int32_t rbFrame = active ? RollbackSession_GetCurrentFrame() : -1;
     const int32_t gameAbs = active ? RollbackSession_GetCurrentGameAbsFrame()
                                    : (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
-    const uint16_t slotBefore = (uint16_t)ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
+    const uint16_t slotBefore = active ? (uint16_t)ReadMemory<uint32_t>(ADDR_EFFECT_INDEX) : 0;
 
     const char result = g_origEffectEnqueue(effect_id, type, x, y);
+
+    if (!active) {
+        if (monitored) {
+            NetplayLog_Verbose("STATUSFX", rbFrame,
+                "OUTSIDE_SESSION effect_id=%d type=%u x=%d y=%d game=%d caller=0x%08X",
+                effect_id,
+                (unsigned)(uint8_t)type,
+                x,
+                y,
+                gameAbs,
+                caller);
+        }
+        s_inHook = false;
+        return result;
+    }
 
     const uint16_t slotAfter = (uint16_t)ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
     if (monitored) {
@@ -536,6 +646,63 @@ char __cdecl Hook_Effect_Enqueue(int effect_id, char type, int16_t x, int16_t y)
     }
 
     s_inHook = false;
+    return result;
+}
+
+int __cdecl Hook_Effect_DrawQueue(int match) {
+    if (!g_origEffectDrawQueue) {
+        return 0;
+    }
+
+    if (!RollbackSession_IsActive()) {
+        return g_origEffectDrawQueue(match);
+    }
+
+    struct HiddenSlot {
+        uint16_t slot;
+        uint32_t effect_id;
+    };
+
+    HiddenSlot hidden[EFFECT_MAX_SLOTS];
+    int hiddenCount = 0;
+    const bool rolling = RollbackSession_IsRollingBack();
+    PruneSuppressedSlots();
+
+    for (uint16_t slot = 0; slot < EFFECT_MAX_SLOTS; ++slot) {
+        const uintptr_t effectIdAddr = ADDR_EFFECT_ARRAY + ((uintptr_t)slot * EFFECT_ENTRY_SIZE);
+        const uint32_t effectId = ReadMemory<uint32_t>(effectIdAddr);
+        if (!IsMonitoredStatusFx((int)effectId)) {
+            continue;
+        }
+
+        if (!rolling && !IsSlotSuppressed(slot, (uint16_t)effectId)) {
+            continue;
+        }
+
+        if (WriteMemory<uint32_t>(effectIdAddr, 0)) {
+            hidden[hiddenCount].slot = slot;
+            hidden[hiddenCount].effect_id = effectId;
+            ++hiddenCount;
+        }
+    }
+
+    const int result = g_origEffectDrawQueue(match);
+
+    for (int i = 0; i < hiddenCount; ++i) {
+        const uintptr_t effectIdAddr = ADDR_EFFECT_ARRAY + ((uintptr_t)hidden[i].slot * EFFECT_ENTRY_SIZE);
+        WriteMemory<uint32_t>(effectIdAddr, hidden[i].effect_id);
+    }
+
+    if (hiddenCount > 0) {
+        s_drawSuppressCount += (uint32_t)hiddenCount;
+        NetplayLog_Verbose("STATUSFX", s_currentRbFrame,
+            "DRAW_FILTER hidden=%d rolling=%d rb=%d game=%d",
+            hiddenCount,
+            rolling ? 1 : 0,
+            s_currentRbFrame,
+            s_currentGameAbsFrame);
+    }
+
     return result;
 }
 

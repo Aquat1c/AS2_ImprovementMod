@@ -571,6 +571,22 @@ static bool RestoreState(const GekkoState* state) {
 // GekkoNet Event Handlers
 // ============================================================================
 
+static void ClearMatchPerFrameTempForAdvance(int32_t rbFrame,
+                                             int32_t gameAbsFrame,
+                                             bool rollingBack) {
+    __try {
+        memset((void*)ADDR_MATCH_PER_FRAME_TEMP, 0, MATCH_PER_FRAME_TEMP_SIZE);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        NetplayLog_Write("AUDIO", rbFrame,
+            "WARN failed to clear match per-frame temp before advance: rb_frame=%d game_abs_frame=%d rolling_back=%d addr=0x%08X size=%u",
+            rbFrame,
+            gameAbsFrame,
+            rollingBack ? 1 : 0,
+            ADDR_MATCH_PER_FRAME_TEMP,
+            MATCH_PER_FRAME_TEMP_SIZE);
+    }
+}
+
 static void HandleSaveEvent(GekkoGameEvent* ev) {
     const int32_t rbFrame = ev->data.save.frame;
     const int32_t gameAbsFrame = RbCheckpointFrameToGameAbsFrame(rbFrame);
@@ -725,6 +741,7 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
     RollbackAudio_OnAdvanceBegin(rbFrame, gameAbsFrame, rolling_back);
     RollbackStatusFx_OnAdvanceBegin(rbFrame, gameAbsFrame, rolling_back);
     RollbackComboFx_OnAdvanceBegin(rbFrame, gameAbsFrame, rolling_back);
+    ClearMatchPerFrameTempForAdvance(rbFrame, gameAbsFrame, rolling_back);
 
     // Store for GetAdvanceInputs (read by input_override.cpp for normal frames)
     s_advP1 = raw_p1;

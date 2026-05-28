@@ -7,6 +7,7 @@
 #include "net/netplay_palette_runtime.h"
 #include "net/mode_ownership.h"
 #include "net/player_side_mapping.h"
+#include "net/set_tracker.h"
 #include "net/session_manager.h"
 #include "patches/memory_utils.h"
 #include "patches/tick_hooks.h"
@@ -46,7 +47,11 @@ constexpr uint16_t kReplayInputMask =
     INPUT_A | INPUT_B | INPUT_C | INPUT_D;
 constexpr size_t kReplayHeaderSize = 0x48;
 constexpr size_t kReplayTapeSize = static_cast<size_t>(INPUT_HISTORY_MAX) * 2;
-constexpr size_t kReplayPlayerBlockSize = 22;
+constexpr size_t kReplayHeaderP1PaletteOffset = 0x0C;
+constexpr size_t kReplayHeaderP2PaletteOffset = 0x0D;
+constexpr size_t kReplayHeaderP1NameOffset = 0x0E;
+constexpr size_t kReplayHeaderP2NameOffset = 0x23;
+constexpr size_t kReplayHeaderNameBytes = 21;
 constexpr size_t kReplayPaletteTrailerHeaderSize = 16;
 constexpr size_t kReplayPaletteTrailerRecordSize = 8 + Net::NETPLAY_PALETTE_BANK_SIZE;
 constexpr int32_t kReplayMenuSelectSubstate = 2;
@@ -214,6 +219,9 @@ static bool s_menuBackWasDown = false;
 static ReplaySave_t s_originalReplaySave = nullptr;
 static ReplaySelectDraw_t s_originalReplaySelectDraw = nullptr;
 static ReplayPaletteOverrideState s_loadedReplayPalette[2] = {};
+static fs::path s_netplaySetFolder;
+static std::string s_netplaySetKey;
+static int s_netplaySetLastTotalMatches = 0;
 
 static uint32_t ReadU32(const uint8_t* data);
 static std::string WideToUtf8(const std::wstring& text);
@@ -229,6 +237,9 @@ static bool ShouldRenameNetplayReplaySave(const Net::SessionSnapshot& session);
 static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
                                        const ReplayFileMetadata& metadata,
                                        fs::path* outRenamedPath);
+static bool MoveReplayIntoNetplaySetFolder(const fs::path& replayPath,
+                                           const ReplayFileMetadata& metadata,
+                                           fs::path* outMovedPath);
 
 using GetWindowHandle_t = LPVOID (__cdecl *)();
 
@@ -478,11 +489,23 @@ static bool AppendReplayPaletteTrailer(const fs::path& path,
 }
 
 static uint8_t ReplayHeaderPaletteForSlot(const ReplayFileMetadata& metadata, uint8_t slot) {
-    return slot == 0 ? metadata.header[0x0C] : metadata.header[0x22];
+    return slot == 0
+        ? metadata.header[kReplayHeaderP1PaletteOffset]
+        : metadata.header[kReplayHeaderP2PaletteOffset];
 }
 
 static uint32_t ReplayHeaderCharacterForSlot(const ReplayFileMetadata& metadata, uint8_t slot) {
     return slot == 0 ? metadata.p1_char : metadata.p2_char;
+}
+
+static std::string ReplayHeaderNameForSlot(const ReplayFileMetadata& metadata, uint8_t slot) {
+    const size_t offset = slot == 0 ? kReplayHeaderP1NameOffset : kReplayHeaderP2NameOffset;
+    std::string name(reinterpret_cast<const char*>(metadata.header.data() + offset),
+        kReplayHeaderNameBytes);
+    while (!name.empty() && (name.back() == '\0' || name.back() == ' ')) {
+        name.pop_back();
+    }
+    return name;
 }
 
 static void ParseReplayPaletteTrailer(std::ifstream& stream,
@@ -634,7 +657,14 @@ static char __cdecl Hook_ReplaySave(int matchBase) {
     if (shouldRenameNetplayReplay) {
         ReplayFileMetadata metadata{};
         if (ReadReplayMetadata(replayPath, &metadata) && metadata.valid) {
-            RenameReplaySaveForNetplay(replayPath, metadata, nullptr);
+            fs::path processedPath = replayPath;
+            if (RenameReplaySaveForNetplay(replayPath, metadata, &processedPath)) {
+                fs::path movedPath;
+                if (!MoveReplayIntoNetplaySetFolder(processedPath, metadata, &movedPath)) {
+                    LOG_WARN("[Replay] Netplay replay set-folder move failed; replay remains at %s",
+                        WideToUtf8(processedPath.wstring()).c_str());
+                }
+            }
         } else {
             LOG_WARN("[Replay] Skipped netplay replay rename because saved replay metadata could not be read");
         }
@@ -831,6 +861,29 @@ static std::string FormatReplayTimestampForFilename(const fs::path& path) {
     return buffer;
 }
 
+static std::string FormatReplayTimestampForFolder(const fs::path& path) {
+    std::error_code ec;
+    fs::file_time_type fileTime = fs::last_write_time(path, ec);
+    if (ec) {
+        fileTime = fs::file_time_type::clock::now();
+    }
+
+    const auto systemNow = std::chrono::system_clock::now();
+    const auto fileNow = fs::file_time_type::clock::now();
+    const auto systemTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        fileTime - fileNow + systemNow);
+
+    const std::time_t rawTime = std::chrono::system_clock::to_time_t(systemTime);
+    std::tm localTime = {};
+    if (localtime_s(&localTime, &rawTime) != 0) {
+        return "unknown_time";
+    }
+
+    char buffer[32] = {};
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d_%H-%M-%S", &localTime);
+    return buffer;
+}
+
 static std::string GetCharacterDisplayName(uint32_t characterId) {
     switch (characterId) {
         case 0: return "Rance";
@@ -904,15 +957,22 @@ static bool ShouldRenameNetplayReplaySave(const Net::SessionSnapshot& session) {
         (session.active || Net::PlayerMapping_IsAssigned());
 }
 
-static std::string BuildNetplayReplayFilename(const fs::path& replayPath,
-                                              const ReplayFileMetadata& metadata) {
+struct NetplayReplayNames {
+    std::string local_nickname;
+    std::string remote_nickname;
+    std::string p1_nickname;
+    std::string p2_nickname;
+};
+
+static NetplayReplayNames BuildNetplayReplayNames() {
     Net::SessionSnapshot session{};
     Net::Session_GetSnapshot(&session);
 
-    const std::string localNickname = SanitizeReplayFilenameComponent(
+    NetplayReplayNames names{};
+    names.local_nickname = SanitizeReplayFilenameComponent(
         session.local_nickname[0] ? session.local_nickname : "Local",
         "Local");
-    const std::string remoteNickname = SanitizeReplayFilenameComponent(
+    names.remote_nickname = SanitizeReplayFilenameComponent(
         session.remote_peer.nickname[0] ? session.remote_peer.nickname : "Remote",
         "Remote");
 
@@ -921,14 +981,20 @@ static std::string BuildNetplayReplayFilename(const fs::path& replayPath,
         localSlot = Net::Session_GetRole() == Net::SessionRole::Host ? 0 : 1;
     }
 
-    const std::string p1Nickname = localSlot == 0 ? localNickname : remoteNickname;
-    const std::string p2Nickname = localSlot == 0 ? remoteNickname : localNickname;
+    names.p1_nickname = localSlot == 0 ? names.local_nickname : names.remote_nickname;
+    names.p2_nickname = localSlot == 0 ? names.remote_nickname : names.local_nickname;
+    return names;
+}
+
+static std::string BuildNetplayReplayFilename(const fs::path& replayPath,
+                                              const ReplayFileMetadata& metadata) {
+    const NetplayReplayNames names = BuildNetplayReplayNames();
     const std::string p1Character = SanitizeReplayFilenameComponent(GetCharacterDisplayName(metadata.p1_char), "P1Char");
     const std::string p2Character = SanitizeReplayFilenameComponent(GetCharacterDisplayName(metadata.p2_char), "P2Char");
 
     return FormatReplayTimestampForFilename(replayPath) + "_" +
-        p1Nickname + "_" + p1Character + "_vs_" +
-        p2Nickname + "_" + p2Character + ".rep";
+        names.p1_nickname + "_" + p1Character + "_vs_" +
+        names.p2_nickname + "_" + p2Character + ".rep";
 }
 
 static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
@@ -974,6 +1040,147 @@ static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
         WideToUtf8(candidate.wstring()).c_str());
     if (outRenamedPath) {
         *outRenamedPath = candidate;
+    }
+    return true;
+}
+
+static std::string BuildNetplayReplaySetKey(const NetplayReplayNames& names) {
+    char buffer[256] = {};
+    snprintf(buffer, sizeof(buffer), "%s|%s|%d|%d",
+        names.p1_nickname.c_str(),
+        names.p2_nickname.c_str(),
+        Net::PlayerMapping_GetLocalGameSlot(),
+        (int)Net::Session_GetRole());
+    return buffer;
+}
+
+static void ResetNetplayReplaySetFolder(const char* reason) {
+    if (!s_netplaySetFolder.empty()) {
+        LOG_INFO("[Replay] Reset netplay replay set folder (%s): %s",
+            reason ? reason : "unknown",
+            WideToUtf8(s_netplaySetFolder.wstring()).c_str());
+    }
+    s_netplaySetFolder.clear();
+    s_netplaySetKey.clear();
+    s_netplaySetLastTotalMatches = 0;
+}
+
+static bool EnsureNetplayReplaySetFolder(const fs::path& replayPath,
+                                         const ReplayFileMetadata& metadata,
+                                         fs::path* outFolder) {
+    if (!outFolder) {
+        return false;
+    }
+
+    const NetplayReplayNames names = BuildNetplayReplayNames();
+    const std::string key = BuildNetplayReplaySetKey(names);
+    Net::SetTrackerSnapshot setSnapshot{};
+    Net::SetTracker_GetSnapshot(&setSnapshot);
+
+    if (!s_netplaySetKey.empty() && s_netplaySetKey != key) {
+        ResetNetplayReplaySetFolder("participant change");
+    }
+    if (!s_netplaySetFolder.empty() &&
+        setSnapshot.total_matches > 0 &&
+        setSnapshot.total_matches <= s_netplaySetLastTotalMatches) {
+        ResetNetplayReplaySetFolder("set counter reset");
+    }
+
+    std::error_code ec;
+    if (!s_netplaySetFolder.empty()) {
+        if (!fs::exists(s_netplaySetFolder, ec)) {
+            ec.clear();
+            if (!fs::create_directories(s_netplaySetFolder, ec) || ec) {
+                LOG_WARN("[Replay] Existing netplay set folder could not be recreated: %s (%s)",
+                    WideToUtf8(s_netplaySetFolder.wstring()).c_str(),
+                    ec.message().c_str());
+                ResetNetplayReplaySetFolder("folder missing");
+            }
+        }
+    }
+
+    if (s_netplaySetFolder.empty()) {
+        const std::string p1Character = SanitizeReplayFilenameComponent(
+            GetCharacterDisplayName(metadata.p1_char),
+            "P1Char");
+        const std::string p2Character = SanitizeReplayFilenameComponent(
+            GetCharacterDisplayName(metadata.p2_char),
+            "P2Char");
+        const std::string baseName =
+            names.p1_nickname + "_" + p1Character + "_vs_" +
+            names.p2_nickname + "_" + p2Character + " - " +
+            FormatReplayTimestampForFolder(replayPath);
+        fs::path candidate = fs::path(L"replay") / L"netplay" / fs::path(baseName);
+
+        int suffix = 2;
+        while (fs::exists(candidate, ec)) {
+            ec.clear();
+            char suffixBuffer[16] = {};
+            snprintf(suffixBuffer, sizeof(suffixBuffer), "_%d", suffix++);
+            candidate = fs::path(L"replay") / L"netplay" / fs::path(baseName + suffixBuffer);
+        }
+
+        if (!fs::create_directories(candidate, ec) && ec) {
+            LOG_WARN("[Replay] Failed to create netplay replay set folder %s (%s)",
+                WideToUtf8(candidate.wstring()).c_str(),
+                ec.message().c_str());
+            return false;
+        }
+
+        s_netplaySetFolder = candidate;
+        s_netplaySetKey = key;
+        LOG_INFO("[Replay] Created netplay replay set folder: %s",
+            WideToUtf8(s_netplaySetFolder.wstring()).c_str());
+    }
+
+    s_netplaySetLastTotalMatches = setSnapshot.total_matches;
+    *outFolder = s_netplaySetFolder;
+    return true;
+}
+
+static bool MoveReplayIntoNetplaySetFolder(const fs::path& replayPath,
+                                           const ReplayFileMetadata& metadata,
+                                           fs::path* outMovedPath) {
+    fs::path folder;
+    if (!EnsureNetplayReplaySetFolder(replayPath, metadata, &folder)) {
+        return false;
+    }
+
+    fs::path candidate = folder / replayPath.filename();
+    const std::string stem = candidate.stem().string();
+    const std::string extension = candidate.extension().string();
+
+    int suffix = 2;
+    std::error_code ec;
+    while (candidate != replayPath && fs::exists(candidate, ec)) {
+        ec.clear();
+
+        char suffixBuffer[16] = {};
+        snprintf(suffixBuffer, sizeof(suffixBuffer), "_%d", suffix++);
+        candidate = folder / fs::path(stem + suffixBuffer + extension);
+    }
+
+    if (candidate == replayPath) {
+        if (outMovedPath) {
+            *outMovedPath = replayPath;
+        }
+        return true;
+    }
+
+    fs::rename(replayPath, candidate, ec);
+    if (ec) {
+        LOG_WARN("[Replay] Failed to move saved replay into set folder %s -> %s (%s)",
+            WideToUtf8(replayPath.wstring()).c_str(),
+            WideToUtf8(candidate.wstring()).c_str(),
+            ec.message().c_str());
+        return false;
+    }
+
+    LOG_INFO("[Replay] Moved saved replay into set folder: %s -> %s",
+        WideToUtf8(replayPath.wstring()).c_str(),
+        WideToUtf8(candidate.wstring()).c_str());
+    if (outMovedPath) {
+        *outMovedPath = candidate;
     }
     return true;
 }
@@ -1743,6 +1950,19 @@ static bool LaunchReplayEntry(const ReplayBrowserEntry& entry) {
 
     ParseReplayPaletteTrailer(stream, metadata, entry.relative_path.c_str());
 
+    const std::string p1HeaderName = ReplayHeaderNameForSlot(metadata, 0);
+    const std::string p2HeaderName = ReplayHeaderNameForSlot(metadata, 1);
+    LOG_INFO("[Replay] Header parse %s: p1_char=%u p1_palette=%u p1_name='%s' "
+             "p2_char=%u p2_palette=%u p2_name='%s' frames=%d",
+        entry.relative_path.c_str(),
+        metadata.p1_char,
+        metadata.header[kReplayHeaderP1PaletteOffset],
+        p1HeaderName.c_str(),
+        metadata.p2_char,
+        metadata.header[kReplayHeaderP2PaletteOffset],
+        p2HeaderName.c_str(),
+        metadata.frames);
+
     if (!WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_REPLAY_HEADER_BASE),
                               metadata.header.data(),
                               metadata.header.size())) {
@@ -1771,12 +1991,16 @@ static bool LaunchReplayEntry(const ReplayBrowserEntry& entry) {
 
     WriteMemory<uint32_t>(ADDR_CHARSEL_P1_CHAR_ID, ReadU32(metadata.header.data() + 0x04));
     WriteMemory<uint32_t>(ADDR_CHARSEL_P2_CHAR_ID, ReadU32(metadata.header.data() + 0x08));
-    WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_CHARSEL_P1_PALETTE),
-                         metadata.header.data() + 0x0C,
-                         kReplayPlayerBlockSize);
-    WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_CHARSEL_P2_PALETTE),
-                         metadata.header.data() + 0x22,
-                         kReplayPlayerBlockSize);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_P1_PALETTE,
+                         metadata.header[kReplayHeaderP1PaletteOffset]);
+    WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_CHARSEL_P1_PALETTE + 1),
+                         metadata.header.data() + kReplayHeaderP1NameOffset,
+                         kReplayHeaderNameBytes);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_P2_PALETTE,
+                         metadata.header[kReplayHeaderP2PaletteOffset]);
+    WriteMemoryBlockSafe(reinterpret_cast<void*>(ADDR_CHARSEL_P2_PALETTE + 1),
+                         metadata.header.data() + kReplayHeaderP2NameOffset,
+                         kReplayHeaderNameBytes);
     WriteMemory<uint16_t>(ADDR_CHARSEL_P1_VARIANT, ReadU16(metadata.header.data() + 0x38));
     WriteMemory<uint8_t>(ADDR_CHARSEL_P1_VARIANT_EXTRA, metadata.header[0x3A]);
     WriteMemory<uint16_t>(ADDR_CHARSEL_P2_VARIANT, ReadU16(metadata.header.data() + 0x3B));
@@ -2443,6 +2667,7 @@ bool ReplayRuntime_InstallHooks() {
 void ReplayRuntime_Init() {
     ResetMatchRuntimeState();
     ResetLoadedReplayPaletteState();
+    ResetNetplayReplaySetFolder("runtime init");
     ResetBrowserState();
     ResetMatchHotkeyEdges();
     ResetMenuHotkeyEdges();
@@ -2457,6 +2682,7 @@ void ReplayRuntime_Shutdown() {
 
     DeactivateReplayMatch("shutdown");
     ResetLoadedReplayPaletteState();
+    ResetNetplayReplaySetFolder("runtime shutdown");
     ResetBrowserState();
     s_initialized = false;
     LOG_INFO("[Replay] Runtime shutdown");

@@ -488,6 +488,7 @@ The rollback session manages the GekkoNet rollback library integration:
 - Transport adapter bridging ENet packets to GekkoNet's internal format
 - Serialized game state (`GekkoState`) with explicit frame metadata and CRC
 - FPU state capture (x87 control word + MXCSR) for floating-point determinism
+- AS2 per-frame temp scratch is cleared before every Gekko advance, not only after loads, so sound/channel-active and hit temp guards cannot bleed across replayed frames
 
 **Replay atomicity:** Gekko rollback replay aborts if an advance event cannot assemble inputs. In that case the replay batch is cleared, the current frame is restored, and incorrect-prediction markers are not cleared. This prevents partial replays from masking a bad prediction.
 
@@ -514,8 +515,8 @@ FPU state is captured for diagnostics but not restored by default.
 
 The active replay side-effect controls live in rollback session sidecars:
 - `rollback_audio.cpp` journals/suppresses gameplay sound effects during replay and emits corrected audio once frames settle.
-- `rollback_status_fx.cpp` tracks status/combo/effect presentation candidates so visual cleanup can be implemented with runtime evidence instead of blind suppression.
-- `rollback_combo_fx.cpp` logs combo/hit-reaction/attached-FX presentation state while filtering ordinary render-parameter animation churn from normal log level.
+- `rollback_status_fx.cpp` journals native global status/sidebar effects during active rollback sessions only, then filters the global effect draw pass (`sub_4AB0F0`) so rollback-resim and ghost-predicted monitored status effects do not present stale visuals. It still always calls native `Effect_Enqueue` and restores draw-filtered slots immediately after rendering.
+- `rollback_combo_fx.cpp` tracks combo/hit-reaction/attached-FX entity state separately. These fields are inside the deterministic entity snapshot, so the current implementation does not clear or suppress combo state; visible status/effect ghosts are handled at the global-effect draw layer instead.
 
 ### Input Timeline
 
@@ -968,7 +969,7 @@ The Practice tab inside the mod menu (F1) contains seven sub-tabs:
 
 ### Trigger Engine
 
-Five scripted reversal events, fired on actionable-edge transitions:
+Five scripted reversal events, fired on actionable-edge transitions through the shared training action-state classifier. The candidate byte at entity `+0x0676` is logged as audit data only and is not used as the primary "can act" signal.
 
 | Trigger | Condition |
 |---------|-----------|
@@ -1023,11 +1024,14 @@ Three-stage interaction tracking -- pending attack → contact → recovery -- r
 | `=` (neutral) | Both recover the same frame |
 | `gap N` (yellow) | Defender recovered N frames before the next contact (max 60) |
 
-**Action classification** used to detect the actionable edge: Actionable / Blockstun / Hitstun / WakeupNoTech / Tech / Knockdown / Healing / Other.
+**Action classification** is centralized in `training/action_state_classifier` and used by both frame advantage and practice triggers. Legacy action IDs remain the shipping source of truth; entity `+0x0676` is treated as a candidate native actionability bit and can be compared with the **Audit Actionability** toggle before any future promotion.
+
+Classification labels: Actionable / ProxGuard / Blockstun / Hitstun / WakeupNoTech / AirTech / GroundTech / PostTech / Healing / Other. Contact starts only on blockstun or hitstun states; wakeup, launch, and tech states remain forced recovery and do not open new contacts. Landing (`23`) is allowed for threat-window cleanup only, not canonical FA recovery.
 
 - Overlay is anchored above the meter bars and shares its slot with the pause and macro overlays
 - History ring buffer retains the last 20 interactions for the ImGui panel
-- Debug logging toggle in the Options tab logs every sample transition
+- Debug logging toggle in the Options tab logs sample transitions
+- Audit Actionability logs `[FAACT]` and `[FAREC]` lines on action/native-candidate mismatches, chosen recovery edges, and contact edges
 - Timeouts: 180-frame pending window, 300-frame interaction window, 180-frame result display, 30-frame gap display
 
 ### Input Macros

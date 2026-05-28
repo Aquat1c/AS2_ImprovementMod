@@ -66,6 +66,7 @@ void WriteKeyboardInput(uint8_t scancode, bool pressed);
 void WriteMatchInput(int player, uint16_t input);
 void WritePlayerInput(int player, uint16_t input);
 uint16_t ReadPlayerInput(int player);
+void InputOverride_LoadSettings();
 void InputOverride_Shutdown();
 bool InputOverride_AreShellHotkeyImeWorkaroundsEnabled();
 bool InputOverride_AreSystemKeyWorkaroundsEnabled();

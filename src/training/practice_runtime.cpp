@@ -1,5 +1,6 @@
 #include "practice_internal.h"
 
+#include "training/action_state_classifier.h"
 #include "training/frame_advantage.h"
 #include "training/hotkey_config.h"
 #include "training/input_macro.h"
@@ -278,6 +279,7 @@ struct PlayerSnapshot {
     uint8_t hitActive;
     uint8_t blockstun;
     uint8_t hitstunDuration;
+    uint16_t knockbackTimer;
     uint16_t comboCount;
 };
 
@@ -682,55 +684,65 @@ static uint32_t ReadEntityCharacterId(uintptr_t entityBase) {
     return (charId < kPracticeRosterCount) ? charId : 0;
 }
 
-static bool IsLegacyActionableAction(uint32_t actionId) {
-    // 2=stand, 3=turnaround, 4/5=walk, 6=stand→crouch, 7=crouch, 8=crouch→stand,
-    // 22=air neutral, 23=landing
-    // 63/66/69=ProxGuard (cancellable), 106=healing stance cancel
-    return actionId == 2  || actionId == 3  || actionId == 4  || actionId == 5  ||
-           actionId == 6  || actionId == 7  || actionId == 8  || actionId == 22 ||
-           actionId == 23 ||
-           actionId == 63 || actionId == 66 || actionId == 69 ||
-           actionId == 106;
+static Training::ActionStateSample ToActionStateSample(const PlayerSnapshot& snapshot) {
+    Training::ActionStateSample out{};
+    out.actionId = snapshot.actionId;
+    out.nativeActionableCandidate = snapshot.nativeActionable;
+    out.attackState = snapshot.attackState;
+    out.hitActive = snapshot.hitActive;
+    out.blockstun = snapshot.blockstun;
+    out.hitstunDuration = snapshot.hitstunDuration;
+    out.knockbackTimer = snapshot.knockbackTimer;
+    return out;
+}
+
+static bool IsActionableWithContext(const PlayerSnapshot& snapshot,
+                                    Training::ActionableContext context) {
+    return Training::EvaluateActionability(
+        ToActionStateSample(snapshot),
+        context,
+        false,
+        Training::ActionabilitySource::LegacyActionId).actionable;
 }
 
 static bool IsActionable(const PlayerSnapshot& snapshot) {
-    return snapshot.nativeActionable != 0;
+    return IsActionableWithContext(snapshot, Training::ActionableContext::PracticeTrigger);
+}
+
+static bool IsThreatWindowFree(const PlayerSnapshot& snapshot) {
+    return IsActionableWithContext(snapshot, Training::ActionableContext::ThreatWindowEnd);
 }
 
 static bool IsBlockstun(uint32_t actionId) {
-    // Real forced blockstun only: Hold/Hit pairs.
-    // ProxGuard (63, 66, 69) is cancellable and lives in IsLegacyActionableAction instead.
-    return (actionId == 64 || actionId == 65) ||
-           (actionId == 67 || actionId == 68) ||
-           (actionId == 70 || actionId == 71);
+    return Training::IsBlockstun(actionId);
 }
 
 static bool IsHitstun(uint32_t actionId) {
-    return actionId == 72 || actionId == 73;
+    return Training::IsHitstun(actionId);
 }
 
 static bool IsStunned(uint32_t actionId) {
-    return IsBlockstun(actionId) || IsHitstun(actionId);
+    return Training::IsContactStartState(actionId);
 }
 
 static bool IsTechState(uint32_t actionId) {
-    return actionId >= 78 && actionId <= 82;
+    return Training::IsTechOrPostTech(actionId);
 }
 
 static bool IsAirTechState(uint32_t actionId) {
-    return actionId == 78;
+    return Training::IsAirTech(actionId);
 }
 
 static bool IsGroundTechState(uint32_t actionId) {
-    return actionId >= 79 && actionId <= 81;
+    return Training::IsGroundTech(actionId);
 }
 
 static bool IsPostTechState(uint32_t actionId) {
-    return actionId == 82;
+    return Training::IsPostTech(actionId);
 }
 
 static bool IsWakeupNoTechState(uint32_t actionId) {
-    return actionId == 74;
+    return Training::IsWakeupNoTech(actionId);
 }
 
 static bool IsGroundedAction(const PlayerSnapshot& snapshot) {
@@ -850,6 +862,7 @@ static PlayerSnapshot ReadPlayerSnapshot(int player) {
     snapshot.hitActive = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_HIT_ACTIVE);
     snapshot.blockstun = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_BLOCKSTUN);
     snapshot.hitstunDuration = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_HITSTUN_DURATION);
+    snapshot.knockbackTimer = ReadMemory<uint16_t>(snapshot.base + ENTITY_OFF_KNOCKBACK_TIMER);
     snapshot.comboCount = ReadComboCount(snapshot.base);
     return snapshot;
 }
@@ -1906,7 +1919,7 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
             runtime.jumpCooldown--;
         }
 
-        const bool actionable = IsLegacyActionableAction(current.actionId);
+        const bool actionable = IsActionable(current);
         if (actionable) {
             if (!runtime.neutralValid) {
                 runtime.neutralValid = true;
@@ -1930,7 +1943,7 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
                      (unsigned int)opponent.attackState,
                      (unsigned int)opponent.hitActive,
                      runtime.randomBlockThisWindow ? 1 : 0);
-        } else if (runtime.threatWindowActive && !threatNow && IsLegacyActionableAction(opponent.actionId)) {
+        } else if (runtime.threatWindowActive && !threatNow && IsThreatWindowFree(opponent)) {
             LOG_INFO("[Practice] Threat window end: defender=%s attacker=%s frame=%u opp_act=%u contact_seen=%d",
                      SideLabel(player),
                      SideLabel(1 - player),
@@ -2243,7 +2256,7 @@ static uint16_t ComputeAutomationInput(int player,
         if (InputSystem_GetControlSwap()) {
             runtime.jumpHoldFrames = 0;
             runtime.jumpHoldInput = 0;
-        } else if (!IsGroundedAction(dummy) || !IsLegacyActionableAction(dummy.actionId)) {
+        } else if (!IsGroundedAction(dummy) || !IsActionable(dummy)) {
             LOG_INFO("[Practice] Dummy jump accepted: action=%u y=%d frame=%u",
                      dummy.actionId,
                      dummy.y,
@@ -2263,7 +2276,7 @@ static uint16_t ComputeAutomationInput(int player,
     }
 
     if (!InputSystem_GetControlSwap() &&
-        IsLegacyActionableAction(dummy.actionId) &&
+        IsActionable(dummy) &&
         IsGroundedAction(dummy)) {
         const bool wantsJumpLoop = s_practiceConfig.stanceMode == DUMMY_STANCE_JUMP ||
                                    s_practiceConfig.jumpMode != DUMMY_JUMP_DISABLED;
@@ -3241,9 +3254,11 @@ void PracticeTools_FrameUpdate() {
                  newSwap ? "P2" : "P1");
     }
 
+    bool positionResetThisFrame = false;
     if (HotkeyConfig_JustPressed(HOTKEY_POSITION_LOAD)) {
         if (const PositionPreset* preset = GetLoadPositionPresetFromHotkey()) {
             if (ApplyPositionPreset(*preset)) {
+                positionResetThisFrame = true;
                 PushToast(preset->label, IM_COL32(120, 255, 180, 255));
                 LOG_INFO("[Practice] Position preset hotkey pressed: %s", preset->label);
             } else {
@@ -3251,6 +3266,7 @@ void PracticeTools_FrameUpdate() {
             }
         } else if (s_positionSnapshot.valid) {
             if (LoadPositionSnapshot()) {
+                positionResetThisFrame = true;
                 char toastLabel[96] = {};
                 FormatHotkeyToast(toastLabel,
                                   sizeof(toastLabel),
@@ -3280,6 +3296,17 @@ void PracticeTools_FrameUpdate() {
         } else {
             PushToast("Position save unavailable", IM_COL32(255, 180, 120, 255));
         }
+    }
+
+    if (positionResetThisFrame) {
+        Rollback::NetplayLog_Write(
+            "TRAINRESET", -1,
+            "position_reset_frame_early_out frame=%u",
+            ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER));
+        LOG_INFO("[TRAINRESET] position reset frame early-out frame=%u",
+                 ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER));
+        PracticeTools_SyncControlSwapState();
+        return;
     }
 
     if (HotkeyConfig_JustPressed(HOTKEY_MACRO_RECORD)) {
