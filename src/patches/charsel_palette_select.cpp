@@ -7,6 +7,8 @@
 #include "net/netplay_palette_runtime.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
+#include "ui/netplay_hud_style.h"
+#include "ui/netplay_hud_vanilla.h"
 #include "MinHook.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1260,6 +1262,9 @@ static int __cdecl Hook_CharSelRenderHelper() {
 
     DrawSlotOverlay(0);
     DrawSlotOverlay(1);
+    if (NetplayHudStyle::GetRenderMode() == NetplayHudStyle::HudRenderMode::Vanilla) {
+        NetplayHudVanilla_RenderCharSel();
+    }
     return result;
 }
 

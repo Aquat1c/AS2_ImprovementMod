@@ -36,6 +36,7 @@
 #include "testing/autoconnect_harness.h"
 #include "ui/log_window.h"
 #include "ui/menu_utils.h"
+#include "ui/netplay_hud_style.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -138,6 +139,15 @@ static char          s_actionPromptOptions[3][32] = {};
 static char          s_actionPromptJoinEndpoint[96] = "";
 static bool          s_idleSpectatorPromptDeferred = false;
 
+enum class ConnectionEntry : uint8_t {
+    None = 0,
+    Host,
+    Join,
+};
+
+static ConnectionEntry s_connectionEntry = ConnectionEntry::None;
+static MenuState       s_disconnectReturnState = MenuState::MenuRoot;
+
 // Config file path (relative to game directory)
 static const char*   kConfigFile          = "as2_netplay.cfg";
 static const char*   kAutoConnectFile     = "as2_autoconnect.cfg";
@@ -148,6 +158,7 @@ static char  s_cachedAutoConnectContent[4096] = {};
 static bool  s_cachedAutoConnectValid = false;
 
 static void TransitionTo(MenuState next, const char* why);
+static MenuState ResolveDisconnectReturnMenu();
 static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg);
 static void ApplyNatSettingsToService(const char* reason);
 static bool ParseEndpoint(const char* str, char* outHost, size_t hostCap,
@@ -265,6 +276,29 @@ static void SaveSettings() {
     fprintf(f, "palette_sync=%d\n", s_paletteSyncEnabled ? 1 : 0);
     fprintf(f, "remote_palette_preview=%d\n", s_remotePalettePreviewEnabled ? 1 : 0);
     fprintf(f, "debug_logging=%d\n", s_debugLoggingEnabled ? 1 : 0);
+    NetplayHudStyle::Settings hudStyle{};
+    NetplayHudStyle::GetLocal(&hudStyle);
+    fprintf(f, "hud_trail_r=%u\n", hudStyle.trail_r);
+    fprintf(f, "hud_trail_g=%u\n", hudStyle.trail_g);
+    fprintf(f, "hud_trail_b=%u\n", hudStyle.trail_b);
+    fprintf(f, "hud_text_r=%u\n", hudStyle.text_r);
+    fprintf(f, "hud_text_g=%u\n", hudStyle.text_g);
+    fprintf(f, "hud_text_b=%u\n", hudStyle.text_b);
+    fprintf(f, "hud_score_r=%u\n", hudStyle.score_r);
+    fprintf(f, "hud_score_g=%u\n", hudStyle.score_g);
+    fprintf(f, "hud_score_b=%u\n", hudStyle.score_b);
+    fprintf(f, "hud_trail_length=%u\n", hudStyle.trail_length_px);
+    fprintf(f, "hud_vertical_position=%s\n",
+        hudStyle.vertical_position == (uint8_t)NetplayHudStyle::HudVerticalPosition::Top ? "top" : "menu_safe");
+    const char* fontSizeKey = "large";
+    if (hudStyle.font_size == (uint8_t)NetplayHudStyle::HudFontSize::Small) {
+        fontSizeKey = "small";
+    } else if (hudStyle.font_size == (uint8_t)NetplayHudStyle::HudFontSize::Normal) {
+        fontSizeKey = "normal";
+    }
+    fprintf(f, "hud_font_size=%s\n", fontSizeKey);
+    fprintf(f, "hud_render_mode=%s\n",
+        hudStyle.render_mode == (uint8_t)NetplayHudStyle::HudRenderMode::Vanilla ? "vanilla" : "overlay");
     fclose(f);
     LOG_NETPLAY(LOG_DEBUG, "[NetMenu] Settings saved to %s", kConfigFile);
 }
@@ -374,6 +408,7 @@ static void LoadSettings() {
     }
 
     fclose(f);
+    NetplayHudStyle::Load();
     LOG_NETPLAY(LOG_INFO,
         "[NetMenu] Settings loaded: nick='%s' port=%u endpoint='%s' delay=%d rb=%d rb_tol=%d delay_mode=%s "
         "mode=%s upnp=%d pcp=%d stun=%d punch=%d turn=%d ipv6=%d relay='%s' stun_srv='%s' turn_srv='%s' "
@@ -1496,6 +1531,7 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
         return false;
     }
 
+    s_connectionEntry = ConnectionEntry::Join;
     s_activeBranch = RootBranch::DirectPlay;
     s_selectedIndex = 0;
     ClearError();
@@ -1507,11 +1543,19 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
 static void CancelSpectatorConnectionAndReturn(const char* disconnectReason,
                                                const char* statusText,
                                                const char* transitionWhy) {
+    const bool fromJoinProbe = s_joinSpectatorProbeActive;
     ClearActionPrompt("cancel_spectator_connection");
     ClearJoinSpectatorProbe("user_cancel");
     s_idleSpectatorPromptDeferred = false;
     Net::SpectatorClient_Disconnect(disconnectReason ? disconnectReason : "spectator canceled");
     s_selectedIndex = 0;
+    if (fromJoinProbe) {
+        s_activeBranch = RootBranch::DirectPlay;
+        s_connectionEntry = ConnectionEntry::None;
+        SetStatus(statusText && statusText[0] ? statusText : "Returned to Join a Match.");
+        TransitionTo(MenuState::JoinEntry, transitionWhy ? transitionWhy : "cancel join spectator probe");
+        return;
+    }
     if (statusText && statusText[0]) {
         SetStatus("%s", statusText);
     }
@@ -1557,7 +1601,8 @@ static bool BeginJoinSpectatorProbe(const char* sessionError) {
         return false;
     }
 
-    s_activeBranch = RootBranch::Spectate;
+    s_activeBranch = RootBranch::DirectPlay;
+    s_connectionEntry = ConnectionEntry::Join;
     s_selectedIndex = 0;
     ClearError();
     SetStatus("The host may already be playing. Checking whether a live watch feed is available...");
@@ -2292,11 +2337,31 @@ static void BeginClose(const char* why) {
 // Disconnect / error
 // ============================================================================
 
+static MenuState ResolveDisconnectReturnMenu() {
+    if (s_connectionEntry == ConnectionEntry::Join || s_joinSpectatorProbeActive) {
+        return MenuState::JoinEntry;
+    }
+    if (s_connectionEntry == ConnectionEntry::Host) {
+        return MenuState::HostEntry;
+    }
+    if (s_activeBranch == RootBranch::Spectate) {
+        return MenuState::SpectateEntry;
+    }
+    if (s_activeBranch == RootBranch::Settings) {
+        return MenuState::SettingsCategoryMenu;
+    }
+    if (s_activeBranch == RootBranch::DirectPlay) {
+        return MenuState::DirectConnectEntry;
+    }
+    return MenuState::MenuRoot;
+}
+
 static void OpenDisconnectError(const char* why) {
     uint32_t currentMode = GetGameMode();
     LOG_NETPLAY(LOG_WARNING, "[NetMenu] OpenDisconnectError: reason='%s' mode=%u", why ? why : "?", currentMode);
     Net::SpectatorClient_Disconnect("disconnect error");
     ClearActionPrompt("disconnect_error");
+    s_disconnectReturnState = ResolveDisconnectReturnMenu();
     ClearJoinSpectatorProbe("disconnect_error");
     s_idleSpectatorPromptDeferred = false;
 
@@ -2627,10 +2692,11 @@ static int ItemCount(MenuState st) {
         case MenuState::SpectateEntry:       return 4; // Connect, Discover LAN, Endpoint, Back
         case MenuState::SpectatorConnecting: return 1; // Cancel
         case MenuState::SpectatorConnected:  return 1; // Disconnect
-        case MenuState::SettingsCategoryMenu: return 5; // Player, Network, Watch, Diagnostics, Back
+        case MenuState::SettingsCategoryMenu: return 6; // Player, Appearance, Network, Watch, Diagnostics, Back
         case MenuState::SettingsEntry: {
             switch (s_settingsCategory) {
                 case SettingsCategory::Identity:     return 6; // Name, Delay, Rollback, Bias, Delay Mode, Back
+                case SettingsCategory::Appearance:   return 8; // Trail, Text, Score, Length, Position, Font, Render, Back
                 case SettingsCategory::Endpoint:     return 8; // Route, UPnP, STUN, Hole, IPv6, Relay, STUN srv, Back
                 case SettingsCategory::SessionMatch: return 5; // Watchers, Port, PalSync, PalPreview, Back
                 case SettingsCategory::Diagnostics:  return 2; // Debug logging, Back
@@ -2659,6 +2725,17 @@ static int SettingGlobalId() {
                 case 2: return 2;   // Max Rollback
                 case 3: return 3;   // Stability Bias
                 case 4: return 16;  // Gameplay Delay Mode
+                default: return -1; // Back
+            }
+        case SettingsCategory::Appearance:
+            switch (s_selectedIndex) {
+                case 0: return 17;  // Trail color
+                case 1: return 18;  // Text color
+                case 2: return 19;  // Score color
+                case 3: return 20;  // Trail length
+                case 4: return 21;  // Vertical position
+                case 5: return 22;  // Font size
+                case 6: return 23;  // Render mode
                 default: return -1; // Back
             }
         case SettingsCategory::Endpoint:
@@ -3088,7 +3165,9 @@ static void SyncSpectatorClientState() {
         case Net::SpectatorClientState::Redirected:
             s_idleSpectatorPromptDeferred = false;
             if (s_state != MenuState::SpectatorConnecting) {
-                s_activeBranch = RootBranch::Spectate;
+                if (!s_joinSpectatorProbeActive) {
+                    s_activeBranch = RootBranch::Spectate;
+                }
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SpectatorConnecting, "spectator connecting");
             }
@@ -3119,7 +3198,9 @@ static void SyncSpectatorClientState() {
                     activeEndpoint[0] ? activeEndpoint : "(unset)");
             }
             if (s_state != MenuState::SpectatorConnected) {
-                s_activeBranch = RootBranch::Spectate;
+                if (!s_joinSpectatorProbeActive) {
+                    s_activeBranch = RootBranch::Spectate;
+                }
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SpectatorConnected, "spectator streaming");
             }
@@ -3208,10 +3289,13 @@ static void HandleNavigationInput() {
     {
         bool cDown = IsCopyAddressKeyDown();
         if (cDown && !s_prevCopyAddressKeyDown) {
-            if (s_state == MenuState::HostEntry ||
-                s_state == MenuState::Connecting ||
-                s_state == MenuState::Handshake ||
-                s_state == MenuState::ConnectedSession) {
+            const bool hostContext =
+                s_state == MenuState::HostEntry ||
+                ((s_state == MenuState::Connecting ||
+                  s_state == MenuState::Handshake ||
+                  s_state == MenuState::ConnectedSession) &&
+                 s_connectionEntry == ConnectionEntry::Host);
+            if (hostContext) {
                 MenuUtils::UpdateYourAddress(s_listenPort);
                 if (MenuUtils::CopyToClipboard(MenuUtils::GetYourAddress())) {
                     MenuUtils::FlashClipboardMessage("Copied!");
@@ -3434,6 +3518,36 @@ static void HandleNavigationInput() {
                     s_gameplayDelayMode == Net::GameplayDelayMode::SharedSafe
                         ? "Shared max"
                         : "Per-player");
+            } else if (gid == 17) {
+                NetplayHudStyle::CycleTrailPreset(left ? -1 : 1);
+                changed = true;
+                SetStatus("Bar color: %s", NetplayHudStyle::GetTrailPresetLabel());
+            } else if (gid == 18) {
+                NetplayHudStyle::CycleTextPreset(left ? -1 : 1);
+                changed = true;
+                SetStatus("Text color: %s", NetplayHudStyle::GetTextPresetLabel());
+            } else if (gid == 19) {
+                NetplayHudStyle::CycleScorePreset(left ? -1 : 1);
+                changed = true;
+                SetStatus("Score color: %s", NetplayHudStyle::GetScorePresetLabel());
+            } else if (gid == 20) {
+                NetplayHudStyle::AdjustTrailLength(left ? -16 : 16);
+                changed = true;
+                NetplayHudStyle::Settings hudStyle{};
+                NetplayHudStyle::GetLocal(&hudStyle);
+                SetStatus("Bar extend: %u px", hudStyle.trail_length_px);
+            } else if (gid == 21) {
+                NetplayHudStyle::CycleVerticalPosition(left ? -1 : 1);
+                changed = true;
+                SetStatus("Name position: %s", NetplayHudStyle::GetVerticalPositionLabel());
+            } else if (gid == 22) {
+                NetplayHudStyle::CycleFontSize(left ? -1 : 1);
+                changed = true;
+                SetStatus("Font size: %s", NetplayHudStyle::GetFontSizeLabel());
+            } else if (gid == 23) {
+                NetplayHudStyle::CycleRenderMode(left ? -1 : 1);
+                changed = true;
+                SetStatus("Render mode: %s", NetplayHudStyle::GetRenderModeLabel());
             }
 
             if (changed) {
@@ -3600,6 +3714,8 @@ static void ActivateCurrentSelection() {
                 ApplyNatSettingsToService("manual host start");
                 MenuUtils::BeginPublicIPFetch();
                 if (Net::Session_StartHost(&cfg)) {
+                    s_connectionEntry = ConnectionEntry::Host;
+                    s_activeBranch = RootBranch::DirectPlay;
                     SetStatus("Room is open. Waiting for another player...");
                     TransitionTo(MenuState::Connecting, "host started");
                 } else {
@@ -3725,14 +3841,18 @@ static void ActivateCurrentSelection() {
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SettingsEntry, "open player settings");
             } else if (s_selectedIndex == 1) {
+                s_settingsCategory = SettingsCategory::Appearance;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "open appearance settings");
+            } else if (s_selectedIndex == 2) {
                 s_settingsCategory = SettingsCategory::Endpoint;
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SettingsEntry, "open network settings");
-            } else if (s_selectedIndex == 2) {
+            } else if (s_selectedIndex == 3) {
                 s_settingsCategory = SettingsCategory::SessionMatch;
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SettingsEntry, "open watch settings");
-            } else if (s_selectedIndex == 3) {
+            } else if (s_selectedIndex == 4) {
                 s_settingsCategory = SettingsCategory::Diagnostics;
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::SettingsEntry, "open diagnostics settings");
@@ -3766,11 +3886,22 @@ static void ActivateCurrentSelection() {
 
         case MenuState::Connecting:
         case MenuState::Handshake:
-            // Cancel
             Net::Session_Cancel();
-            s_selectedIndex = 0;
-            SetStatus("Returned to Play Online.");
-            TransitionTo(MenuState::DirectConnectEntry, "back from connection");
+            Net::SpectatorClient_Disconnect("cancel connection flow");
+            ClearJoinSpectatorProbe("cancel connection flow");
+            {
+                const MenuState target =
+                    s_connectionEntry == ConnectionEntry::Join ? MenuState::JoinEntry :
+                    s_connectionEntry == ConnectionEntry::Host ? MenuState::HostEntry :
+                    MenuState::DirectConnectEntry;
+                s_connectionEntry = ConnectionEntry::None;
+                s_activeBranch = RootBranch::DirectPlay;
+                s_selectedIndex = 0;
+                SetStatus(target == MenuState::JoinEntry ? "Returned to Join a Match."
+                        : target == MenuState::HostEntry ? "Returned to Host a Room."
+                        : "Returned to Play Online.");
+                TransitionTo(target, "cancel connection");
+            }
             break;
 
         case MenuState::PostMatch:
@@ -3795,10 +3926,18 @@ static void ActivateCurrentSelection() {
 
         case MenuState::DisconnectError:
             if (s_selectedIndex == 0) {
-                // OK - return to root
                 ClearError();
                 s_selectedIndex = 0;
-                TransitionTo(MenuState::MenuRoot, "ack disconnect");
+                const MenuState target = s_disconnectReturnState;
+                if (target == MenuState::JoinEntry ||
+                    target == MenuState::HostEntry ||
+                    target == MenuState::DirectConnectEntry) {
+                    s_activeBranch = RootBranch::DirectPlay;
+                } else if (target == MenuState::SpectateEntry) {
+                    s_activeBranch = RootBranch::Spectate;
+                }
+                s_connectionEntry = ConnectionEntry::None;
+                TransitionTo(target, "ack disconnect");
             } else {
                 BeginClose("close from disconnect");
             }
@@ -3853,9 +3992,21 @@ static void HandleBackNavigation() {
         case MenuState::Connecting:
         case MenuState::Handshake:
             Net::Session_Cancel();
-            s_selectedIndex = 0;
-            SetStatus("Returned to Play Online.");
-            TransitionTo(MenuState::DirectConnectEntry, "cancel connection");
+            Net::SpectatorClient_Disconnect("cancel connection flow");
+            ClearJoinSpectatorProbe("cancel connection flow");
+            {
+                const MenuState target =
+                    s_connectionEntry == ConnectionEntry::Join ? MenuState::JoinEntry :
+                    s_connectionEntry == ConnectionEntry::Host ? MenuState::HostEntry :
+                    MenuState::DirectConnectEntry;
+                s_connectionEntry = ConnectionEntry::None;
+                s_activeBranch = RootBranch::DirectPlay;
+                s_selectedIndex = 0;
+                SetStatus(target == MenuState::JoinEntry ? "Returned to Join a Match."
+                        : target == MenuState::HostEntry ? "Returned to Host a Room."
+                        : "Returned to Play Online.");
+                TransitionTo(target, "cancel connection");
+            }
             break;
         case MenuState::ConnectedSession:
             Net::Session_Cancel();
@@ -4139,6 +4290,9 @@ void GetSnapshot(MenuSnapshot* out) {
     out->remote_palette_preview_enabled = s_remotePalettePreviewEnabled;
     out->debug_logging_enabled = GetVerboseLogging();
 
+    out->join_spectator_probe_active = s_joinSpectatorProbeActive;
+    out->connecting_as_host = s_connectionEntry == ConnectionEntry::Host;
+
     Net::NatSnapshot natSnap{};
     Net::Nat_GetSnapshot(&natSnap);
     char endpointShort[40] = {};
@@ -4174,10 +4328,11 @@ void GetSnapshot(MenuSnapshot* out) {
         s_holePunchEnabled ? "On" : "Off",
         s_relayEndpoint[0] ? ", custom relay" : ", default relay");
     _snprintf_s(out->nat_stun_status, sizeof(out->nat_stun_status), _TRUNCATE,
-        "%s%s%s",
-        Net::StunStatusName(natSnap.stun_status),
-        endpointShort[0] && endpointShort[0] != '-' ? " " : "",
-        endpointShort[0] && endpointShort[0] != '-' ? endpointShort : "");
+        "%s", Net::StunStatusName(natSnap.stun_status));
+    if (endpointShort[0] && endpointShort[0] != '-') {
+        _snprintf_s(out->nat_stun_endpoint, sizeof(out->nat_stun_endpoint), _TRUNCATE,
+            "%s", endpointShort);
+    }
     _snprintf_s(out->spectator_punch_status, sizeof(out->spectator_punch_status), _TRUNCATE,
         "%s, watch port %u%s",
         s_holePunchEnabled ? "Punch on" : "Punch off",
@@ -4322,6 +4477,22 @@ void GetSnapshot(MenuSnapshot* out) {
     Net::SetTracker_GetSnapshot(&setSnap);
     out->local_wins = setSnap.local_wins;
     out->remote_wins = setSnap.remote_wins;
+
+    CopyText(out->hud_trail_color_label, sizeof(out->hud_trail_color_label),
+        NetplayHudStyle::GetTrailPresetLabel());
+    CopyText(out->hud_text_color_label, sizeof(out->hud_text_color_label),
+        NetplayHudStyle::GetTextPresetLabel());
+    CopyText(out->hud_score_color_label, sizeof(out->hud_score_color_label),
+        NetplayHudStyle::GetScorePresetLabel());
+    CopyText(out->hud_vertical_position_label, sizeof(out->hud_vertical_position_label),
+        NetplayHudStyle::GetVerticalPositionLabel());
+    CopyText(out->hud_font_size_label, sizeof(out->hud_font_size_label),
+        NetplayHudStyle::GetFontSizeLabel());
+    CopyText(out->hud_render_mode_label, sizeof(out->hud_render_mode_label),
+        NetplayHudStyle::GetRenderModeLabel());
+    NetplayHudStyle::Settings hudStyle{};
+    NetplayHudStyle::GetLocal(&hudStyle);
+    out->hud_trail_length = (int)hudStyle.trail_length_px;
 }
 
 void RenderFrame() {

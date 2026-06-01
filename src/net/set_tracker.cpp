@@ -7,6 +7,8 @@
 
 #include "net/set_tracker.h"
 #include "net/player_side_mapping.h"
+#include "net/session_manager.h"
+#include "net/session_types.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
@@ -98,6 +100,13 @@ void SetTracker_GetSnapshot(SetTrackerSnapshot* out) {
 
 void SetTracker_GetGameSideWins(int* p1_wins, int* p2_wins) {
     int localSlot = PlayerMapping_GetLocalGameSlot();
+    // Before bootstrap assigns the slot, mirror the menu controller's fallback:
+    // host is game P1, client is game P2.
+    if (localSlot != 0 && localSlot != 1) {
+        SessionSnapshot snap{};
+        Session_GetSnapshot(&snap);
+        localSlot = (snap.role == SessionRole::Host) ? 0 : 1;
+    }
     if (localSlot == 0) {
         // Local is P1
         if (p1_wins) *p1_wins = s_localWins;

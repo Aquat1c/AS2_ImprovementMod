@@ -408,6 +408,8 @@ set(UI_SOURCES
     src/ui/menu_utils.cpp
     src/ui/hitbox_viewer.cpp
     src/ui/netplay_hud.cpp
+    src/ui/netplay_hud_style.cpp
+    src/ui/netplay_hud_vanilla.cpp
 )
 
 set(INPUT_SOURCES

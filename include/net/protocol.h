@@ -18,7 +18,7 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 16;
+constexpr uint16_t PROTOCOL_VERSION = 18;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -141,6 +141,18 @@ struct HelloPayload {
     uint16_t listen_port;        // Port this peer is listening on
     uint8_t  round_count;        // Sender's current vanilla round option 0..2
     uint8_t  frame_timing_mode;  // Net::FrameTimingMode
+    uint8_t  hud_trail_r;
+    uint8_t  hud_trail_g;
+    uint8_t  hud_trail_b;
+    uint8_t  hud_text_r;
+    uint8_t  hud_text_g;
+    uint8_t  hud_text_b;
+    uint8_t  hud_trail_length;   // Encoded bar extend (64-320 px)
+    uint8_t  hud_score_r;
+    uint8_t  hud_score_g;
+    uint8_t  hud_score_b;
+    uint8_t  hud_font_size;      // NetplayHudStyle::HudFontSize
+    uint8_t  hud_vertical_position; // NetplayHudStyle::HudVerticalPosition
 };
 
 struct HelloAckPayload {
@@ -150,6 +162,18 @@ struct HelloAckPayload {
     uint16_t listen_port;
     uint8_t  round_count;        // Sender's current vanilla round option 0..2
     uint8_t  frame_timing_mode;  // Host-authoritative Net::FrameTimingMode
+    uint8_t  hud_trail_r;
+    uint8_t  hud_trail_g;
+    uint8_t  hud_trail_b;
+    uint8_t  hud_text_r;
+    uint8_t  hud_text_g;
+    uint8_t  hud_text_b;
+    uint8_t  hud_trail_length;
+    uint8_t  hud_score_r;
+    uint8_t  hud_score_g;
+    uint8_t  hud_score_b;
+    uint8_t  hud_font_size;
+    uint8_t  hud_vertical_position;
 };
 
 struct DisconnectPayload {
@@ -554,9 +578,9 @@ static_assert(sizeof(PacketType) + sizeof(PaletteDataPayload) <= MAX_PACKET_SIZE
     "PaletteDataPayload must fit inside one transport packet");
 static_assert(sizeof(PacketType) + sizeof(CharSelInputPayload) <= MAX_PACKET_SIZE,
     "CharSelInputPayload must fit inside one transport packet");
-static_assert(sizeof(HelloPayload) == 74,
+static_assert(sizeof(HelloPayload) == 86,
     "HelloPayload wire size must remain stable");
-static_assert(sizeof(HelloAckPayload) == 74,
+static_assert(sizeof(HelloAckPayload) == 86,
     "HelloAckPayload wire size must remain stable");
 static_assert(sizeof(SyncAnnouncePayload) == 8,
     "SyncAnnouncePayload wire size must remain stable");

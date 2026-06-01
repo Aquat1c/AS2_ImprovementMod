@@ -203,7 +203,7 @@ static bool AutopunchSendRegister(AutopunchState& state) {
         "Autopunch register");
     if (sent == (int)sizeof(payload)) {
         state.relay_register_sent++;
-        Rollback::NetplayLog_Verbose("ENET", -1,
+        Rollback::NetplayLog_Write("ENET", -1,
             "%s Autopunch register sent: local_port=%u count=%u",
             AutopunchLabel(state),
             (unsigned)state.local_port,
@@ -236,7 +236,7 @@ static bool AutopunchSendLookup(AutopunchState& state) {
     if (sent == (int)sizeof(payload)) {
         state.relay_lookup_sent++;
         char target[96] = {};
-        Rollback::NetplayLog_Verbose("ENET", -1,
+        Rollback::NetplayLog_Write("ENET", -1,
             "%s Autopunch lookup sent: target=%s advertised_port=%u count=%u",
             AutopunchLabel(state),
             FormatEnetAddress(state.target, target, sizeof(target)),
@@ -360,7 +360,7 @@ static int ENET_CALLBACK AutopunchIntercept(ENetHost* host, ENetEvent*) {
 
     if (len == 1 && data[0] == 0) {
         char fromText[96] = {};
-        Rollback::NetplayLog_Verbose("ENET", -1,
+        Rollback::NetplayLog_Write("ENET", -1,
             "%s Autopunch consumed direct punch from %s",
             AutopunchLabel(*state),
             FormatEnetAddress(from, fromText, sizeof(fromText)));

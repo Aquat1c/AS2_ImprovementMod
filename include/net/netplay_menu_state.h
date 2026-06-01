@@ -83,6 +83,7 @@ enum class RootBranch : uint32_t {
 
 enum class SettingsCategory : uint32_t {
     Identity = 0,
+    Appearance,
     Endpoint,
     SessionMatch,
     Diagnostics,
@@ -126,6 +127,13 @@ struct MenuSnapshot {
     float         rtt_ms;
     int           local_wins;
     int           remote_wins;
+    char          hud_trail_color_label[32];
+    char          hud_text_color_label[32];
+    char          hud_score_color_label[32];
+    char          hud_vertical_position_label[32];
+    char          hud_font_size_label[32];
+    char          hud_render_mode_label[32];
+    int           hud_trail_length;
 
     // Connection config (editable by user)
     uint16_t      listen_port;
@@ -143,7 +151,8 @@ struct MenuSnapshot {
     char          nat_route_status[96];
     char          nat_mapping_status[96];
     char          nat_punch_status[96];
-    char          nat_stun_status[96];
+    char          nat_stun_status[96];    // state text only, e.g. "Mapped"
+    char          nat_stun_endpoint[48]; // your external IP:port (host screens only)
     char          spectator_punch_status[96];
     bool          spectators_enabled;
     uint16_t      spectator_listen_port;
@@ -189,6 +198,8 @@ struct MenuSnapshot {
     char          prompt_option_labels[3][32];
 
     // Session display
+    bool          join_spectator_probe_active;
+    bool          connecting_as_host;
     bool          is_host;
     int           active_delay;
     int           rollback_budget;

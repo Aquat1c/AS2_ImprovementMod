@@ -9,6 +9,7 @@
 #include "net/network_thread.h"
 #include "net/nat_traversal.h"
 #include "net/game_settings_sync.h"
+#include "ui/netplay_hud_style.h"
 #include "patches/memory_utils.h"
 #include "patches/tick_hooks.h"
 #include "log_window.h"
@@ -890,6 +891,71 @@ static void FlushNatTraversalOutboundSignals() {
     }
 }
 
+static void ApplyRemoteHudStyle(uint8_t trailR,
+                                uint8_t trailG,
+                                uint8_t trailB,
+                                uint8_t textR,
+                                uint8_t textG,
+                                uint8_t textB,
+                                uint8_t trailLengthWire,
+                                uint8_t scoreR,
+                                uint8_t scoreG,
+                                uint8_t scoreB,
+                                uint8_t fontSize) {
+    s_remotePeer.hud_style_valid = true;
+    s_remotePeer.hud_trail_r = trailR;
+    s_remotePeer.hud_trail_g = trailG;
+    s_remotePeer.hud_trail_b = trailB;
+    s_remotePeer.hud_text_r = textR;
+    s_remotePeer.hud_text_g = textG;
+    s_remotePeer.hud_text_b = textB;
+    s_remotePeer.hud_trail_length = trailLengthWire;
+    s_remotePeer.hud_score_r = scoreR;
+    s_remotePeer.hud_score_g = scoreG;
+    s_remotePeer.hud_score_b = scoreB;
+    s_remotePeer.hud_font_size = fontSize;
+}
+
+static void FillHelloHudStyle(HelloPayload* hello) {
+    if (!hello) {
+        return;
+    }
+    NetplayHudStyle::WireStyle wire{};
+    NetplayHudStyle::PackWire(&wire);
+    hello->hud_trail_r = wire.trail_r;
+    hello->hud_trail_g = wire.trail_g;
+    hello->hud_trail_b = wire.trail_b;
+    hello->hud_text_r = wire.text_r;
+    hello->hud_text_g = wire.text_g;
+    hello->hud_text_b = wire.text_b;
+    hello->hud_trail_length = wire.trail_length;
+    hello->hud_score_r = wire.score_r;
+    hello->hud_score_g = wire.score_g;
+    hello->hud_score_b = wire.score_b;
+    hello->hud_font_size = wire.font_size;
+    hello->hud_vertical_position = 0;
+}
+
+static void FillHelloAckHudStyle(HelloAckPayload* ack) {
+    if (!ack) {
+        return;
+    }
+    NetplayHudStyle::WireStyle wire{};
+    NetplayHudStyle::PackWire(&wire);
+    ack->hud_trail_r = wire.trail_r;
+    ack->hud_trail_g = wire.trail_g;
+    ack->hud_trail_b = wire.trail_b;
+    ack->hud_text_r = wire.text_r;
+    ack->hud_text_g = wire.text_g;
+    ack->hud_text_b = wire.text_b;
+    ack->hud_trail_length = wire.trail_length;
+    ack->hud_score_r = wire.score_r;
+    ack->hud_score_g = wire.score_g;
+    ack->hud_score_b = wire.score_b;
+    ack->hud_font_size = wire.font_size;
+    ack->hud_vertical_position = 0;
+}
+
 // ============================================================================
 // Handshake
 // ============================================================================
@@ -903,6 +969,7 @@ static void SendHello() {
     hello.frame_timing_mode = (uint8_t)LocalFrameTimingMode();
     memset(hello.nickname, 0, sizeof(hello.nickname));
     strncpy(hello.nickname, s_config.nickname, sizeof(hello.nickname) - 1);
+    FillHelloHudStyle(&hello);
 
     if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::Hello,
                           &hello, sizeof(hello), true, "hello")) {
@@ -932,6 +999,7 @@ static void SendHelloAck() {
     ack.frame_timing_mode = (uint8_t)LocalFrameTimingMode();
     memset(ack.nickname, 0, sizeof(ack.nickname));
     strncpy(ack.nickname, s_config.nickname, sizeof(ack.nickname) - 1);
+    FillHelloAckHudStyle(&ack);
 
     if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::HelloAck,
                           &ack, sizeof(ack), true, "hello-ack")) {
@@ -963,7 +1031,7 @@ static bool ProcessHelloPayload(const void* payload, size_t len) {
     }
 
     const HelloPayload* hello = static_cast<const HelloPayload*>(payload);
-    return ProcessHandshakeIdentity(
+    const bool accepted = ProcessHandshakeIdentity(
         "Hello",
         hello->protocol_version,
         hello->build_hash,
@@ -972,6 +1040,20 @@ static bool ProcessHelloPayload(const void* payload, size_t len) {
         hello->listen_port,
         hello->round_count,
         hello->frame_timing_mode);
+    if (accepted) {
+        ApplyRemoteHudStyle(hello->hud_trail_r,
+                            hello->hud_trail_g,
+                            hello->hud_trail_b,
+                            hello->hud_text_r,
+                            hello->hud_text_g,
+                            hello->hud_text_b,
+                            hello->hud_trail_length,
+                            hello->hud_score_r,
+                            hello->hud_score_g,
+                            hello->hud_score_b,
+                            hello->hud_font_size);
+    }
+    return accepted;
 }
 
 static bool ProcessHelloAckPayload(const void* payload, size_t len) {
@@ -994,6 +1076,19 @@ static bool ProcessHelloAckPayload(const void* payload, size_t len) {
         ack->listen_port,
         ack->round_count,
         ack->frame_timing_mode);
+    if (accepted) {
+        ApplyRemoteHudStyle(ack->hud_trail_r,
+                            ack->hud_trail_g,
+                            ack->hud_trail_b,
+                            ack->hud_text_r,
+                            ack->hud_text_g,
+                            ack->hud_text_b,
+                            ack->hud_trail_length,
+                            ack->hud_score_r,
+                            ack->hud_score_g,
+                            ack->hud_score_b,
+                            ack->hud_font_size);
+    }
     if (accepted && s_role == SessionRole::Join) {
         const FrameTimingMode hostTiming = (FrameTimingMode)ack->frame_timing_mode;
         TickHooks_SetFrameLimiter60FpsSessionOverride(

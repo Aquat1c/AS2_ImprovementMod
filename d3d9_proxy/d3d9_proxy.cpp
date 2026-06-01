@@ -85,6 +85,30 @@ struct MatchHudData {
     char     p2_name[64];
     int      p1_wins;
     int      p2_wins;
+    uint8_t  p1_trail_r;
+    uint8_t  p1_trail_g;
+    uint8_t  p1_trail_b;
+    uint8_t  p1_text_r;
+    uint8_t  p1_text_g;
+    uint8_t  p1_text_b;
+    uint8_t  p2_trail_r;
+    uint8_t  p2_trail_g;
+    uint8_t  p2_trail_b;
+    uint8_t  p2_text_r;
+    uint8_t  p2_text_g;
+    uint8_t  p2_text_b;
+    uint8_t  p1_score_r;
+    uint8_t  p1_score_g;
+    uint8_t  p1_score_b;
+    uint8_t  p2_score_r;
+    uint8_t  p2_score_g;
+    uint8_t  p2_score_b;
+    uint16_t p1_trail_length_px;
+    uint16_t p2_trail_length_px;
+    uint8_t  p1_vertical_position;
+    uint8_t  p2_vertical_position;
+    uint8_t  p1_font_size;
+    uint8_t  p2_font_size;
     float    ping_ms;
     int      delay_frames;
     int      rollback_frames;
@@ -1246,6 +1270,8 @@ static const wchar_t* kAs2ModVersion = L"0.6-beta";
 static HWND g_titleWindow = nullptr;
 static bool g_titleApplied = false;
 
+static ImFont* g_netplayHudFonts[3] = {};
+
 static void ConfigureOverlayFonts(ImGuiIO& io) {
     ImFont* loadedFont = nullptr;
     const ImWchar* glyphRanges = io.Fonts->GetGlyphRangesJapanese();
@@ -1281,9 +1307,21 @@ static void ConfigureOverlayFonts(ImGuiIO& io) {
     if (!loadedFont) {
         ProxyLog("[IMGUI] WARNING: Failed to load a Japanese-capable system font, using default font only");
         loadedFont = io.Fonts->AddFontDefault();
+        fontPath[0] = '\0';
     }
 
     io.FontDefault = loadedFont;
+
+    const float hudFontSizes[] = { 12.0f, 14.0f, 16.0f };
+    for (int i = 0; i < 3; ++i) {
+        if (fontPath[0]) {
+            g_netplayHudFonts[i] = io.Fonts->AddFontFromFileTTF(
+                fontPath, hudFontSizes[i], &fontConfig, glyphRanges);
+        }
+        if (!g_netplayHudFonts[i]) {
+            g_netplayHudFonts[i] = loadedFont;
+        }
+    }
 }
 
 static void ApplyCustomWindowTitle(HWND hWnd) {
@@ -6356,4 +6394,17 @@ extern "C" __declspec(dllexport) void GetLetterboxViewport(int* x, int* y, int* 
     if (y) *y = (int)g_letterboxViewport.Y;
     if (w) *w = (int)g_letterboxViewport.Width;
     if (h) *h = (int)g_letterboxViewport.Height;
+}
+
+extern "C" __declspec(dllexport) void* GetNetplayHudFont(int preset) {
+    if (preset < 0 || preset > 2) {
+        preset = 1;
+    }
+    if (g_netplayHudFonts[preset]) {
+        return g_netplayHudFonts[preset];
+    }
+    if (ImGui::GetCurrentContext()) {
+        return ImGui::GetIO().FontDefault;
+    }
+    return nullptr;
 }

@@ -116,6 +116,19 @@ struct PeerInfo {
     uint8_t  round_count;
     bool     frame_timing_valid;
     uint8_t  frame_timing_mode;
+    bool     hud_style_valid;
+    uint8_t  hud_trail_r;
+    uint8_t  hud_trail_g;
+    uint8_t  hud_trail_b;
+    uint8_t  hud_text_r;
+    uint8_t  hud_text_g;
+    uint8_t  hud_text_b;
+    uint8_t  hud_trail_length;
+    uint8_t  hud_score_r;
+    uint8_t  hud_score_g;
+    uint8_t  hud_score_b;
+    uint8_t  hud_font_size;
+    uint8_t  hud_vertical_position;
 };
 
 // ============================================================================

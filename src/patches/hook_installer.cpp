@@ -11,6 +11,7 @@
 #include "patches/session_pump_hook.h"
 #include "patches/netplay_background_run.h"
 #include "patches/shell_hotkey_patch.h"
+#include "ui/netplay_hud_vanilla.h"
 #include "replay/replay_runtime.h"
 #include "rollback/rollback_audio.h"
 #include "rollback/rollback_combo_fx.h"
@@ -346,6 +347,10 @@ bool InstallHooks() {
 
     if (!NetplayBackgroundRun::InstallHook()) {
         LOG_WARN("Failed to install netplay inactive-window bypass hook (continuing anyway)");
+    }
+
+    if (!NetplayHudVanilla_InstallHooks()) {
+        LOG_WARN("Failed to install vanilla netplay HUD hook (continuing anyway)");
     }
     
     // --- Enable all hooks ---

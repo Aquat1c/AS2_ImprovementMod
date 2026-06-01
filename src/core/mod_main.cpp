@@ -12,6 +12,7 @@
 #include "mod_menu.h"
 #include "hitbox_viewer.h"
 #include "ui/netplay_hud.h"
+#include "ui/netplay_hud_style.h"
 #include "game_console.h"
 #include "patches/memory_utils.h"
 #include "patches/unlock_patch.h"
@@ -945,6 +946,32 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
             _TRUNCATE);
         out->p1_wins = spectatorClient.p1_wins;
         out->p2_wins = spectatorClient.p2_wins;
+        NetplayHudStyle::Settings defaultStyle{};
+        NetplayHudStyle::SetDefaults(&defaultStyle);
+        out->p1_trail_r = defaultStyle.trail_r;
+        out->p1_trail_g = defaultStyle.trail_g;
+        out->p1_trail_b = defaultStyle.trail_b;
+        out->p1_text_r = defaultStyle.text_r;
+        out->p1_text_g = defaultStyle.text_g;
+        out->p1_text_b = defaultStyle.text_b;
+        out->p2_trail_r = 120;
+        out->p2_trail_g = 20;
+        out->p2_trail_b = 30;
+        out->p2_text_r = defaultStyle.text_r;
+        out->p2_text_g = defaultStyle.text_g;
+        out->p2_text_b = defaultStyle.text_b;
+        out->p1_score_r = defaultStyle.score_r;
+        out->p1_score_g = defaultStyle.score_g;
+        out->p1_score_b = defaultStyle.score_b;
+        out->p2_score_r = defaultStyle.score_r;
+        out->p2_score_g = defaultStyle.score_g;
+        out->p2_score_b = defaultStyle.score_b;
+        out->p1_trail_length_px = defaultStyle.trail_length_px;
+        out->p2_trail_length_px = defaultStyle.trail_length_px;
+        out->p1_vertical_position = defaultStyle.vertical_position;
+        out->p2_vertical_position = defaultStyle.vertical_position;
+        out->p1_font_size = defaultStyle.font_size;
+        out->p2_font_size = defaultStyle.font_size;
         out->ping_ms = -1.0f;
         out->delay_frames = 0;
         out->rollback_frames = 0;
@@ -1011,9 +1038,12 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
 
     bool inMatch = lifeSnap.active && lifeSnap.match_owned;
     bool rollbackActive = Net::GameplayBridge_IsSessionActive();
+    // Also show HUD during charsel/stagesel lockstep (pregame active but no
+    // match lifecycle or rollback yet). This covers initial charsel and rematch
+    // charsel where MatchLifecycle is Inactive and rollback hasn't started.
+    bool pregameActive = Net::PregameSync_IsActive();
 
-    // Show HUD if session is connected and either in match or rollback active
-    if (!inMatch && !rollbackActive) return false;
+    if (!inMatch && !rollbackActive && !pregameActive) return false;
 
     out->active = true;
     out->is_host = (Net::Session_GetRole() == Net::SessionRole::Host);
@@ -1030,6 +1060,11 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     const char* remoteNick = sessionSnap.remote_peer.nickname[0] ? sessionSnap.remote_peer.nickname : "Remote";
 
     int localSlot = Net::PlayerMapping_GetLocalGameSlot();
+    // Before bootstrap assigns the player slot (initial charsel, rematch charsel
+    // before bootstrap), fall back to session role: host=P1, client=P2.
+    if (localSlot != 0 && localSlot != 1) {
+        localSlot = (Net::Session_GetRole() == Net::SessionRole::Host) ? 0 : 1;
+    }
     if (localSlot == 0) {
         // Local is P1
         strncpy_s(out->p1_name, sizeof(out->p1_name), localNick, _TRUNCATE);
@@ -1042,6 +1077,60 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
 
     // --- Win counts: game-side P1/P2 ---
     Net::SetTracker_GetGameSideWins(&out->p1_wins, &out->p2_wins);
+
+    NetplayHudStyle::Settings remoteStyle{};
+    if (sessionSnap.remote_peer.hud_style_valid) {
+        NetplayHudStyle::WireStyle wire{};
+        wire.trail_r = sessionSnap.remote_peer.hud_trail_r;
+        wire.trail_g = sessionSnap.remote_peer.hud_trail_g;
+        wire.trail_b = sessionSnap.remote_peer.hud_trail_b;
+        wire.text_r = sessionSnap.remote_peer.hud_text_r;
+        wire.text_g = sessionSnap.remote_peer.hud_text_g;
+        wire.text_b = sessionSnap.remote_peer.hud_text_b;
+        wire.trail_length = sessionSnap.remote_peer.hud_trail_length;
+        wire.score_r = sessionSnap.remote_peer.hud_score_r;
+        wire.score_g = sessionSnap.remote_peer.hud_score_g;
+        wire.score_b = sessionSnap.remote_peer.hud_score_b;
+        wire.font_size = sessionSnap.remote_peer.hud_font_size;
+        NetplayHudStyle::UnpackWire(&wire, &remoteStyle);
+    } else {
+        NetplayHudStyle::SetDefaults(&remoteStyle);
+    }
+
+    NetplayHudStyle::ResolvedSideStyle p1Style{};
+    NetplayHudStyle::ResolvedSideStyle p2Style{};
+    NetplayHudStyle::ResolveSideStyles(localSlot,
+                                       sessionSnap.remote_peer.hud_style_valid,
+                                       &remoteStyle,
+                                       &p1Style,
+                                       &p2Style);
+    out->p1_trail_r = p1Style.trail_r;
+    out->p1_trail_g = p1Style.trail_g;
+    out->p1_trail_b = p1Style.trail_b;
+    out->p1_text_r = p1Style.text_r;
+    out->p1_text_g = p1Style.text_g;
+    out->p1_text_b = p1Style.text_b;
+    out->p1_score_r = p1Style.score_r;
+    out->p1_score_g = p1Style.score_g;
+    out->p1_score_b = p1Style.score_b;
+    out->p1_trail_length_px = p1Style.trail_length_px;
+    out->p1_font_size = p1Style.font_size;
+    out->p2_trail_r = p2Style.trail_r;
+    out->p2_trail_g = p2Style.trail_g;
+    out->p2_trail_b = p2Style.trail_b;
+    out->p2_text_r = p2Style.text_r;
+    out->p2_text_g = p2Style.text_g;
+    out->p2_text_b = p2Style.text_b;
+    out->p2_score_r = p2Style.score_r;
+    out->p2_score_g = p2Style.score_g;
+    out->p2_score_b = p2Style.score_b;
+    out->p2_trail_length_px = p2Style.trail_length_px;
+    out->p2_font_size = p2Style.font_size;
+
+    NetplayHudStyle::Settings localHud{};
+    NetplayHudStyle::GetLocal(&localHud);
+    out->p1_vertical_position = localHud.vertical_position;
+    out->p2_vertical_position = localHud.vertical_position;
 
     // --- Ping: from session stats ---
     out->ping_ms = sessionSnap.stats.rtt_ms;

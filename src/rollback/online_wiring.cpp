@@ -1032,9 +1032,9 @@ static void CheckLifecyclePhase() {
             ResetStartupBarrierState("lifecycle inactive");
             NetplayLog_Write("LIFE", -1,
                 "Rollback cleanup complete: lifecycle inactive, frame_origin_abs reset");
-
-            // Reset set tracker when session fully ends
-            Net::SetTracker_Reset();
+            // Do NOT reset SetTracker here — Inactive is reached on both rematch
+            // (charsel return) and real session end. The session-end reset is in
+            // OnlineWiring_OnDisconnect, which is the only correct reset point.
         }
 
         // MatchInit — potential round restart, re-enable gameplay flag

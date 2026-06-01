@@ -548,9 +548,15 @@ static void JuiceStateChanged(juice_agent_t* agent, juice_state_t state, void*) 
     switch (state) {
         case JUICE_STATE_GATHERING:
             s_snapshot.traversal_state = NatTraversalState::Gathering;
+            Rollback::NetplayLog_Write("NAT", -1, "ICE gathering started");
             break;
         case JUICE_STATE_CONNECTING:
             s_snapshot.traversal_state = NatTraversalState::Connecting;
+            Rollback::NetplayLog_Write("NAT", -1,
+                "ICE connecting: local_candidates=%d remote_candidates=%d stun=%s",
+                s_snapshot.local_candidate_count,
+                s_snapshot.remote_candidate_count,
+                StunStatusName(s_snapshot.stun_status));
             break;
         case JUICE_STATE_CONNECTED:
         case JUICE_STATE_COMPLETED:
@@ -559,6 +565,11 @@ static void JuiceStateChanged(juice_agent_t* agent, juice_state_t state, void*) 
         case JUICE_STATE_FAILED:
             s_snapshot.traversal_state = NatTraversalState::Failed;
             CopyText(s_snapshot.failure_reason, sizeof(s_snapshot.failure_reason), "ICE connection failed");
+            Rollback::NetplayLog_Write("NAT", -1,
+                "ICE failed: local_candidates=%d remote_candidates=%d remote_desc_seen=%d",
+                s_snapshot.local_candidate_count,
+                s_snapshot.remote_candidate_count,
+                s_remoteDescriptionSeen.load() ? 1 : 0);
             break;
         default:
             break;
@@ -582,6 +593,12 @@ static void JuiceStateChanged(juice_agent_t* agent, juice_state_t state, void*) 
             CopyText(s_snapshot.selected_local_address, sizeof(s_snapshot.selected_local_address), localAddr);
             CopyText(s_snapshot.selected_remote_address, sizeof(s_snapshot.selected_remote_address), remoteAddr);
         }
+        Rollback::NetplayLog_Write("NAT", -1,
+            "ICE connected: local_addr=%s remote_addr=%s local_cand=%s remote_cand=%s",
+            s_snapshot.selected_local_address[0] ? s_snapshot.selected_local_address : "?",
+            s_snapshot.selected_remote_address[0] ? s_snapshot.selected_remote_address : "?",
+            s_snapshot.selected_local_candidate[0] ? s_snapshot.selected_local_candidate : "?",
+            s_snapshot.selected_remote_candidate[0] ? s_snapshot.selected_remote_candidate : "?");
     }
 
     UpdateStatusTextLocked();
@@ -609,6 +626,9 @@ static void JuiceCandidate(juice_agent_t*, const char* sdp, void*) {
         s_snapshot.stun_external_port = endpointPort;
         CopyText(s_snapshot.external_ip, sizeof(s_snapshot.external_ip), endpointIp);
         FormatHostPort(s_snapshot.stun_endpoint, sizeof(s_snapshot.stun_endpoint), endpointIp, endpointPort);
+        Rollback::NetplayLog_Write("NAT", -1,
+            "ICE srflx candidate #%d: external=%s:%u (your public endpoint)",
+            s_snapshot.local_candidate_count, endpointIp, (unsigned)endpointPort);
     } else if (s_snapshot.turn_enabled &&
                ParseCandidateByType(sdp, "relay", endpointIp, sizeof(endpointIp), &endpointPort)) {
         if (!s_snapshot.stun_endpoint[0]) {
@@ -616,6 +636,12 @@ static void JuiceCandidate(juice_agent_t*, const char* sdp, void*) {
             CopyText(s_snapshot.external_ip, sizeof(s_snapshot.external_ip), endpointIp);
             FormatHostPort(s_snapshot.stun_endpoint, sizeof(s_snapshot.stun_endpoint), endpointIp, endpointPort);
         }
+        Rollback::NetplayLog_Write("NAT", -1,
+            "ICE relay candidate #%d: %s:%u (TURN relay)",
+            s_snapshot.local_candidate_count, endpointIp, (unsigned)endpointPort);
+    } else {
+        Rollback::NetplayLog_Verbose("NAT", -1,
+            "ICE host candidate #%d", s_snapshot.local_candidate_count);
     }
 
     UpdateStatusTextLocked();
@@ -632,6 +658,11 @@ static void JuiceGatherDone(juice_agent_t* agent, void*) {
     if (s_snapshot.stun_enabled && s_snapshot.stun_status == StunStatus::Probing) {
         s_snapshot.stun_status = StunStatus::Failed;
     }
+    Rollback::NetplayLog_Write("NAT", -1,
+        "ICE gather complete: local_candidates=%d stun=%s external=%s",
+        s_snapshot.local_candidate_count,
+        StunStatusName(s_snapshot.stun_status),
+        s_snapshot.stun_endpoint[0] ? s_snapshot.stun_endpoint : "(none)");
     UpdateStatusTextLocked();
     s_cv.notify_all();
 }
@@ -689,6 +720,11 @@ static void HandleInboundSignal(
             rc = juice_set_remote_gathering_done(agent);
             if (rc == JUICE_ERR_SUCCESS || rc == JUICE_ERR_IGNORED) {
                 s_remoteGatherDone.store(true);
+                std::lock_guard<std::mutex> lock(s_mutex);
+                Rollback::NetplayLog_Write("NAT", -1,
+                    "Remote gather done: remote_candidates=%d local_candidates=%d",
+                    s_snapshot.remote_candidate_count,
+                    s_snapshot.local_candidate_count);
             }
             break;
     }
@@ -888,6 +924,13 @@ static void WorkerMain() {
                 CopyText(s_snapshot.failure_reason, sizeof(s_snapshot.failure_reason), "libjuice gather failed");
                 UpdateStatusTextLocked();
                 Rollback::NetplayLog_Write("NAT", -1, "libjuice gather failed rc=%d", gatherRc);
+            } else {
+                Rollback::NetplayLog_Write("NAT", -1,
+                    "libjuice agent created, gathering started: stun=%s:%u turn=%s gather_timeout=%ums",
+                    cfg.stun_host[0] ? cfg.stun_host : "stun.l.google.com",
+                    (unsigned)(cfg.stun_port ? cfg.stun_port : 19302),
+                    (cfg.enable_turn && cfg.turn_host[0]) ? cfg.turn_host : "disabled",
+                    cfg.gather_timeout_ms ? cfg.gather_timeout_ms : 5000);
             }
         }
     }
@@ -931,7 +974,12 @@ static void WorkerMain() {
                     CopyText(s_snapshot.failure_reason, sizeof(s_snapshot.failure_reason), "ICE gather timed out");
                     UpdateStatusTextLocked();
                     s_localGatherDone.store(true);
-                    Rollback::NetplayLog_Write("NAT", -1, "ICE gather timeout after %u ms", gatherElapsedMs);
+                    Rollback::NetplayLog_Write("NAT", -1,
+                        "ICE gather timeout after %ums: local_candidates=%d stun=%s external=%s",
+                        gatherElapsedMs,
+                        s_snapshot.local_candidate_count,
+                        StunStatusName(s_snapshot.stun_status),
+                        s_snapshot.stun_endpoint[0] ? s_snapshot.stun_endpoint : "(none)");
                 }
             }
 
@@ -939,6 +987,16 @@ static void WorkerMain() {
                 if (!connectTimerStarted) {
                     connectTimerStarted = true;
                     connectStart = now;
+                    const uint32_t connectTimeout = (cfg.connect_timeout_ms > 0) ? cfg.connect_timeout_ms : 8000;
+                    int localCands = 0, remoteCands = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(s_mutex);
+                        localCands = s_snapshot.local_candidate_count;
+                        remoteCands = s_snapshot.remote_candidate_count;
+                    }
+                    Rollback::NetplayLog_Write("NAT", -1,
+                        "ICE connect timer started: timeout=%ums local_cands=%d remote_cands=%d",
+                        connectTimeout, localCands, remoteCands);
                 }
                 const uint32_t connectTimeout = (cfg.connect_timeout_ms > 0) ? cfg.connect_timeout_ms : 8000;
                 const auto connectElapsedMs = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(now - connectStart).count();
@@ -951,6 +1009,20 @@ static void WorkerMain() {
                     }
                     CopyText(s_snapshot.failure_reason, sizeof(s_snapshot.failure_reason), "ICE connect timed out");
                     UpdateStatusTextLocked();
+                    const char* juiceStateName = "?";
+                    switch (state) {
+                        case JUICE_STATE_DISCONNECTED: juiceStateName = "disconnected"; break;
+                        case JUICE_STATE_GATHERING:    juiceStateName = "gathering"; break;
+                        case JUICE_STATE_CONNECTING:   juiceStateName = "connecting"; break;
+                        case JUICE_STATE_FAILED:       juiceStateName = "failed"; break;
+                        default: break;
+                    }
+                    Rollback::NetplayLog_Write("NAT", -1,
+                        "ICE connect timeout after %ums: ice_state=%s local_cands=%d remote_cands=%d remote_desc=%d",
+                        connectElapsedMs, juiceStateName,
+                        s_snapshot.local_candidate_count,
+                        s_snapshot.remote_candidate_count,
+                        s_remoteDescriptionSeen.load() ? 1 : 0);
                 }
             }
         }

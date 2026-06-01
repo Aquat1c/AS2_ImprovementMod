@@ -89,6 +89,8 @@
 // Sound/effect
 #define ADDR_EFFECT_SET_PARAMS  (GAME_BASE + 0x0C3ED0)  // sub_4C3ED0 — Effect_SetParams1 (entity state writer, NOT sound)
 #define ADDR_MATCH_RENDER_PLAYERS (GAME_BASE + 0x0C6B60) // sub_4C6B60 — match player renderer
+#define ADDR_MATCH_HUD_RENDER     (GAME_BASE + 0x0C05B0) // sub_4C05B0 — match HUD (nickname bars)
+#define ADDR_NAME_BAR_TEXTURE     0x816038               // dword_816038 — gradient bar texture
 #define ADDR_SE_PLAY            (GAME_BASE + 0x0C3C00)  // sub_4C3C00 — SE_Play (actual sound effect trigger)
 
 // Legacy aliases (kept for backward compatibility / reference)
