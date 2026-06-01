@@ -22,11 +22,6 @@ typedef LRESULT(CALLBACK* GameWndProc_t)(HWND, UINT, WPARAM, LPARAM);
 
 static GameWndProc_t g_origGameWndProc = nullptr;
 static bool s_installed = false;
-static uint32_t s_callGameWndprocLogCount = 0;
-static uint32_t s_scKeymenuRetryLogCount = 0;
-static uint32_t s_inputLangRetryLogCount = 0;
-static uint32_t s_fastPathLogCount = 0;
-static uint32_t s_stateTraceLogCount = 0;
 
 static bool IsMiddleMouseMessage(UINT msg) {
     return msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP || msg == WM_MBUTTONDBLCLK;
@@ -88,54 +83,10 @@ static LRESULT CallDefaultWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static void LogShellPathState(const char* reason, UINT msg, WPARAM wParam, LRESULT vanillaResult, LRESULT fallbackResult) {
-    if (s_stateTraceLogCount >= 128) {
-        return;
-    }
-    ++s_stateTraceLogCount;
-    int32_t suppress = 0;
-    int32_t gate = 0;
-    intptr_t custom = 0;
-    intptr_t cb = 0;
-    __try {
-        suppress = *reinterpret_cast<int32_t*>(ADDR_SHELL_HOTKEY_SUPPRESS_FLAG);
-        gate = *reinterpret_cast<int32_t*>(ADDR_GAME_WNDPROC_CUSTOM_HANDLER);
-        custom = *reinterpret_cast<intptr_t*>(ADDR_GAME_WNDPROC_CUSTOM_PROC_PTR);
-        cb = *reinterpret_cast<intptr_t*>(ADDR_GAME_WNDPROC_MSG_CALLBACK);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-
-    LOG_INFO("[STARTUPTRACE][ShellWndProc] %s mode=%u sub=%u msg=0x%03X vk=0x%02X vanilla=0x%p fallback=0x%p suppress=%d gate=%d custom=0x%p cb=0x%p",
-             reason ? reason : "unknown",
-             static_cast<unsigned>(GetGameMode()),
-             static_cast<unsigned>(GetSubstate()),
-             msg,
-             static_cast<unsigned>(wParam & 0xFFu),
-             reinterpret_cast<void*>(vanillaResult),
-             reinterpret_cast<void*>(fallbackResult),
-             suppress,
-             gate,
-             reinterpret_cast<void*>(custom),
-             reinterpret_cast<void*>(cb));
-}
-
 static void ForceDisableCustomWndProcPaths() {
     WriteMemory<int32_t>(ADDR_GAME_WNDPROC_CUSTOM_HANDLER, 0);
     WriteMemory<intptr_t>(ADDR_GAME_WNDPROC_CUSTOM_PROC_PTR, 0);
     WriteMemory<intptr_t>(ADDR_GAME_WNDPROC_MSG_CALLBACK, 0);
-}
-
-static void LogCallGameWndprocOnce(UINT msg, WPARAM wParam, LRESULT result) {
-    if (s_callGameWndprocLogCount >= 48) {
-        return;
-    }
-
-    ++s_callGameWndprocLogCount;
-    LOG_INFO("[ShellHotkey] CallGameWndProc msg=0x%03X vk=0x%02X result=0x%p trampoline=0x%p",
-             msg,
-             static_cast<unsigned>(wParam & 0xFFu),
-             reinterpret_cast<void*>(result),
-             reinterpret_cast<void*>(g_origGameWndProc));
 }
 
 static void RestoreCursorAfterMiddleButton(HWND hwnd) {
@@ -186,23 +137,6 @@ static LRESULT RetryVanillaAfterSuppressClear(HWND hwnd,
     WriteMemory<int32_t>(ADDR_GAME_WNDPROC_CUSTOM_HANDLER, 0);
 
     const LRESULT retriedResult = g_origGameWndProc(hwnd, msg, wParam, lParam);
-    if (retryKeymenu && s_scKeymenuRetryLogCount < 16) {
-        ++s_scKeymenuRetryLogCount;
-        LOG_INFO("[ShellHotkey] Retried SC_KEYMENU after clearing suppress=%d gate=%d initial=0x%p retried=0x%p",
-                 suppressFlag,
-                 customWndprocGate,
-                 reinterpret_cast<void*>(initialResult),
-                 reinterpret_cast<void*>(retriedResult));
-    } else if (retryImeLang && s_inputLangRetryLogCount < 16) {
-        ++s_inputLangRetryLogCount;
-        LOG_INFO("[ShellHotkey] Retried input-language msg=0x%03X after clearing suppress=%d gate=%d initial=0x%p retried=0x%p",
-                 msg,
-                 suppressFlag,
-                 customWndprocGate,
-                 reinterpret_cast<void*>(initialResult),
-                 reinterpret_cast<void*>(retriedResult));
-    }
-
     return retriedResult;
 }
 
@@ -220,31 +154,10 @@ static LRESULT CALLBACK Hook_GameWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         const LRESULT vanillaResult = g_origGameWndProc(hwnd, msg, wParam, lParam);
         ForceDisableCustomWndProcPaths();
         if (vanillaResult != 0) {
-            if (s_fastPathLogCount < 64) {
-                ++s_fastPathLogCount;
-                LOG_INFO("[ShellHotkey] Shell fallback kept vanilla unicode=%d msg=0x%03X wp=0x%p lp=0x%p vanilla=0x%p",
-                         ::IsWindowUnicode(hwnd) ? 1 : 0,
-                         msg,
-                         reinterpret_cast<void*>(wParam),
-                         reinterpret_cast<void*>(lParam),
-                         reinterpret_cast<void*>(vanillaResult));
-            }
-            LogShellPathState("keep-vanilla", msg, wParam, vanillaResult, vanillaResult);
             return vanillaResult;
         }
 
         const LRESULT defResult = CallDefaultWindowProc(hwnd, msg, wParam, lParam);
-        if (s_fastPathLogCount < 64) {
-            ++s_fastPathLogCount;
-            LOG_INFO("[ShellHotkey] Shell fallback used default-proc unicode=%d msg=0x%03X wp=0x%p lp=0x%p vanilla=0x%p default=0x%p",
-                     ::IsWindowUnicode(hwnd) ? 1 : 0,
-                     msg,
-                     reinterpret_cast<void*>(wParam),
-                     reinterpret_cast<void*>(lParam),
-                     reinterpret_cast<void*>(vanillaResult),
-                     reinterpret_cast<void*>(defResult));
-        }
-        LogShellPathState("default-fallback", msg, wParam, vanillaResult, defResult);
         return RetryVanillaAfterSuppressClear(hwnd, msg, wParam, lParam, defResult);
     }
 
@@ -275,16 +188,6 @@ bool ShellHotkey_CallGameWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     }
 
     *outResult = Hook_GameWndProc(hwnd, msg, wParam, lParam);
-
-    const bool traceKey =
-        msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP ||
-        msg == WM_INPUTLANGCHANGEREQUEST || msg == WM_INPUTLANGCHANGE ||
-        (msg == WM_SYSCOMMAND && ((wParam & 0xFFF0u) == SC_KEYMENU));
-
-    if (traceKey) {
-        LogCallGameWndprocOnce(msg, wParam, *outResult);
-    }
-
     return true;
 }
 

@@ -41,6 +41,7 @@ namespace NetMenu {
     void HandleDisconnection(const char* reason);
     void HandlePostMatchReturn();
     void RenderFrame();
+    void RenderMainMenuReturnFade();
 }
 
 // ============================================================================
@@ -86,6 +87,13 @@ static bool     s_interceptEnabled = true;
 static bool     s_pendingMenuRestore = false;
 static uint32_t s_lastStableGameType = GAMETYPE_ARCADE;
 
+// Pre-open main-menu fade-out: when Network is selected we ramp the game's
+// global darkness (dword_816370, applied by sub_488DC0) over the still-drawn
+// vanilla menu before opening the net menu, so the menu fades out instead of
+// cutting straight to black. 0 = inactive, 1..kOpenFadeOutFrames = ramping.
+static constexpr int kOpenFadeOutFrames = 25;
+static int s_pendingOpenFade = 0;
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -130,19 +138,45 @@ static char __cdecl Hook_MainMenuStateMachine() {
     const bool menuActive = NetMenu::IsMenuActive();
 
     if (!menuActive) {
+        // Pre-open fade-out in progress: keep drawing the vanilla menu (pinned at
+        // sub=3 so it can't advance) while ramping the global darkness, then open
+        // the net menu once the screen is fully black.
+        if (s_pendingOpenFade > 0) {
+            WriteU32(ADDR_SUB_STATE, 3);
+            if (s_origMainMenuStateMachine) s_origMainMenuStateMachine();
+            WriteU32(ADDR_SUB_STATE, 3);
+            WriteU32(ADDR_SUB_STATE_TIMER, 0);
+
+            if (s_pendingOpenFade > kOpenFadeOutFrames) {
+                s_pendingOpenFade = 0;
+                LOG_NETPLAY(LOG_INFO, "[ModeOwn] Main-menu fade-out complete — opening net menu");
+                NetMenu::HandleNetworkSelected();
+                ModeOwnership::SanitizeOwnedGameType(MODE_MENU, false, "open-after-fadeout");
+                NetMenu::RenderFrame();
+                return (char)ReadU32(ADDR_SUB_STATE, 3);
+            }
+
+            WriteU32(ADDR_FADE_TIMER_LOCAL, (uint32_t)s_pendingOpenFade);
+            ++s_pendingOpenFade;
+            return (char)3;
+        }
+
         // Not in custom menu — detect vanilla "Network" selection (option index 3)
         const uint32_t mode = GetGameMode();
         const uint32_t sub  = GetSubstate();
         const uint8_t  sel  = ReadU8(ADDR_TITLE_MENU_SELECTION, 0xFF);
 
         if (s_interceptEnabled && mode == MODE_MENU && sub == 3 && sel == 3 && ConfirmPressed()) {
-            LOG_NETPLAY(LOG_INFO, "[ModeOwn] Intercepted Network selection from main menu");
-            NetMenu::HandleNetworkSelected();
-            ModeOwnership::SanitizeOwnedGameType(MODE_MENU, false, "main-menu-intercept");
-            // Render immediately on the intercept frame so there's no black flash.
-            // The old code did this: OpenMenu() then RenderInGameMenu() in the same frame.
-            NetMenu::RenderFrame();
-            return (char)ReadU32(ADDR_SUB_STATE, 3);
+            LOG_NETPLAY(LOG_INFO, "[ModeOwn] Intercepted Network selection — starting main-menu fade-out");
+            // Begin the native fade-out: let vanilla draw (and play its confirm
+            // SFX) this frame, but pin sub=3 and reset darkness to fully visible.
+            WriteU32(ADDR_SUB_STATE, 3);
+            if (s_origMainMenuStateMachine) s_origMainMenuStateMachine();
+            WriteU32(ADDR_SUB_STATE, 3);
+            WriteU32(ADDR_SUB_STATE_TIMER, 0);
+            WriteU32(ADDR_FADE_TIMER_LOCAL, 0);
+            s_pendingOpenFade = 1;
+            return (char)3;
         }
 
         // Let vanilla handler run normally
@@ -155,6 +189,10 @@ static char __cdecl Hook_MainMenuStateMachine() {
             NetMenu::RenderFrame();
             return (char)ReadU32(ADDR_SUB_STATE, 3);
         }
+
+        // Just closed the custom menu: fade the vanilla main menu back in over
+        // the black the net menu faded out to (no-op when no fade is pending).
+        NetMenu::RenderMainMenuReturnFade();
         return result;
     }
 

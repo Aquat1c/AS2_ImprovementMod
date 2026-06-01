@@ -508,37 +508,11 @@ static void LoadInputGuardSettings() {
         wcscpy_s(path, L"as2_rollback_settings.ini");
     }
 
-    auto readIniBool = [&](const wchar_t* key) {
-        wchar_t iniValue[64] = {};
-        GetPrivateProfileStringW(L"ModSettings", key, L"", iniValue,
-            (DWORD)(sizeof(iniValue) / sizeof(iniValue[0])), path);
-        return iniValue[0] != L'\0' &&
-               (_wcsicmp(iniValue, L"1") == 0 ||
-                _wcsicmp(iniValue, L"true") == 0 ||
-                _wcsicmp(iniValue, L"yes") == 0 ||
-                _wcsicmp(iniValue, L"on") == 0);
-    };
-
-    g_enableHotkeyTraceLogs = readIniBool(L"input_guard_hotkey_trace");
-    g_enableSwallowTraceLogs = readIniBool(L"input_guard_swallow_trace");
-    if (!g_enableSwallowTraceLogs && g_enableHotkeyTraceLogs) {
-        g_enableSwallowTraceLogs = true;
-    }
-
-    auto writeIniBool = [&](const wchar_t* key, bool enabled) {
-        WritePrivateProfileStringW(L"ModSettings", key, enabled ? L"1" : L"0", path);
-    };
-    writeIniBool(L"input_guard_hotkey_trace", g_enableHotkeyTraceLogs);
-    writeIniBool(L"input_guard_swallow_trace", g_enableSwallowTraceLogs);
-
+    // The hotkey/swallow trace toggles are no longer INI-configurable; they
+    // stay off (their diagnostic logging remains inert).
     g_inputGuardSettingsLoaded = true;
-    ProxyLog("[INPUTGUARD] d3d9_proxy: game chain via ModCallGameWndProc (not DXLib 0xFFFF stub); hotkey_trace=%d swallow_trace=%d ini=%ls",
-        g_enableHotkeyTraceLogs ? 1 : 0,
-        g_enableSwallowTraceLogs ? 1 : 0,
+    ProxyLog("[INPUTGUARD] d3d9_proxy: game chain via ModCallGameWndProc (not DXLib 0xFFFF stub); ini=%ls",
         path);
-    if (g_enableSwallowTraceLogs || g_enableHotkeyTraceLogs) {
-        ProxyLog("[SWALLOW-TRACE] Win/Apps usually skip WM_KEYDOWN; d3d9 logs GetAsyncKeyState edges when hotkey_trace or swallow_trace");
-    }
 }
 
 static constexpr uintptr_t kAddrShellHotkeySuppressFlag = 0x009E5B74;

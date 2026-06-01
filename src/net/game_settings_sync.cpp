@@ -380,14 +380,6 @@ static bool SavePersistentSettings(const char* reason) {
         "proper_60fps=%d\r\n"
         "; input_guard_shell_hotkeys_ime: 1 clears vanilla Win/Alt+Shift suppression hooks\r\n"
         "input_guard_shell_hotkeys_ime=%d\r\n"
-        "; input_guard_system_keys: 1 strips Win/Apps from DInput/GetKeyboardState polls\r\n"
-        "input_guard_system_keys=%d\r\n"
-        "; input_guard_diag_interval_sec: periodic InputGuard DIAG log interval (0=off)\r\n"
-        "input_guard_diag_interval_sec=%u\r\n"
-        "; input_guard_hotkey_trace: 1 logs WM_* shell keys + enables async Win poll trace\r\n"
-        "input_guard_hotkey_trace=%d\r\n"
-        "; input_guard_swallow_trace: 1 logs DInput strips and wndproc swallow classification\r\n"
-        "input_guard_swallow_trace=%d\r\n"
         "\r\n"
         "[GameSettings]\r\n"
         "; difficulty: 0=easy, 1=normal, 2=hard\r\n"
@@ -412,10 +404,6 @@ static bool SavePersistentSettings(const char* reason) {
         "settings_block_b=%s\r\n",
         TickHooks_GetFrameLimiter60FpsPreferenceEnabled() ? 1 : 0,
         inputGuard.shell_hotkeys_ime ? 1 : 0,
-        inputGuard.system_keys ? 1 : 0,
-        inputGuard.diag_interval_sec,
-        inputGuard.hotkey_trace ? 1 : 0,
-        inputGuard.swallow_trace ? 1 : 0,
         ReadMemory<uint8_t>(kGameOptionDifficulty),
         GameSettingsSync_RoundsToWin(s_persistedRoundOption),
         ReadMemory<uint8_t>(ADDR_STAGESEL_ENABLE),

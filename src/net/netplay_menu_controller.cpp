@@ -62,6 +62,10 @@ using namespace NetMenu;
     } while (0)
 
 constexpr int kFadeFrames = 25;
+// Counts down from kFadeFrames after the menu closes, fading the vanilla main
+// menu back in from black (the mod parks in MODE_MENU and bypasses the vanilla
+// mode-transition fade, so we recreate the fade-in ourselves on return).
+static int s_mainMenuReturnFade = 0;
 
 static bool          s_initialized       = false;
 static MenuState     s_state             = MenuState::Inactive;
@@ -469,8 +473,182 @@ static void ApplyPaletteSettingsToRuntime(const char* reason) {
 // ============================================================================
 
 static uint8_t  ReadU8(uintptr_t a, uint8_t d = 0)   { __try { return *(volatile uint8_t*)a;  } __except(EXCEPTION_EXECUTE_HANDLER) { return d; } }
+static uint32_t ReadU32(uintptr_t a, uint32_t d = 0) { __try { return *(volatile uint32_t*)a; } __except(EXCEPTION_EXECUTE_HANDLER) { return d; } }
 static void WriteU8(uintptr_t a, uint8_t v)   { __try { *(volatile uint8_t*)a = v;  } __except(EXCEPTION_EXECUTE_HANDLER) {} }
 static void WriteU32(uintptr_t a, uint32_t v)  { __try { *(volatile uint32_t*)a = v; } __except(EXCEPTION_EXECUTE_HANDLER) {} }
+
+// ============================================================================
+// Menu presentation (vanilla net.bin background + wave\net.bin SFX + BGM 74)
+//
+// The mod never enters vanilla game mode 4 (Network_MenuStateMachine) because
+// that starts the vanilla lockstep/socket machinery. Instead we call only the
+// standalone resource loaders directly and reuse the (otherwise unused) mode-4
+// asset slots, so the custom menu looks and sounds like the vanilla net menu
+// while staying parked in MODE_MENU substate 3.
+// ============================================================================
+
+using AssetLoadAllFromArchive_t = int  (__cdecl*)(int* dst, const char* binPath, const char* palPath, int arg4);
+using MenuSfxLoad3_t            = void (__cdecl*)(int* dst3, const char* binPath);
+using BgmPlayTrack_t            = int  (__cdecl*)(int track);
+using AudioPlayWrapper_t        = int  (__cdecl*)(int handle);
+using AudioSetVolumeLevel_t     = int  (__cdecl*)(int handle, int level);
+using AudioPlay_t              = int  (__cdecl*)(int handle, int mode, int immediate);
+using AudioStop_t              = int  (__cdecl*)(int handle);
+
+static AssetLoadAllFromArchive_t s_assetLoadAll = reinterpret_cast<AssetLoadAllFromArchive_t>(ADDR_ASSET_LOAD_ALL_FROM_ARCHIVE);
+static MenuSfxLoad3_t            s_menuSfxLoad3  = reinterpret_cast<MenuSfxLoad3_t>(ADDR_MENU_SFX_LOAD3);
+static BgmPlayTrack_t            s_bgmPlay       = reinterpret_cast<BgmPlayTrack_t>(ADDR_BGM_PLAY_TRACK);
+static AudioPlayWrapper_t        s_audioPlay     = reinterpret_cast<AudioPlayWrapper_t>(ADDR_AUDIO_PLAY_HANDLE);
+static AudioSetVolumeLevel_t     s_audioSetVol   = reinterpret_cast<AudioSetVolumeLevel_t>(ADDR_AUDIO_SET_VOLUME_LEVEL);
+static AudioPlay_t               s_audioPlayRaw  = reinterpret_cast<AudioPlay_t>(ADDR_AUDIO_PLAY);
+static AudioStop_t               s_audioStopRaw  = reinterpret_cast<AudioStop_t>(ADDR_AUDIO_STOP);
+
+// BGM handle reuse: BGM_PlayTrack() reloads+decrypts the song from bgm.bin every
+// call (~0.5s, the menu open/close lag). Audio_Stop only pauses — the song buffer
+// stays resident — so once a track is loaded we can switch to it instantly with
+// Audio_Stop/Audio_Play. We preload track 74 once (cached) and remember the
+// main-menu track-0 handle to resume on close, both reset on a real mode change.
+static constexpr int kBgmHandleNone = -1;
+static int s_netBgmHandle      = kBgmHandleNone;  // cached track 74 handle
+static int s_savedMainBgmHandle = kBgmHandleNone; // main-menu BGM (track 0) saved on open
+
+// s_assetsLoaded tracks the cached net.bin / wave\net.bin archive handles. They
+// are freed by the engine's Handle_ReleaseAll only on a real game-mode change,
+// so while parked in MODE_MENU they survive menu open/close cycles. Caching them
+// is what keeps reopening the menu instant instead of reloading the archive
+// (a multi-ms hitch) mid-fade every time. s_bgmStarted is a per-open latch so
+// BGM 74 restarts each time the menu opens (the main menu reclaims track 0 on
+// close).
+static bool s_assetsLoaded       = false;
+static bool s_bgmStarted         = false;
+static bool s_sfxCursorPlayed    = false;
+static bool s_sfxConfirmPlayed   = false;
+static bool s_sfxCancelPlayed    = false;
+
+static void ResetMenuSfxFrameGuards() {
+    s_sfxCursorPlayed  = false;
+    s_sfxConfirmPlayed = false;
+    s_sfxCancelPlayed  = false;
+}
+
+static double NowMs() {
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+
+static void StartNetMenuBgm();
+
+// Load the net.bin background + wave\net.bin SFX bank (cached) and start the
+// menu BGM (per open). Called once the menu is actually drawable (after any
+// pending mode restore), so the slots are safe to use.
+static void EnsureNetMenuPresentation() {
+    if (!s_assetsLoaded) {
+        s_assetsLoaded = true;  // latch up-front: never retry the heavy load every frame
+
+        const double t0 = NowMs();
+        s_assetLoadAll(reinterpret_cast<int*>(ADDR_NET_MENU_BG_HANDLE), "data\\net.bin", "data\\net.pal", 0);
+        const double t1 = NowMs();
+        s_menuSfxLoad3(reinterpret_cast<int*>(ADDR_NET_MENU_SFX_CURSOR), "wave\\net.bin");
+        const double t2 = NowMs();
+
+        const int vol = (int)ReadU8(ADDR_MENU_SFX_VOLUME_BYTE, 0);
+        s_audioSetVol((int)ReadU32(ADDR_NET_MENU_SFX_CURSOR,  0), vol);
+        s_audioSetVol((int)ReadU32(ADDR_NET_MENU_SFX_CONFIRM, 0), vol);
+        s_audioSetVol((int)ReadU32(ADDR_NET_MENU_SFX_CANCEL,  0), vol);
+
+        LOG_NETPLAY(LOG_INFO, "[NetMenu][TIMING] Loaded net assets: bg=0x%X vol=%d | bgLoad=%.1fms sfxLoad=%.1fms",
+            ReadU32(ADDR_NET_MENU_BG_HANDLE, 0), vol, t1 - t0, t2 - t1);
+    }
+
+    if (!s_bgmStarted) {
+        s_bgmStarted = true;
+        StartNetMenuBgm();
+    }
+}
+
+// Switch to the network-menu BGM (track 74). First time per menu session we let
+// the game load+volume-init it (one ~0.5s hit, cached); afterwards we just stop
+// the current track and replay the resident track-74 buffer — instant.
+static void StartNetMenuBgm() {
+    if (ReadU32(ADDR_BGM_ENABLED, 0) != 1) {
+        return;  // BGM disabled in options — nothing to switch
+    }
+
+    // Remember whatever is playing now (main-menu track 0) so close can resume it.
+    s_savedMainBgmHandle = (int)ReadU32(ADDR_BGM_CURRENT_HANDLE, (uint32_t)kBgmHandleNone);
+
+    if (s_netBgmHandle == kBgmHandleNone) {
+        const double t0 = NowMs();
+        s_bgmPlay(NET_MENU_BGM_TRACK);  // loads + plays + sets volume (one-time)
+        const double t1 = NowMs();
+        s_netBgmHandle = (int)ReadU32(ADDR_BGM_CURRENT_HANDLE, (uint32_t)kBgmHandleNone);
+        LOG_NETPLAY(LOG_INFO, "[NetMenu][TIMING] BGM_PlayTrack(%d) first load = %.1fms (handle=0x%X, cached)",
+            NET_MENU_BGM_TRACK, t1 - t0, s_netBgmHandle);
+        return;
+    }
+
+    // Cached: replay the resident buffer (loop mode 3) without reloading.
+    const double t0 = NowMs();
+    if (s_savedMainBgmHandle != kBgmHandleNone) {
+        s_audioStopRaw(s_savedMainBgmHandle);
+    }
+    s_audioPlayRaw(s_netBgmHandle, 3, 1);
+    WriteU32(ADDR_BGM_CURRENT_HANDLE, (uint32_t)s_netBgmHandle);
+    const double t1 = NowMs();
+    LOG_NETPLAY(LOG_INFO, "[NetMenu][TIMING] BGM switch to %d (cached handle) = %.1fms", NET_MENU_BGM_TRACK, t1 - t0);
+}
+
+// Drop the cached handles when the game leaves MODE_MENU. Handle_ReleaseAll frees
+// the sprite handles and the audio system recycles BGM handles on a real mode
+// change (e.g. match launch), so they must be reloaded on the next open. While we
+// stay in MODE_MENU everything remains valid and cached.
+static void InvalidateNetMenuPresentationOnModeLeave() {
+    if ((s_assetsLoaded || s_netBgmHandle != kBgmHandleNone) && GetGameMode() != MODE_MENU) {
+        s_assetsLoaded = false;
+        s_netBgmHandle = kBgmHandleNone;
+        s_savedMainBgmHandle = kBgmHandleNone;
+        s_mainMenuReturnFade = 0;
+    }
+}
+
+// Restore the main-menu BGM on close. If we have the saved resident track-0
+// handle, resume it instantly; otherwise fall back to a (slow) reload.
+static void RestoreMainMenuBgm() {
+    if (ReadU32(ADDR_BGM_ENABLED, 0) != 1) {
+        return;
+    }
+    if (s_savedMainBgmHandle != kBgmHandleNone) {
+        const double t0 = NowMs();
+        if (s_netBgmHandle != kBgmHandleNone) {
+            s_audioStopRaw(s_netBgmHandle);
+        }
+        s_audioPlayRaw(s_savedMainBgmHandle, 3, 1);
+        WriteU32(ADDR_BGM_CURRENT_HANDLE, (uint32_t)s_savedMainBgmHandle);
+        const double t1 = NowMs();
+        LOG_NETPLAY(LOG_INFO, "[NetMenu][TIMING] BGM resume main (cached handle) = %.1fms", t1 - t0);
+    } else {
+        const double t0 = NowMs();
+        s_bgmPlay(MAIN_MENU_BGM_TRACK);
+        const double t1 = NowMs();
+        LOG_NETPLAY(LOG_INFO, "[NetMenu][TIMING] BGM_PlayTrack(%d) reload (no cache) = %.1fms", MAIN_MENU_BGM_TRACK, t1 - t0);
+    }
+}
+
+static void PlayNetMenuSfx(uintptr_t handleAddr, bool* frameGuard) {
+    if (*frameGuard) return;
+    *frameGuard = true;
+    if (!s_assetsLoaded) return;
+    const uint32_t handle = ReadU32(handleAddr, 0);
+    if (handle != 0 && s_audioPlay) {
+        s_audioPlay((int)handle);
+    }
+}
+
+static void PlayMenuCursorSfx()  { PlayNetMenuSfx(ADDR_NET_MENU_SFX_CURSOR,  &s_sfxCursorPlayed);  }
+static void PlayMenuConfirmSfx() { PlayNetMenuSfx(ADDR_NET_MENU_SFX_CONFIRM, &s_sfxConfirmPlayed); }
+static void PlayMenuCancelSfx()  { PlayNetMenuSfx(ADDR_NET_MENU_SFX_CANCEL,  &s_sfxCancelPlayed);  }
 
 // ============================================================================
 // String helpers
@@ -2068,6 +2246,7 @@ static void OpenMenu() {
     s_settingsCategory = SettingsCategory::Identity;
     s_phase = MenuPhase::Opening;
     s_fadeFrames = 0;
+    s_mainMenuReturnFade = 0;  // cancel any in-progress return fade
     s_captureInput = true;
     ResetMenuInputState();
     ClearError();
@@ -2093,6 +2272,11 @@ static void FinishClose() {
     TransitionTo(MenuState::Inactive, "menu closed");
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Custom netplay menu closed");
     InputSystem_ResetRepeatState(0);
+    // Restart BGM 74 on the next open (the main menu reclaims track 0 on close).
+    // Keep the cached net.bin / wave\net.bin handles: while parked in MODE_MENU
+    // they survive, so reopening the menu is instant. They are invalidated
+    // separately once the game leaves MODE_MENU (handles freed by the engine).
+    s_bgmStarted = false;
 }
 
 static void BeginClose(const char* why) {
@@ -2511,6 +2695,9 @@ static void MoveSelection(int delta) {
     int next = (int)s_selectedIndex + delta;
     while (next < 0) next += count;
     while (next >= count) next -= count;
+    if ((uint32_t)next != s_selectedIndex) {
+        PlayMenuCursorSfx();
+    }
     s_selectedIndex = (uint32_t)next;
 }
 
@@ -3012,6 +3199,11 @@ static void SyncSpectatorClientState() {
 }
 
 static void HandleNavigationInput() {
+    // Confirm / cancel SFX. Edge-triggered and latched once per frame so every
+    // navigable substate gets the vanilla net-menu beep without per-site wiring.
+    if (ConfirmPressed())   PlayMenuConfirmSfx();
+    else if (BackPressed()) PlayMenuCancelSfx();
+
     // C key: copy your address to clipboard (in states where it's relevant)
     {
         bool cDown = IsCopyAddressKeyDown();
@@ -3245,6 +3437,7 @@ static void HandleNavigationInput() {
             }
 
             if (changed) {
+                PlayMenuCursorSfx();
                 if (natChanged) {
                     ApplyNatSettingsToService("settings navigation");
                     ApplySpectatorSettingsToRuntime("settings navigation");
@@ -3743,15 +3936,31 @@ void FrameUpdate() {
 
     // ALWAYS pump the session — even when the menu is hidden (CharSel/Match).
     // This drives ENet polling, keepalive, and timeout detection.
+    const double tf0 = NowMs();
     SyncSessionState();
+    const double tf1 = NowMs();
 
     // Re-read mode after session sync (disconnect may have forced mode change)
     mode = GetGameMode();
 
+    // Drop cached net assets if the game has left MODE_MENU (engine freed them).
+    // Runs even while the menu is hidden so a post-match reopen reloads cleanly.
+    InvalidateNetMenuPresentationOnModeLeave();
+
     HandleAutoConnect();
+    const double tf2 = NowMs();
     TryAutoRestartPregameFromPostMatchCharSel();
     SyncSpectatorDiscoveryState();
+    const double tf3 = NowMs();
     SyncSpectatorClientState();
+    const double tf4 = NowMs();
+
+    // Surface any per-frame stall (network/spectator pumps) that could be felt
+    // as menu lag. Only logs when something actually blocks (>20ms).
+    if ((tf4 - tf0) > 20.0) {
+        LOG_NETPLAY(LOG_WARNING, "[NetMenu][TIMING] FrameUpdate pump stall=%.1fms (session=%.1f autoconnect=%.1f spectatorDisc=%.1f spectatorClient=%.1f)",
+            tf4 - tf0, tf1 - tf0, tf2 - tf1, tf3 - tf2, tf4 - tf3);
+    }
 
     if (!MenuVisible()) return;
 
@@ -3770,6 +3979,11 @@ void FrameUpdate() {
         return;
     }
 
+    // Now that the menu is drawable, load the vanilla net.bin background +
+    // wave\net.bin SFX and start BGM 74. Idempotent per open.
+    EnsureNetMenuPresentation();
+    ResetMenuSfxFrameGuards();
+
     // Fade transitions
     if (s_phase == MenuPhase::Opening) {
         if (++s_fadeFrames >= kFadeFrames) {
@@ -3778,7 +3992,13 @@ void FrameUpdate() {
         }
     } else if (s_phase == MenuPhase::Closing) {
         if (--s_fadeFrames <= 0) {
+            // Real close back to the title: restore the main-menu BGM before
+            // handing the mode back to vanilla.
+            RestoreMainMenuBgm();
             ModeOwnership::RestoreMainMenuContext();
+            // Start a full-screen fade-in over the vanilla main menu so the
+            // return doesn't hard-cut (the net menu has just faded to black).
+            s_mainMenuReturnFade = kFadeFrames;
             FinishClose();
             return;
         }
@@ -4110,6 +4330,16 @@ void RenderFrame() {
     MenuSnapshot snap{};
     GetSnapshot(&snap);
     NetMenuUI::Render(&snap);
+}
+
+void RenderMainMenuReturnFade() {
+    if (s_mainMenuReturnFade <= 0) return;
+    // alpha: kFadeFrames -> 255 (black), 0 -> clear. Draw over the vanilla menu,
+    // then decrement so it fades in over kFadeFrames frames.
+    const float norm = (float)s_mainMenuReturnFade / (float)kFadeFrames;
+    uint8_t alpha = (uint8_t)(norm * 255.0f + 0.5f);
+    NetMenuUI::RenderFullscreenFade(alpha);
+    --s_mainMenuReturnFade;
 }
 
 } // namespace NetMenu

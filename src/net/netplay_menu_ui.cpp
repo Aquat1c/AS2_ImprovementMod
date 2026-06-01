@@ -33,6 +33,7 @@ constexpr uintptr_t ADDR_RENDER_DRAW_SPRITE   = 0x5D3130;
 constexpr uintptr_t ADDR_DRAW_FORMAT_STRING   = 0x629A20;
 
 constexpr uintptr_t ADDR_TITLE_MENU_BG_ACTIVE = 0x8EA00C;
+constexpr uintptr_t ADDR_NET_MENU_BG = 0x7AC2A4;  // data\net.bin sprite (vanilla dword_7AC2A4)
 
 typedef int (__cdecl *RenderFillRect_t)(int left, int top, int right, int bottom, int color, int drawFlag);
 typedef int (__cdecl *RenderSetBlendMode_t)(int blendMode, unsigned __int8 alphaValue);
@@ -402,13 +403,13 @@ static void RenderRow(int y, const char* label, const char* value, bool selected
     if (!HasRowSpace(y)) return;
 
     if (selected) {
-        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 40));
+        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 70));
         GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 22, 0, 0, 0);
-        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 128));
+        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 150));
         GameFillRect(kContentLeft, y - 4, kContentRight, y + 20,
             enabled ? 180 : 120, enabled ? 60 : 70, enabled ? 50 : 70);
     } else {
-        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 22));
+        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 60));
         GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 22, 0, 0, 0);
     }
 
@@ -1164,11 +1165,24 @@ static const char* GetHeaderSubtitle(const NetMenu::MenuSnapshot* snap) {
 
 namespace NetMenuUI {
 
+void RenderFullscreenFade(uint8_t blackAlpha) {
+    if (blackAlpha == 0) return;
+    GameSetBlend(1, blackAlpha);
+    GameFillRect(0, 0, 639, 479, 0, 0, 0);
+    GameSetBlend(0, 255);
+    GameSetDrawColor(255, 255, 255);
+}
+
 void Render(const NetMenu::MenuSnapshot* snap) {
     if (!snap || !snap->menu_active) return;
 
-    // Background sprite
-    const int bgHandle = (int)ReadU32(ADDR_TITLE_MENU_BG_ACTIVE, 0);
+    // Background sprite: prefer the vanilla net.bin background (loaded by the
+    // controller's presentation step); fall back to the title background if it
+    // isn't loaded yet.
+    int bgHandle = (int)ReadU32(ADDR_NET_MENU_BG, 0);
+    if (bgHandle == 0) {
+        bgHandle = (int)ReadU32(ADDR_TITLE_MENU_BG_ACTIVE, 0);
+    }
     GameSetBlend(0, 255);
     GameSetDrawColor(255, 255, 255);
     GameDrawSprite(0, 0, bgHandle);
@@ -1177,11 +1191,21 @@ void Render(const NetMenu::MenuSnapshot* snap) {
     if (fadeNorm < 0.0f) fadeNorm = 0.0f;
     if (fadeNorm > 1.0f) fadeNorm = 1.0f;
     uint8_t alpha = (uint8_t)Alpha8(fadeNorm, 255);
-    if (!alpha) return;
 
-    // Light dim overlay for readability
-    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 100));
+    // Fade the whole scene (background included) from / to black, settling on a
+    // constant readability dim once the menu is fully open. fadeNorm: 0 = black,
+    // 1 = open. Drawing this over the background is what makes the open/close
+    // transitions actually fade instead of popping the background in and out.
+    constexpr int kSceneDim = 120;
+    uint8_t sceneOverlay = (uint8_t)((float)kSceneDim + (1.0f - fadeNorm) * (255.0f - (float)kSceneDim));
+    GameSetBlend(1, sceneOverlay);
     GameFillRect(0, 0, 639, 479, 0, 0, 0);
+
+    if (!alpha) {
+        GameSetBlend(0, 255);
+        GameSetDrawColor(255, 255, 255);
+        return;
+    }
 
     // Header shadow
     GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 40));

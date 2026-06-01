@@ -292,6 +292,17 @@ static bool ReplayMenuInputJustPressed(uint16_t button) {
     return InputSystem_JustPressed(0, button) || InputSystem_JustPressed(1, button);
 }
 
+// Play one of the vanilla replay-select SFX handles (wave\rep.bin). The handles
+// at 0x815E88/8C/90 are populated by the vanilla mode-5 init that still runs;
+// we only override the draw, so they are valid while the browser is active.
+static void PlayReplayMenuSfx(uintptr_t handleAddr) {
+    using ReplayAudioPlay_t = int (__cdecl*)(int handle);
+    const uint32_t handle = ReadMemory<uint32_t>(handleAddr);
+    if (handle != 0) {
+        reinterpret_cast<ReplayAudioPlay_t>(ADDR_AUDIO_PLAY_HANDLE)(static_cast<int>(handle));
+    }
+}
+
 static void ResetMatchHotkeyEdges() {
     s_pauseKeyWasDown = RawKeyDown(kHotkeyPause);
     s_stepForwardKeyWasDown = RawKeyDown(kHotkeyStepForward);
@@ -2035,6 +2046,7 @@ static void HandleReplayMenuInput() {
             s_browserSelected = (s_browserSelected + static_cast<int32_t>(s_browserEntries.size()) - 1) %
                 static_cast<int32_t>(s_browserEntries.size());
             ClampBrowserSelection();
+            PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CURSOR);
         }
     }
 
@@ -2042,27 +2054,32 @@ static void HandleReplayMenuInput() {
         if (!s_browserEntries.empty()) {
             s_browserSelected = (s_browserSelected + 1) % static_cast<int32_t>(s_browserEntries.size());
             ClampBrowserSelection();
+            PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CURSOR);
         }
     }
 
     if (ReplayMenuInputJustPressed(INPUT_LEFT)) {
         s_browserSelected -= kReplayBrowserPageSize;
         ClampBrowserSelection();
+        PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CURSOR);
     }
 
     if (ReplayMenuInputJustPressed(INPUT_RIGHT)) {
         s_browserSelected += kReplayBrowserPageSize;
         ClampBrowserSelection();
+        PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CURSOR);
     }
 
     if (ConsumeEdge(VK_HOME, &s_menuHomeWasDown)) {
         s_browserSelected = 0;
         ClampBrowserSelection();
+        PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CURSOR);
     }
 
     if (ConsumeEdge(VK_END, &s_menuEndWasDown)) {
         s_browserSelected = static_cast<int32_t>(s_browserEntries.size()) - 1;
         ClampBrowserSelection();
+        PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CURSOR);
     }
 
     if (ReplayMenuInputJustPressed(INPUT_A) ||
@@ -2071,6 +2088,7 @@ static void HandleReplayMenuInput() {
         if (s_browserEntries.empty()) {
             SetBrowserStatus("No replay folders or files are available here.");
         } else {
+            PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CONFIRM);
             const ReplayBrowserEntry& entry = s_browserEntries[s_browserSelected];
             switch (entry.type) {
                 case ReplayBrowserEntryType::ParentDirectory:
@@ -2092,6 +2110,7 @@ static void HandleReplayMenuInput() {
         ConsumeEdge(VK_ESCAPE, &s_menuCancelWasDown) ||
         ConsumeEdge(VK_BACK, &s_menuBackWasDown);
     if (cancelPressed) {
+        PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CANCEL);
         if (!ReturnToBrowserParentDirectory()) {
             CancelReplaySelection();
         }

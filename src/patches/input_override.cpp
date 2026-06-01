@@ -63,7 +63,9 @@ static bool s_inputGuardSettingsPathResolved = false;
 static wchar_t s_inputGuardSettingsPathW[MAX_PATH] = {};
 static char s_inputGuardSettingsPathUtf8[MAX_PATH * 3] = {};
 static bool s_enableShellHotkeyImeWorkarounds = true;
-static bool s_enableSystemKeyWorkarounds = true;
+// System-key stripping (Win/Apps) stays disabled by shell hotkey policy; the
+// trace/diagnostic toggles below are no longer INI-configurable and remain off.
+static bool s_enableSystemKeyWorkarounds = false;
 static bool s_enableSwallowTrace = false;
 static bool s_enableHotkeyTraceLog = false;
 static uint32_t s_inputGuardDiagIntervalSec = 15;
@@ -126,24 +128,6 @@ static void ResolveInputGuardSettingsPath() {
     s_inputGuardSettingsPathResolved = true;
 }
 
-static uint32_t ReadInputGuardIniUInt(const wchar_t* key, uint32_t fallback, bool* found) {
-    wchar_t value[64] = {};
-    ResolveInputGuardSettingsPath();
-    GetPrivateProfileStringW(L"ModSettings", key, L"", value,
-        (DWORD)(sizeof(value) / sizeof(value[0])), s_inputGuardSettingsPathW);
-    if (value[0] == L'\0') {
-        if (found) {
-            *found = false;
-        }
-        return fallback;
-    }
-
-    if (found) {
-        *found = true;
-    }
-    return (uint32_t)wcstoul(value, nullptr, 10);
-}
-
 static bool ReadInputGuardIniBool(const wchar_t* key, bool fallback, bool* found) {
     wchar_t value[64] = {};
     ResolveInputGuardSettingsPath();
@@ -173,19 +157,8 @@ static void WriteInputGuardDefaultBool(const wchar_t* key, bool enabled) {
                                s_inputGuardSettingsPathW);
 }
 
-static void WriteInputGuardDefaultUInt(const wchar_t* key, uint32_t value) {
-    ResolveInputGuardSettingsPath();
-    wchar_t text[32] = {};
-    swprintf_s(text, L"%u", value);
-    WritePrivateProfileStringW(L"ModSettings", key, text, s_inputGuardSettingsPathW);
-}
-
 static void SyncInputGuardIniKeys() {
     WriteInputGuardDefaultBool(L"input_guard_shell_hotkeys_ime", s_enableShellHotkeyImeWorkarounds);
-    WriteInputGuardDefaultBool(L"input_guard_system_keys", s_enableSystemKeyWorkarounds);
-    WriteInputGuardDefaultUInt(L"input_guard_diag_interval_sec", s_inputGuardDiagIntervalSec);
-    WriteInputGuardDefaultBool(L"input_guard_hotkey_trace", s_enableHotkeyTraceLog);
-    WriteInputGuardDefaultBool(L"input_guard_swallow_trace", s_enableSwallowTrace);
 }
 
 void InputOverride_GetIniSnapshot(InputGuardIniSnapshot* out) {
@@ -194,10 +167,6 @@ void InputOverride_GetIniSnapshot(InputGuardIniSnapshot* out) {
     }
     InputOverride_LoadSettings();
     out->shell_hotkeys_ime = s_enableShellHotkeyImeWorkarounds;
-    out->system_keys = s_enableSystemKeyWorkarounds;
-    out->diag_interval_sec = s_inputGuardDiagIntervalSec;
-    out->hotkey_trace = s_enableHotkeyTraceLog;
-    out->swallow_trace = s_enableSwallowTrace;
 }
 
 void InputOverride_SyncIniKeys() {
@@ -211,55 +180,18 @@ void InputOverride_LoadSettings() {
     }
 
     bool foundShell = false;
-    bool foundSystem = false;
-    bool foundDiag = false;
-    bool foundSwallowTrace = false;
-    bool foundHotkeyTrace = false;
 
     s_enableShellHotkeyImeWorkarounds =
         ReadInputGuardIniBool(L"input_guard_shell_hotkeys_ime", true, &foundShell);
-    s_enableSystemKeyWorkarounds =
-        ReadInputGuardIniBool(L"input_guard_system_keys", false, &foundSystem);
-    s_inputGuardDiagIntervalSec =
-        ReadInputGuardIniUInt(L"input_guard_diag_interval_sec", 15, &foundDiag);
-    s_enableHotkeyTraceLog =
-        ReadInputGuardIniBool(L"input_guard_hotkey_trace", false, &foundHotkeyTrace);
-    s_enableSwallowTrace =
-        ReadInputGuardIniBool(L"input_guard_swallow_trace", s_enableHotkeyTraceLog, &foundSwallowTrace);
-    if (s_enableHotkeyTraceLog) {
-        s_enableSwallowTrace = true;
-    }
-
-    // Win-key stripping blocks shell behavior (Start/layout). Keep this disabled.
-    if (s_enableSystemKeyWorkarounds) {
-        LOG_WARN("[InputGuard] input_guard_system_keys=1 requested, but Win/App key stripping is disabled by shell hotkey policy");
-        s_enableSystemKeyWorkarounds = false;
-    }
 
     (void)foundShell;
-    (void)foundSystem;
-    (void)foundDiag;
-    (void)foundHotkeyTrace;
-    (void)foundSwallowTrace;
     SyncInputGuardIniKeys();
 
     s_inputGuardSettingsLoaded = true;
-    LOG_INFO("[InputGuard] Settings: shell_hotkeys_ime=%d (%s) system_keys=%d (%s) diag_interval_sec=%u (%s) "
-             "hotkey_trace=%d (%s) swallow_trace=%d (%s) game_wndproc=ModCallGameWndProc path=%s",
+    LOG_INFO("[InputGuard] Settings: shell_hotkeys_ime=%d (%s) game_wndproc=ModCallGameWndProc path=%s",
         s_enableShellHotkeyImeWorkarounds ? 1 : 0,
         foundShell ? "ini" : "written",
-        s_enableSystemKeyWorkarounds ? 1 : 0,
-        foundSystem ? "ini" : "written",
-        s_inputGuardDiagIntervalSec,
-        foundDiag ? "ini" : "written",
-        s_enableHotkeyTraceLog ? 1 : 0,
-        foundHotkeyTrace ? "ini" : "written",
-        s_enableSwallowTrace ? 1 : 0,
-        foundSwallowTrace ? "ini" : (foundHotkeyTrace ? "hotkey_trace" : "written"),
         s_inputGuardSettingsPathUtf8[0] ? s_inputGuardSettingsPathUtf8 : "as2_rollback_settings.ini");
-    if (s_enableSwallowTrace || s_enableHotkeyTraceLog) {
-        LOG_INFO("[SWALLOW-TRACE] Win/Apps often skip WM_KEYDOWN; async GetAsyncKeyState + DInput polls are logged on change");
-    }
 }
 
 bool InputOverride_AreShellHotkeyImeWorkaroundsEnabled() {

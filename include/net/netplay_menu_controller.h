@@ -69,4 +69,9 @@ void GetSnapshot(MenuSnapshot* out);
 /// Render the menu in the game's render pass (called from Hook_MainMenuStateMachine).
 void RenderFrame();
 
+/// After the menu closes, fade the vanilla main menu back in (drawn over the
+/// vanilla menu in the game's render pass). No-op when no return fade is pending.
+/// Called from Hook_MainMenuStateMachine's vanilla (menu-inactive) path.
+void RenderMainMenuReturnFade();
+
 } // namespace NetMenu

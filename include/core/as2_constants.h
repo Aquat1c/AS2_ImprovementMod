@@ -217,6 +217,32 @@
 #define ADDR_SOUND_CREATE       (GAME_BASE + 0x22C060)
 #define ADDR_SOUND_QUICK        (GAME_BASE + 0x22C340)
 
+// --- Menu presentation: vanilla asset/SFX/BGM loaders (net.bin / rep.bin) ---
+#define ADDR_MENU_SFX_LOAD3         (GAME_BASE + 0x14AA00)  // sub_54AA00(int* dst3, char* binPath) - loads a 3-handle SFX bank
+#define ADDR_BGM_PLAY_TRACK         (GAME_BASE + 0x1D3380)  // BGM_PlayTrack(track) - 0..77, 255 stops (loads track from bgm.bin: ~0.5s)
+#define ADDR_BGM_LOAD_TRACK         (GAME_BASE + 0x14ABE0)  // sub_54ABE0(char* bgmBin, track) - loads one track, returns handle
+#define ADDR_AUDIO_PLAY             (GAME_BASE + 0x22C5F0)  // Audio_Play(handle, mode, immediate) - mode 3 = looping BGM
+#define ADDR_AUDIO_STOP             (GAME_BASE + 0x22C780)  // Audio_Stop(handle) - stops playback, keeps buffer resident
+#define ADDR_AUDIO_PLAY_HANDLE      (GAME_BASE + 0x1D3410)  // Audio_Play_Wrapper(handle)
+#define ADDR_AUDIO_SET_VOLUME_LEVEL (GAME_BASE + 0x1D3450)  // Audio_SetVolumeLevel(handle, level)
+#define ADDR_MENU_SFX_VOLUME_BYTE   0x8E9409                // BYTE1(dword_8E9408) - menu SFX volume level
+#define ADDR_BGM_CURRENT_HANDLE     0x816374                // dword_816374 - currently playing BGM handle (-1 = none)
+#define ADDR_BGM_ENABLED            0x816378                // dword_816378 - BGM enabled flag (1 = on)
+
+// Network menu (vanilla mode 4 slots; mode 4 never runs in the mod, so we reuse them)
+#define ADDR_NET_MENU_BG_HANDLE     0x7AC2A4  // data\net.bin background sprite (dword_7AC2A4)
+#define ADDR_NET_MENU_SFX_CURSOR    0x7AC304  // wave\net.bin handle: cursor move (dword_7AC304)
+#define ADDR_NET_MENU_SFX_CONFIRM   0x7AC308  // confirm (dword_7AC308)
+#define ADDR_NET_MENU_SFX_CANCEL    0x7AC30C  // cancel (dword_7AC30C)
+
+// Replay select menu (vanilla mode 5 - init still runs and loads these handles)
+#define ADDR_REPLAY_MENU_SFX_CURSOR  0x815E88  // wave\rep.bin handle: cursor move (dword_815E88)
+#define ADDR_REPLAY_MENU_SFX_CONFIRM 0x815E8C  // confirm (dword_815E8C)
+#define ADDR_REPLAY_MENU_SFX_CANCEL  0x815E90  // cancel (dword_815E90)
+
+#define NET_MENU_BGM_TRACK   74  // network menu music
+#define MAIN_MENU_BGM_TRACK  0   // title/main menu music
+
 // ============================================================================
 // Input Structures
 // ============================================================================

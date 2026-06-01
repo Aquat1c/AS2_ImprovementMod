@@ -71,10 +71,6 @@ void InputOverride_Shutdown();
 
 struct InputGuardIniSnapshot {
     bool shell_hotkeys_ime;
-    bool system_keys;
-    uint32_t diag_interval_sec;
-    bool hotkey_trace;
-    bool swallow_trace;
 };
 
 void InputOverride_GetIniSnapshot(InputGuardIniSnapshot* out);
