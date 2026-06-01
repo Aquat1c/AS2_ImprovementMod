@@ -1028,28 +1028,21 @@ static bool PatchByMaskedSignatureNearRva(uintptr_t preferredRva,
 static void PatchVanillaWndprocSwallowBranches() {
     // Fixed-RVA patch plan verified against D:\Alice in wonderland 2\as2.exe.
     // We intentionally avoid runtime pattern relocation/scanning for these sites.
-    static const uintptr_t kRvaScKeymenuBlock = 0x233DFE;
+    //
+    // NOTE: The actual Win key / Alt+Shift fix is the keybd_event(VK 0x07) phantom-key
+    // drop in PatchEarlyHotkeyImports (see SHELL_HOTKEY_POLICY.md). The patches below are
+    // kept only for behaviors confirmed to depend on them: the cursor-hide bypass
+    // (middle-click), the SC_TASKLIST / SC_SCREENSAVE swallow bypasses (Ctrl+Esc /
+    // task-switch), and the live 0x9DB660 / 0x9DB668 wndproc gates. The former
+    // SC_KEYMENU / shell-helper-arming patches (both gated on dword_9E5B74, which is
+    // never assigned in this build) and the DInput coop-level patches (proven irrelevant
+    // to shell hotkeys) were removed as dead/ineffective.
     static const uintptr_t kRvaCursorHideBlock = 0x234107;
     static const uintptr_t kRvaWndprocDefWindowGate = 0x233F25;
-    static const uintptr_t kRvaDInputKbCoopArg1 = 0x22F1A6;
-    static const uintptr_t kRvaDInputKbCoopArg2 = 0x22F2F1;
     static const uintptr_t kRvaWndprocCustomCallGuard = 0x2334B5;
-    static const uintptr_t kRvaShellHelperGuard = 0x233979;
     static const uintptr_t kRvaScTasklistBlock = 0x233E21;
     static const uintptr_t kRvaScScreensaveBlock = 0x233E38;
 
-    static const uint8_t kExpectedScKeymenu[] = {
-        0x81, 0xFB, 0x00, 0xF1, 0x00, 0x00, 0x75, 0x1B,
-        0x39, 0x15, 0x74, 0x5B, 0x9E, 0x00, 0x0F, 0x85,
-        0x13, 0x01, 0x00, 0x00, 0x5F, 0x5E, 0x5D, 0x33,
-        0xC0, 0x5B, 0x81, 0xC4, 0xB8, 0x00, 0x00, 0x00,
-        0xC2, 0x10, 0x00
-    };
-    // Convert "JNE +0x113" (0F 85 13 01 00 00) to "JMP +0x114; NOP".
-    // E9 uses a 5-byte instruction (vs 6-byte 0F 85), so rel32 must be +1.
-    static const uint8_t kPatchScKeymenu[] = {
-        0xE9, 0x14, 0x01, 0x00, 0x00, 0x90
-    };
     // WM_SYSCOMMAND SC_TASKLIST (0xF170): vanilla currently returns 1 (swallow).
     // Convert JNE to unconditional JMP so even equal case skips the "return 1" block.
     static const uint8_t kExpectedScTasklist[] = {
@@ -1096,16 +1089,6 @@ static void PatchVanillaWndprocSwallowBranches() {
     static const uint8_t kPatchDefWindowGate[] = {
         0xE9, 0xED, 0x02, 0x00, 0x00, 0x90
     };
-    // sub_62EE80: SetCooperativeLevel(..., 0x0A) -> force 0x06.
-    static const uint8_t kExpectedDInputCoopCall1[] = {
-        0x6A, 0x0A, 0x8B, 0x1A, 0xE8, 0x41, 0x58, 0x00, 0x00
-    };
-    static const uint8_t kExpectedDInputCoopCall2[] = {
-        0x6A, 0x0A, 0x8B, 0x38, 0xE8, 0xF6, 0x56, 0x00, 0x00
-    };
-    static const uint8_t kPatchDInputCoopArg[] = {
-        0x06
-    };
     // sub_633490 early custom-proc call guard:
     // cmp gate,1; jne skip; mov eax,[9DB668]; cmp eax,0; je skip; ... call eax
     // Change JE to JMP so this block is always skipped.
@@ -1115,24 +1098,6 @@ static void PatchVanillaWndprocSwallowBranches() {
     static const uint8_t kPatchCustomProcGuardBypass[] = {
         0xEB
     };
-    // if (dword_9E5B74 != 1) goto LABEL_193;
-    // Convert JNE to JMP to always skip shell-helper arming block.
-    static const uint8_t kExpectedShellHelperGuard[] = {
-        0x74, 0x5B, 0x9E, 0x00, 0xBE, 0x01, 0x00, 0x00, 0x00, 0x3B,
-        0xC6, 0x0F, 0x85, 0x94, 0x05, 0x00, 0x00, 0x81, 0x3D, 0x9C,
-        0x5C, 0x9E, 0x00, 0x04, 0x01, 0x00, 0x00, 0x7D
-    };
-    static const uint8_t kPatchShellHelperGuardJmp[] = {
-        0xE9, 0x95, 0x05, 0x00, 0x00, 0x90
-    };
-
-    PatchRvaIfMatches(kRvaScKeymenuBlock,
-                      kExpectedScKeymenu,
-                      sizeof(kExpectedScKeymenu),
-                      14,
-                      kPatchScKeymenu,
-                      sizeof(kPatchScKeymenu),
-                      "sub_633490 SC_KEYMENU swallow bypass");
 
     PatchRvaIfMatches(kRvaScTasklistBlock,
                       kExpectedScTasklist,
@@ -1166,22 +1131,6 @@ static void PatchVanillaWndprocSwallowBranches() {
                       sizeof(kPatchDefWindowGate),
                       "sub_633490 DefWindowProc gate bypass (ignore 0x9DB660)");
 
-    PatchRvaIfMatches(kRvaDInputKbCoopArg1,
-                      kExpectedDInputCoopCall1,
-                      sizeof(kExpectedDInputCoopCall1),
-                      1,
-                      kPatchDInputCoopArg,
-                      sizeof(kPatchDInputCoopArg),
-                      "sub_62EE80 keyboard coop arg #1 (0x0A->0x06)");
-
-    PatchRvaIfMatches(kRvaDInputKbCoopArg2,
-                      kExpectedDInputCoopCall2,
-                      sizeof(kExpectedDInputCoopCall2),
-                      1,
-                      kPatchDInputCoopArg,
-                      sizeof(kPatchDInputCoopArg),
-                      "sub_62EE80 keyboard coop arg #2 (0x0A->0x06)");
-
     PatchRvaIfMatches(kRvaWndprocCustomCallGuard,
                       kExpectedCustomProcGuard,
                       sizeof(kExpectedCustomProcGuard),
@@ -1189,14 +1138,6 @@ static void PatchVanillaWndprocSwallowBranches() {
                       kPatchCustomProcGuardBypass,
                       sizeof(kPatchCustomProcGuardBypass),
                       "sub_633490 custom-proc guard bypass (ignore 0x9DB668)");
-
-    PatchRvaIfMatches(kRvaShellHelperGuard,
-                      kExpectedShellHelperGuard,
-                      sizeof(kExpectedShellHelperGuard),
-                      11,
-                      kPatchShellHelperGuardJmp,
-                      sizeof(kPatchShellHelperGuardJmp),
-                      "sub_633490 shell-helper arming guard bypass");
 }
 
 static void PatchEarlyHotkeyImports() {

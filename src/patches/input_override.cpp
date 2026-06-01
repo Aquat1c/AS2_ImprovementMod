@@ -473,8 +473,13 @@ static inline const void* CaptureCallerAddress();
 static void LogShellStateProvenance(const char* reason, const void* caller, bool forceLog);
 
 static bool ShouldRepairDInputKeyboardCooperativeLevel() {
-    // Keep shell/layout fixes active even when legacy "system_keys" filtering is off.
-    return s_enableShellHotkeyImeWorkarounds;
+    // Disabled: the DInput unacquire experiment proved the keyboard's background
+    // cooperative level is unrelated to the Win key / Alt+Shift / middle-click issues
+    // (the real fix is dropping the per-frame keybd_event(VK 0x07) phantom key in
+    // wsock32_proxy). Forcing FOREGROUND coop + periodic Unacquire/Acquire only fought
+    // vanilla and added needless per-interval work, so this repair is now inert. The
+    // SetCooperativeLevel hook stays installed as a harmless pass-through.
+    return false;
 }
 
 void* InputOverride_GetDInputKeyboardSetCooperativeLevelTarget() {
