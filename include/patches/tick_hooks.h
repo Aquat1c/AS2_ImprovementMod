@@ -27,10 +27,11 @@ struct NetplayTickState {
 	float    current_scale;
 	float    target_scale;
 	bool     pacing_active;
+	char     scale_reason[96];
 };
 
 // Tick scale control
-void SetGlobalTickScale(float scale);
+void SetGlobalTickScale(float scale, const char* reason = nullptr);
 float GetGlobalTickScale();
 void TickHooks_LoadSettings();
 void TickHooks_SaveSettings();
@@ -43,10 +44,10 @@ void TickHooks_ClearFrameLimiter60FpsSessionOverride(const char* reason);
 bool TickHooks_IsFrameLimiter60FpsSessionOverrideActive();
 const char* TickHooks_FrameLimiter60FpsLabel(bool enabled);
 float GetFrameLimiter60FpsCorrectionScale();
-void SetNetplayTickScale(float scale);
-void SetNetplayTickScaleTarget(float scale);
-void SetNetplayPacingActive(bool active);
-void ResetNetplayTickScaleState();
+void SetNetplayTickScale(float scale, const char* reason = nullptr);
+void SetNetplayTickScaleTarget(float scale, const char* reason = nullptr);
+void SetNetplayPacingActive(bool active, const char* reason = nullptr);
+void ResetNetplayTickScaleState(const char* reason = nullptr);
 void GetNetplayTickState(NetplayTickState* out);
 float GetNetplayTickScale();
 float GetEffectiveTickScale();

@@ -37,6 +37,9 @@ void WinScreenSync_Abort();
 /// Drive lockstep maintenance (timeout/resend/mode guards) each frame.
 bool WinScreenSync_FrameUpdate();
 
+/// True once both peers confirmed advance and the handoff barrier completed.
+bool WinScreenSync_IsHandoffComplete();
+
 // ============================================================================
 // Lockstep Input Interface (called by Hook_InputDispatcher)
 // ============================================================================

@@ -9,6 +9,8 @@
 #include <windows.h>
 
 #include "input_system.h"
+#include "input/gamepad_worker.h"
+#include "net/churn_pause.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 #include <SDL3/SDL.h>
@@ -30,14 +32,13 @@ static SDL_Gamepad* g_playerGamepad[2] = {};       // open handle for each playe
 static SDL_GUID     g_playerGUID[2] = {};           // hardware GUID for reconnect matching
 static bool         g_playerGUIDValid[2] = {};      // whether g_playerGUID[i] is populated
 
-// Deferred close: SDL_CloseGamepad blocks 50-300ms on Windows due to XInput
-// teardown. We collect handles during the event loop and close them afterwards.
-static constexpr int MAX_PENDING_CLOSE = 4;
-static SDL_Gamepad* g_pendingClose[MAX_PENDING_CLOSE] = {};
-static int          g_pendingCloseCount = 0;
-
-static bool g_gamepadSubsystemInitialized = false;
-static bool g_gamepadSubsystemFailed = false;
+// Background worker owns SDL_OpenGamepad / SDL_CloseGamepad. Main thread keeps
+// slot assignment and reads only from live handles (never queued-for-close).
+static constexpr int MAX_PENDING_CLOSE_RETRY = 8;
+static SDL_Gamepad* g_pendingCloseRetry[MAX_PENDING_CLOSE_RETRY] = {};
+static int          g_pendingCloseRetryCount = 0;
+static bool         g_gamepadSubsystemInitialized = false;
+static bool         g_gamepadSubsystemFailed = false;
 static DWORD g_nextDeferredGamepadLogTick = 0;
 
 // DXLib's startup font/cache code is fragile while Steam Input devices are
@@ -200,8 +201,17 @@ static bool ReadGameDefaultFontHandle(uint32_t* outHandle) {
 }
 
 static void ConfigureGamepadHints() {
+    // Avoid pumping SDL device enumeration on unrelated USB/audio plug events.
+    SDL_SetHint(SDL_HINT_AUTO_UPDATE_JOYSTICKS, "0");
+    SDL_SetHint(SDL_HINT_AUTO_UPDATE_SENSORS, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "0");
-    LOG_INFO("[Input] SDL gamepad hints: HIDAPI_STEAM=%s",
+    LOG_INFO("[Input] SDL gamepad hints: AUTO_UPDATE_JOYSTICKS=%s AUTO_UPDATE_SENSORS=%s HIDAPI_STEAM=%s",
+             SDL_GetHint(SDL_HINT_AUTO_UPDATE_JOYSTICKS)
+                 ? SDL_GetHint(SDL_HINT_AUTO_UPDATE_JOYSTICKS)
+                 : "(unset)",
+             SDL_GetHint(SDL_HINT_AUTO_UPDATE_SENSORS)
+                 ? SDL_GetHint(SDL_HINT_AUTO_UPDATE_SENSORS)
+                 : "(unset)",
              SDL_GetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM)
                  ? SDL_GetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM)
                  : "(unset)");
@@ -230,111 +240,187 @@ static void LogGamepadDetails(int slot, SDL_Gamepad* gp, const char* eventName) 
              realTypeName ? realTypeName : "unknown");
 }
 
-static bool GUIDEquals(const SDL_GUID& a, const SDL_GUID& b) {
-    return memcmp(a.data, b.data, sizeof(a.data)) == 0;
-}
-
-static void OpenInitialGamepads() {
-    int count = 0;
-    SDL_JoystickID* ids = SDL_GetGamepads(&count);
-    LOG_INFO("[Input] SDL reports %d gamepad candidate(s) after deferred init", count);
-    if (!ids) return;
-
-    for (int i = 0; i < count; i++) {
-        int slot = -1;
-        for (int p = 0; p < 2; p++) {
-            if (!g_playerGamepad[p]) { slot = p; break; }
-        }
-        if (slot < 0) break;  // Both player slots assigned
-
-        SDL_Gamepad* gp = SDL_OpenGamepad(ids[i]);
-        if (gp) {
-            g_playerGamepad[slot] = gp;
-            g_playerGUID[slot] = SDL_GetGamepadGUIDForID(ids[i]);
-            g_playerGUIDValid[slot] = true;
-            LogGamepadDetails(slot, gp, "opened");
-        } else {
-            LOG_WARN("[Input] SDL_OpenGamepad failed for id=%u: %s",
-                     (unsigned)ids[i], SDL_GetError());
+static void SyncSlotSnapshotToWorker() {
+    Input::GamepadWorkerSlotSnapshot snapshot{};
+    for (int slot = 0; slot < 2; slot++) {
+        snapshot.occupied[slot] = g_playerGamepad[slot] != nullptr;
+        snapshot.guid_valid[slot] = g_playerGUIDValid[slot];
+        snapshot.guid[slot] = g_playerGUID[slot];
+        if (g_playerGamepad[slot]) {
+            snapshot.live_instance_id[slot] = SDL_GetGamepadID(g_playerGamepad[slot]);
         }
     }
-    SDL_free(ids);
+    Input::GamepadWorker_UpdateSlotSnapshot(&snapshot);
+}
+
+static bool QueueGamepadClose(SDL_Gamepad* gamepad) {
+    if (!gamepad) {
+        return true;
+    }
+
+    if (Input::GamepadWorker_RequestClose(gamepad)) {
+        return true;
+    }
+
+    Net::ChurnPause_NotifyPendingCloseRetry();
+
+    if (g_pendingCloseRetryCount < MAX_PENDING_CLOSE_RETRY) {
+        g_pendingCloseRetry[g_pendingCloseRetryCount++] = gamepad;
+        LOG_WARN("[Input] Gamepad close queue full; deferring retry handle=0x%p count=%d",
+                 static_cast<void*>(gamepad),
+                 g_pendingCloseRetryCount);
+        return true;
+    }
+
+    LOG_WARN("[Input] Gamepad close retry overflow; closing on main thread handle=0x%p",
+             static_cast<void*>(gamepad));
+    Net::ChurnPause_NotifyMainThreadBlockingIo();
+    SDL_CloseGamepad(gamepad);
+    return false;
+}
+
+static void FlushPendingCloseRetries() {
+    if (g_pendingCloseRetryCount > 0) {
+        Net::ChurnPause_NotifyPendingCloseRetry();
+    }
+
+    for (int i = 0; i < g_pendingCloseRetryCount; ) {
+        SDL_Gamepad* handle = g_pendingCloseRetry[i];
+        if (!handle) {
+            g_pendingCloseRetry[i] = g_pendingCloseRetry[--g_pendingCloseRetryCount];
+            g_pendingCloseRetry[g_pendingCloseRetryCount] = nullptr;
+            continue;
+        }
+
+        if (Input::GamepadWorker_RequestClose(handle)) {
+            g_pendingCloseRetry[i] = g_pendingCloseRetry[--g_pendingCloseRetryCount];
+            g_pendingCloseRetry[g_pendingCloseRetryCount] = nullptr;
+            continue;
+        }
+
+        ++i;
+    }
+}
+
+static void ApplyGamepadAttachResult(const Input::GamepadWorkerOpenResult& result) {
+    if (result.slot < 0 || result.slot > 1) {
+        if (result.gamepad) {
+            QueueGamepadClose(result.gamepad);
+        }
+        return;
+    }
+
+    if (!result.gamepad) {
+        LOG_WARN("[Input] SDL_OpenGamepad failed for slot=%d id=%u: %s",
+                 result.slot,
+                 (unsigned)result.instance_id,
+                 SDL_GetError());
+        return;
+    }
+
+    if (g_playerGamepad[result.slot]) {
+        Rollback::NetplayLog_Write("INPUT", -1,
+            "Discarding duplicate gamepad attach: slot=%d id=%u existing=0x%p new=0x%p",
+            result.slot,
+            (unsigned)result.instance_id,
+            static_cast<void*>(g_playerGamepad[result.slot]),
+            static_cast<void*>(result.gamepad));
+        QueueGamepadClose(result.gamepad);
+        return;
+    }
+
+    g_playerGamepad[result.slot] = result.gamepad;
+    if (result.guid_valid) {
+        g_playerGUID[result.slot] = result.guid;
+        g_playerGUIDValid[result.slot] = true;
+    }
+    LogGamepadDetails(result.slot, result.gamepad, "connected");
+    Net::ChurnPause_NotifyLocalGamepadChurn(
+        Net::ChurnPauseReason::GamepadConnect,
+        400);
+    Rollback::NetplayLog_Write("INPUT", -1,
+        "Gamepad attach applied: slot=%d id=%u handle=0x%p worker_ms=%lu",
+        result.slot,
+        (unsigned)result.instance_id,
+        static_cast<void*>(result.gamepad),
+        (unsigned long)result.duration_ms);
+}
+
+static void DrainGamepadWorkerResults() {
+    Input::GamepadWorkerResult workerResult{};
+    while (Input::GamepadWorker_TryPopResult(&workerResult)) {
+        ApplyGamepadAttachResult(workerResult.attach);
+    }
+}
+
+static void DetachGamepadSlot(int slot, SDL_JoystickID instanceId, const char* reason) {
+    if (slot < 0 || slot > 1 || !g_playerGamepad[slot]) {
+        return;
+    }
+
+    LogGamepadDetails(slot, g_playerGamepad[slot], reason ? reason : "disconnected");
+    SDL_Gamepad* handle = g_playerGamepad[slot];
+    g_playerGamepad[slot] = nullptr;
+    QueueGamepadClose(handle);
+    Net::ChurnPause_NotifyLocalGamepadChurn(
+        Net::ChurnPauseReason::GamepadDisconnect,
+        600);
+    Rollback::NetplayLog_Write("INPUT", -1,
+        "Gamepad disconnect queued close: slot=%d id=%u handle=0x%p reason=%s",
+        slot,
+        (unsigned)instanceId,
+        static_cast<void*>(handle),
+        reason ? reason : "?");
+}
+
+static void CheckDisconnectedGamepads() {
+    for (int p = 0; p < 2; p++) {
+        SDL_Gamepad* gp = g_playerGamepad[p];
+        if (!gp) {
+            continue;
+        }
+
+        if (SDL_GamepadConnected(gp)) {
+            continue;
+        }
+
+        const SDL_JoystickID instanceId = SDL_GetGamepadID(gp);
+        DetachGamepadSlot(p, instanceId, "disconnected");
+        Input::GamepadWorker_CancelOpen(instanceId);
+    }
+}
+
+static void UpdateLiveGamepadState() {
+    if (!g_gamepadSubsystemInitialized) {
+        return;
+    }
+
+    static DWORD s_lastSlowUpdateLogMs = 0;
+    const DWORD startMs = GetTickCount();
+    SDL_UpdateGamepads();
+    const DWORD durationMs = GetTickCount() - startMs;
+    if (durationMs >= 16) {
+        const DWORD now = GetTickCount();
+        if (s_lastSlowUpdateLogMs == 0 ||
+            (DWORD)(now - s_lastSlowUpdateLogMs) >= 1000) {
+            s_lastSlowUpdateLogMs = now;
+            Rollback::NetplayLog_Write("INPUT", -1,
+                "SDL_UpdateGamepads slow: duration_ms=%lu",
+                (unsigned long)durationMs);
+        }
+    }
 }
 
 static void HandleGamepadEvents() {
     if (!g_gamepadSubsystemInitialized) return;
 
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-        switch (event.type) {
-        case SDL_EVENT_GAMEPAD_ADDED: {
-            const SDL_JoystickID newId = event.gdevice.which;
-            const SDL_GUID newGUID = SDL_GetGamepadGUIDForID(newId);
-
-            // Prefer restoring a matching GUID to its original player slot.
-            int slot = -1;
-            for (int p = 0; p < 2; p++) {
-                if (!g_playerGamepad[p] && g_playerGUIDValid[p] &&
-                    GUIDEquals(g_playerGUID[p], newGUID)) {
-                    slot = p;
-                    break;
-                }
-            }
-            // No prior GUID match: assign to the first free player slot.
-            if (slot < 0) {
-                for (int p = 0; p < 2; p++) {
-                    if (!g_playerGamepad[p]) { slot = p; break; }
-                }
-            }
-            if (slot < 0) {
-                LOG_INFO("[Input] Both player slots occupied, ignoring gamepad id=%u",
-                         (unsigned)newId);
-                break;
-            }
-
-            SDL_Gamepad* gp = SDL_OpenGamepad(newId);
-            if (gp) {
-                g_playerGamepad[slot] = gp;
-                g_playerGUID[slot] = newGUID;
-                g_playerGUIDValid[slot] = true;
-                LogGamepadDetails(slot, gp, "connected");
-            } else {
-                LOG_WARN("[Input] SDL_OpenGamepad hotplug failed for id=%u: %s",
-                         (unsigned)newId, SDL_GetError());
-            }
-            break;
-        }
-        case SDL_EVENT_GAMEPAD_REMOVED: {
-            for (int p = 0; p < 2; p++) {
-                if (g_playerGamepad[p] &&
-                    SDL_GetGamepadID(g_playerGamepad[p]) == event.gdevice.which) {
-                    LogGamepadDetails(p, g_playerGamepad[p], "disconnected");
-                    // Capture GUID while the instance ID is still valid.
-                    g_playerGUID[p] = SDL_GetGamepadGUIDForID(event.gdevice.which);
-                    g_playerGUIDValid[p] = true;
-                    // Defer SDL_CloseGamepad: calling it here blocks 50-300ms on
-                    // Windows due to XInput handle teardown inside SDL_PollEvent.
-                    if (g_pendingCloseCount < MAX_PENDING_CLOSE) {
-                        g_pendingClose[g_pendingCloseCount++] = g_playerGamepad[p];
-                    } else {
-                        SDL_CloseGamepad(g_playerGamepad[p]);  // fallback if list full
-                    }
-                    g_playerGamepad[p] = nullptr;
-                    break;
-                }
-            }
-            break;
-        }
-        }
-    }
-
-    // Process deferred closes after SDL_PollEvent has drained all events.
-    // This moves the XInput teardown stall out of the event-loop critical path.
-    for (int i = 0; i < g_pendingCloseCount; i++) {
-        SDL_CloseGamepad(g_pendingClose[i]);
-        g_pendingClose[i] = nullptr;
-    }
-    g_pendingCloseCount = 0;
+    SyncSlotSnapshotToWorker();
+    DrainGamepadWorkerResults();
+    FlushPendingCloseRetries();
+    CheckDisconnectedGamepads();
+    SyncSlotSnapshotToWorker();
+    DrainGamepadWorkerResults();
+    FlushPendingCloseRetries();
 }
 
 static bool EnsureGamepadSubsystemReady() {
@@ -362,8 +448,19 @@ static bool EnsureGamepadSubsystemReady() {
         return false;
     }
 
+    SDL_SetGamepadEventsEnabled(false);
+    SDL_SetJoystickEventsEnabled(false);
+    LOG_INFO("[Input] SDL gamepad/joystick OS events disabled (manual update + worker scan)");
+
     g_gamepadSubsystemInitialized = true;
-    OpenInitialGamepads();
+    if (!Input::GamepadWorker_Init()) {
+        LOG_ERROR("[Input] Failed to start gamepad worker thread");
+        SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+        g_gamepadSubsystemFailed = true;
+        return false;
+    }
+    SyncSlotSnapshotToWorker();
+    Input::GamepadWorker_RequestBootstrap();
     return true;
 }
 
@@ -638,8 +735,8 @@ bool InputSystem_Init(void) {
     memset(g_playerGamepad, 0, sizeof(g_playerGamepad));
     memset(g_playerGUID, 0, sizeof(g_playerGUID));
     memset(g_playerGUIDValid, 0, sizeof(g_playerGUIDValid));
-    memset(g_pendingClose, 0, sizeof(g_pendingClose));
-    g_pendingCloseCount = 0;
+    memset(g_pendingCloseRetry, 0, sizeof(g_pendingCloseRetry));
+    g_pendingCloseRetryCount = 0;
     g_nextDeferredGamepadLogTick = 0;
     printf("[Input] Input system initialized (Win32 keyboard; SDL3 gamepad deferred)\n");
     LOG_INFO("[Input] Input system initialized (Win32 keyboard active; SDL3 gamepad deferred until default font ready)");
@@ -650,15 +747,25 @@ void InputSystem_Shutdown(void) {
     if (!g_initialized) return;
     InputSystem_SaveConfig("as2_input.cfg");
 
+    DrainGamepadWorkerResults();
+
     for (int i = 0; i < 2; i++) {
-        if (g_playerGamepad[i]) SDL_CloseGamepad(g_playerGamepad[i]);
-        g_playerGamepad[i] = nullptr;
+        if (g_playerGamepad[i]) {
+            QueueGamepadClose(g_playerGamepad[i]);
+            g_playerGamepad[i] = nullptr;
+        }
     }
-    for (int i = 0; i < g_pendingCloseCount; i++) {
-        if (g_pendingClose[i]) SDL_CloseGamepad(g_pendingClose[i]);
-        g_pendingClose[i] = nullptr;
+
+    FlushPendingCloseRetries();
+    Input::GamepadWorker_Shutdown();
+
+    for (int i = 0; i < g_pendingCloseRetryCount; i++) {
+        if (g_pendingCloseRetry[i]) {
+            SDL_CloseGamepad(g_pendingCloseRetry[i]);
+            g_pendingCloseRetry[i] = nullptr;
+        }
     }
-    g_pendingCloseCount = 0;
+    g_pendingCloseRetryCount = 0;
 
     if (g_gamepadSubsystemInitialized) {
         SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
@@ -678,6 +785,7 @@ void InputSystem_Update(void) {
     // Gamepad/Steam-facing SDL startup is intentionally delayed until after
     // the game's early DXLib font/cache setup is complete.
     if (EnsureGamepadSubsystemReady()) {
+        UpdateLiveGamepadState();
         HandleGamepadEvents();
     }
 

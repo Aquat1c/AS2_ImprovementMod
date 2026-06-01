@@ -14,6 +14,7 @@
 #include "net/sync_policy.h"
 #include "patches/memory_utils.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rollback_debug.h"
 #include "rollback/rollback_session.h"
 #include "core/as2_constants.h"
 #include "core/game_state.h"
@@ -31,6 +32,7 @@ namespace {
 
 constexpr uint16_t kSyncTraceSchema = 1;
 constexpr uint32_t kPairSlots = 256;
+constexpr int32_t kIntegrityTraceInterval = 60;
 constexpr uint32_t kFnvOffset = 2166136261u;
 constexpr uint32_t kFnvPrime = 16777619u;
 
@@ -44,10 +46,19 @@ struct TracePair {
 
 static bool s_initialized = false;
 static bool s_enabled = false;
+static bool s_integrityMode = false;
 static bool s_fullCrc = false;
 static uint32_t s_seq = 0;
 static int32_t s_lastGameplayTraceFrame = -1;
 static TracePair s_pairs[kPairSlots] = {};
+
+static bool IsCompareActive() {
+    return s_initialized && (s_enabled || s_integrityMode);
+}
+
+static bool ShouldWriteCsv() {
+    return s_enabled;
+}
 
 static bool EnvFlagEnabled(const char* name) {
     char value[32] = {};
@@ -183,6 +194,9 @@ static void InputsByGameSlot(uint16_t localInput,
 
 static void AppendTraceCsv(const char* source,
                            const SyncTracePayload& p) {
+    if (!ShouldWriteCsv()) {
+        return;
+    }
     char row[1024];
     snprintf(row,
              sizeof(row),
@@ -226,6 +240,9 @@ static void AppendCompareCsv(const char* result,
                              const SyncTracePayload& local,
                              const SyncTracePayload& remote,
                              const char* reason) {
+    if (!ShouldWriteCsv()) {
+        return;
+    }
     char row[1024];
     snprintf(row,
              sizeof(row),
@@ -279,7 +296,7 @@ static void ComparePair(TracePair* pair) {
                          remote,
                          match ? "frontend_aligned" : "frontend_input_or_crc");
         if (!match) {
-            Rollback::NetplayLog_Write(
+            Rollback::NetplayLog_Verbose(
                 "SYNCCHECK",
                 (int32_t)local.frontend_frame,
                 "Frontend SyncTrace mismatch: epoch=%u phase=%s frame=%u "
@@ -307,17 +324,28 @@ static void ComparePair(TracePair* pair) {
     }
 
     if (domain == SyncTraceDomain::GameplayRollback) {
-        const uint16_t required = SYNC_TRACE_FLAG_VALID_STATE_CRC |
-                                  SYNC_TRACE_FLAG_ROLLBACK_SETTLED;
-        const bool comparable =
-            (local.flags & required) == required &&
-            (remote.flags & required) == required &&
-            (local.flags & SYNC_TRACE_FLAG_ROLLING_BACK) == 0 &&
-            (remote.flags & SYNC_TRACE_FLAG_ROLLING_BACK) == 0;
-        if (!comparable) {
-            AppendCompareCsv("DEFER", local, remote, "gameplay_not_settled");
+        if ((local.flags & SYNC_TRACE_FLAG_ROLLING_BACK) != 0 ||
+            (remote.flags & SYNC_TRACE_FLAG_ROLLING_BACK) != 0) {
+            AppendCompareCsv("DEFER", local, remote, "rolling_back");
+            pair->compared = false;
             return;
         }
+
+        if ((local.flags & SYNC_TRACE_FLAG_VALID_STATE_CRC) == 0 ||
+            (remote.flags & SYNC_TRACE_FLAG_VALID_STATE_CRC) == 0) {
+            AppendCompareCsv("DEFER", local, remote, "missing_state_crc");
+            pair->compared = false;
+            return;
+        }
+
+        const int32_t remoteConfirmedRb = (int32_t)remote.remote_ack_frame;
+        if (!Rollback::RollbackDebug_IsRbFrameReadyToCompare(local.rb_frame, remoteConfirmedRb)) {
+            AppendCompareCsv("DEFER", local, remote, "gameplay_not_settled");
+            pair->compared = false;
+            return;
+        }
+
+        pair->compared = true;
 
         bool match = local.state_crc == remote.state_crc;
         if ((local.flags & SYNC_TRACE_FLAG_VALID_PLAYER_CRC) != 0 &&
@@ -332,14 +360,15 @@ static void ComparePair(TracePair* pair) {
                          remote,
                          match ? "gameplay_aligned" : "gameplay_crc");
         if (!match) {
-            Rollback::NetplayLog_Write(
+            Rollback::NetplayLog_Verbose(
                 "SYNCCHECK",
                 local.rb_frame,
-                "Gameplay SyncTrace mismatch: epoch=%u rb=%d abs=%d "
+                "Gameplay SyncTrace mismatch (diagnostic only): epoch=%u rb=%d abs=%d/%d "
                 "state=0x%08X/0x%08X p1=0x%08X/0x%08X p2=0x%08X/0x%08X flags=0x%04X/0x%04X",
                 local.epoch_id,
                 local.rb_frame,
                 local.game_abs_frame,
+                remote.game_abs_frame,
                 local.state_crc,
                 remote.state_crc,
                 local.p1_crc,
@@ -446,8 +475,21 @@ static void AddFullPlayerCrcs(SyncTracePayload* p) {
     p->flags |= SYNC_TRACE_FLAG_VALID_PLAYER_CRC;
 }
 
+static void RetryDeferredCompares() {
+    for (uint32_t i = 0; i < kPairSlots; ++i) {
+        TracePair* pair = &s_pairs[i];
+        if (!pair->has_local || !pair->has_remote || pair->compared) {
+            continue;
+        }
+        if ((SyncTraceDomain)pair->local.domain != SyncTraceDomain::GameplayRollback) {
+            continue;
+        }
+        ComparePair(pair);
+    }
+}
+
 static void EmitLocalTrace(SyncTracePayload* p) {
-    if (!p || !s_enabled) {
+    if (!p || !IsCompareActive()) {
         return;
     }
 
@@ -459,7 +501,7 @@ static void EmitLocalTrace(SyncTracePayload* p) {
             PacketType::SyncTrace,
             p,
             sizeof(*p));
-        if (!sent) {
+        if (!sent && ShouldWriteCsv()) {
             Rollback::NetplayLog_Verbose(
                 "SYNCTRCE",
                 p->rb_frame >= 0 ? p->rb_frame : (int32_t)p->frontend_frame,
@@ -478,12 +520,14 @@ void SyncTrace_Init() {
     s_lastGameplayTraceFrame = -1;
     s_initialized = true;
     s_enabled = EnvFlagEnabled("AS2_SYNC_TRACE");
+    s_integrityMode = false;
     s_fullCrc = EnvFlagEnabled("AS2_SYNC_TRACE_FULL_CRC");
     Rollback::NetplayLog_Write(
         "SYNCTRCE",
         -1,
-        "SyncTrace init: enabled=%d full_crc=%d env=AS2_SYNC_TRACE",
+        "SyncTrace init: full_trace=%d integrity_on_rollback=%d full_crc=%d env=AS2_SYNC_TRACE/AS2_SYNC_TRACE_INTEGRITY",
         s_enabled ? 1 : 0,
+        EnvFlagEnabled("AS2_SYNC_TRACE_INTEGRITY") ? 1 : 0,
         s_fullCrc ? 1 : 0);
 }
 
@@ -493,6 +537,7 @@ void SyncTrace_Shutdown() {
     }
     s_initialized = false;
     s_enabled = false;
+    s_integrityMode = false;
     memset(s_pairs, 0, sizeof(s_pairs));
 }
 
@@ -516,10 +561,41 @@ bool SyncTrace_IsEnabled() {
     return s_initialized && s_enabled;
 }
 
+void SyncTrace_SetIntegrityActive(bool active, const char* reason) {
+    if (!s_initialized) {
+        return;
+    }
+    if (s_integrityMode == active) {
+        return;
+    }
+    s_integrityMode = active;
+    if (!active) {
+        s_lastGameplayTraceFrame = -1;
+    }
+    Rollback::NetplayLog_Write(
+        "SYNCTRCE",
+        -1,
+        "SyncTrace integrity compare %s (%s)",
+        active ? "armed" : "disarmed",
+        reason ? reason : "manual");
+}
+
+bool SyncTrace_IsIntegrityActive() {
+    return s_initialized && s_integrityMode;
+}
+
+bool SyncTrace_ShouldArmIntegrityOnRollback() {
+    return s_enabled || EnvFlagEnabled("AS2_SYNC_TRACE_INTEGRITY");
+}
+
+bool SyncTrace_IsCompareActive() {
+    return IsCompareActive();
+}
+
 void SyncTrace_ResetSession(const char* reason) {
     memset(s_pairs, 0, sizeof(s_pairs));
     s_lastGameplayTraceFrame = -1;
-    if (s_enabled) {
+    if (IsCompareActive()) {
         Rollback::NetplayLog_Write(
             "SYNCTRCE",
             -1,
@@ -529,14 +605,19 @@ void SyncTrace_ResetSession(const char* reason) {
 }
 
 void SyncTrace_FrameUpdate() {
-    if (!s_initialized || !s_enabled) {
+    if (!IsCompareActive()) {
         return;
     }
+    RetryDeferredCompares();
+
     if (!Rollback::RollbackSession_IsActive()) {
         s_lastGameplayTraceFrame = -1;
         return;
     }
     if (!MatchLifecycle_IsGameplayPlayable()) {
+        return;
+    }
+    if (Rollback::RollbackSession_IsRollingBack()) {
         return;
     }
 
@@ -548,6 +629,15 @@ void SyncTrace_FrameUpdate() {
     if (rb.rb_frame_current == s_lastGameplayTraceFrame) {
         return;
     }
+
+    const bool fullTrace = s_enabled;
+    if (!fullTrace) {
+        if (rb.rb_frame_current <= 0 ||
+            (rb.rb_frame_current % kIntegrityTraceInterval) != 0) {
+            return;
+        }
+    }
+
     s_lastGameplayTraceFrame = rb.rb_frame_current;
 
     SyncTracePayload payload{};
@@ -565,7 +655,12 @@ void SyncTrace_FrameUpdate() {
     payload.last_rollback_depth = ClampU8(rb.last_rollback_replay_length);
     payload.max_rollback_depth = ClampU8(rb.max_rollback_distance);
     payload.state_crc = rb.current_checksum;
-    payload.flags |= SYNC_TRACE_FLAG_VALID_STATE_CRC;
+    if (Rollback::RollbackDebug_TryGetChecksumForFrame(rb.rb_frame_current, &payload.state_crc)) {
+        payload.flags |= SYNC_TRACE_FLAG_VALID_STATE_CRC;
+    } else if (rb.current_checksum != 0) {
+        payload.state_crc = rb.current_checksum;
+        payload.flags |= SYNC_TRACE_FLAG_VALID_STATE_CRC;
+    }
     if (rb.rb_frame_current <= rb.rb_frame_last_confirmed) {
         payload.flags |= SYNC_TRACE_FLAG_ROLLBACK_SETTLED;
     }
@@ -641,7 +736,7 @@ void SyncTrace_OnRemoteTrace(const SyncTracePayload* payload) {
             payload->schema);
         return;
     }
-    if (!s_initialized || !s_enabled) {
+    if (!IsCompareActive()) {
         return;
     }
 

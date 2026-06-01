@@ -1,12 +1,19 @@
 #include "net/netplay_pacing.h"
 
+#include "net/churn_pause.h"
 #include "net/delay_policy.h"
 #include "patches/tick_hooks.h"
 #include "rollback/netplay_log.h"
 
 #include <algorithm>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 namespace {
 
@@ -44,6 +51,7 @@ static bool s_localModeLogged = false;
 static bool s_stallActive = false;
 static bool s_softHoldActive = false;
 static bool s_hardHoldActive = false;
+static bool s_prevHardHoldActive = false;
 static int  s_stallFrameCount = 0;
 static int  s_softHoldCount = 0;
 static int  s_hardHoldCount = 0;
@@ -69,6 +77,114 @@ static bool s_profileSourceAvgOnly = true;
 static bool s_debtHistory[8] = {};
 static int  s_debtHistoryPos = 0;
 static int  s_debtHistoryCount = 0;
+
+static float s_lastWarnedPacingTarget = 1.0f;
+static bool s_pacingSlowWarned = false;
+static bool s_pacingHaywireWarned = false;
+static int32_t s_lastPacingSlowLogRb = -1000000;
+static int32_t s_lastPacingHaywireLogRb = -1000000;
+
+static constexpr float kPacingSlowThreshold = 0.98f;
+static constexpr float kPacingSlowRecoverThreshold = 0.985f;
+static constexpr float kPacingHaywireThreshold = 0.5f;
+static constexpr int32_t kPacingSlowRepeatRb = 120;
+static constexpr int32_t kPacingHaywireRepeatRb = 60;
+
+static void ResetPacingScaleMonitorState() {
+    s_lastWarnedPacingTarget = 1.0f;
+    s_pacingSlowWarned = false;
+    s_pacingHaywireWarned = false;
+    s_lastPacingSlowLogRb = -1000000;
+    s_lastPacingHaywireLogRb = -1000000;
+}
+
+static void MaybeWarnNetplayPacingScale(int32_t rbFrame,
+                                        float targetScale,
+                                        float currentScale,
+                                        const char* reason,
+                                        const char* context) {
+    const float scaleMin = NetplayPacingController::kScaleMin;
+    const float scaleMax = NetplayPacingController::kScaleMax;
+    const bool belowHalf =
+        targetScale < kPacingHaywireThreshold || currentScale < kPacingHaywireThreshold;
+    const bool outsideClamp =
+        targetScale < (scaleMin - 0.01f) || targetScale > (scaleMax + 0.01f);
+    const bool haywire = belowHalf || outsideClamp;
+
+    if (haywire) {
+        const bool repeatDue =
+            s_pacingHaywireWarned &&
+            rbFrame >= 0 &&
+            (rbFrame - s_lastPacingHaywireLogRb) >= kPacingHaywireRepeatRb;
+        if (!s_pacingHaywireWarned || repeatDue) {
+            Rollback::NetplayLog_Write(
+                "PACE",
+                rbFrame,
+                "WARN pacing scale haywire: target=%.3f current=%.3f clamp=[%.2f,%.2f] "
+                "below_half=%d outside_clamp=%d ahead=%.2f adjust_ms=%.1f debt=%d pressure=%.2f "
+                "context=%s reason=%s",
+                targetScale,
+                currentScale,
+                scaleMin,
+                scaleMax,
+                belowHalf ? 1 : 0,
+                outsideClamp ? 1 : 0,
+                s_controller.last_frames_ahead,
+                s_controller.filtered_adjust_ms,
+                s_predictionDebt,
+                s_pressure,
+                context ? context : "?",
+                reason ? reason : "?");
+            s_pacingHaywireWarned = true;
+            s_lastPacingHaywireLogRb = rbFrame;
+        }
+    } else if (s_pacingHaywireWarned) {
+        Rollback::NetplayLog_Write(
+            "PACE",
+            rbFrame,
+            "Pacing scale recovered from haywire: target=%.3f current=%.3f context=%s",
+            targetScale,
+            currentScale,
+            context ? context : "?");
+        s_pacingHaywireWarned = false;
+    }
+
+    const bool slow = s_controller.active && targetScale < kPacingSlowThreshold;
+    if (slow) {
+        const bool repeatDue =
+            s_pacingSlowWarned &&
+            rbFrame >= 0 &&
+            (rbFrame - s_lastPacingSlowLogRb) >= kPacingSlowRepeatRb;
+        if (!s_pacingSlowWarned || repeatDue) {
+            Rollback::NetplayLog_Write(
+                "PACE",
+                rbFrame,
+                "WARN pacing slowdown: target=%.3f current=%.3f ahead=%.2f adjust_ms=%.1f "
+                "debt=%d pressure=%.2f context=%s reason=%s",
+                targetScale,
+                currentScale,
+                s_controller.last_frames_ahead,
+                s_controller.filtered_adjust_ms,
+                s_predictionDebt,
+                s_pressure,
+                context ? context : "?",
+                reason ? reason : "?");
+            s_pacingSlowWarned = true;
+            s_lastPacingSlowLogRb = rbFrame;
+        }
+    } else if (s_pacingSlowWarned && targetScale >= kPacingSlowRecoverThreshold) {
+        Rollback::NetplayLog_Write(
+            "PACE",
+            rbFrame,
+            "Pacing slowdown recovered: target=%.3f current=%.3f context=%s",
+            targetScale,
+            currentScale,
+            context ? context : "?");
+        s_pacingSlowWarned = false;
+    }
+
+    s_lastWarnedPacingTarget = targetScale;
+}
 
 static bool IsInteractivePacingEnabled(Net::MatchRollbackPhase phase,
                                        bool startupBarrierReleased) {
@@ -306,8 +422,8 @@ static void DeactivatePacing(Net::MatchRollbackPhase phase,
     const bool hadPacing = s_controller.active;
     const float priorAdjust = s_controller.filtered_adjust_ms;
 
-    SetNetplayPacingActive(false);
-    SetNetplayTickScaleTarget(1.0f);
+    SetNetplayPacingActive(false, reason);
+    SetNetplayTickScaleTarget(1.0f, reason);
 
     s_controller.filtered_adjust_ms = 0.0f;
     s_controller.last_frames_ahead = 0.0f;
@@ -323,6 +439,19 @@ static void DeactivatePacing(Net::MatchRollbackPhase phase,
     s_softThreshold = 0;
     s_hardThreshold = 0;
     ResetDebtController();
+
+    if (s_pacingSlowWarned || s_pacingHaywireWarned) {
+        NetplayTickState tickState{};
+        GetNetplayTickState(&tickState);
+        Rollback::NetplayLog_Write(
+            "PACE",
+            -1,
+            "Pacing scale monitor reset: target=%.3f current=%.3f reason=%s",
+            tickState.target_scale,
+            tickState.current_scale,
+            reason ? reason : "deactivate");
+    }
+    ResetPacingScaleMonitorState();
 
     if (!hadPacing && fabsf(priorAdjust) <= 0.001f) {
         s_phase = phase;
@@ -345,7 +474,8 @@ static void DeactivatePacing(Net::MatchRollbackPhase phase,
 }
 
 static void ApplyTickSlew(const Rollback::RollbackTimesyncTelemetry& telemetry,
-                          bool clampSpeedup) {
+                          bool clampSpeedup,
+                          const char* context) {
     const float frames = telemetry.frames_ahead;
     float targetAdjustMs = 0.0f;
     if (fabsf(frames) >= NetplayPacingController::kDeadbandFrames) {
@@ -377,8 +507,27 @@ static void ApplyTickSlew(const Rollback::RollbackTimesyncTelemetry& telemetry,
         NetplayPacingController::kScaleMin,
         clampSpeedup ? 1.0f : NetplayPacingController::kScaleMax);
 
-    SetNetplayPacingActive(true);
-    SetNetplayTickScaleTarget(targetScale);
+    SetNetplayPacingActive(true, "pacing_slew");
+    char slewReason[128];
+    _snprintf_s(
+        slewReason,
+        sizeof(slewReason),
+        _TRUNCATE,
+        "pacing_slew ahead=%.2f adjust_ms=%.1f target_scale=%.3f clamp_speedup=%d",
+        frames,
+        s_controller.filtered_adjust_ms,
+        targetScale,
+        clampSpeedup ? 1 : 0);
+    SetNetplayTickScaleTarget(targetScale, slewReason);
+
+    NetplayTickState tickState{};
+    GetNetplayTickState(&tickState);
+    MaybeWarnNetplayPacingScale(
+        telemetry.rb_frame_current,
+        targetScale,
+        tickState.current_scale,
+        slewReason,
+        context ? context : "pacing_slew");
 
     s_controller.active = true;
     s_controller.last_frames_ahead = frames;
@@ -465,8 +614,8 @@ void NetplayPacing_Init() {
     s_quality = NetQuality::Unknown;
     s_profileSourceAvgOnly = true;
     ResetDebtController();
-    SetNetplayPacingActive(false);
-    SetNetplayTickScaleTarget(1.0f);
+    SetNetplayPacingActive(false, "pacing_init");
+    SetNetplayTickScaleTarget(1.0f, "pacing_init");
 }
 
 void NetplayPacing_Shutdown() {
@@ -484,7 +633,9 @@ void NetplayPacing_ResetSession(const char* reason) {
     }
 
     DeactivatePacing(s_phase, reason ? reason : "session reset", false);
-    ResetNetplayTickScaleState();
+    s_prevHardHoldActive = false;
+    ResetPacingScaleMonitorState();
+    ResetNetplayTickScaleState(reason ? reason : "session reset");
     s_localModeLogged = false;
     s_quality = NetQuality::Unknown;
     s_lastNetClassLogRb = -1000000;
@@ -549,6 +700,28 @@ NetplayPacingAction NetplayPacing_BeginFrame(
     LogDebtIfNeeded(telemetry);
     LogAsymDelayIfNeeded(telemetry);
 
+    if (ChurnPause_ShouldForceHold(telemetry, phase, startupBarrierReleased)) {
+        s_stallFrameCount++;
+        s_stallActive = true;
+        s_lastAction = NetplayPacingAction::StallHold;
+        s_lastHoldRb = telemetry.rb_frame_current;
+        LogDecision(telemetry, s_lastAction, "device_churn_pause");
+        if (s_stallFrameCount <= 5 || (s_stallFrameCount % 120) == 0) {
+            Rollback::NetplayLog_Write(
+                "PACE",
+                telemetry.rb_frame_current,
+                "churn_pause_hold phase=%s rb=%d remote_rb=%d gap=%d threshold=%d debt=%d frames_ahead=%.2f",
+                MatchRollbackPhaseName(phase),
+                telemetry.rb_frame_current,
+                telemetry.rb_frame_last_remote_received,
+                s_rawRemoteGap,
+                stallThreshold,
+                s_predictionDebt,
+                telemetry.frames_ahead);
+        }
+        return s_lastAction;
+    }
+
     if (stallThreshold >= 0 &&
         telemetry.rb_frame_last_remote_received >= 0 &&
         s_rawRemoteGap > stallThreshold) {
@@ -574,6 +747,22 @@ NetplayPacingAction NetplayPacing_BeginFrame(
     }
 
     if (s_stallActive) {
+        if (ChurnPause_ShouldForceHold(telemetry, phase, startupBarrierReleased)) {
+            s_stallFrameCount++;
+            s_lastAction = NetplayPacingAction::StallHold;
+            s_lastHoldRb = telemetry.rb_frame_current;
+            return s_lastAction;
+        }
+
+        if (stallThreshold >= 0 &&
+            telemetry.rb_frame_last_remote_received >= 0 &&
+            s_rawRemoteGap > stallThreshold) {
+            s_stallFrameCount++;
+            s_lastAction = NetplayPacingAction::StallHold;
+            s_lastHoldRb = telemetry.rb_frame_current;
+            return s_lastAction;
+        }
+
         Rollback::NetplayLog_Write(
             "PACE",
             telemetry.rb_frame_current,
@@ -597,7 +786,34 @@ NetplayPacingAction NetplayPacing_BeginFrame(
         s_lastAction = NetplayPacingAction::HardHold;
         s_lastHoldRb = telemetry.rb_frame_current;
         LogDecision(telemetry, s_lastAction, "near_rollback_budget");
+        if (!s_prevHardHoldActive) {
+            Rollback::NetplayLog_Verbose(
+                "WATCHDOG",
+                telemetry.rb_frame_current,
+                "hard_hold activate: rb=%d remote_rb=%d gap=%d debt=%d budget=%d threshold=%d frames_ahead=%.2f",
+                telemetry.rb_frame_current,
+                telemetry.rb_frame_last_remote_received,
+                s_rawRemoteGap,
+                s_predictionDebt,
+                s_rollbackBudget,
+                s_hardThreshold,
+                telemetry.frames_ahead);
+        }
+        s_prevHardHoldActive = true;
         return s_lastAction;
+    }
+
+    if (s_prevHardHoldActive) {
+        Rollback::NetplayLog_Verbose(
+            "WATCHDOG",
+            telemetry.rb_frame_current,
+            "hard_hold deactivate: rb=%d remote_rb=%d gap=%d debt=%d action=%s",
+            telemetry.rb_frame_current,
+            telemetry.rb_frame_last_remote_received,
+            s_rawRemoteGap,
+            s_predictionDebt,
+            NetplayPacingActionName(s_lastAction));
+        s_prevHardHoldActive = false;
     }
 
     const bool enoughGapSinceSoftHold =
@@ -652,7 +868,7 @@ void NetplayPacing_OnSessionSample(
     }
 
     const bool firstEnable = !s_controller.active;
-    ApplyTickSlew(telemetry, false);
+    ApplyTickSlew(telemetry, false, "session_sample");
 
     if (firstEnable) {
         LogEnable(telemetry);
@@ -674,7 +890,7 @@ void NetplayPacing_OnHoldSample(
         return;
     }
 
-    ApplyTickSlew(telemetry, true);
+    ApplyTickSlew(telemetry, true, NetplayPacingActionName(holdKind));
 
     NetplayTickState tickState{};
     GetNetplayTickState(&tickState);

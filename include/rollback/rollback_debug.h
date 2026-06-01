@@ -38,8 +38,27 @@ void RollbackDebug_FrameUpdate();
 // Desync Detection
 // ============================================================================
 
+/// Authoritative gameplay checksum (same algorithm as RollbackSession_ComputeLiveStateChecksum).
+uint32_t RollbackDebug_ComputeAuthoritativeChecksum();
+
+/// Lookup a retained per-rb-frame authoritative checksum (-1 if not retained).
+bool RollbackDebug_TryGetChecksumForFrame(int32_t frame, uint32_t* checksum);
+
+/// True when both peers should have a settled authoritative view of rb_frame.
+bool RollbackDebug_IsRbFrameReadyToCompare(int32_t frame, int32_t remote_confirmed_rb);
+
 /// Feed a remote state digest for comparison.
 void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc);
+
+/// Report confirmed simulation drift from any detection path (StateDigest, Gekko, SyncTrace).
+void RollbackDebug_ReportDrift(const char* source,
+                               int32_t frame,
+                               uint32_t local_crc,
+                               uint32_t remote_crc,
+                               const char* detail);
+
+/// Emit digest/integrity counters for the ending match.
+void RollbackDebug_LogSessionSummary(const char* reason);
 
 /// Feed remote frame-progress telemetry for live frame skew diagnosis.
 void RollbackDebug_OnRemoteFrameSyncStatus(int32_t remote_rb_frame,
@@ -90,6 +109,9 @@ struct RollbackDebugSnapshot {
     int32_t  digests_received;
     int32_t  digests_matched;
     int32_t  digests_mismatched;
+    int32_t  digests_skipped_not_settled;
+    int32_t  digests_skipped_no_history;
+    int32_t  digests_skipped_remote_unsettled;
 };
 
 void RollbackDebug_GetSnapshot(RollbackDebugSnapshot* out);

@@ -2,6 +2,9 @@
 
 #include "net/barrier_protocol.h"
 #include "net/delay_policy.h"
+#include "net/pregame_sync.h"
+#include "net/winscreen_sync.h"
+#include "core/game_state.h"
 #if !defined(AS2_FRONTEND_SYNC_TESTING)
 #include "net/sync_trace.h"
 #endif
@@ -423,6 +426,16 @@ static uint32_t AllocatePhaseSerial() {
 static bool SendInputPacket(uint32_t frame, const char* reason) {
     if (!s_epochActive || !s_inputPhaseActive) {
         return false;
+    }
+
+    if (s_packetType == PacketType::WinScreenFrameInput) {
+        if (s_phase != FrontendSyncPhase::WinScreen || !WinScreenSync_IsActive()) {
+            return false;
+        }
+        const PregamePhase prePhase = PregameSync_GetPhase();
+        if (prePhase != PregamePhase::Idle && prePhase != PregamePhase::GameplayHandoff) {
+            return false;
+        }
     }
 
     if (s_packetType == PacketType::CharSelFrameInput) {
@@ -957,6 +970,20 @@ void FrontendInputSync_AbortEpoch(const char* reason) {
         FrontendSyncPhaseName(s_phase),
         reason ? reason : "?");
     ClearEpochState();
+}
+
+void FrontendInputSync_StopWinScreenInputPhase(const char* reason) {
+    if (s_phase == FrontendSyncPhase::WinScreen && s_inputPhaseActive) {
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Stopping win-screen input phase: epoch=%u reason=%s",
+            s_epochId,
+            reason ? reason : "?");
+        FrontendInputSync_EndPhase(reason ? reason : "win-screen stop");
+    }
+    if (s_packetType == PacketType::WinScreenFrameInput) {
+        s_packetType = PacketType::CharSelFrameInput;
+    }
 }
 
 void FrontendInputSync_OnRemoteSyncAnnounce(uint16_t remoteDelayProposal, const char* reason) {

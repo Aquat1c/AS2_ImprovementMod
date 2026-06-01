@@ -1003,6 +1003,31 @@ static void UpdateBootstrapReady() {
     }
 }
 
+static void ResetTrackingStateForNewRun() {
+    s_logTickCounter = 0;
+    s_charselLogCounter = 0;
+    s_configAgreed = false;
+    s_configHash = 0;
+    LockedMatchConfig_Clear(&s_lockedConfig);
+    s_errorText[0] = '\0';
+    s_localCharSelLocked = false;
+    s_remoteCharSelLocked = false;
+    s_localStageLocked = false;
+    s_remoteStageLocked = false;
+    s_remoteSessionId = 0;
+    s_assignedSide = 0;
+    s_remoteCapabilities = 0;
+    s_syncAnnounceSent = false;
+    s_remoteSyncAnnounced = false;
+    s_syncConfirmSent = false;
+    s_remoteSyncConfirmed = false;
+    s_syncRoundOption = 0;
+    s_haveSyncRoundOption = false;
+    s_lastAnnounceSendTime = 0;
+    s_lastConfirmSendTime = 0;
+    s_phaseStartTime = GetTickCount();
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -1261,6 +1286,98 @@ const LockedMatchConfig* PregameSync_GetLockedConfig() {
 
 bool PregameSync_IsComplete() {
     return s_phase == PregamePhase::GameplayHandoff;
+}
+
+bool PregameSync_HandleCrossPhaseSessionPacket(PacketType type,
+                                               const void* payload,
+                                               size_t payloadLen) {
+    if (!s_initialized) {
+        return false;
+    }
+    if (type != PacketType::SyncAnnounce && type != PacketType::SyncConfirm) {
+        return false;
+    }
+    if (s_phase != PregamePhase::Idle && s_phase != PregamePhase::GameplayHandoff) {
+        return false;
+    }
+
+    const SessionRole role = Session_GetRole();
+    if (role != SessionRole::Join) {
+        return false;
+    }
+
+    Rollback::NetplayLog_Write(
+        "PREGAME", -1,
+        "Cross-phase session sync while gameplay callback active: type=%s phase=%s winscreen=%d handoff=%d lifecycle=%s",
+        PacketTypeName(type),
+        PregamePhaseName(s_phase),
+        WinScreenSync_IsActive() ? 1 : 0,
+        WinScreenSync_IsHandoffComplete() ? 1 : 0,
+        MatchLifecyclePhaseName(MatchLifecycle_GetPhase()));
+    Rollback::NetplayLog_Flush();
+
+    Rollback::OnlineWiring_OnRematch();
+
+    if (s_phase == PregamePhase::GameplayHandoff) {
+        InputSyncHooks_SetLoadBarrierFreeze(false);
+        CharSelSync_Abort();
+        MatchBootstrap_Abort();
+        SetPhase(PregamePhase::Idle, "cross-phase adopt");
+    }
+
+    ResetTrackingStateForNewRun();
+    Session_SetPacketCallback(OnPregamePacket);
+    NetplayPaletteRuntime_OnDisconnect("cross-phase pregame adopt");
+
+    if (type == PacketType::SyncAnnounce) {
+        if (payloadLen < sizeof(SyncAnnouncePayload)) {
+            LogPregamePacketAnomaly("Short SyncAnnounce", type, payloadLen, sizeof(SyncAnnouncePayload));
+            return true;
+        }
+
+        const SyncAnnouncePayload* announce =
+            static_cast<const SyncAnnouncePayload*>(payload);
+        s_sessionId = announce->session_id;
+        FrontendInputSync_BeginEpoch(
+            role,
+            s_sessionId,
+            (uint16_t)FrontendInputSync_ComputeDelayProposal(),
+            "cross-phase join adopt");
+        Rollback::OwnerDiag_Log("cross_phase_pregame_adopt");
+
+        SetStatusFmt("Synchronizing session...");
+        SetPhase(PregamePhase::SyncAnnounce, "cross-phase announce received");
+        HandleSyncAnnounce(announce);
+
+        LOG_NETPLAY(LOG_INFO,
+            "[PregameSync] Adopted host rematch session via cross-phase SyncAnnounce: session=0x%08X",
+            s_sessionId);
+        return true;
+    }
+
+    if (payloadLen < sizeof(SyncConfirmPayload)) {
+        LogPregamePacketAnomaly("Short SyncConfirm", type, payloadLen, sizeof(SyncConfirmPayload));
+        return true;
+    }
+
+    const SyncConfirmPayload* confirm =
+        static_cast<const SyncConfirmPayload*>(payload);
+    s_sessionId = confirm->session_id;
+    FrontendInputSync_BeginEpoch(
+        role,
+        s_sessionId,
+        (uint16_t)FrontendInputSync_ComputeDelayProposal(),
+        "cross-phase join adopt confirm");
+    Rollback::OwnerDiag_Log("cross_phase_pregame_adopt_confirm");
+
+    SetStatusFmt("Synchronizing session...");
+    SetPhase(PregamePhase::SyncAnnounce, "cross-phase confirm fallback");
+    HandleSyncConfirm(confirm);
+
+    LOG_NETPLAY(LOG_INFO,
+        "[PregameSync] Adopted host rematch session via cross-phase SyncConfirm: session=0x%08X",
+        s_sessionId);
+    return true;
 }
 
 } // namespace Net

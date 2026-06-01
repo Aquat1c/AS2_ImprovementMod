@@ -261,6 +261,8 @@ static void PrepareMatchBoundaryForNextFlow(const char* banner, const char* reas
         Rollback::NetplayLog_Write("REMATCH", -1,
             "Resetting win screen sync state before next match");
         Net::WinScreenSync_Abort();
+    } else {
+        Net::FrontendInputSync_StopWinScreenInputPhase("rematch cleanup reset");
     }
 
     if (Net::PauseHandler_IsPauseTracked()) {

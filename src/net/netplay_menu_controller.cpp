@@ -15,7 +15,9 @@
 #include "net/charsel_sync.h"
 #include "net/frontend_input_sync.h"
 #include "net/pregame_sync.h"
+#include "net/winscreen_sync.h"
 #include "net/match_lifecycle.h"
+#include "rollback/rollback_session.h"
 #include "net/sync_policy.h"
 #include "net/set_tracker.h"
 #include "net/delay_policy.h"
@@ -2357,8 +2359,15 @@ static MenuState ResolveDisconnectReturnMenu() {
 }
 
 static void OpenDisconnectError(const char* why) {
+    const char* rollbackReason = Rollback::RollbackSession_GetErrorReason();
+    const char* effectiveWhy = why;
+    if (!effectiveWhy || !effectiveWhy[0]) {
+        effectiveWhy = (rollbackReason && rollbackReason[0]) ? rollbackReason : "Disconnected.";
+    }
+
     uint32_t currentMode = GetGameMode();
-    LOG_NETPLAY(LOG_WARNING, "[NetMenu] OpenDisconnectError: reason='%s' mode=%u", why ? why : "?", currentMode);
+    LOG_NETPLAY(LOG_WARNING, "[NetMenu] OpenDisconnectError: reason='%s' mode=%u",
+        effectiveWhy, currentMode);
     Net::SpectatorClient_Disconnect("disconnect error");
     ClearActionPrompt("disconnect_error");
     s_disconnectReturnState = ResolveDisconnectReturnMenu();
@@ -2367,13 +2376,13 @@ static void OpenDisconnectError(const char* why) {
 
     // Notify match lifecycle layer of disconnect
     if (Net::MatchLifecycle_IsMatchOwned()) {
-        Net::MatchLifecycle_OnDisconnect(why ? why : "Disconnected");
+        Net::MatchLifecycle_OnDisconnect(effectiveWhy);
     }
-    Rollback::OnlineWiring_OnDisconnect(why ? why : "Disconnected");
+    Rollback::OnlineWiring_OnDisconnect(effectiveWhy);
 
     // Abort any in-progress pre-game sync
-    Net::PregameSync_Abort(why ? why : "Disconnected");
-    Net::FrontendInputSync_AbortEpoch(why ? why : "Disconnected");
+    Net::PregameSync_Abort(effectiveWhy);
+    Net::FrontendInputSync_AbortEpoch(effectiveWhy);
 
     // Clean vanilla netplay flags
     WriteU32(ADDR_GAME_TYPE, GAMETYPE_VS_HUMAN);
@@ -2637,12 +2646,21 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
         return;
     }
 
+    if (Net::WinScreenSync_IsActive()) {
+        return;
+    }
+
+    const Net::MatchLifecyclePhase lifePhase = Net::MatchLifecycle_GetPhase();
+    if (lifePhase == Net::MatchLifecyclePhase::MatchEnd ||
+        lifePhase == Net::MatchLifecyclePhase::WinScreenActive) {
+        if (!Net::WinScreenSync_IsHandoffComplete()) {
+            return;
+        }
+    }
+
     // Primary rematch signature: previous pregame run ended in GameplayHandoff
     // and the game routed back to CharSel from win screen.
     const bool staleGameplayHandoff = (prePhase == Net::PregamePhase::GameplayHandoff);
-    if (Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::WinScreenActive) {
-        return;
-    }
 
     const bool lifecycleSuggestsPostMatch =
         Net::MatchLifecycle_IsPostMatchRouting() ||

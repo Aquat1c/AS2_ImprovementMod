@@ -22,6 +22,8 @@ struct DesyncDumpParams {
     uint32_t local_crc;
     uint32_t remote_crc;
     int      dump_number;     // Sequential dump count
+    const char* source;       // Detection path (StateDigest, Gekko, SyncTrace, ...)
+    const char* detail;       // Optional extra context
 };
 
 /// Extra context emitted when baseline agreement fails during bootstrap.
@@ -57,7 +59,11 @@ void DesyncDump_HexDumpRegion(FILE* f, const char* label, uintptr_t addr, size_t
 
 /// Top-level convenience: checks cooldown, opens file, writes dump, closes.
 /// Returns true if a dump was actually written.
-bool DesyncDump_TryDump(int32_t frame, uint32_t local_crc, uint32_t remote_crc);
+bool DesyncDump_TryDump(int32_t frame,
+                        uint32_t local_crc,
+                        uint32_t remote_crc,
+                        const char* source = nullptr,
+                        const char* detail = nullptr);
 
 /// Writes a dedicated baseline-mismatch dump file with bootstrap context.
 bool DesyncDump_TryBaselineMismatchDump(const BaselineMismatchDumpParams& params);

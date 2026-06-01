@@ -384,7 +384,7 @@ static void TabAdvancedDebug() {
             ImGui::BeginDisabled();
         }
         if (ImGui::SliderFloat("Global Tick Scale", &globalScale, 0.25f, 8.0f, "%.2fx")) {
-            SetGlobalTickScale(globalScale);
+            SetGlobalTickScale(globalScale, "mod_menu_slider");
         }
         if (fpsLocked) {
             ImGui::EndDisabled();

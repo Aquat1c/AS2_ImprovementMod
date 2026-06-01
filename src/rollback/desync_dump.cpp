@@ -7,6 +7,7 @@
  */
 
 #include "rollback/desync_dump.h"
+#include "rollback/rollback_debug.h"
 #include "rollback/rollback_session.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
@@ -28,29 +29,6 @@ namespace Rollback {
 static DWORD s_lastDumpTickMs = 0;
 static int   s_dumpCount      = 0;
 static constexpr DWORD kDumpCooldownMs = 10000; // 10 seconds real-time
-
-// Checksum history access — defined in rollback_debug.cpp, we duplicate a
-// small local ring for the dump module so it can show nearby checksums.
-// The canonical history lives in rollback_debug; we store our own copy of
-// the last few frames for the dump's "nearby checksums" section.
-static constexpr int kLocalHistSize = 128;
-static int32_t  s_histFrame[kLocalHistSize] = {};
-static uint32_t s_histCrc[kLocalHistSize]   = {};
-
-static void StoreLocalChecksum(int32_t frame, uint32_t crc) {
-    if (frame < 0) return;
-    int idx = frame % kLocalHistSize;
-    s_histFrame[idx] = frame;
-    s_histCrc[idx]   = crc;
-}
-
-static bool TryGetLocalChecksum(int32_t frame, uint32_t* out) {
-    if (!out || frame < 0) return false;
-    int idx = frame % kLocalHistSize;
-    if (s_histFrame[idx] != frame) return false;
-    *out = s_histCrc[idx];
-    return true;
-}
 
 // ============================================================================
 // Helpers
@@ -260,6 +238,10 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     fprintf(f, "PID:        %lu\n", GetCurrentProcessId());
     fprintf(f, "RB Frame:   %d\n", params.frame);
+    fprintf(f, "Source:     %s\n", params.source ? params.source : "unknown");
+    if (params.detail && params.detail[0]) {
+        fprintf(f, "Detail:     %s\n", params.detail);
+    }
     fprintf(f, "Local CRC:  0x%08X\n", params.local_crc);
     fprintf(f, "Remote CRC: 0x%08X\n", params.remote_crc);
     fprintf(f, "\n");
@@ -377,7 +359,7 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
         int32_t f2 = params.frame + delta;
         if (f2 < 0) continue;
         uint32_t crc = 0;
-        if (TryGetLocalChecksum(f2, &crc)) {
+        if (RollbackDebug_TryGetChecksumForFrame(f2, &crc)) {
             fprintf(f, "  f%-6d  crc=0x%08X%s\n", f2, crc,
                     (f2 == params.frame) ? "  <-- DESYNC" : "");
         }
@@ -496,7 +478,11 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
 // Public: Convenience top-level dump with cooldown
 // ============================================================================
 
-bool DesyncDump_TryDump(int32_t frame, uint32_t local_crc, uint32_t remote_crc) {
+bool DesyncDump_TryDump(int32_t frame,
+                        uint32_t local_crc,
+                        uint32_t remote_crc,
+                        const char* source,
+                        const char* detail) {
     DWORD now = GetTickCount();
     if (s_dumpCount > 0 && (now - s_lastDumpTickMs) < kDumpCooldownMs)
         return false;
@@ -523,6 +509,8 @@ bool DesyncDump_TryDump(int32_t frame, uint32_t local_crc, uint32_t remote_crc) 
     params.local_crc   = local_crc;
     params.remote_crc  = remote_crc;
     params.dump_number = s_dumpCount;
+    params.source      = source;
+    params.detail      = detail;
 
     DesyncDump_WriteFullDump(f, params);
 
@@ -600,17 +588,15 @@ bool DesyncDump_TryBaselineMismatchDump(const BaselineMismatchDumpParams& params
 // Public: Feed checksum (called from rollback_debug each frame)
 // ============================================================================
 
-// Called externally to feed checksums into the local ring for dump display.
-// This avoids the dump module needing direct access to rollback_debug internals.
+// Kept for API compatibility; authoritative history lives in rollback_debug.
 void DesyncDump_StoreChecksum(int32_t frame, uint32_t crc) {
-    StoreLocalChecksum(frame, crc);
+    (void)frame;
+    (void)crc;
 }
 
 void DesyncDump_Reset() {
     s_lastDumpTickMs = 0;
     s_dumpCount = 0;
-    memset(s_histFrame, 0xFF, sizeof(s_histFrame)); // -1
-    memset(s_histCrc, 0, sizeof(s_histCrc));
 }
 
 } // namespace Rollback

@@ -15,6 +15,11 @@
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 namespace {
 
 using namespace Net;
@@ -23,6 +28,10 @@ static bool s_initialized = false;
 static bool s_active = false;
 static bool s_isHost = false;
 static bool s_loggedSkipPropagate = false;
+static bool s_handoffPending = false;
+static bool s_handoffComplete = false;
+static DWORD s_activeSinceMs = 0;
+static constexpr DWORD kWinScreenHandoffTimeoutMs = 45000;
 
 constexpr uint16_t WINSCREEN_ADVANCE_MASK = (uint16_t)(INPUT_A | INPUT_C | INPUT_START);
 constexpr int PENDING_WINSCREEN_FRAME_INPUTS = 64;
@@ -49,6 +58,7 @@ static void ResetRuntimeState() {
     s_active = false;
     s_isHost = false;
     s_loggedSkipPropagate = false;
+    s_handoffPending = false;
 }
 
 static void ClearPendingRemoteFrames() {
@@ -59,6 +69,28 @@ static void ClearPendingRemoteFrames() {
 static void ResetState() {
     ResetRuntimeState();
     ClearPendingRemoteFrames();
+    s_handoffComplete = false;
+    s_activeSinceMs = 0;
+}
+
+static void FinalizeLockstep(const char* reason) {
+    if (!s_active) {
+        return;
+    }
+
+    Rollback::NetplayLog_Write(
+        "WINLOCK", -1,
+        "Finalizing win-screen lockstep: reason=%s consume=%u local_adv=%d remote_adv=%d",
+        reason ? reason : "?",
+        FrontendInputSync_GetConsumeFrame(),
+        FrontendInputSync_LocalAdvanceObserved() ? 1 : 0,
+        FrontendInputSync_RemoteAdvanceObserved() ? 1 : 0);
+
+    FrontendInputSync_StopWinScreenInputPhase(reason ? reason : "win-screen finalize");
+    FrontendInputSync_ClearPhaseBarrier();
+    ResetState();
+    s_handoffComplete = true;
+    LOG_NETPLAY(LOG_INFO, "[WinScreenSync] Finalized (%s)", reason ? reason : "?");
 }
 
 static bool IsPendingCandidate(const WinScreenFrameInputPayload* p) {
@@ -168,6 +200,9 @@ void WinScreenSync_Begin() {
     ResetRuntimeState();
     s_active = true;
     s_isHost = (Session_GetRole() == SessionRole::Host);
+    s_handoffComplete = false;
+    s_handoffPending = false;
+    s_activeSinceMs = GetTickCount();
     FrontendInputSync_BeginInputPhase(
         FrontendSyncPhase::WinScreen,
         PacketType::WinScreenFrameInput,
@@ -185,9 +220,11 @@ void WinScreenSync_Begin() {
 }
 
 void WinScreenSync_Abort() {
-    if (!s_active) {
+    if (!s_active && !s_handoffPending) {
         return;
     }
+
+    const bool abandonedLockstep = FrontendInputSync_HasRecoveryRequest();
 
     Rollback::NetplayLog_Write(
         "WINLOCK", -1,
@@ -199,29 +236,65 @@ void WinScreenSync_Abort() {
         FrontendInputSync_RemoteAdvanceObserved() ? 1 : 0,
         FrontendInputSync_HasRecoveryRequest() ? FrontendInputSync_GetRecoveryReason() : "none");
 
-    FrontendInputSync_EndPhase("winscreen abort");
+    FrontendInputSync_StopWinScreenInputPhase("winscreen abort");
+    FrontendInputSync_ClearPhaseBarrier();
     ResetState();
+    if (abandonedLockstep) {
+        // Timeout/recovery abort — allow post-match routing without blocking rematch.
+        s_handoffComplete = true;
+    }
     LOG_NETPLAY(LOG_INFO, "[WinScreenSync] Abort");
 }
 
 bool WinScreenSync_FrameUpdate() {
-    if (!s_active || !s_initialized) {
-        return false;
+    if (!s_initialized) {
+        return true;
+    }
+    if (!s_active) {
+        // Inactive before Begin, after successful handoff, or after Abort — not an error.
+        return true;
     }
 
     if (!IsWinScreenLockstepRoute()) {
         WinScreenSync_Abort();
-        return false;
+        return true;
     }
 
     FrontendInputSync_FrameUpdate();
+
+    if (FrontendInputSync_BothAdvanceObserved() && !s_handoffPending && !s_handoffComplete) {
+        s_handoffPending = true;
+        FrontendInputSync_SendPhaseBarrier(
+            FrontendSyncPhase::None,
+            1,
+            "win screen both confirmed");
+    }
+
+    if (s_handoffPending &&
+        FrontendInputSync_IsPhaseBarrierSatisfied(FrontendSyncPhase::None)) {
+        FinalizeLockstep("both peers confirmed win-screen handoff");
+        return true;
+    }
+
+    if (s_activeSinceMs != 0) {
+        const DWORD elapsed = GetTickCount() - s_activeSinceMs;
+        if (elapsed >= kWinScreenHandoffTimeoutMs &&
+            !FrontendInputSync_BothAdvanceObserved()) {
+            Rollback::NetplayLog_Write(
+                "WINLOCK", -1,
+                "Win-screen handoff timeout after %lums; resetting frontend phase",
+                (unsigned long)elapsed);
+            FrontendInputSync_RequestRecovery("win screen handoff timeout");
+        }
+    }
+
     if (FrontendInputSync_HasRecoveryRequest()) {
         Rollback::NetplayLog_Write(
             "WINLOCK", -1,
             "Win-screen frontend timeout; aborting lockstep: %s",
             FrontendInputSync_GetRecoveryReason());
-        WinScreenSync_Abort();  // clears recovery request via EndPhase
-        return false;           // caller must disconnect
+        WinScreenSync_Abort();
+        return true;
     }
     return true;
 }
@@ -294,6 +367,10 @@ void WinScreenSync_NotifyLocalRawAdvance(uint16_t rawInput) {
 
 bool WinScreenSync_IsActive() {
     return s_active;
+}
+
+bool WinScreenSync_IsHandoffComplete() {
+    return s_handoffComplete;
 }
 
 bool WinScreenSync_LocalConfirmed() {

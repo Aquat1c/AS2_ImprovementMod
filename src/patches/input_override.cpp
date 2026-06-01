@@ -215,9 +215,12 @@ bool InputOverride_AreSystemKeyWorkaroundsEnabled() {
 // Per-session startup tracking — reset when a new rollback session begins.
 // Must be declared before AbortRollbackDispatcher which references it.
 static bool s_rollbackSessionWasActive = false;
+static bool s_hardHoldWatchdogActive = false;
+static int s_hardHoldWatchdogFrames = 0;
 
 static int AbortRollbackDispatcher(const char* fallbackReason) {
-    const char* reason = Rollback::RollbackSession_GetErrorReason();
+    const char* sessionErr = Rollback::RollbackSession_GetErrorReason();
+    const char* reason = (sessionErr && sessionErr[0]) ? sessionErr : nullptr;
     if (!reason || !reason[0]) {
         reason = fallbackReason ? fallbackReason : "Rollback session failure";
     }
@@ -1644,18 +1647,15 @@ int __cdecl Hook_DInputJoyRefresh(int joyID) {
     EnsureInputUpdated();
     
     if (ModConfig_UseSDLInput()) {
-        const int result = g_origDInputJoyRefresh ? g_origDInputJoyRefresh(joyID) : 0;
-
         if (joyID >= 0 && joyID < DINPUT_JOY_MAX) {
             ClearVanillaDInputJoyState(joyID, "SDL owns game input");
         } else if (s_dinputJoyRefreshLogCount < 24) {
-            LOG_INFO("[InputHook] DInputJoyRefresh received unexpected joyID=%d under SDL input; result=%d",
-                     joyID,
-                     result);
+            LOG_INFO("[InputHook] DInputJoyRefresh received unexpected joyID=%d under SDL input",
+                     joyID);
             s_dinputJoyRefreshLogCount++;
         }
 
-        return result;
+        return 0;
     }
     
     int result = g_origDInputJoyRefresh(joyID);
@@ -3058,6 +3058,47 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                         : (pacingAction == Net::NetplayPacingAction::HardHold
                             ? pacingSnap.hard_threshold
                             : pacingSnap.stall_threshold);
+
+                if (pacingAction == Net::NetplayPacingAction::HardHold) {
+                    if (!s_hardHoldWatchdogActive) {
+                        s_hardHoldWatchdogActive = true;
+                        s_hardHoldWatchdogFrames = 0;
+                        Rollback::NetplayLog_Verbose(
+                            "WATCHDOG", currentFrame,
+                            "hard_hold ENTER: rb=%d remote_rb=%d gap=%d debt=%d budget=%d threshold=%d session_running=%d",
+                            currentFrame,
+                            preTelemetry.rb_frame_last_remote_received,
+                            pacingSnap.raw_remote_gap,
+                            pacingSnap.prediction_debt,
+                            preTelemetry.rollback_budget,
+                            holdThreshold,
+                            Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
+                    }
+                    s_hardHoldWatchdogFrames++;
+                    if (s_hardHoldWatchdogFrames <= 3 || (s_hardHoldWatchdogFrames % 60) == 0) {
+                        Rollback::NetplayLog_Verbose(
+                            "WATCHDOG", currentFrame,
+                            "hard_hold active: frames=%d rb=%d remote_rb=%d gap=%d debt=%d budget=%d session_running=%d",
+                            s_hardHoldWatchdogFrames,
+                            currentFrame,
+                            preTelemetry.rb_frame_last_remote_received,
+                            pacingSnap.raw_remote_gap,
+                            pacingSnap.prediction_debt,
+                            preTelemetry.rollback_budget,
+                            Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
+                    }
+                } else if (s_hardHoldWatchdogActive) {
+                    Rollback::NetplayLog_Verbose(
+                        "WATCHDOG", currentFrame,
+                        "hard_hold EXIT: action=%s held_frames=%d rb=%d remote_rb=%d",
+                        Net::NetplayPacingActionName(pacingAction),
+                        s_hardHoldWatchdogFrames,
+                        currentFrame,
+                        preTelemetry.rb_frame_last_remote_received);
+                    s_hardHoldWatchdogActive = false;
+                    s_hardHoldWatchdogFrames = 0;
+                }
+
                 if (holdCount <= 5 || (holdCount % 120) == 0) {
                     Rollback::NetplayLog_Write(
                         "STALL", currentFrame,
@@ -3094,7 +3135,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     "First BeginFrame allowed after startup release");
             }
 
-            Rollback::NetplayLog_Write("INPUT", currentFrame,
+            Rollback::NetplayLog_Verbose("INPUT", currentFrame,
                 "Dispatcher frame start: local_input=0x%04X phase=%s stall_threshold=%d",
                 localInput,
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),

@@ -21,6 +21,7 @@
 #pragma once
 
 #include "net/locked_match_config.h"
+#include "net/protocol.h"
 #include <stdint.h>
 
 namespace Net {
@@ -164,5 +165,11 @@ const LockedMatchConfig* PregameSync_GetLockedConfig();
 
 /// Has the pre-game sync completed successfully?
 bool PregameSync_IsComplete();
+
+/// Handle SyncAnnounce/SyncConfirm while the gameplay packet callback is still
+/// active (rematch race). Returns true when the packet was consumed.
+bool PregameSync_HandleCrossPhaseSessionPacket(PacketType type,
+                                               const void* payload,
+                                               size_t payloadLen);
 
 } // namespace Net

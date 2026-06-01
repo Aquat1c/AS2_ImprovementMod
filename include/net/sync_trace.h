@@ -1,9 +1,9 @@
 /**
  * Alice Senki 2 - SyncTrace diagnostics
  *
- * Optional, low-overhead trace exchange for checking that both peers are
- * consuming the same frontend/gameplay timeline. Disabled unless
- * AS2_SYNC_TRACE=1 is present in the environment.
+ * Full CSV/network trace requires AS2_SYNC_TRACE=1.
+ * Optional rollback integrity compare requires AS2_SYNC_TRACE_INTEGRITY=1.
+ * Authoritative drift detection uses StateDigest during normal rollback.
  */
 
 #pragma once
@@ -19,6 +19,10 @@ void SyncTrace_Init();
 void SyncTrace_Shutdown();
 void SyncTrace_SetEnabled(bool enabled, const char* reason);
 bool SyncTrace_IsEnabled();
+void SyncTrace_SetIntegrityActive(bool active, const char* reason);
+bool SyncTrace_IsIntegrityActive();
+bool SyncTrace_ShouldArmIntegrityOnRollback();
+bool SyncTrace_IsCompareActive();
 void SyncTrace_ResetSession(const char* reason);
 
 void SyncTrace_FrameUpdate();

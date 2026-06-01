@@ -744,7 +744,11 @@ void SpectatorRuntime_OnSelectionCommitted(const LockedMatchConfig* config) {
 
     // Compute the provisional match identity — same formula OnMatchBegin will use,
     // so the spectator can match against the MatchState that arrives at gameplay start.
-    const uint32_t preMatchId = config->session_seed ^ (LockedMatchConfig_Hash(config) << 1) | 1u;
+    // Same formula as OnMatchBegin so pre_match_id == match_id for this match.
+    uint32_t preMatchId = config->session_seed ^ (LockedMatchConfig_Hash(config) << 1);
+    if (preMatchId == 0) {
+        preMatchId = 1;
+    }
     const uint32_t preMatchOrdinal = s_matchOrdinal + 1;
 
     RefreshNamesFromSession();

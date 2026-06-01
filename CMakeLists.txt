@@ -291,6 +291,7 @@ set(UI_HEADERS
 
 set(INPUT_HEADERS
     include/input/input_system.h
+    include/input/gamepad_worker.h
 )
 
 set(DIAGNOSTICS_HEADERS
@@ -350,6 +351,7 @@ set(NET_HEADERS
     include/net/match_lifecycle.h
     include/net/sync_policy.h
     include/net/delay_policy.h
+    include/net/churn_pause.h
     include/net/player_side_mapping.h
     include/net/barrier_protocol.h
     include/net/sync_trace.h
@@ -414,6 +416,7 @@ set(UI_SOURCES
 
 set(INPUT_SOURCES
     src/input/input_system.cpp
+    src/input/gamepad_worker.cpp
 )
 
 set(DIAGNOSTICS_SOURCES
@@ -454,6 +457,7 @@ set(NET_SOURCES
     src/net/netplay_palette_runtime.cpp
     src/net/netplay_palette_storage.cpp
     src/net/netplay_pacing.cpp
+    src/net/churn_pause.cpp
     src/net/netplay_phase_runtime.cpp
     src/net/game_settings_sync.cpp
     src/net/nat_traversal.cpp

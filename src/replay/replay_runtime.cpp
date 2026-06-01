@@ -1487,13 +1487,20 @@ static uint16_t ReadLiveTakeoverInput() {
 
 static void ApplySpeedScale() {
     float scale = kSpeedSteps[s_speedIndex];
+    const char* reason = "replay_speed";
+    char reasonBuf[48] = {};
     if (s_seekTargetFrame >= 0) {
         scale = kSeekScale;
+        reason = "replay_seek_fast";
     } else if (s_paused) {
         scale = 1.0f;
+        reason = "replay_paused";
+    } else {
+        _snprintf_s(reasonBuf, sizeof(reasonBuf), _TRUNCATE, "replay_speed_%.2fx", scale);
+        reason = reasonBuf;
     }
 
-    SetGlobalTickScale(scale);
+    SetGlobalTickScale(scale, reason);
 }
 
 static void EraseOverridesFrom(int32_t firstFrame) {
@@ -2163,7 +2170,7 @@ static void DeactivateReplayMatch(const char* reason) {
     LOG_INFO("[Replay] Deactivated at frame %d (%s)", s_currentFrame, reason ? reason : "inactive");
     ClearReplayDispatcherState();
     InputSystem_SetPauseBlocked(s_savedPauseBlocked);
-    SetGlobalTickScale(s_savedGlobalTickScale);
+    SetGlobalTickScale(s_savedGlobalTickScale, "replay_deactivate_restore");
     Rollback::StateHistory_Reset();
     ResetMatchRuntimeState();
     ResetLoadedReplayPaletteState();

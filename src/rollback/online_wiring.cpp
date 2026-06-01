@@ -36,6 +36,7 @@
 #include "net/locked_match_config.h"
 #include "net/enet_transport.h"
 #include "net/netplay_pacing.h"
+#include "net/churn_pause.h"
 #include "net/game_settings_sync.h"
 #include "net/player_side_mapping.h"
 #include "net/charsel_sync.h"
@@ -316,6 +317,15 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
             break;
         }
 
+        case Net::PacketType::ChurnPause: {
+            if (payloadLen < sizeof(Net::ChurnPausePayload)) {
+                LogGameplayPacketAnomaly("Short ChurnPause", type, payloadLen, sizeof(Net::ChurnPausePayload));
+                break;
+            }
+            Net::ChurnPause_OnRemotePacket(static_cast<const Net::ChurnPausePayload*>(payload));
+            break;
+        }
+
         case Net::PacketType::GekkoReady: {
             uint8_t flags = Net::GEKKO_READY_FLAG_READY;  // Legacy fallback: empty payload => READY
             uint8_t phase = 0xFF;
@@ -507,6 +517,18 @@ static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t p
                 static_cast<const Net::PaletteAckPayload*>(payload));
             break;
         }
+
+        case Net::PacketType::SyncAnnounce:
+        case Net::PacketType::SyncConfirm:
+            if (Net::PregameSync_HandleCrossPhaseSessionPacket(type, payload, payloadLen)) {
+                break;
+            }
+            NetplayLog_Write("HANDOFF", GetStartupLogFrame(),
+                "Ignored cross-phase session sync packet: type=%s pregame=%s lifecycle=%s",
+                Net::PacketTypeName(type),
+                Net::PregamePhaseName(Net::PregameSync_GetPhase()),
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+            break;
 
         default:
             // Check for win screen / pause packets
@@ -728,8 +750,11 @@ static bool TryStartRollbackSession() {
     RollbackDebug_ResetSession();
     Net::SyncTrace_ResetSession("rollback start");
 
-    // Enable state digest for desync detection
+    // Enable state digest for desync detection (authoritative, settled-frame compare).
     RollbackDebug_SetDigestEnabled(true);
+    if (Net::SyncTrace_ShouldArmIntegrityOnRollback()) {
+        Net::SyncTrace_SetIntegrityActive(true, "rollback start");
+    }
 
     if (!s_gameplayActive) {
         NetplayLog_Write("HANDOFF", interactiveFrame,
@@ -795,6 +820,7 @@ static void StopRollbackSession(const char* reason) {
         snap.local_inputs_sent, snap.remote_inputs_received);
 
     // Check for desync before ending
+    RollbackDebug_LogSessionSummary(reason ? reason : "rollback stop");
     if (RollbackDebug_IsDesyncDetected()) {
         int32_t desyncFrame = RollbackDebug_GetDesyncFrame();
         NetplayLog_Write("TEARDOWN", frame,
@@ -804,7 +830,9 @@ static void StopRollbackSession(const char* reason) {
     // End session through GameplayBridge
     Net::GameplayBridge_EndSession();
     Net::NetplayPacing_ResetSession(reason ? reason : "rollback stop");
+    Net::ChurnPause_ResetSession(reason ? reason : "rollback stop");
     Net::SyncTrace_ResetSession(reason ? reason : "rollback stop");
+    Net::SyncTrace_SetIntegrityActive(false, reason ? reason : "rollback stop");
     RollbackDebug_SetDigestEnabled(false);
     InputSyncHooks_SetLoadBarrierFreeze(false);
     InputSyncHooks_SetTimesyncFreeze(false);
@@ -1089,6 +1117,7 @@ void OnlineWiring_Init() {
     ResetStartupBarrierState("init");
 
     Net::NetplayPacing_Init();
+    Net::ChurnPause_Init();
     StressHooks_Init();
     Net::SetTracker_Init();
     Net::WinScreenSync_Init();
@@ -1106,6 +1135,7 @@ void OnlineWiring_Shutdown() {
         StopRollbackSession("mod shutdown");
     }
     Net::NetplayPacing_Shutdown();
+    Net::ChurnPause_Shutdown();
     s_liveReleaseArmed = false;
     s_rollbackBeginPending = false;
     s_frameOriginAbs = -1;
@@ -1133,6 +1163,9 @@ void OnlineWiring_FrameUpdate() {
     // dispatcher's ability to advance simulation.
     if (s_rollbackActive) {
         s_backgroundPollCount++;
+        Net::ChurnPause_OnRollbackPoll(
+            s_gameplayActive && s_rollbackActive,
+            RollbackSession_GetCurrentFrame());
         const bool pollOk = RollbackSession_PollSession();
         if (!pollOk) {
             s_backgroundPollFailures++;
@@ -1292,15 +1325,17 @@ void OnlineWiring_FrameUpdate() {
     // Drive win screen sync through match-end transition and win screen phase.
     if (curPhase == Net::MatchLifecyclePhase::MatchEnd ||
         curPhase == Net::MatchLifecyclePhase::WinScreenActive) {
-        if (!Net::WinScreenSync_FrameUpdate()) {
-            Net::MatchLifecycle_OnDisconnect("winscreen lockstep timeout");
-        }
+        Net::WinScreenSync_FrameUpdate();
     }
 
     // Drive pause handler when session is owned
     if (Net::MatchLifecycle_IsMatchOwned()) {
         Net::PauseHandler_FrameUpdate();
     }
+
+    Net::ChurnPause_FrameUpdate(
+        s_gameplayActive && s_rollbackActive,
+        s_rollbackActive ? RollbackSession_GetCurrentFrame() : -1);
 
     // Drive rollback subsystems only when gameplay is active
     if (s_rollbackActive && s_gameplayActive) {
@@ -1378,11 +1413,22 @@ void OnlineWiring_OnMatchEnd() {
 }
 
 void OnlineWiring_OnDisconnect(const char* reason) {
+    const char* sessionErr = RollbackSession_GetErrorReason();
+    const char* effectiveReason = reason;
+    if (!effectiveReason || !effectiveReason[0]) {
+        effectiveReason = (sessionErr && sessionErr[0]) ? sessionErr : "Disconnected.";
+    } else if (sessionErr && sessionErr[0]) {
+        NetplayLog_Write("DISCONNECT", s_rollbackActive ? RollbackSession_GetCurrentFrame() : -1,
+            "Rollback drop reason: %s (caller reason: %s)",
+            sessionErr,
+            reason);
+    }
+
     Net::SetTrackerSnapshot setSnap{};
     Net::SetTracker_GetSnapshot(&setSnap);
     NetplayLog_Write("DISCONNECT", s_rollbackActive ? RollbackSession_GetCurrentFrame() : -1,
         "=== DISCONNECT: %s === mode=%u pregame=%s lifecycle=%s frame_origin=%d local=%d remote=%d draws=%d matches=%d",
-        reason ? reason : "unknown",
+        effectiveReason,
         GetGameMode(),
         Net::PregamePhaseName(Net::PregameSync_GetPhase()),
         Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
@@ -1395,7 +1441,7 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     const bool boundaryCleanupNeeded = DisconnectNeedsBoundaryCleanup();
 
     if (s_rollbackActive) {
-        StopRollbackSession(reason ? reason : "disconnect");
+        StopRollbackSession(effectiveReason);
     }
 
     if (boundaryCleanupNeeded) {
@@ -1411,7 +1457,7 @@ void OnlineWiring_OnDisconnect(const char* reason) {
             s_rollbackBeginPending ? 1 : 0,
             s_baselineCRC,
             s_configHash);
-        RematchCleanup_PrepareForNextMatch(reason ? reason : "disconnect");
+        RematchCleanup_PrepareForNextMatch(effectiveReason);
     } else {
         NetplayLog_Write("DISCONNECT", -1,
             "Skipping forced match-boundary cleanup; disconnect occurred before match ownership");
@@ -1421,7 +1467,7 @@ void OnlineWiring_OnDisconnect(const char* reason) {
         NetplayLog_Write("DISCONNECT", -1,
             "Aborting pregame/bootstrap state during disconnect cleanup: phase=%s",
             Net::PregamePhaseName(Net::PregameSync_GetPhase()));
-        Net::PregameSync_Abort(reason ? reason : "disconnect");
+        Net::PregameSync_Abort(effectiveReason);
     }
 
     s_rollbackStarted = false;
@@ -1442,7 +1488,9 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
     Net::NetplayPacing_ResetSession("disconnect");
+    Net::ChurnPause_ResetSession(reason ? reason : "disconnect");
     Net::SyncTrace_ResetSession(reason ? reason : "disconnect");
+    Net::SyncTrace_SetIntegrityActive(false, reason ? reason : "disconnect");
     Net::WinScreenSync_Abort();
     Net::FrontendInputSync_AbortEpoch(reason ? reason : "disconnect");
     Net::SpectatorRuntime_OnDisconnect(reason ? reason : "disconnect");
@@ -1499,7 +1547,9 @@ void OnlineWiring_OnRematch() {
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
     Net::NetplayPacing_ResetSession("rematch");
+    Net::ChurnPause_ResetSession("rematch");
     Net::SyncTrace_ResetSession("rematch");
+    Net::SyncTrace_SetIntegrityActive(false, "rematch");
     ResetStartupBarrierState("rematch");
     Net::SpectatorRuntime_OnMatchEnd("rematch");
     Net::NetplayPaletteRuntime_OnMatchEnd("rematch");
@@ -1539,7 +1589,9 @@ void OnlineWiring_OnReturnToSession() {
     s_backgroundPollCount = 0;
     s_backgroundPollFailures = 0;
     Net::NetplayPacing_ResetSession("return to session");
+    Net::ChurnPause_ResetSession("return to session");
     Net::SyncTrace_ResetSession("return to session");
+    Net::SyncTrace_SetIntegrityActive(false, "return to session");
     ResetStartupBarrierState("return to session");
     Net::SpectatorRuntime_OnMatchEnd("return to session");
     Net::NetplayPaletteRuntime_OnMatchEnd("return to session");

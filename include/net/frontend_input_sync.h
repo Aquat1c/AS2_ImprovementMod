@@ -129,6 +129,9 @@ int  FrontendInputSync_ComputeDelayProposal();
 void FrontendInputSync_BeginEpoch(SessionRole role, uint32_t epochId, uint16_t localDelayProposal, const char* reason);
 void FrontendInputSync_RebindEpoch(uint32_t epochId, const char* reason);
 void FrontendInputSync_AbortEpoch(const char* reason);
+
+/// Stop win-screen input emission immediately (rematch / cross-phase handoff).
+void FrontendInputSync_StopWinScreenInputPhase(const char* reason);
 void FrontendInputSync_OnRemoteSyncAnnounce(uint16_t remoteDelayProposal, const char* reason);
 void FrontendInputSync_OnRemoteSyncConfirm(uint16_t remoteDelayProposal, uint16_t remoteSharedDelay, const char* reason);
 bool FrontendInputSync_FinalizeDelayNegotiation(const char* reason);

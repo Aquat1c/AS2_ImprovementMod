@@ -1,7 +1,9 @@
 #include "patches/tick_hooks.h"
 #include "log_window.h"
+#include "rollback/netplay_log.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -13,8 +15,14 @@ static volatile bool g_frameLimiter60FpsSessionOverrideActive = false;
 static volatile bool g_frameLimiter60FpsSessionEnabled = true;
 static volatile float g_preSessionManualTickScale = 1.0f;
 static NetplayTickState g_netplayTickState{};
+static char g_scaleReason[96] = "initial";
 static float g_lastLoggedEffectiveScale = 1.0f;
+static bool g_slowSpeedWarned = false;
+static DWORD g_lastSlowSpeedLogMs = 0;
 static constexpr bool kEnableEffectiveTickScaleLogs = false;
+static constexpr float kSlowSpeedThreshold = 0.5f;
+static constexpr float kSlowSpeedRecoverThreshold = 0.52f;
+static constexpr DWORD kSlowSpeedRepeatLogMs = 5000;
 static constexpr float kNativeLimiterFrameMs = 17.0f;
 static constexpr float kTarget60FrameMs = 1000.0f / 60.0f;
 static constexpr float kFrameLimiter60FpsScale = kNativeLimiterFrameMs / kTarget60FrameMs;
@@ -59,6 +67,70 @@ static float ComputeEffectiveScale() {
         scale *= kFrameLimiter60FpsScale;
     }
     return ClampTickScale(scale);
+}
+
+static void SetScaleReason(const char* reason) {
+    if (!reason || !reason[0]) {
+        return;
+    }
+    strncpy_s(g_scaleReason, reason, _TRUNCATE);
+}
+
+static void MaybeWarnSlowEffectiveSpeed(float effectiveScale, DWORD realTickMs) {
+    if (effectiveScale < kSlowSpeedThreshold) {
+        const bool repeatDue =
+            g_slowSpeedWarned &&
+            (realTickMs - g_lastSlowSpeedLogMs) >= kSlowSpeedRepeatLogMs;
+        if (!g_slowSpeedWarned || repeatDue) {
+            LOG_WARN(
+                "[TickHooks] Effective game speed below half: effective=%.3fx manual=%.3fx "
+                "netplay_current=%.3fx netplay_target=%.3fx pacing_active=%d limiter_60fps=%d reason=%s",
+                effectiveScale,
+                g_manualTickScale,
+                g_netplayTickState.current_scale,
+                g_netplayTickState.target_scale,
+                g_netplayTickState.pacing_active ? 1 : 0,
+                EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
+                g_scaleReason);
+            Rollback::NetplayLog_Write(
+                "SPEED",
+                -1,
+                "WARN effective speed below half: effective=%.3f manual=%.3f netplay_current=%.3f "
+                "netplay_target=%.3f pacing_active=%d limiter_60fps=%d reason=%s",
+                effectiveScale,
+                g_manualTickScale,
+                g_netplayTickState.current_scale,
+                g_netplayTickState.target_scale,
+                g_netplayTickState.pacing_active ? 1 : 0,
+                EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
+                g_scaleReason);
+            g_slowSpeedWarned = true;
+            g_lastSlowSpeedLogMs = realTickMs;
+        }
+        return;
+    }
+
+    if (g_slowSpeedWarned && effectiveScale >= kSlowSpeedRecoverThreshold) {
+        LOG_INFO(
+            "[TickHooks] Effective game speed recovered: effective=%.3fx manual=%.3fx "
+            "netplay_current=%.3fx netplay_target=%.3fx reason=%s",
+            effectiveScale,
+            g_manualTickScale,
+            g_netplayTickState.current_scale,
+            g_netplayTickState.target_scale,
+            g_scaleReason);
+        Rollback::NetplayLog_Write(
+            "SPEED",
+            -1,
+            "Recovered from slow speed: effective=%.3f manual=%.3f netplay_current=%.3f "
+            "netplay_target=%.3f reason=%s",
+            effectiveScale,
+            g_manualTickScale,
+            g_netplayTickState.current_scale,
+            g_netplayTickState.target_scale,
+            g_scaleReason);
+        g_slowSpeedWarned = false;
+    }
 }
 
 static void ResolveTickSettingsPath() {
@@ -148,6 +220,7 @@ DWORD __cdecl Hook_GetTick() {
         DesiredNetplayScale());
 
     const float effectiveScale = ComputeEffectiveScale();
+    MaybeWarnSlowEffectiveSpeed(effectiveScale, real);
     if (fabsf(g_lastLoggedEffectiveScale - effectiveScale) > 0.005f) {
         if (kEnableEffectiveTickScaleLogs) {
             LOG_INFO(
@@ -165,15 +238,17 @@ DWORD __cdecl Hook_GetTick() {
     return (DWORD)(((uint64_t)floor(g_netplayTickState.virtual_tick_ms)) & 0x7FFFFFFF);
 }
 
-void SetGlobalTickScale(float scale) {
+void SetGlobalTickScale(float scale, const char* reason) {
     if (g_frameLimiter60FpsSessionOverrideActive) {
         LOG_WARN(
-            "[TickHooks] Ignoring manual tick scale change during locked netplay timing: requested=%.3f active=%.3f",
+            "[TickHooks] Ignoring manual tick scale change during locked netplay timing: requested=%.3f active=%.3f reason=%s",
             scale,
-            g_manualTickScale);
+            g_manualTickScale,
+            reason ? reason : "?");
         return;
     }
     g_manualTickScale = ClampTickScale(scale);
+    SetScaleReason(reason ? reason : "manual_global_scale");
 }
 
 float GetGlobalTickScale() {
@@ -255,6 +330,7 @@ void TickHooks_SetFrameLimiter60FpsSessionOverride(bool enabled, const char* rea
     }
     g_frameLimiter60FpsSessionOverrideActive = true;
     g_frameLimiter60FpsSessionEnabled = enabled;
+    SetScaleReason(reason ? reason : "session_fps_override");
 
     const bool effective = EffectiveFrameLimiter60FpsEnabled();
     if (!hadOverride || previousEffective != effective) {
@@ -280,6 +356,7 @@ void TickHooks_ClearFrameLimiter60FpsSessionOverride(const char* reason) {
     g_frameLimiter60FpsSessionOverrideActive = false;
     g_frameLimiter60FpsSessionEnabled = g_frameLimiter60FpsPreferenceEnabled;
     g_manualTickScale = ClampTickScale(g_preSessionManualTickScale);
+    SetScaleReason(reason ? reason : "session_fps_override_clear");
     LOG_INFO(
         "[TickHooks] Cleared session FPS timing override: previous_effective=%d restored=%d preference=%d restored_manual=%.3f effective_tick_scale=%.5f reason=%s",
         previousEffective ? 1 : 0,
@@ -302,29 +379,39 @@ float GetFrameLimiter60FpsCorrectionScale() {
     return kFrameLimiter60FpsScale;
 }
 
-void SetNetplayTickScale(float scale) {
+void SetNetplayTickScale(float scale, const char* reason) {
     const float clamped = ClampTickScale(scale);
     g_netplayTickState.current_scale = clamped;
     g_netplayTickState.target_scale = clamped;
     g_netplayTickState.pacing_active = fabsf(clamped - 1.0f) > 0.001f;
+    SetScaleReason(reason ? reason : "netplay_scale_immediate");
 }
 
-void SetNetplayTickScaleTarget(float scale) {
+void SetNetplayTickScaleTarget(float scale, const char* reason) {
     g_netplayTickState.target_scale = ClampTickScale(scale);
-}
-
-void SetNetplayPacingActive(bool active) {
-    g_netplayTickState.pacing_active = active;
-    if (!active) {
-        g_netplayTickState.target_scale = 1.0f;
+    if (reason && reason[0]) {
+        SetScaleReason(reason);
     }
 }
 
-void ResetNetplayTickScaleState() {
+void SetNetplayPacingActive(bool active, const char* reason) {
+    g_netplayTickState.pacing_active = active;
+    if (!active) {
+        g_netplayTickState.target_scale = 1.0f;
+        SetScaleReason(reason ? reason : "pacing_inactive");
+    } else if (reason && reason[0]) {
+        SetScaleReason(reason);
+    }
+}
+
+void ResetNetplayTickScaleState(const char* reason) {
     memset(&g_netplayTickState, 0, sizeof(g_netplayTickState));
     g_netplayTickState.current_scale = 1.0f;
     g_netplayTickState.target_scale = 1.0f;
     g_lastLoggedEffectiveScale = 1.0f;
+    g_slowSpeedWarned = false;
+    g_lastSlowSpeedLogMs = 0;
+    SetScaleReason(reason ? reason : "netplay_scale_reset");
 }
 
 void GetNetplayTickState(NetplayTickState* out) {
@@ -333,6 +420,7 @@ void GetNetplayTickState(NetplayTickState* out) {
     }
 
     *out = g_netplayTickState;
+    strncpy_s(out->scale_reason, g_scaleReason, _TRUNCATE);
 }
 
 float GetNetplayTickScale() {

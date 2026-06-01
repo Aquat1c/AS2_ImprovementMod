@@ -154,6 +154,10 @@ bool RollbackSession_ShouldSuppressSideEffects();
 /// Fatal session error text, or an empty string when healthy.
 const char* RollbackSession_GetErrorReason();
 
+/// Copy the pending fatal error into out and clear the live session error.
+/// Returns true when a non-empty reason was captured.
+bool RollbackSession_TakeErrorReason(char* out, size_t outSize);
+
 struct RollbackTimesyncTelemetry {
     int32_t  rb_frame_current;
     int32_t  rb_frame_last_confirmed;
@@ -245,5 +249,8 @@ struct RollbackSessionSnapshot {
 };
 
 void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out);
+
+/// Authoritative gameplay checksum (Gekko save/load equivalent: main match region + effect index).
+uint32_t RollbackSession_ComputeLiveStateChecksum();
 
 } // namespace Rollback

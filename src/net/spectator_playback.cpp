@@ -31,8 +31,14 @@ constexpr uintptr_t ADDR_STAGE_AUX = 0x816028;
 constexpr uintptr_t ADDR_STAGE_CONFIRM_MENU_CURSOR = 0x81602A;
 constexpr uintptr_t ADDR_STAGE_CONFIRM_MENU_ACTION = 0x81602B;
 
-constexpr int32_t kBootstrapStartBufferFrames = 60;
-constexpr uint32_t kBootstrapRetryFrames = 120;
+// Minimum confirmed frames before starting bootstrap on the normal (non-early)
+// path. The early bootstrap (PreMatchState) bypasses this entirely.
+// 10 frames is enough — frames continue arriving while bootstrap runs.
+constexpr int32_t kBootstrapStartBufferFrames = 10;
+// How many frames to wait before retrying a stalled stage-grid or stage-confirm
+// write. 120 (2s) was a worst-case latency hedge; 30 (0.5s) is responsive enough
+// while still giving the game state machine time to settle between retries.
+constexpr uint32_t kBootstrapRetryFrames = 30;
 constexpr uint32_t kBootstrapStateLogFrames = 120;
 constexpr int32_t kCatchupBudgetStepGap = 30;
 constexpr int32_t kCatchupBudgetMax = 9;
@@ -312,9 +318,9 @@ static bool OwnsLocalSimulation() {
 
 static void ResetTickPacing() {
     s_targetCatchupScale = 1.0f;
-    SetNetplayTickScale(1.0f);
-    SetNetplayTickScaleTarget(1.0f);
-    SetNetplayPacingActive(false);
+    SetNetplayTickScale(1.0f, "spectator_playback_reset");
+    SetNetplayTickScaleTarget(1.0f, "spectator_playback_reset");
+    SetNetplayPacingActive(false, "spectator_playback_reset");
 }
 
 static void ClearPlaybackOverrides() {
@@ -523,9 +529,17 @@ static void ApplyCatchupScale(float targetScale, int32_t gap) {
     }
 
     s_targetCatchupScale = targetScale;
-    SetNetplayTickScale(1.0f);
-    SetNetplayTickScaleTarget(1.0f);
-    SetNetplayPacingActive(false);
+    char catchupReason[96];
+    _snprintf_s(
+        catchupReason,
+        sizeof(catchupReason),
+        _TRUNCATE,
+        "spectator_catchup target=%.0fx gap=%d",
+        targetScale,
+        gap);
+    SetNetplayTickScale(1.0f, catchupReason);
+    SetNetplayTickScaleTarget(1.0f, catchupReason);
+    SetNetplayPacingActive(false, catchupReason);
 }
 
 static bool BootstrapReady(const SpectatorClientSnapshot& client,
@@ -1198,16 +1212,23 @@ void SpectatorPlayback_FrameUpdate() {
         (client.have_pre_match_state && !client.have_match_state);
 
     if (!effectivelyActive) {
-        // If we are already bootstrapping, keep going — MatchState will arrive.
+        // If bootstrap is running and match_active just went false because
+        // MatchState arrived with MATCH_STATE_ENDED (match ended before we could
+        // watch it), stop the bootstrap. Don't continue driving charsel into a
+        // match that is already over.
         if (IsBootstrappingState(s_state)) {
-            // match_active went false while in early bootstrap; this is normal
-            // between match end and next PreMatchState/MatchState.
             SPLAY_LOG(s_localPlaybackRbFrame,
-                "Continuing early bootstrap despite !effectivelyActive: state=%s have_pre=%d have_match=%d",
+                "Aborting bootstrap: match ended before playback reached gameplay "
+                "(state=%s have_pre=%d have_match=%d match_active=%d)",
                 StateNameInternal(s_state),
                 client.have_pre_match_state ? 1 : 0,
-                client.have_match_state ? 1 : 0);
-            DriveBootstrap(client);
+                client.have_match_state ? 1 : 0,
+                client.match_active ? 1 : 0);
+            EnterSafeMenuIfNeeded();
+            ResetLocalSimulationState();
+            ClearSpectatorPaletteHints();
+            TransitionState(SpectatorPlaybackState::WaitingNextMatch,
+                "The match ended before local playback could start. Waiting for the next match.");
             return;
         }
 
@@ -1238,6 +1259,26 @@ void SpectatorPlayback_FrameUpdate() {
         return;
     }
 
+    // Handle ReadyToBootstrap explicitly so BeginLocalSpectatorLaunch and the
+    // mode transition happen before DriveBootstrap is called (next frame).
+    if (s_state == SpectatorPlaybackState::ReadyToBootstrap) {
+        BeginLocalSpectatorLaunch(client);
+        TransitionState(SpectatorPlaybackState::BootstrappingFrontend,
+            "Starting watch playback for game %u.",
+            ResolveBootstrapOrdinal(client));
+        return;
+    }
+
+    // Once bootstrap is in progress (BootstrappingFrontend / WaitingInteractiveStart),
+    // skip BootstrapReady — it already passed once. Re-checking it here would kill
+    // the bootstrap when MatchState arrives mid-early-bootstrap but before the palette
+    // data packets (which arrive shortly after in the same burst) are buffered.
+    if (s_state == SpectatorPlaybackState::BootstrappingFrontend ||
+        s_state == SpectatorPlaybackState::WaitingInteractiveStart) {
+        DriveBootstrap(client);
+        return;
+    }
+
     bool waitNextMatch = false;
     uint8_t paletteWaitSlot = 0xFF;
     const char* paletteWaitReason = nullptr;
@@ -1260,21 +1301,14 @@ void SpectatorPlayback_FrameUpdate() {
         return;
     }
 
-    if (!OwnsLocalSimulation() &&
-        s_state != SpectatorPlaybackState::ReadyToBootstrap) {
+    if (!OwnsLocalSimulation()) {
         TransitionState(SpectatorPlaybackState::ReadyToBootstrap,
             "Ready to start local playback.");
         return;
     }
-
-    if (s_state == SpectatorPlaybackState::ReadyToBootstrap) {
-        BeginLocalSpectatorLaunch(client);
-        TransitionState(SpectatorPlaybackState::BootstrappingFrontend,
-            "Starting watch playback for game %u.",
-            ResolveBootstrapOrdinal(client));
-        return;
-    }
-
+    // Reached for Live / CatchingUp / Buffering / EndOfMatch — all states where
+    // OwnsLocalSimulation() is true but we're not in a bootstrap-specific state.
+    // DriveBootstrap handles these via UpdateLivePlayback internally.
     DriveBootstrap(client);
 }
 

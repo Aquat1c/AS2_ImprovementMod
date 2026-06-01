@@ -14,6 +14,7 @@
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rollback_debug.h"
 #include "rollback/rollback_audio.h"
 #include "rollback/rollback_combo_fx.h"
 #include "rollback/rollback_status_fx.h"
@@ -208,17 +209,28 @@ static void ReleaseBufferedPacket(BufferedPacket* packet) {
 // GekkoNet Transport Adapter (ENet ↔ GekkoNet)
 // ============================================================================
 
+// Gekko::PacketType::SessionHealth (see GekkoNet GekkoLib/include/net.h).
+// zpp serializes MsgHeader.type as the first payload byte.
+static constexpr uint8_t kGekkoPacketSessionHealth = 6;
+
+static bool GekkoPayloadPrefersReliableDelivery(const char* data, int length) {
+    return length >= 1 &&
+           static_cast<uint8_t>(data[0]) == kGekkoPacketSessionHealth;
+}
+
 /// Called by GekkoNet to send data to the remote peer.
 /// We wrap it in a GekkoData packet and send via ENet.
 static void AdapterSendData(GekkoNetAddress* /*addr*/, const char* data, int length) {
     if (!Net::Session_IsConnected()) return;
     if (length <= 0 || !data) return;
 
+    const bool reliable = GekkoPayloadPrefersReliableDelivery(data, length);
+
     Net::Session_SendPacket(
         Net::CHANNEL_GAMEPLAY,
         Net::PacketType::GekkoData,
         data, (size_t)length,
-        false  // Unreliable — GekkoNet handles its own reliability
+        reliable
     );
 }
 
@@ -904,6 +916,12 @@ static void HandleSessionEvents() {
                 break;
 
             case GekkoDesyncDetected:
+                RollbackDebug_ReportDrift(
+                    "Gekko",
+                    ev->data.desynced.frame,
+                    ev->data.desynced.local_checksum,
+                    ev->data.desynced.remote_checksum,
+                    "SessionIntegrityCheck confirmed-frame checksum mismatch");
                 NetplayLog_Write("GEKKO", ev->data.desynced.frame,
                     "DESYNC DETECTED: frame=%d local_crc=0x%08X remote_crc=0x%08X remote_handle=%d",
                     ev->data.desynced.frame,
@@ -1597,6 +1615,18 @@ const char* RollbackSession_GetErrorReason() {
     return s_sessionError;
 }
 
+bool RollbackSession_TakeErrorReason(char* out, size_t outSize) {
+    if (!out || outSize == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!s_sessionError[0]) {
+        return false;
+    }
+    strncpy_s(out, outSize, s_sessionError, _TRUNCATE);
+    return out[0] != '\0';
+}
+
 void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -1716,6 +1746,10 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     // GekkoNet network stats
     out->gekko_avg_ping = s_cachedAvgPing;
     out->gekko_jitter = s_cachedJitter;
+}
+
+uint32_t RollbackSession_ComputeLiveStateChecksum() {
+    return ComputeLiveStateChecksum();
 }
 
 } // namespace Rollback

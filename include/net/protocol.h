@@ -100,6 +100,7 @@ enum class PacketType : uint16_t {
     StateDigest     = 32,   // CRC32 state digest for desync detection
     FrameSyncStatus = 33,   // Lightweight frame-progress telemetry
     SyncTrace       = 35,   // Synchronized diagnostics trace, debug channel
+    ChurnPause      = 36,   // Peer-visible device I/O pause hint (debug channel)
 };
 
 enum class FrameTimingMode : uint8_t {
@@ -206,6 +207,18 @@ struct FrameSyncStatusPayload {
     int32_t  predicted_frames;              // Sender's outstanding predicted frames
     uint32_t checksum;                      // Sender's current state checksum
 };
+
+struct ChurnPausePayload {
+    uint8_t  flags;                         // CHURN_PAUSE_FLAG_*
+    uint8_t  reason;                          // Net::ChurnPauseReason
+    uint16_t session_epoch;                   // Matches sender ChurnPause session epoch
+    int32_t  rb_frame;                        // Sender rollback frame when pausing
+    uint32_t sender_ms;                       // GetTickCount() at send time
+    uint32_t grace_ms;                        // Suggested hold duration for peer
+};
+
+constexpr uint8_t CHURN_PAUSE_FLAG_ACTIVE = 1 << 0;
+constexpr uint8_t CHURN_PAUSE_FLAG_CLEAR  = 1 << 1;
 
 enum class SyncTraceDomain : uint8_t {
     None             = 0,
@@ -590,6 +603,8 @@ static_assert(sizeof(StageSyncPayload) == 24,
     "StageSyncPayload wire size must remain stable");
 static_assert(sizeof(PacketType) + sizeof(SyncTracePayload) <= MAX_PACKET_SIZE,
     "SyncTracePayload must fit inside one transport packet");
+static_assert(sizeof(PacketType) + sizeof(ChurnPausePayload) <= MAX_PACKET_SIZE,
+    "ChurnPausePayload must fit inside one transport packet");
 
 // NatInfoPayload flags
 constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;
@@ -657,6 +672,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::StateDigest:    return "StateDigest";
         case PacketType::FrameSyncStatus:return "FrameSyncStatus";
         case PacketType::SyncTrace:      return "SyncTrace";
+        case PacketType::ChurnPause:     return "ChurnPause";
         default:                         return "Unknown";
     }
 }
