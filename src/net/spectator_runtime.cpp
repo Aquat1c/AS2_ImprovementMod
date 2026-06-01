@@ -725,6 +725,59 @@ uint16_t SpectatorRuntime_GetListenPort() {
     return s_listenPort;
 }
 
+void SpectatorRuntime_OnSelectionCommitted(const LockedMatchConfig* config) {
+    if (!s_initialized || !config) {
+        return;
+    }
+    if (!s_enabled) {
+        SPECTATE_LOG(-1, "Selection committed but spectator server is disabled — skipping PreMatchState");
+        return;
+    }
+    if (!Session_IsConnected()) {
+        SPECTATE_LOG(-1, "Selection committed but session is not connected — skipping PreMatchState");
+        return;
+    }
+    if (Session_GetRole() != SessionRole::Host) {
+        // Joiner doesn't run the spectator server; this is expected, not an error.
+        return;
+    }
+
+    // Compute the provisional match identity — same formula OnMatchBegin will use,
+    // so the spectator can match against the MatchState that arrives at gameplay start.
+    const uint32_t preMatchId = config->session_seed ^ (LockedMatchConfig_Hash(config) << 1) | 1u;
+    const uint32_t preMatchOrdinal = s_matchOrdinal + 1;
+
+    RefreshNamesFromSession();
+
+    Spectator::PreMatchStatePayload payload{};
+    payload.pre_match_id = preMatchId;
+    payload.pre_match_ordinal = preMatchOrdinal;
+    payload.config_crc = LockedMatchConfig_Hash(config);
+    payload.session_seed = config->session_seed;
+    payload.config = *config;
+    CopyText(payload.p1_name, sizeof(payload.p1_name), s_p1Name);
+    CopyText(payload.p2_name, sizeof(payload.p2_name), s_p2Name);
+
+    SpectatorPeerSnapshot peers[kMaxPeers] = {};
+    const int peerCount = SpectatorManager_GetPeerSnapshots(peers, kMaxPeers);
+    int sent = 0;
+    for (int i = 0; i < peerCount; i++) {
+        if (SpectatorManager_SendPreMatchState(peers[i].peer_id, &payload)) {
+            sent++;
+        }
+    }
+
+    SPECTATE_LOG(-1,
+        "Selection committed: pre_match_id=0x%08X ordinal=%u chars=(%u,%u) stage=%u spectators_notified=%d/%d",
+        preMatchId,
+        preMatchOrdinal,
+        (unsigned)config->p1_character,
+        (unsigned)config->p2_character,
+        (unsigned)config->stage_id,
+        sent,
+        peerCount);
+}
+
 void SpectatorRuntime_OnMatchBegin(const LockedMatchConfig* config) {
     if (!s_initialized || !config) {
         return;

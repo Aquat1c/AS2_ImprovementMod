@@ -36,6 +36,11 @@ bool SpectatorRuntime_GetEnabled();
 void SpectatorRuntime_SetListenPort(uint16_t port);
 uint16_t SpectatorRuntime_GetListenPort();
 
+/// Called when both players' selection is committed (chars + stage locked), before
+/// loading starts. Sends PreMatchState to connected spectators so they can start
+/// charsel bootstrap in parallel with the players' loading screen, eliminating
+/// the forced speed-up at the beginning of each game.
+void SpectatorRuntime_OnSelectionCommitted(const LockedMatchConfig* config);
 void SpectatorRuntime_OnMatchBegin(const LockedMatchConfig* config);
 void SpectatorRuntime_OnRollbackStarted(int32_t frame_origin_abs);
 void SpectatorRuntime_OnGameplayFrame(int32_t rb_frame,

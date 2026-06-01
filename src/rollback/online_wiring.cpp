@@ -1378,8 +1378,19 @@ void OnlineWiring_OnMatchEnd() {
 }
 
 void OnlineWiring_OnDisconnect(const char* reason) {
+    Net::SetTrackerSnapshot setSnap{};
+    Net::SetTracker_GetSnapshot(&setSnap);
     NetplayLog_Write("DISCONNECT", s_rollbackActive ? RollbackSession_GetCurrentFrame() : -1,
-        "=== DISCONNECT: %s ===", reason ? reason : "unknown");
+        "=== DISCONNECT: %s === mode=%u pregame=%s lifecycle=%s frame_origin=%d local=%d remote=%d draws=%d matches=%d",
+        reason ? reason : "unknown",
+        GetGameMode(),
+        Net::PregamePhaseName(Net::PregameSync_GetPhase()),
+        Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
+        s_frameOriginAbs,
+        setSnap.local_wins,
+        setSnap.remote_wins,
+        setSnap.draws,
+        setSnap.total_matches);
 
     const bool boundaryCleanupNeeded = DisconnectNeedsBoundaryCleanup();
 

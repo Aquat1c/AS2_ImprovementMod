@@ -891,6 +891,27 @@ bool SpectatorManager_SendMatchState(uintptr_t peer_id, const Spectator::MatchSt
     return sent;
 }
 
+bool SpectatorManager_SendPreMatchState(uintptr_t peer_id, const Spectator::PreMatchStatePayload* payload) {
+    PeerState* peer = FindPeer(peer_id);
+    if (!peer || !payload) {
+        return false;
+    }
+    const bool sent = SendTyped(peer->peer,
+        Spectator::CHANNEL_CONTROL,
+        Spectator::PacketType::PreMatchState,
+        payload,
+        sizeof(*payload),
+        true);
+    if (!sent) {
+        SMGR_LOG(LOG_WARNING, -1,
+            "[SpectatorMgr] SendPreMatchState failed peer=0x%p pre_match_id=0x%08X ordinal=%u",
+            reinterpret_cast<void*>(peer_id),
+            payload->pre_match_id,
+            payload->pre_match_ordinal);
+    }
+    return sent;
+}
+
 bool SpectatorManager_SendPaletteState(uintptr_t peer_id, const Spectator::PaletteStatePayload* payload) {
     PeerState* peer = FindPeer(peer_id);
     if (!peer || !payload) {

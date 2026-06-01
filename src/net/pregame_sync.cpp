@@ -28,6 +28,7 @@
 #include "patches/charsel_palette_select.h"
 #include "patches/input_sync_hooks.h"
 #include "patches/memory_utils.h"
+#include "net/spectator_runtime.h"
 #include "rollback/online_wiring.h"
 #include "rollback/netplay_log.h"
 #include "rollback/owner_diagnostics.h"
@@ -860,6 +861,15 @@ static void UpdateConfigAgreed() {
     // Do not freeze here: Mode 7 / Mode 8 substates 0-2 must continue running
     // so both peers can actually finish loading and reach the baseline gate.
     SetStatusFmt("Waiting for assets to load...");
+
+    // Notify spectators that selection is committed so they can start charsel
+    // bootstrap in parallel with the loading screen. This eliminates the
+    // forced speed-up at gameplay start caused by bootstrap lag.
+    const LockedMatchConfig* cfg = PregameSync_GetLockedConfig();
+    if (cfg) {
+        SpectatorRuntime_OnSelectionCommitted(cfg);
+    }
+
     SetPhase(PregamePhase::BootstrapLoading, "begin loading");
     MatchBootstrap_BeginLoading();
 }

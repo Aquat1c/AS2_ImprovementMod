@@ -41,6 +41,16 @@ struct SpectatorClientSnapshot {
     uint32_t config_crc;
     uint32_t session_seed;
     LockedMatchConfig config;
+    // Set when a PreMatchState packet arrives (before MatchState/archive).
+    // Lets playback start charsel bootstrap early, in parallel with loading.
+    bool     have_pre_match_state;
+    uint32_t pre_match_id;
+    uint32_t pre_match_ordinal;
+    uint32_t pre_match_config_crc;
+    uint32_t pre_match_session_seed;
+    LockedMatchConfig pre_match_config;
+    char     pre_match_p1_name[64];
+    char     pre_match_p2_name[64];
     char     p1_name[64];
     char     p2_name[64];
     uint16_t p1_wins;

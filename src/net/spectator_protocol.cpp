@@ -14,6 +14,7 @@ const char* PacketTypeName(PacketType type) {
         case PacketType::Heartbeat: return "Heartbeat";
         case PacketType::Disconnect: return "Disconnect";
         case PacketType::ClientStatus: return "ClientStatus";
+        case PacketType::PreMatchState: return "PreMatchState";
         default: return "Unknown";
     }
 }

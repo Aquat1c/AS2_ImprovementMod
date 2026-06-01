@@ -105,6 +105,16 @@ static uint32_t s_streamSessionSeed = 0;
 static char s_p1Name[64] = "P1";
 static char s_p2Name[64] = "P2";
 static bool s_haveMatchState = false;
+// Pre-match state: received when selection is committed, before archive starts.
+// Lets playback begin charsel bootstrap while players are on loading screen.
+static bool s_havePreMatchState = false;
+static uint32_t s_preMatchId = 0;
+static uint32_t s_preMatchOrdinal = 0;
+static LockedMatchConfig s_preMatchConfig{};
+static uint32_t s_preMatchConfigCrc = 0;
+static uint32_t s_preMatchSessionSeed = 0;
+static char s_preMatchP1Name[64] = "P1";
+static char s_preMatchP2Name[64] = "P2";
 static uint16_t s_p1Wins = 0;
 static uint16_t s_p2Wins = 0;
 static uint16_t s_draws = 0;
@@ -452,9 +462,14 @@ static void FailConnection(const char* message) {
         SetError("%s", message);
         SetStatus("%s", message);
         SCLIENT_LOG(LOG_WARNING, s_playbackRbFrame,
-            "[SCLIENT] fail reason=%s endpoint=%s",
+            "[SCLIENT] fail reason=%s endpoint=%s match=0x%08X/%u playback=%d buffered=%u confirmed=%d",
             message,
-            s_endpoint[0] ? s_endpoint : "(unset)");
+            s_endpoint[0] ? s_endpoint : "(unset)",
+            s_matchId,
+            s_matchOrdinal,
+            s_playbackRbFrame,
+            (unsigned)s_bufferedValidFrameCount,
+            s_confirmedContiguousRbFrame);
     }
     if (s_relayServer) {
         DestroyRelayServer(message && message[0] ? message : "upstream failure");
@@ -502,6 +517,14 @@ static void ResetBuffer() {
     CopyText(s_p1Name, sizeof(s_p1Name), "P1");
     CopyText(s_p2Name, sizeof(s_p2Name), "P2");
     s_haveMatchState = false;
+    s_havePreMatchState = false;
+    s_preMatchId = 0;
+    s_preMatchOrdinal = 0;
+    LockedMatchConfig_Clear(&s_preMatchConfig);
+    s_preMatchConfigCrc = 0;
+    s_preMatchSessionSeed = 0;
+    CopyText(s_preMatchP1Name, sizeof(s_preMatchP1Name), "P1");
+    CopyText(s_preMatchP2Name, sizeof(s_preMatchP2Name), "P2");
     s_p1Wins = 0;
     s_p2Wins = 0;
     s_draws = 0;
@@ -2087,6 +2110,43 @@ void SpectatorClient_FrameUpdate() {
                         }
                         break;
 
+                    case Spectator::PacketType::PreMatchState:
+                        if (payloadLen >= sizeof(Spectator::PreMatchStatePayload)) {
+                            const auto* pre = static_cast<const Spectator::PreMatchStatePayload*>(payload);
+                            // Validate: only adopt if config CRC is plausible
+                            const uint32_t verifiedCrc = pre->config_crc != 0
+                                ? pre->config_crc
+                                : ComputeConfigCrc(pre->config);
+                            if (verifiedCrc != 0 && pre->session_seed != 0) {
+                                s_havePreMatchState = true;
+                                s_preMatchId = pre->pre_match_id;
+                                s_preMatchOrdinal = pre->pre_match_ordinal;
+                                s_preMatchConfig = pre->config;
+                                s_preMatchConfigCrc = verifiedCrc;
+                                s_preMatchSessionSeed = pre->session_seed;
+                                CopyText(s_preMatchP1Name, sizeof(s_preMatchP1Name), pre->p1_name);
+                                CopyText(s_preMatchP2Name, sizeof(s_preMatchP2Name), pre->p2_name);
+                                SCLIENT_LOG(LOG_INFO, s_playbackRbFrame,
+                                    "[SCLIENT] pre_match_state endpoint=%s pre_match_id=0x%08X ordinal=%u chars=(%u,%u) stage=%u crc=0x%08X seed=0x%08X",
+                                    s_endpoint[0] ? s_endpoint : "(unset)",
+                                    s_preMatchId,
+                                    s_preMatchOrdinal,
+                                    (unsigned)pre->config.p1_character,
+                                    (unsigned)pre->config.p2_character,
+                                    (unsigned)pre->config.stage_id,
+                                    verifiedCrc,
+                                    pre->session_seed);
+                            } else {
+                                SCLIENT_LOG(LOG_WARNING, s_playbackRbFrame,
+                                    "[SCLIENT] pre_match_state_rejected endpoint=%s reason=%s crc=0x%08X seed=0x%08X",
+                                    s_endpoint[0] ? s_endpoint : "(unset)",
+                                    verifiedCrc == 0 ? "config_crc_zero" : "session_seed_zero",
+                                    verifiedCrc,
+                                    pre->session_seed);
+                            }
+                        }
+                        break;
+
                     case Spectator::PacketType::FrameBatch:
                         if (payloadLen >= offsetof(Spectator::FrameBatchPayload, records)) {
                             const auto* batch = static_cast<const Spectator::FrameBatchPayload*>(payload);
@@ -2280,8 +2340,10 @@ void SpectatorClient_FrameUpdate() {
         s_stateEnteredAt != 0 &&
         (now - s_stateEnteredAt) >= kConnectTimeoutMs) {
         SCLIENT_LOG(LOG_WARNING, s_playbackRbFrame,
-            "[SCLIENT] connect_timeout endpoint=%s",
-            s_endpoint[0] ? s_endpoint : "(unset)");
+            "[SCLIENT] connect_timeout endpoint=%s elapsed_ms=%lu have_pre_match=%d",
+            s_endpoint[0] ? s_endpoint : "(unset)",
+            (unsigned long)(now - s_stateEnteredAt),
+            s_havePreMatchState ? 1 : 0);
         FailConnection("The watch connection timed out.");
         DestroyClientHostNow("connect_timeout");
         return;
@@ -2291,8 +2353,9 @@ void SpectatorClient_FrameUpdate() {
         s_stateEnteredAt != 0 &&
         (now - s_stateEnteredAt) >= kHandshakeTimeoutMs) {
         SCLIENT_LOG(LOG_WARNING, s_playbackRbFrame,
-            "[SCLIENT] handshake_timeout endpoint=%s",
-            s_endpoint[0] ? s_endpoint : "(unset)");
+            "[SCLIENT] handshake_timeout endpoint=%s elapsed_ms=%lu",
+            s_endpoint[0] ? s_endpoint : "(unset)",
+            (unsigned long)(now - s_stateEnteredAt));
         FailConnection("The watch handshake timed out.");
         DestroyClientHostNow("handshake_timeout");
         return;
@@ -2302,9 +2365,14 @@ void SpectatorClient_FrameUpdate() {
         s_lastServerPacketAt != 0 &&
         (now - s_lastServerPacketAt) >= kServerSilenceTimeoutMs) {
         SCLIENT_LOG(LOG_WARNING, s_playbackRbFrame,
-            "[SCLIENT] stream_timeout endpoint=%s last_packet_ms=%lu",
+            "[SCLIENT] stream_timeout endpoint=%s last_packet_ms=%lu match=0x%08X/%u buffered=%u playback=%d confirmed=%d",
             s_endpoint[0] ? s_endpoint : "(unset)",
-            (unsigned long)(now - s_lastServerPacketAt));
+            (unsigned long)(now - s_lastServerPacketAt),
+            s_matchId,
+            s_matchOrdinal,
+            (unsigned)s_bufferedValidFrameCount,
+            s_playbackRbFrame,
+            s_confirmedContiguousRbFrame);
         FailConnection("The live match timed out.");
         DestroyClientHostNow("stream_timeout");
         return;
@@ -2359,6 +2427,14 @@ void SpectatorClient_GetSnapshot(SpectatorClientSnapshot* out) {
     out->match_ordinal = s_matchOrdinal;
     out->have_match_state = s_haveMatchState;
     out->match_active = s_matchActive;
+    out->have_pre_match_state = s_havePreMatchState;
+    out->pre_match_id = s_preMatchId;
+    out->pre_match_ordinal = s_preMatchOrdinal;
+    out->pre_match_config = s_preMatchConfig;
+    out->pre_match_config_crc = s_preMatchConfigCrc;
+    out->pre_match_session_seed = s_preMatchSessionSeed;
+    CopyText(out->pre_match_p1_name, sizeof(out->pre_match_p1_name), s_preMatchP1Name);
+    CopyText(out->pre_match_p2_name, sizeof(out->pre_match_p2_name), s_preMatchP2Name);
     out->config_crc = s_streamConfigCrc != 0
         ? s_streamConfigCrc
         : (s_haveMatchState ? ComputeConfigCrc(s_matchConfig) : 0);

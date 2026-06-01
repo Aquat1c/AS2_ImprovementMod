@@ -542,6 +542,26 @@ static bool BootstrapReady(const SpectatorClientSnapshot& client,
         *outPaletteWaitReason = nullptr;
     }
 
+    // Early bootstrap path: PreMatchState arrived before MatchState/archive.
+    // The selection is committed and the players are now on the loading screen.
+    // Start charsel bootstrap immediately — it runs in parallel with loading so
+    // the spectator finishes setup by the time the archive frames arrive,
+    // eliminating the forced speed-up at gameplay start.
+    if (client.have_pre_match_state &&
+        !client.have_match_state &&
+        client.pre_match_id != 0 &&
+        client.pre_match_config_crc != 0) {
+        // No palette data yet — use base palette (custom will arrive with MatchState)
+        SPLAY_LOG(-1,
+            "Early bootstrap from PreMatchState: pre_match_id=0x%08X ordinal=%u chars=(%u,%u) stage=%u",
+            client.pre_match_id,
+            client.pre_match_ordinal,
+            (unsigned)client.pre_match_config.p1_character,
+            (unsigned)client.pre_match_config.p2_character,
+            (unsigned)client.pre_match_config.stage_id);
+        return true;
+    }
+
     if (!client.have_match_state || client.match_id == 0 || client.config_crc == 0) {
         return false;
     }
@@ -570,6 +590,18 @@ static bool BootstrapReady(const SpectatorClientSnapshot& client,
     return client.confirmed_contiguous_rb_frame >= (kBootstrapStartBufferFrames - 1);
 }
 
+static const LockedMatchConfig& ResolveBootstrapConfig(const SpectatorClientSnapshot& client) {
+    // For early bootstrap (PreMatchState received before MatchState), use the
+    // pre-match config. Once MatchState arrives the two should be identical.
+    return client.have_match_state ? client.config : client.pre_match_config;
+}
+
+static uint32_t ResolveBootstrapOrdinal(const SpectatorClientSnapshot& client) {
+    return client.have_match_state
+        ? (client.match_ordinal != 0 ? client.match_ordinal : 1)
+        : (client.pre_match_ordinal != 0 ? client.pre_match_ordinal : 1);
+}
+
 static void BeginLocalSpectatorLaunch(const SpectatorClientSnapshot& client) {
     NetMenu::HideForLaunch("spectator playback");
     ModeOwnership::SetPendingMenuRestore(false);
@@ -581,12 +613,22 @@ static void BeginLocalSpectatorLaunch(const SpectatorClientSnapshot& client) {
     WriteMemory<uint8_t>(ADDR_STAGESEL_ENABLE, 1);
     ModeOwnership::CallOriginalSetGameMode(MODE_CHARSEL, 1);
     ModeOwnership::ResetCharSelFields();
-    DetVer_SetRngSeed(client.config.session_seed);
-    ApplySpectatorMatchSettings(client.config, "spectator playback launch");
+
+    const LockedMatchConfig& cfg = ResolveBootstrapConfig(client);
+    DetVer_SetRngSeed(cfg.session_seed);
+    ApplySpectatorMatchSettings(cfg, "spectator playback launch");
 
     s_launchIssued = true;
-    SetStatus("Starting watch playback for game %u.",
-        client.match_ordinal != 0 ? client.match_ordinal : 1);
+    const bool earlyStart = client.have_pre_match_state && !client.have_match_state;
+    SetStatus("%sStarting watch playback for game %u.",
+        earlyStart ? "Early " : "",
+        ResolveBootstrapOrdinal(client));
+    if (earlyStart) {
+        SPLAY_LOG(-1,
+            "Early bootstrap launch: pre_match_id=0x%08X ordinal=%u (archive not yet received)",
+            client.pre_match_id,
+            client.pre_match_ordinal);
+    }
 }
 
 static void LogBootstrapState(const SpectatorClientSnapshot& client, const char* reason) {
@@ -607,7 +649,7 @@ static void LogBootstrapState(const SpectatorClientSnapshot& client, const char*
         reason ? reason : "state",
         mode,
         sub,
-        (unsigned)client.config.stage_id,
+        (unsigned)ResolveBootstrapConfig(client).stage_id,
         (unsigned)stageCursor,
         (unsigned)stageConfirmed,
         (unsigned)stageCounter,
@@ -621,8 +663,7 @@ static void LogBootstrapState(const SpectatorClientSnapshot& client, const char*
         s_launchIssued ? 1 : 0);
 }
 
-static void ForceBootstrapStageGridConfirm(const SpectatorClientSnapshot& client, const char* reason) {
-    const uint8_t targetStage = client.config.stage_id;
+static void ForceBootstrapStageGridConfirm(uint8_t targetStage, const char* reason) {
     const uint8_t cursor = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR);
     const uint8_t confirmed = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR + 1);
     const uint8_t counter = ReadMemory<uint8_t>(ADDR_STAGE_CURSOR + 2);
@@ -654,8 +695,7 @@ static void ForceBootstrapStageGridConfirm(const SpectatorClientSnapshot& client
         (unsigned)ReadMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID));
 }
 
-static void ForceBootstrapStageConfirmAccept(const SpectatorClientSnapshot& client, const char* reason) {
-    const uint8_t targetStage = client.config.stage_id;
+static void ForceBootstrapStageConfirmAccept(uint8_t targetStage, const char* reason) {
     const uint8_t menuCursor = ReadMemory<uint8_t>(ADDR_STAGE_CONFIRM_MENU_CURSOR);
     const uint8_t menuAction = ReadMemory<uint8_t>(ADDR_STAGE_CONFIRM_MENU_ACTION);
     const uint8_t cancel = ReadMemory<uint8_t>(ADDR_CHARSEL_CANCEL);
@@ -796,8 +836,13 @@ static void DriveBootstrap(const SpectatorClientSnapshot& client) {
         }
     }
 
-    DetVer_SetRngSeed(client.config.session_seed);
-    UpdateSpectatorPaletteHints(client);
+    const LockedMatchConfig& cfg = ResolveBootstrapConfig(client);
+    DetVer_SetRngSeed(cfg.session_seed);
+    // Only apply palette hints once we have the full match state (palette data
+    // is not sent with PreMatchState — it arrives with MatchState).
+    if (client.have_match_state) {
+        UpdateSpectatorPaletteHints(client);
+    }
 
     if (mode == MODE_MENU) {
         TransitionState(SpectatorPlaybackState::BootstrappingFrontend,
@@ -806,18 +851,22 @@ static void DriveBootstrap(const SpectatorClientSnapshot& client) {
     }
 
     if (mode == MODE_CHARSEL) {
+        // For early bootstrap, custom palette data isn't available yet — use base.
+        // Palette hints will be applied once MatchState arrives.
         bool p1UseCustom = false;
         bool p2UseCustom = false;
-        (void)TryResolveBufferedSpectatorPalette(client, 0, &p1UseCustom, nullptr);
-        (void)TryResolveBufferedSpectatorPalette(client, 1, &p2UseCustom, nullptr);
+        if (client.have_match_state) {
+            (void)TryResolveBufferedSpectatorPalette(client, 0, &p1UseCustom, nullptr);
+            (void)TryResolveBufferedSpectatorPalette(client, 1, &p2UseCustom, nullptr);
+        }
 
         const bool p1Locked = CharSelPaletteSelect_ForceSelectionLocked(0,
-            client.config.p1_character,
-            client.config.p1_palette,
+            cfg.p1_character,
+            cfg.p1_palette,
             p1UseCustom);
         const bool p2Locked = CharSelPaletteSelect_ForceSelectionLocked(1,
-            client.config.p2_character,
-            client.config.p2_palette,
+            cfg.p2_character,
+            cfg.p2_palette,
             p2UseCustom);
 
         if (!p1Locked || !p2Locked) {
@@ -828,19 +877,19 @@ static void DriveBootstrap(const SpectatorClientSnapshot& client) {
                 p2Locked ? 1 : 0,
                 mode,
                 sub,
-                (unsigned)client.config.p1_character,
-                (unsigned)client.config.p1_palette,
+                (unsigned)cfg.p1_character,
+                (unsigned)cfg.p1_palette,
                 p1UseCustom ? 1 : 0,
-                (unsigned)client.config.p2_character,
-                (unsigned)client.config.p2_palette,
+                (unsigned)cfg.p2_character,
+                (unsigned)cfg.p2_palette,
                 p2UseCustom ? 1 : 0);
         }
 
-        WriteMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID, client.config.stage_id);
+        WriteMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID, cfg.stage_id);
 
         if (sub == CHARSEL_SUB_STAGESEL_GRID) {
             ForceBootstrapStageGridConfirm(
-                client,
+                cfg.stage_id,
                 s_bootstrapSubFrames == 0 || (s_bootstrapSubFrames % kBootstrapRetryFrames) == 0
                     ? (s_bootstrapSubFrames == 0 ? "enter stage grid" : "retry stage grid drive")
                     : nullptr);
@@ -851,7 +900,7 @@ static void DriveBootstrap(const SpectatorClientSnapshot& client) {
 
         if (sub == CHARSEL_SUB_STAGESEL_CONFIRM) {
             ForceBootstrapStageConfirmAccept(
-                client,
+                cfg.stage_id,
                 s_bootstrapSubFrames == 0 || (s_bootstrapSubFrames % kBootstrapRetryFrames) == 0
                     ? (s_bootstrapSubFrames == 0 ? "enter stage confirm fallback" : "retry stage confirm fallback")
                     : nullptr);
@@ -907,6 +956,15 @@ static void DriveBootstrap(const SpectatorClientSnapshot& client) {
 }
 
 static void ResetPlayback(const char* reason) {
+    if (s_matchId != 0 || s_localPlaybackRbFrame >= 0) {
+        SPLAY_LOG(s_localPlaybackRbFrame,
+            "Playback reset: reason=%s match=0x%08X/%u last_frame=%d cfg=0x%08X",
+            reason && reason[0] ? reason : "(none)",
+            s_matchId,
+            s_matchOrdinal,
+            s_localPlaybackRbFrame,
+            s_configCrc);
+    }
     ResetLocalSimulationState();
     ClearTrackedIdentity();
     ClearSpectatorPaletteHints();
@@ -921,6 +979,12 @@ static void DisconnectAfterBufferedPlayback(const char* reason) {
     const char* message =
         (reason && reason[0]) ? reason : "The live match ended after local playback finished.";
 
+    SPLAY_LOG(s_localPlaybackRbFrame,
+        "Buffered playback complete — disconnecting: reason=%s last_frame=%d match=0x%08X/%u",
+        message,
+        s_localPlaybackRbFrame,
+        s_matchId,
+        s_matchOrdinal);
     EnterSafeMenuIfNeeded();
     SpectatorClient_Disconnect(message);
     ResetPlayback(message);
@@ -1009,19 +1073,49 @@ void SpectatorPlayback_FrameUpdate() {
     }
 
     if (client.state == SpectatorClientState::ConnectedNoActiveMatch) {
-        EnterSafeMenuIfNeeded();
-        ResetLocalSimulationState();
-        ClearTrackedIdentity();
-        ClearSpectatorPaletteHints();
-        TransitionState(SpectatorPlaybackState::ConnectedNoActiveMatch,
-            "%s",
-            client.status[0] ? client.status : "Connected. Waiting for a live match.");
-        return;
+        // If PreMatchState arrived, the match is starting — fall through to the
+        // bootstrap logic so charsel setup begins immediately. The MatchState
+        // (with archive) will arrive by the time gameplay starts.
+        if (!client.have_pre_match_state) {
+            EnterSafeMenuIfNeeded();
+            ResetLocalSimulationState();
+            ClearTrackedIdentity();
+            ClearSpectatorPaletteHints();
+            TransitionState(SpectatorPlaybackState::ConnectedNoActiveMatch,
+                "%s",
+                client.status[0] ? client.status : "Connected. Waiting for a live match.");
+            return;
+        }
+        // Fall through: have_pre_match_state lets us proceed to bootstrap below.
+        SPLAY_LOG(-1,
+            "Early bootstrap: ConnectedNoActiveMatch -> bootstrap (pre_match_id=0x%08X ordinal=%u chars=(%u,%u) stage=%u)",
+            client.pre_match_id,
+            client.pre_match_ordinal,
+            (unsigned)client.pre_match_config.p1_character,
+            (unsigned)client.pre_match_config.p2_character,
+            (unsigned)client.pre_match_config.stage_id);
     }
 
     HandleSpectatorHotkeys();
 
-    if (!client.have_match_state || client.match_id == 0 || client.config_crc == 0) {
+    // Allow the early bootstrap path through: have_pre_match_state is enough to
+    // start and drive charsel. Once MatchState arrives, adopt identity normally.
+    const bool haveUsableState = client.have_match_state ||
+        (client.have_pre_match_state && client.pre_match_id != 0 && client.pre_match_config_crc != 0);
+
+    if (!haveUsableState) {
+        if (client.have_pre_match_state) {
+            // Pre-match state is present but invalid — log which field is bad.
+            SPLAY_LOG(-1,
+                "Early bootstrap blocked: pre_match_id=0x%08X ordinal=%u cfg_crc=0x%08X seed=0x%08X "
+                "(id_zero=%d crc_zero=%d)",
+                client.pre_match_id,
+                client.pre_match_ordinal,
+                client.pre_match_config_crc,
+                client.pre_match_session_seed,
+                client.pre_match_id == 0 ? 1 : 0,
+                client.pre_match_config_crc == 0 ? 1 : 0);
+        }
         ResetLocalSimulationState();
         ClearTrackedIdentity();
         ClearSpectatorPaletteHints();
@@ -1030,18 +1124,44 @@ void SpectatorPlayback_FrameUpdate() {
         return;
     }
 
-    if (!HasTrackedIdentity()) {
+    // If MatchState just arrived while we are already bootstrapping via an early
+    // PreMatchState, adopt the real identity but do NOT reset the simulation —
+    // the bootstrap is already running and the config must match.
+    if (client.have_match_state && !HasTrackedIdentity()) {
         AdoptTrackedIdentity(client);
-        const bool unsupportedMidMatch = client.buffered_start_rb_frame > 0;
-        TransitionState(
-            unsupportedMidMatch
-                ? SpectatorPlaybackState::WaitingNextMatch
-                : SpectatorPlaybackState::WaitingFullArchive,
-            unsupportedMidMatch
-                ? "This match started before you connected. Waiting for the next full match."
-                : "Waiting for confirmed match data from the start.",
-            client.buffered_start_rb_frame);
-        return;
+        if (IsBootstrappingState(s_state)) {
+            // Already bootstrapping from PreMatchState — apply palette hints now
+            // that we have the full config, and continue without restarting.
+            SPLAY_LOG(s_localPlaybackRbFrame,
+                "MatchState arrived mid-bootstrap: adopting identity 0x%08X/%u, continuing bootstrap",
+                client.match_id,
+                client.match_ordinal);
+            UpdateSpectatorPaletteHints(client);
+            ApplySpectatorMatchSettings(ResolveBootstrapConfig(client),
+                "match state arrived mid early bootstrap");
+        } else {
+            const bool unsupportedMidMatch = client.buffered_start_rb_frame > 0;
+            SPLAY_LOG(-1,
+                "MatchState arrived before bootstrap: match=0x%08X/%u buffered_start=%d mid_match=%d",
+                client.match_id,
+                client.match_ordinal,
+                client.buffered_start_rb_frame,
+                unsupportedMidMatch ? 1 : 0);
+            TransitionState(
+                unsupportedMidMatch
+                    ? SpectatorPlaybackState::WaitingNextMatch
+                    : SpectatorPlaybackState::WaitingFullArchive,
+                unsupportedMidMatch
+                    ? "This match started before you connected. Waiting for the next full match."
+                    : "Waiting for confirmed match data from the start.",
+                client.buffered_start_rb_frame);
+            return;
+        }
+    }
+
+    if (!HasTrackedIdentity() && client.have_pre_match_state) {
+        // Using pre-match identity — don't call AdoptTrackedIdentity yet since
+        // match_id/ordinal are not final. Continue bootstrapping.
     }
 
     if (StreamIdentityChanged(client)) {
@@ -1072,7 +1192,25 @@ void SpectatorPlayback_FrameUpdate() {
         return;
     }
 
-    if (!client.match_active) {
+    // Treat early-bootstrap (pre-match state only) as implicitly active — the
+    // MatchState hasn't arrived yet but we know a match is starting.
+    const bool effectivelyActive = client.match_active ||
+        (client.have_pre_match_state && !client.have_match_state);
+
+    if (!effectivelyActive) {
+        // If we are already bootstrapping, keep going — MatchState will arrive.
+        if (IsBootstrappingState(s_state)) {
+            // match_active went false while in early bootstrap; this is normal
+            // between match end and next PreMatchState/MatchState.
+            SPLAY_LOG(s_localPlaybackRbFrame,
+                "Continuing early bootstrap despite !effectivelyActive: state=%s have_pre=%d have_match=%d",
+                StateNameInternal(s_state),
+                client.have_pre_match_state ? 1 : 0,
+                client.have_match_state ? 1 : 0);
+            DriveBootstrap(client);
+            return;
+        }
+
         if (HasConfirmedTailToDrain(client)) {
             UpdateLivePlayback(client);
             return;
@@ -1133,7 +1271,7 @@ void SpectatorPlayback_FrameUpdate() {
         BeginLocalSpectatorLaunch(client);
         TransitionState(SpectatorPlaybackState::BootstrappingFrontend,
             "Starting watch playback for game %u.",
-            client.match_ordinal != 0 ? client.match_ordinal : 1);
+            ResolveBootstrapOrdinal(client));
         return;
     }
 

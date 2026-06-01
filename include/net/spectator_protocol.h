@@ -15,7 +15,7 @@
 
 namespace Net::Spectator {
 
-constexpr uint16_t PROTOCOL_VERSION = 7;
+constexpr uint16_t PROTOCOL_VERSION = 8;
 constexpr int MAX_PACKET_SIZE = 1200;
 constexpr int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;
 constexpr int MAX_FRAME_BATCH = 32;
@@ -38,6 +38,10 @@ enum class PacketType : uint16_t {
     Heartbeat = 8,
     Disconnect = 9,
     ClientStatus = 10,
+    // Sent when selection is committed (both chars + stage locked), before loading
+    // starts. Lets spectators begin charsel bootstrap in parallel with the players'
+    // loading screen so there is no forced speed-up at gameplay start.
+    PreMatchState = 11,
 };
 
 enum MatchStateKind : uint8_t {
@@ -95,6 +99,19 @@ struct MatchStatePayload {
     uint16_t completed_matches;
     uint16_t session_listen_port;
     uint16_t _pad1;
+    LockedMatchConfig config;
+    char p1_name[64];
+    char p2_name[64];
+};
+
+// PreMatchState: sent when both players' selection is committed (chars + stage
+// locked), BEFORE the loading screen. Spectators can start charsel bootstrap
+// immediately so they finish setup by the time gameplay archive frames arrive.
+struct PreMatchStatePayload {
+    uint32_t pre_match_id;      // provisional ID — same value OnMatchBegin will use
+    uint32_t pre_match_ordinal; // provisional ordinal
+    uint32_t config_crc;
+    uint32_t session_seed;
     LockedMatchConfig config;
     char p1_name[64];
     char p2_name[64];
