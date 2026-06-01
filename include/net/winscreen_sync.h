@@ -1,10 +1,9 @@
 /**
  * Alice Senki 2 - Win Screen Lockstep Synchronization
  *
- * Mode 9 is input-driven across multiple substates, not just one confirm gate.
- * This module provides per-frame lockstep input exchange so both peers consume
- * identical P1/P2 inputs throughout WinScreenActive, preventing post-match
- * desync before rematch / return routing.
+ * Mode 9 is input-driven across multiple substates. Lockstep begins at MatchEnd
+ * (Mode 8 sub 5) so both peers stay aligned through the Mode 9 fade-in, and one
+ * player's skip input propagates to both sides like offline behavior.
  */
 
 #pragma once

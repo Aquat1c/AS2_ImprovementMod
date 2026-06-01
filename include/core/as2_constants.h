@@ -312,6 +312,12 @@
 #define ADDR_GAME_HWND           0x9DB648
 #define ADDR_SYS_GET_WINDOW_HANDLE ADDR_WINDOW_GET_HANDLE
 
+// sub_634910 — DXLib message-pump idle gate. When uiParam (window active) is 0 the
+// game thread spins until focus returns, freezing netplay post-match phases.
+#define ADDR_GAME_MESSAGE_PUMP_IDLE (GAME_BASE + 0x234910)  // sub_634910
+#define ADDR_GAME_WINDOW_ACTIVE       0x9DB6A4                // uiParam (WM_ACTIVATE)
+#define ADDR_GAME_RUN_IN_BACKGROUND   0x9E5CA0                // g_bRunInBackground
+
 #define ADDR_DINPUT_KB_REFRESH  (GAME_BASE + 0x230130)
 #define ADDR_DINPUT_JOY_REFRESH (GAME_BASE + 0x2302F0)
 

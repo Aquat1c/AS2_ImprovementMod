@@ -980,16 +980,24 @@ static void CheckLifecyclePhase() {
             StopRollbackSession("match ended (non-gameplay)");
         }
 
+        // Begin win-screen lockstep as soon as the match ends so both peers stay
+        // aligned through the Mode 8 -> Mode 9 transition and fade-in substates.
+        if (curPhase == Net::MatchLifecyclePhase::MatchEnd &&
+            s_lastLifecyclePhase != Net::MatchLifecyclePhase::MatchEnd) {
+            Net::WinScreenSync_Begin();
+            NetplayLog_Write("LIFE", -1,
+                "Match ended — win-screen lockstep armed before Mode 9 entry");
+        }
+
         // Disconnect from any state
         if (curPhase == Net::MatchLifecyclePhase::DisconnectRecovery && s_rollbackActive) {
             StopRollbackSession("disconnect");
         }
 
-        // Entering WinScreenActive — begin win screen sync
+        // Entering WinScreenActive — palette cleanup only (lockstep already armed at MatchEnd)
         if (curPhase == Net::MatchLifecyclePhase::WinScreenActive &&
             s_lastLifecyclePhase != Net::MatchLifecyclePhase::WinScreenActive) {
             Net::NetplayPaletteRuntime_OnWinScreenEnter();
-            Net::WinScreenSync_Begin();
             NetplayLog_Write("LIFE", -1,
                 "Win screen entered — rollback gameplay session detached, post-match lockstep active");
         }
@@ -1281,8 +1289,9 @@ void OnlineWiring_FrameUpdate() {
         }
     }
 
-    // Drive win screen sync when in win screen phase
-    if (curPhase == Net::MatchLifecyclePhase::WinScreenActive) {
+    // Drive win screen sync through match-end transition and win screen phase.
+    if (curPhase == Net::MatchLifecyclePhase::MatchEnd ||
+        curPhase == Net::MatchLifecyclePhase::WinScreenActive) {
         if (!Net::WinScreenSync_FrameUpdate()) {
             Net::MatchLifecycle_OnDisconnect("winscreen lockstep timeout");
         }

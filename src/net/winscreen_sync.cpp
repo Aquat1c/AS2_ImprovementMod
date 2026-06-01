@@ -8,6 +8,7 @@
 #include "net/winscreen_sync.h"
 
 #include "net/frontend_input_sync.h"
+#include "net/match_lifecycle.h"
 #include "net/session_manager.h"
 #include "core/game_state.h"
 #include "input/input_system.h"
@@ -21,7 +22,7 @@ using namespace Net;
 static bool s_initialized = false;
 static bool s_active = false;
 static bool s_isHost = false;
-static bool s_advanceGateReleased = false;
+static bool s_loggedSkipPropagate = false;
 
 constexpr uint16_t WINSCREEN_ADVANCE_MASK = (uint16_t)(INPUT_A | INPUT_C | INPUT_START);
 constexpr int PENDING_WINSCREEN_FRAME_INPUTS = 64;
@@ -34,10 +35,20 @@ static bool IsAdvanceIntent(uint16_t packedInput) {
     return (packedInput & WINSCREEN_ADVANCE_MASK) != 0;
 }
 
+static bool IsWinScreenLockstepRoute() {
+    const uint32_t mode = GetGameMode();
+    if (mode == MODE_WINSCREEN) {
+        return true;
+    }
+    return mode == MODE_MATCH &&
+           GetSubstate() == MATCH_SUB_END &&
+           MatchLifecycle_GetPhase() == MatchLifecyclePhase::MatchEnd;
+}
+
 static void ResetRuntimeState() {
     s_active = false;
     s_isHost = false;
-    s_advanceGateReleased = false;
+    s_loggedSkipPropagate = false;
 }
 
 static void ClearPendingRemoteFrames() {
@@ -54,7 +65,7 @@ static bool IsPendingCandidate(const WinScreenFrameInputPayload* p) {
     if (!p || s_active || !s_initialized) {
         return false;
     }
-    if (GetGameMode() != MODE_WINSCREEN) {
+    if (!IsWinScreenLockstepRoute()) {
         return false;
     }
     if (p->phase != (uint16_t)FrontendSyncPhase::WinScreen) {
@@ -145,6 +156,9 @@ void WinScreenSync_Begin() {
     if (!s_initialized) {
         return;
     }
+    if (s_active) {
+        return;
+    }
     if (!FrontendInputSync_IsDelayNegotiated()) {
         FrontendInputSync_RequestRecovery("winscreen began without a negotiated frontend delay");
         LOG_NETPLAY(LOG_WARNING, "[WinScreenSync] Begin rejected: no negotiated frontend delay");
@@ -195,7 +209,7 @@ bool WinScreenSync_FrameUpdate() {
         return false;
     }
 
-    if (GetGameMode() != MODE_WINSCREEN) {
+    if (!IsWinScreenLockstepRoute()) {
         WinScreenSync_Abort();
         return false;
     }
@@ -243,35 +257,20 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         FrontendInputSync_ReportRemoteAdvanceIntent(1);
     }
 
-    const bool releaseRequested =
-        s_advanceGateReleased ||
-        localAdvance ||
-        remoteAdvance ||
-        FrontendInputSync_LocalAdvanceObserved() ||  // raw press already signaled this frame
-        FrontendInputSync_RemoteAdvanceObserved();
-
-    if (!releaseRequested) {
-        if (localAdvance || remoteAdvance) {
-            Rollback::NetplayLog_Verbose(
-                "WINLOCK", -1,
-                "Holding win-screen advance: local_adv=%d remote_adv=%d",
-                FrontendInputSync_LocalAdvanceObserved() ? 1 : 0,
-                FrontendInputSync_RemoteAdvanceObserved() ? 1 : 0);
-        }
-        localInput = (uint16_t)(localInput & (uint16_t)~WINSCREEN_ADVANCE_MASK);
-        remoteInput = (uint16_t)(remoteInput & (uint16_t)~WINSCREEN_ADVANCE_MASK);
-    } else {
-        if (!s_advanceGateReleased) {
-            s_advanceGateReleased = true;
+    // Offline either player can skip; mirror that in netplay by propagating one
+    // side's skip intent to both synchronized input streams.
+    if (localAdvance || remoteAdvance) {
+        if (!s_loggedSkipPropagate) {
+            s_loggedSkipPropagate = true;
             Rollback::NetplayLog_Write(
                 "WINLOCK", -1,
-                "Win-screen advance gate released: local_adv=%d remote_adv=%d requester=%s",
-                FrontendInputSync_LocalAdvanceObserved() ? 1 : 0,
-                FrontendInputSync_RemoteAdvanceObserved() ? 1 : 0,
-                localAdvance ? "local" : (remoteAdvance ? "remote" : "legacy"));
+                "Win-screen skip propagated to both sides: local_adv=%d remote_adv=%d requester=%s",
+                localAdvance ? 1 : 0,
+                remoteAdvance ? 1 : 0,
+                localAdvance ? "local" : "remote");
         }
-        localInput = (uint16_t)(localInput | INPUT_A);
-        remoteInput = (uint16_t)(remoteInput | INPUT_A);
+        localInput = (uint16_t)(localInput | WINSCREEN_ADVANCE_MASK);
+        remoteInput = (uint16_t)(remoteInput | WINSCREEN_ADVANCE_MASK);
     }
 
     if (s_isHost) {
@@ -285,15 +284,11 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
 }
 
 void WinScreenSync_NotifyLocalRawAdvance(uint16_t rawInput) {
-    if (!s_active || s_advanceGateReleased) {
+    if (!s_active) {
         return;
     }
     if (IsAdvanceIntent(rawInput)) {
         FrontendInputSync_ReportLocalAdvanceIntent(rawInput);
-        Rollback::NetplayLog_Write(
-            "WINLOCK", -1,
-            "Raw local advance intent: input=0x%04X gate not yet released",
-            rawInput);
     }
 }
 

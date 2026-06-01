@@ -9,6 +9,7 @@
 #include "patches/charsel_select_actions.h"
 #include "patches/render_guard.h"
 #include "patches/session_pump_hook.h"
+#include "patches/netplay_background_run.h"
 #include "patches/shell_hotkey_patch.h"
 #include "replay/replay_runtime.h"
 #include "rollback/rollback_audio.h"
@@ -342,6 +343,10 @@ bool InstallHooks() {
     if (!ShellHotkeyPatch_Install()) {
         LOG_WARN("Failed to install game wndproc shell hotkey patch (continuing anyway)");
     }
+
+    if (!NetplayBackgroundRun::InstallHook()) {
+        LOG_WARN("Failed to install netplay inactive-window bypass hook (continuing anyway)");
+    }
     
     // --- Enable all hooks ---
     
@@ -372,6 +377,7 @@ bool InstallHooks() {
 
 void RemoveHooks() {
     LOG_INFO("Removing hooks...");
+    NetplayBackgroundRun::Shutdown();
     ShellHotkeyPatch_Remove();
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();

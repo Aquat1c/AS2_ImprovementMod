@@ -277,6 +277,7 @@ set(PATCH_HEADERS
     include/patches/charsel_select_actions.h
     include/patches/render_guard.h
     include/patches/session_pump_hook.h
+    include/patches/netplay_background_run.h
 )
 
 # Dead NETPLAY_HEADERS removed — old src/netplay/ code was moved to old_files/
@@ -393,6 +394,7 @@ set(PATCH_SOURCES
     src/patches/input_sync_hooks.cpp
     src/patches/render_guard.cpp
     src/patches/session_pump_hook.cpp
+    src/patches/netplay_background_run.cpp
     src/patches/tick_hooks.cpp
     src/patches/hook_installer.cpp
 )

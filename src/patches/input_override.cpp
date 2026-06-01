@@ -3543,27 +3543,35 @@ int __cdecl Hook_InputProcess(int gameState) {
     }
 
     // Sub 3 is the first interactive substate — subs 0-2 are non-interactive
-    // animations (route detection, asset load, 25-frame fade-in). The lockstep
-    // begins capturing immediately on Mode 9 entry so the buffer is pre-filled
-    // by the time sub 3 is reached, but frame advancement is only blocked in
-    // sub 3+ where player input actually matters.
+    // animations (route detection, asset load, 25-frame fade-in). Lockstep still
+    // consumes every frame during 0-2 so both peers stay aligned before input matters.
     static constexpr uint32_t WINSCREEN_INTERACTIVE_SUB = 3;
 
-    if (gameMode == MODE_WINSCREEN &&
+    const bool winScreenRoute =
+        gameMode == MODE_WINSCREEN ||
+        (gameMode == MODE_MATCH &&
+         subState == MATCH_SUB_END &&
+         Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::MatchEnd);
+
+    if (winScreenRoute &&
         !Net::WinScreenSync_IsActive() &&
         Net::MatchLifecycle_IsMatchOwned() &&
         Net::Session_IsConnected()) {
         Rollback::NetplayLog_Write("WINLOCK", -1,
-            "InputProcess activating winscreen lockstep on-demand (mode=%u sub=%u)",
-            gameMode, subState);
+            "InputProcess activating winscreen lockstep on-demand (mode=%u sub=%u phase=%s)",
+            gameMode,
+            subState,
+            Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
         Net::WinScreenSync_Begin();
     }
 
     if (Net::WinScreenSync_IsActive()) {
-        if (gameMode != MODE_WINSCREEN) {
+        if (!winScreenRoute) {
             Rollback::NetplayLog_Write("WINLOCK", -1,
-                "InputProcess lockstep abort request: sync active outside Mode 9 (mode=%u sub=%u)",
-                gameMode, subState);
+                "InputProcess lockstep abort request: sync active outside win-screen route (mode=%u sub=%u phase=%s)",
+                gameMode,
+                subState,
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
             Net::WinScreenSync_Abort();
             clearLiveInputBuffers();
             resetWinScreenProcessState();
@@ -3583,7 +3591,7 @@ int __cdecl Hook_InputProcess(int gameState) {
 
         const uint32_t absFrame = ReadMemory<uint32_t>(ADDR_FRAME_COUNTER);
         if (absFrame == s_winscreenLastProcessFrame) {
-            if (subState < WINSCREEN_INTERACTIVE_SUB) {
+            if (gameMode == MODE_WINSCREEN && subState < WINSCREEN_INTERACTIVE_SUB) {
                 clearLiveInputBuffers();
             } else if (s_winscreenFrameProduced) {
                 writeLiveInputBuffers(
@@ -3601,18 +3609,11 @@ int __cdecl Hook_InputProcess(int gameState) {
         const uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
         Net::WinScreenSync_CaptureLocalInput(localInput);
 
-        if (subState < WINSCREEN_INTERACTIVE_SUB) {
-            // Animation substates 0-2: feed local input into the queue so the
-            // buffer fills while the fade-in plays, but don't block on remote.
-            // The game ignores input entirely during these substates.
-            clearLiveInputBuffers();
-            return result;
+        const bool writeInputsToGame =
+            gameMode == MODE_WINSCREEN && subState >= WINSCREEN_INTERACTIVE_SUB;
+        if (writeInputsToGame) {
+            Net::WinScreenSync_NotifyLocalRawAdvance(localInput);
         }
-
-        // Interactive sub 3+: signal raw local advance intent before the
-        // consume step so the gate releases this frame, not shared_delay frames
-        // later, matching the responsiveness of offline win screen skipping.
-        Net::WinScreenSync_NotifyLocalRawAdvance(localInput);
 
         if (!Net::WinScreenSync_HasInputsForCurrentFrame()) {
             s_winscreenFrameProduced = false;
@@ -3623,10 +3624,11 @@ int __cdecl Hook_InputProcess(int gameState) {
             s_winscreenWaitCount++;
             if (s_winscreenWaitCount <= 5 || (s_winscreenWaitCount % 120) == 0) {
                 Rollback::NetplayLog_Write("WINLOCK", -1,
-                    "InputProcess waiting for remote frame: wait#%u consume=%u remote_latest=%u sub=%u",
+                    "InputProcess waiting for remote frame: wait#%u consume=%u remote_latest=%u mode=%u sub=%u",
                     s_winscreenWaitCount,
                     Net::WinScreenSync_GetConsumeFrame(),
                     Net::WinScreenSync_GetRemoteLatestFrame(),
+                    gameMode,
                     subState);
             }
             clearLiveInputBuffers();
@@ -3647,6 +3649,19 @@ int __cdecl Hook_InputProcess(int gameState) {
 
         s_winscreenDispatchCount++;
         s_winscreenWaitCount = 0;
+
+        if (!writeInputsToGame) {
+            clearLiveInputBuffers();
+            if (s_winscreenDispatchCount <= 5 || (s_winscreenDispatchCount % 120) == 0) {
+                Rollback::NetplayLog_Write("WINLOCK", -1,
+                    "InputProcess sync-only frame#%u mode=%u sub=%u abs=%u",
+                    s_winscreenDispatchCount,
+                    gameMode,
+                    subState,
+                    absFrame);
+            }
+            return result;
+        }
 
         const uint16_t justP1 = p1 & ~s_winscreenPrevP1;
         const uint16_t justP2 = p2 & ~s_winscreenPrevP2;
