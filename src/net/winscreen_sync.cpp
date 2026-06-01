@@ -204,10 +204,10 @@ bool WinScreenSync_FrameUpdate() {
     if (FrontendInputSync_HasRecoveryRequest()) {
         Rollback::NetplayLog_Write(
             "WINLOCK", -1,
-            "Frontend recovery requested during winscreen; keeping session alive and clearing local recovery flag: %s",
+            "Win-screen frontend timeout; aborting lockstep: %s",
             FrontendInputSync_GetRecoveryReason());
-        FrontendInputSync_ClearRecoveryRequest();
-        return true;
+        WinScreenSync_Abort();  // clears recovery request via EndPhase
+        return false;           // caller must disconnect
     }
     return true;
 }
@@ -247,6 +247,7 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         s_advanceGateReleased ||
         localAdvance ||
         remoteAdvance ||
+        FrontendInputSync_LocalAdvanceObserved() ||  // raw press already signaled this frame
         FrontendInputSync_RemoteAdvanceObserved();
 
     if (!releaseRequested) {
@@ -281,6 +282,19 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         *outP2 = localInput;
     }
     return true;
+}
+
+void WinScreenSync_NotifyLocalRawAdvance(uint16_t rawInput) {
+    if (!s_active || s_advanceGateReleased) {
+        return;
+    }
+    if (IsAdvanceIntent(rawInput)) {
+        FrontendInputSync_ReportLocalAdvanceIntent(rawInput);
+        Rollback::NetplayLog_Write(
+            "WINLOCK", -1,
+            "Raw local advance intent: input=0x%04X gate not yet released",
+            rawInput);
+    }
 }
 
 bool WinScreenSync_IsActive() {

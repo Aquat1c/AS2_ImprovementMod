@@ -52,6 +52,11 @@ bool WinScreenSync_HasInputsForCurrentFrame();
 /// Host maps local→P1, join maps local→P2.
 bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2);
 
+/// Signal local advance intent from raw (non-delay-buffered) input so the
+/// gate is released this frame instead of shared_delay frames later.
+/// Safe to call every frame in the interactive sub — no-op if gate already open.
+void WinScreenSync_NotifyLocalRawAdvance(uint16_t rawInput);
+
 // ============================================================================
 // Queries
 // ============================================================================

@@ -1154,7 +1154,26 @@ void NetplayPaletteRuntime_OnWinScreenEnter() {
 }
 
 void NetplayPaletteRuntime_OnMatchEnd(const char* reason) {
+    // Capture which slots have a visual override applied before zeroing player
+    // state, so that game memory (palette table) is cleaned up even on paths
+    // that don't go through the win-screen (e.g. mid-match disconnect).
+    bool queueReload[2] = {};
+    if (s_matchActive) {
+        for (int slot = 0; slot < 2; ++slot) {
+            queueReload[slot] = HasVisualOverrideForGameSlot(slot) &&
+                                s_player[slot].asset_loaded;
+        }
+    }
+
     ResetMatchState(reason ? reason : "match ended");
+
+    // Re-arm the reload flags after reset so PaletteAssetHook_FrameUpdate
+    // clears the custom palette from game memory on the next frame.
+    for (int slot = 0; slot < 2; ++slot) {
+        if (queueReload[slot]) {
+            s_liveReloadRequested[slot] = true;
+        }
+    }
 }
 
 void NetplayPaletteRuntime_OnDisconnect(const char* reason) {
@@ -1181,6 +1200,14 @@ void NetplayPaletteRuntime_OnDisconnect(const char* reason) {
             remoteReloadSlot + 1,
             reason ? reason : "disconnect");
     }
+
+    // Invalidate the storage cache so the next session always reads palette
+    // availability fresh from disk. Prevents stale catalog masks being sent
+    // to a new opponent when palette files have changed between sessions.
+    NetplayPaletteStorage_ClearCache();
+    Rollback::NetplayLog_Write("PALETTE", -1,
+        "Palette storage cache cleared on disconnect: reason=%s",
+        reason ? reason : "disconnect");
 }
 
 void NetplayPaletteRuntime_OnRemoteConfig(const PaletteConfigPayload* payload) {

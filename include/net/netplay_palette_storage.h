@@ -19,6 +19,10 @@ struct NetplayPalettePresetInfo {
 void NetplayPaletteStorage_Init();
 void NetplayPaletteStorage_Shutdown();
 
+// Invalidate the in-memory load cache. Call between ENet sessions so that the
+// next catalog build and palette exchange always reads fresh data from disk.
+void NetplayPaletteStorage_ClearCache();
+
 bool NetplayPaletteStorage_GetBank(uint8_t character_id,
                                    uint8_t base_palette,
                                    NetplayPaletteBank* out);

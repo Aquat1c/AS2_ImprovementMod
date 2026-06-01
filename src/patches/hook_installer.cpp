@@ -9,6 +9,7 @@
 #include "patches/charsel_select_actions.h"
 #include "patches/render_guard.h"
 #include "patches/session_pump_hook.h"
+#include "patches/shell_hotkey_patch.h"
 #include "replay/replay_runtime.h"
 #include "rollback/rollback_audio.h"
 #include "rollback/rollback_combo_fx.h"
@@ -137,7 +138,7 @@ bool InstallHooks() {
         LOG_INFO("Shell hotkey/IME workarounds disabled - skipping GetProcAddress/SystemParametersInfoA/WINNLSEnableIME hooks");
     }
 
-    if (enableSystemKeyWorkarounds) {
+    if (enableShellHotkeyImeWorkarounds) {
         void* dinputSetCooperativeLevelTarget = InputOverride_GetDInputKeyboardSetCooperativeLevelTarget();
         if (!dinputSetCooperativeLevelTarget) {
             LOG_WARN("Failed to locate DInput keyboard SetCooperativeLevel (continuing anyway)");
@@ -149,11 +150,11 @@ bool InstallHooks() {
             if (status != MH_OK) {
                 LOG_WARN("Failed to hook DInput keyboard SetCooperativeLevel! Status: %d (continuing anyway)", status);
             } else {
-                LOG_INFO("Hooked DInput keyboard SetCooperativeLevel (system-key workaround)");
+                LOG_INFO("Hooked DInput keyboard SetCooperativeLevel (shell/layout workaround)");
             }
         }
     } else {
-        LOG_INFO("System-key DInput workaround disabled - skipping SetCooperativeLevel hook");
+        LOG_INFO("Shell/layout DInput cooperative-level workaround disabled - skipping SetCooperativeLevel hook");
     }
     
     LOG_INFO("ADDR_INPUT_PROCESS = 0x%08X (sub_562060)", ADDR_INPUT_PROCESS);
@@ -337,6 +338,10 @@ bool InstallHooks() {
     if (!Replay::ReplayRuntime_InstallHooks()) {
         LOG_WARN("Failed to install replay save hook (continuing anyway)");
     }
+
+    if (!ShellHotkeyPatch_Install()) {
+        LOG_WARN("Failed to install game wndproc shell hotkey patch (continuing anyway)");
+    }
     
     // --- Enable all hooks ---
     
@@ -367,6 +372,7 @@ bool InstallHooks() {
 
 void RemoveHooks() {
     LOG_INFO("Removing hooks...");
+    ShellHotkeyPatch_Remove();
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
 }

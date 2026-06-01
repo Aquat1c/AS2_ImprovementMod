@@ -14,6 +14,7 @@
 #include "core/as2_constants.h"
 #include "net/locked_match_config.h"
 #include "patches/memory_utils.h"
+#include "patches/input_override.h"
 #include "patches/tick_hooks.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
@@ -356,6 +357,9 @@ static bool SavePersistentSettings(const char* reason) {
     BytesToHex(s_persistedBlockA, sizeof(s_persistedBlockA), blockA, sizeof(blockA));
     BytesToHex(s_persistedBlockB, sizeof(s_persistedBlockB), blockB, sizeof(blockB));
 
+    InputGuardIniSnapshot inputGuard = {};
+    InputOverride_GetIniSnapshot(&inputGuard);
+
     FILE* file = nullptr;
     if (_wfopen_s(&file, s_settingsPathW, L"wb") != 0 || !file) {
         SetStatus("Failed to save local settings.");
@@ -374,6 +378,18 @@ static bool SavePersistentSettings(const char* reason) {
         "[ModSettings]\r\n"
         "; proper_60fps: 1 corrects the native 17ms limiter to 60.000fps; 0 keeps vanilla ~58.8fps\r\n"
         "proper_60fps=%d\r\n"
+        "; input_guard_shell_hotkeys_ime: 1 clears vanilla Win/Alt+Shift suppression hooks\r\n"
+        "input_guard_shell_hotkeys_ime=%d\r\n"
+        "; input_guard_system_keys: 1 strips Win/Apps from DInput/GetKeyboardState polls\r\n"
+        "input_guard_system_keys=%d\r\n"
+        "; input_guard_diag_interval_sec: periodic InputGuard DIAG log interval (0=off)\r\n"
+        "input_guard_diag_interval_sec=%u\r\n"
+        "; input_guard_hotkey_trace: 1 logs WM_* shell keys + enables async Win poll trace\r\n"
+        "input_guard_hotkey_trace=%d\r\n"
+        "; input_guard_swallow_trace: 1 logs DInput strips and wndproc swallow classification\r\n"
+        "input_guard_swallow_trace=%d\r\n"
+        "; input_guard_dinput_unacquire_test: 1 continuously unacquires DInput kb+mouse (diagnostic for Win/Alt+Shift/middle-click)\r\n"
+        "input_guard_dinput_unacquire_test=%d\r\n"
         "\r\n"
         "[GameSettings]\r\n"
         "; difficulty: 0=easy, 1=normal, 2=hard\r\n"
@@ -397,6 +413,12 @@ static bool SavePersistentSettings(const char* reason) {
         "settings_block_a=%s\r\n"
         "settings_block_b=%s\r\n",
         TickHooks_GetFrameLimiter60FpsPreferenceEnabled() ? 1 : 0,
+        inputGuard.shell_hotkeys_ime ? 1 : 0,
+        inputGuard.system_keys ? 1 : 0,
+        inputGuard.diag_interval_sec,
+        inputGuard.hotkey_trace ? 1 : 0,
+        inputGuard.swallow_trace ? 1 : 0,
+        inputGuard.dinput_unacquire_test ? 1 : 0,
         ReadMemory<uint8_t>(kGameOptionDifficulty),
         GameSettingsSync_RoundsToWin(s_persistedRoundOption),
         ReadMemory<uint8_t>(ADDR_STAGESEL_ENABLE),

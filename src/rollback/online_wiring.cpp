@@ -43,6 +43,7 @@
 #include "net/pause_handler.h"
 #include "net/spectator_runtime.h"
 #include "net/netplay_palette_runtime.h"
+#include "patches/charsel_palette_select.h"
 #include "input/input_system.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
@@ -1282,7 +1283,9 @@ void OnlineWiring_FrameUpdate() {
 
     // Drive win screen sync when in win screen phase
     if (curPhase == Net::MatchLifecyclePhase::WinScreenActive) {
-        Net::WinScreenSync_FrameUpdate();
+        if (!Net::WinScreenSync_FrameUpdate()) {
+            Net::MatchLifecycle_OnDisconnect("winscreen lockstep timeout");
+        }
     }
 
     // Drive pause handler when session is owned
@@ -1424,6 +1427,7 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     Net::FrontendInputSync_AbortEpoch(reason ? reason : "disconnect");
     Net::SpectatorRuntime_OnDisconnect(reason ? reason : "disconnect");
     Net::NetplayPaletteRuntime_OnDisconnect(reason ? reason : "disconnect");
+    Net::CharSelPaletteSelect_ResetNetplaySessionState(reason ? reason : "disconnect");
 
     // Reset set tracker on session end
     Net::SetTracker_Reset();

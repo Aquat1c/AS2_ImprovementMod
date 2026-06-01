@@ -4,7 +4,9 @@
 #include "net/match_lifecycle.h"
 #include "net/session_manager.h"
 #include "rollback/netplay_log.h"
+#include "ui/log_window.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <string.h>
 #include <windows.h>
@@ -21,8 +23,12 @@ static DWORD s_lastPumpTick = 0;
 static uint32_t s_assetCallCount = 0;
 static uint32_t s_pumpCount = 0;
 static uint32_t s_skippedTooSoon = 0;
+static uint32_t s_startupAssetTraceCount = 0;
+static bool s_startupTraceReachedTitle = false;
+static DWORD s_startupTraceBeginTick = 0;
 
 constexpr DWORD kMinPumpIntervalMs = 4;
+constexpr uint32_t kMaxStartupAssetTraceLines = 512;
 
 static bool IsWinScreenArchive(const char* archive) {
     return archive &&
@@ -36,6 +42,64 @@ static bool IsPumpableLifecycle(MatchLifecyclePhase phase) {
            phase == MatchLifecyclePhase::PostMatchRoute ||
            phase == MatchLifecyclePhase::ReturningToCharSel ||
            phase == MatchLifecyclePhase::ReturningToMenu;
+}
+
+static bool ContainsInsensitive(const char* haystack, const char* needle) {
+    if (!haystack || !needle || !needle[0]) {
+        return false;
+    }
+
+    const size_t needleLen = strlen(needle);
+    if (needleLen == 0) {
+        return false;
+    }
+
+    for (const char* p = haystack; *p; ++p) {
+        size_t i = 0;
+        while (p[i] && i < needleLen &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            ++i;
+        }
+        if (i == needleLen) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void TraceStartupAssetLoad(const char* archive,
+                                  const char* patch,
+                                  int assetIndex,
+                                  int patchIndex) {
+    if (s_startupTraceReachedTitle || s_startupAssetTraceCount >= kMaxStartupAssetTraceLines) {
+        return;
+    }
+
+    const bool titleHit =
+        ContainsInsensitive(archive, "tit.bin") ||
+        ContainsInsensitive(patch, "tit.bin");
+    const DWORD elapsed = GetTickCount() - s_startupTraceBeginTick;
+
+    ++s_startupAssetTraceCount;
+    LOG_INFO("[STARTUPTRACE][AssetLoad] #%u +%lums archive='%s' patch='%s' asset=%d patch_idx=%d mode=%u sub=%u phase=%s title_hit=%d",
+             s_startupAssetTraceCount,
+             (unsigned long)elapsed,
+             archive ? archive : "",
+             patch ? patch : "",
+             assetIndex,
+             patchIndex,
+             (unsigned)GetGameMode(),
+             (unsigned)GetSubstate(),
+             MatchLifecyclePhaseName(MatchLifecycle_GetPhase()),
+             titleHit ? 1 : 0);
+
+    if (titleHit) {
+        s_startupTraceReachedTitle = true;
+        LOG_INFO("[STARTUPTRACE] Reached title marker via Asset_LoadFromArchive at +%lums after %u loads",
+                 (unsigned long)elapsed,
+                 s_startupAssetTraceCount);
+    }
 }
 
 static void MaybePumpSession(const char* stage,
@@ -94,6 +158,10 @@ void SessionPumpHook_Init() {
     s_assetCallCount = 0;
     s_pumpCount = 0;
     s_skippedTooSoon = 0;
+    s_startupAssetTraceCount = 0;
+    s_startupTraceReachedTitle = false;
+    s_startupTraceBeginTick = GetTickCount();
+    LOG_INFO("[STARTUPTRACE] SessionPumpHook init (tracking Asset_LoadFromArchive until tit.bin)");
 }
 
 void SessionPumpHook_Shutdown() {
@@ -106,6 +174,7 @@ int __cdecl Hook_Asset_LoadFromArchive(const char* archive,
                                         int assetIndex,
                                         int patchIndex) {
     ++s_assetCallCount;
+    TraceStartupAssetLoad(archive, patch, assetIndex, patchIndex);
     const bool isWinScreenContext = IsWinScreenArchive(archive);
 
     MaybePumpSession("before", isWinScreenContext, assetIndex, patchIndex);

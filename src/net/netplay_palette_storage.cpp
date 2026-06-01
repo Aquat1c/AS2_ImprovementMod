@@ -223,6 +223,10 @@ void NetplayPaletteStorage_Shutdown() {
     memset(s_entries, 0, sizeof(s_entries));
 }
 
+void NetplayPaletteStorage_ClearCache() {
+    memset(s_entries, 0, sizeof(s_entries));
+}
+
 bool NetplayPaletteStorage_GetBank(uint8_t characterId,
                                    uint8_t basePalette,
                                    NetplayPaletteBank* out) {

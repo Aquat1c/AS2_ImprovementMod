@@ -389,6 +389,7 @@ set(PATCH_SOURCES
     src/patches/charsel_palette_select.cpp
     src/patches/charsel_select_actions.cpp
     src/patches/input_override.cpp
+    src/patches/shell_hotkey_patch.cpp
     src/patches/input_sync_hooks.cpp
     src/patches/render_guard.cpp
     src/patches/session_pump_hook.cpp

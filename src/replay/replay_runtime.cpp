@@ -248,7 +248,7 @@ static bool RawKeyDown(int vk) {
 }
 
 static HWND GetGameWindowHandle() {
-    auto getWindowHandle = reinterpret_cast<GetWindowHandle_t>(ADDR_SYS_GET_WINDOW_HANDLE);
+    auto getWindowHandle = reinterpret_cast<GetWindowHandle_t>(ADDR_WINDOW_GET_HANDLE);
     return getWindowHandle ? reinterpret_cast<HWND>(getWindowHandle()) : nullptr;
 }
 

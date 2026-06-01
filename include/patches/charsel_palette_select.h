@@ -22,6 +22,10 @@ void CharSelPaletteSelect_FrameUpdate();
 
 void CharSelPaletteSelect_OnCharSelBegin(bool netplay, uint8_t local_game_slot);
 void CharSelPaletteSelect_EndFrontend();
+/// Clear per-character palette cursor cache when the netplay connection ends.
+/// Rematch on the same connection keeps local cache; a new opponent/session does not.
+/// Does not remove custom banks from disk.
+void CharSelPaletteSelect_ResetNetplaySessionState(const char* reason);
 void CharSelPaletteSelect_OnRemoteCatalog(const CharSelInputPayload* payload);
 void CharSelPaletteSelect_OnLocalCatalogChanged();
 void CharSelPaletteSelect_ClearExternalCustomHints();

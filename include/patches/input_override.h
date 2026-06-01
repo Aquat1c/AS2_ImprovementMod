@@ -68,10 +68,30 @@ void WritePlayerInput(int player, uint16_t input);
 uint16_t ReadPlayerInput(int player);
 void InputOverride_LoadSettings();
 void InputOverride_Shutdown();
+
+struct InputGuardIniSnapshot {
+    bool shell_hotkeys_ime;
+    bool system_keys;
+    uint32_t diag_interval_sec;
+    bool hotkey_trace;
+    bool swallow_trace;
+    bool dinput_unacquire_test;
+};
+
+void InputOverride_GetIniSnapshot(InputGuardIniSnapshot* out);
+void InputOverride_SyncIniKeys();
 bool InputOverride_AreShellHotkeyImeWorkaroundsEnabled();
 bool InputOverride_AreSystemKeyWorkaroundsEnabled();
 void* InputOverride_GetDInputKeyboardSetCooperativeLevelTarget();
 void InputOverride_EnsureDInputKeyboardCooperativeLevel(const char* reason);
+
+// RAII: clear game wndproc custom-handler gate so shell keys reach DefWindowProc inside the game.
+struct InputOverrideGameWndProcShellGate {
+    int saved;
+    bool active;
+    InputOverrideGameWndProcShellGate();
+    ~InputOverrideGameWndProcShellGate();
+};
 
 // --- Debug ---
 struct InputDebugInfo {

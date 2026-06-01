@@ -268,9 +268,23 @@
 
 #define ADDR_DINPUT_INTERFACE   0x9D09B8
 #define ADDR_DINPUT_KB_DEVICE   0x9D09C0
+// Mouse DInput device (DIMOUSESTATE2, 20-byte GetDeviceState in sub_62FE60).
+// Acquired in sub_62EE80 with DISCL_BACKGROUND|DISCL_NONEXCLUSIVE (0x0A).
+#define ADDR_DINPUT_MOUSE_DEVICE 0x9D09BC
 #define ADDR_DINPUT_FALLBACK    0x9D09B0
 
-#define ADDR_SYS_GET_WINDOW_HANDLE (GAME_BASE + 0x220C70)
+// Game_MainLoop (sub_5D2AC0). Calls keybd_event(7,0,KEYEVENTF_KEYUP,0) EVERY frame: a phantom
+// VK 0x07 injection that defeats the shell's clean Win-down/up (Start menu) and Alt+Shift layout
+// chord detection. ROOT CAUSE of "Win key / Alt+Shift dead while game focused" (vanilla + mod).
+// Fixed by IAT-hooking keybd_event in wsock32_proxy and dropping bVk==0x07. See SHELL_HOTKEY_POLICY.md.
+#define ADDR_GAME_MAINLOOP      0x5D2AC0
+#define DXLIB_PHANTOM_WINKEY_VK 0x07
+
+// Window_GetHandle (sub_6349F0) returns HWND global wParam @ 0x9DB648.
+// Do NOT use sub_620C70 — IDA mislabels it Sys_GetWindowHandle but it returns IDirectDraw* ppv.
+#define ADDR_WINDOW_GET_HANDLE   (GAME_BASE + 0x2349F0)
+#define ADDR_GAME_HWND           0x9DB648
+#define ADDR_SYS_GET_WINDOW_HANDLE ADDR_WINDOW_GET_HANDLE
 
 #define ADDR_DINPUT_KB_REFRESH  (GAME_BASE + 0x230130)
 #define ADDR_DINPUT_JOY_REFRESH (GAME_BASE + 0x2302F0)
@@ -278,12 +292,33 @@
 // Vanilla shell-hotkey suppression state.
 // On NT-family Windows the game installs an external message hook DLL and on
 // older Win9x it uses SPI_SETSCREENSAVERRUNNING; both are gated by this flag.
+// When non-zero, game wndproc uses its custom handler and may return 0 for shell keys
+// instead of calling DefWindowProc. Also used as g_LogToDebugOnly for file logging.
+#define ADDR_GAME_WNDPROC_CUSTOM_HANDLER  0x9DB660
+#define ADDR_GAME_WNDPROC_CUSTOM_PROC_PTR 0x9DB668
+#define ADDR_GAME_WNDPROC_MSG_CALLBACK    0x9E5CB8
+#define ADDR_GAME_WNDPROC                 (GAME_BASE + 0x233490)  // sub_633490 DXLib wndproc
+#define ADDR_GAME_CURSOR_REQUEST_STATE    0x9DB6D0  // g_nCursorRequestState
+#define ADDR_GAME_CURSOR_CURRENT_SHOWN    0x9DB6D4  // g_bCursorCurrentState
+#define ADDR_GAME_MOUSE_WHEEL_COUNTER     0x9DB6D8  // WM_MOUSEWHEEL delta accumulator
+
 #define ADDR_SHELL_HOTKEY_SUPPRESS_FLAG  0x9E5B74
 #define ADDR_SHELL_HOTKEY_MSG_HOOK       0x9E5B7C
 #define ADDR_SHELL_HOTKEY_LOADED_FLAG    0x9E5B80
 #define ADDR_SHELL_HOTKEY_HOOK_MODULE    0x9E5C8C
 #define ADDR_SHELL_HOTKEY_TEMP_DLL_PATH  0x9E5B84
 #define ADDR_SHELL_HOTKEY_TEMP_DLL_OWNED 0x9E5C88
+
+// Verified Layer-B patch RVAs in shipping as2.exe (sub_633490 region).
+#define RVA_PATCH_SC_KEYMENU_SWALLOW      0x233DFE
+#define RVA_PATCH_SC_TASKLIST_SWALLOW     0x233E21
+#define RVA_PATCH_SC_SCREENSAVE_SWALLOW   0x233E38
+#define RVA_PATCH_DEFWINDOWPROC_GATE      0x233F25
+#define RVA_PATCH_CUSTOM_PROC_GUARD       0x2334B5
+#define RVA_PATCH_SHELL_HELPER_ARM_GUARD  0x233979
+#define RVA_PATCH_CURSOR_HIDE_LOOP        0x234107
+#define RVA_PATCH_DI_KB_COOP_ARG1         0x22F1A6
+#define RVA_PATCH_DI_KB_COOP_ARG2         0x22F2F1
 
 #define JOY_DOWN    0x0001
 #define JOY_UP      0x0002

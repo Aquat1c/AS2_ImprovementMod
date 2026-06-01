@@ -23,10 +23,19 @@ static bool g_initialized = false;
 static InputState_t g_inputState[2] = {};
 static PlayerBindings_t g_bindings[2] = {};
 
-// SDL3 Gamepad state — P1 uses g_gamepads[0], P2 uses g_gamepads[1]
-#define MAX_GAMEPADS 4
-static SDL_Gamepad* g_gamepads[MAX_GAMEPADS] = {};
-static int g_gamepadCount = 0;
+// SDL3 Gamepad state — indexed by player slot (0=P1, 1=P2).
+// Slots are stable: a controller that disconnects and reconnects returns to
+// its original slot (matched by GUID). Each slot is either live or nullptr.
+static SDL_Gamepad* g_playerGamepad[2] = {};       // open handle for each player
+static SDL_GUID     g_playerGUID[2] = {};           // hardware GUID for reconnect matching
+static bool         g_playerGUIDValid[2] = {};      // whether g_playerGUID[i] is populated
+
+// Deferred close: SDL_CloseGamepad blocks 50-300ms on Windows due to XInput
+// teardown. We collect handles during the event loop and close them afterwards.
+static constexpr int MAX_PENDING_CLOSE = 4;
+static SDL_Gamepad* g_pendingClose[MAX_PENDING_CLOSE] = {};
+static int          g_pendingCloseCount = 0;
+
 static bool g_gamepadSubsystemInitialized = false;
 static bool g_gamepadSubsystemFailed = false;
 static DWORD g_nextDeferredGamepadLogTick = 0;
@@ -221,25 +230,35 @@ static void LogGamepadDetails(int slot, SDL_Gamepad* gp, const char* eventName) 
              realTypeName ? realTypeName : "unknown");
 }
 
+static bool GUIDEquals(const SDL_GUID& a, const SDL_GUID& b) {
+    return memcmp(a.data, b.data, sizeof(a.data)) == 0;
+}
+
 static void OpenInitialGamepads() {
     int count = 0;
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     LOG_INFO("[Input] SDL reports %d gamepad candidate(s) after deferred init", count);
-    if (ids) {
-        for (int i = 0; i < count && g_gamepadCount < MAX_GAMEPADS; i++) {
-            SDL_Gamepad* gp = SDL_OpenGamepad(ids[i]);
-            if (gp) {
-                const int slot = g_gamepadCount++;
-                g_gamepads[slot] = gp;
-                LogGamepadDetails(slot, gp, "opened");
-            } else {
-                LOG_WARN("[Input] SDL_OpenGamepad failed for id=%u: %s",
-                         (unsigned)ids[i],
-                         SDL_GetError());
-            }
+    if (!ids) return;
+
+    for (int i = 0; i < count; i++) {
+        int slot = -1;
+        for (int p = 0; p < 2; p++) {
+            if (!g_playerGamepad[p]) { slot = p; break; }
         }
-        SDL_free(ids);
+        if (slot < 0) break;  // Both player slots assigned
+
+        SDL_Gamepad* gp = SDL_OpenGamepad(ids[i]);
+        if (gp) {
+            g_playerGamepad[slot] = gp;
+            g_playerGUID[slot] = SDL_GetGamepadGUIDForID(ids[i]);
+            g_playerGUIDValid[slot] = true;
+            LogGamepadDetails(slot, gp, "opened");
+        } else {
+            LOG_WARN("[Input] SDL_OpenGamepad failed for id=%u: %s",
+                     (unsigned)ids[i], SDL_GetError());
+        }
     }
+    SDL_free(ids);
 }
 
 static void HandleGamepadEvents() {
@@ -248,35 +267,74 @@ static void HandleGamepadEvents() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
-        case SDL_EVENT_GAMEPAD_ADDED:
-            if (g_gamepadCount < MAX_GAMEPADS) {
-                SDL_Gamepad* gp = SDL_OpenGamepad(event.gdevice.which);
-                if (gp) {
-                    const int slot = g_gamepadCount++;
-                    g_gamepads[slot] = gp;
-                    LogGamepadDetails(slot, gp, "connected");
-                } else {
-                    LOG_WARN("[Input] SDL_OpenGamepad hotplug failed for id=%u: %s",
-                             (unsigned)event.gdevice.which,
-                             SDL_GetError());
+        case SDL_EVENT_GAMEPAD_ADDED: {
+            const SDL_JoystickID newId = event.gdevice.which;
+            const SDL_GUID newGUID = SDL_GetGamepadGUIDForID(newId);
+
+            // Prefer restoring a matching GUID to its original player slot.
+            int slot = -1;
+            for (int p = 0; p < 2; p++) {
+                if (!g_playerGamepad[p] && g_playerGUIDValid[p] &&
+                    GUIDEquals(g_playerGUID[p], newGUID)) {
+                    slot = p;
+                    break;
                 }
             }
-            break;
+            // No prior GUID match: assign to the first free player slot.
+            if (slot < 0) {
+                for (int p = 0; p < 2; p++) {
+                    if (!g_playerGamepad[p]) { slot = p; break; }
+                }
+            }
+            if (slot < 0) {
+                LOG_INFO("[Input] Both player slots occupied, ignoring gamepad id=%u",
+                         (unsigned)newId);
+                break;
+            }
 
-        case SDL_EVENT_GAMEPAD_REMOVED:
-            for (int i = 0; i < g_gamepadCount; i++) {
-                if (SDL_GetGamepadID(g_gamepads[i]) == event.gdevice.which) {
-                    LogGamepadDetails(i, g_gamepads[i], "disconnected");
-                    SDL_CloseGamepad(g_gamepads[i]);
-                    for (int j = i; j < g_gamepadCount - 1; j++)
-                        g_gamepads[j] = g_gamepads[j + 1];
-                    g_gamepads[--g_gamepadCount] = nullptr;
+            SDL_Gamepad* gp = SDL_OpenGamepad(newId);
+            if (gp) {
+                g_playerGamepad[slot] = gp;
+                g_playerGUID[slot] = newGUID;
+                g_playerGUIDValid[slot] = true;
+                LogGamepadDetails(slot, gp, "connected");
+            } else {
+                LOG_WARN("[Input] SDL_OpenGamepad hotplug failed for id=%u: %s",
+                         (unsigned)newId, SDL_GetError());
+            }
+            break;
+        }
+        case SDL_EVENT_GAMEPAD_REMOVED: {
+            for (int p = 0; p < 2; p++) {
+                if (g_playerGamepad[p] &&
+                    SDL_GetGamepadID(g_playerGamepad[p]) == event.gdevice.which) {
+                    LogGamepadDetails(p, g_playerGamepad[p], "disconnected");
+                    // Capture GUID while the instance ID is still valid.
+                    g_playerGUID[p] = SDL_GetGamepadGUIDForID(event.gdevice.which);
+                    g_playerGUIDValid[p] = true;
+                    // Defer SDL_CloseGamepad: calling it here blocks 50-300ms on
+                    // Windows due to XInput handle teardown inside SDL_PollEvent.
+                    if (g_pendingCloseCount < MAX_PENDING_CLOSE) {
+                        g_pendingClose[g_pendingCloseCount++] = g_playerGamepad[p];
+                    } else {
+                        SDL_CloseGamepad(g_playerGamepad[p]);  // fallback if list full
+                    }
+                    g_playerGamepad[p] = nullptr;
                     break;
                 }
             }
             break;
         }
+        }
     }
+
+    // Process deferred closes after SDL_PollEvent has drained all events.
+    // This moves the XInput teardown stall out of the event-loop critical path.
+    for (int i = 0; i < g_pendingCloseCount; i++) {
+        SDL_CloseGamepad(g_pendingClose[i]);
+        g_pendingClose[i] = nullptr;
+    }
+    g_pendingCloseCount = 0;
 }
 
 static bool EnsureGamepadSubsystemReady() {
@@ -318,8 +376,8 @@ static const int16_t TRIGGER_THRESHOLD = 8000;
 
 static uint16_t ReadGamepadPlayer(int player) {
     if (!g_gamepadSubsystemInitialized) return 0;
-    if (player < 0 || player >= g_gamepadCount) return 0;
-    SDL_Gamepad* gp = g_gamepads[player];
+    if (player < 0 || player >= 2) return 0;
+    SDL_Gamepad* gp = g_playerGamepad[player];
     if (!gp) return 0;
     if (!IsGameWindowActive()) return 0;
 
@@ -577,8 +635,11 @@ bool InputSystem_Init(void) {
     g_initialized = true;
     g_gamepadSubsystemInitialized = false;
     g_gamepadSubsystemFailed = false;
-    g_gamepadCount = 0;
-    memset(g_gamepads, 0, sizeof(g_gamepads));
+    memset(g_playerGamepad, 0, sizeof(g_playerGamepad));
+    memset(g_playerGUID, 0, sizeof(g_playerGUID));
+    memset(g_playerGUIDValid, 0, sizeof(g_playerGUIDValid));
+    memset(g_pendingClose, 0, sizeof(g_pendingClose));
+    g_pendingCloseCount = 0;
     g_nextDeferredGamepadLogTick = 0;
     printf("[Input] Input system initialized (Win32 keyboard; SDL3 gamepad deferred)\n");
     LOG_INFO("[Input] Input system initialized (Win32 keyboard active; SDL3 gamepad deferred until default font ready)");
@@ -589,11 +650,15 @@ void InputSystem_Shutdown(void) {
     if (!g_initialized) return;
     InputSystem_SaveConfig("as2_input.cfg");
 
-    for (int i = 0; i < g_gamepadCount; i++) {
-        if (g_gamepads[i]) SDL_CloseGamepad(g_gamepads[i]);
-        g_gamepads[i] = nullptr;
+    for (int i = 0; i < 2; i++) {
+        if (g_playerGamepad[i]) SDL_CloseGamepad(g_playerGamepad[i]);
+        g_playerGamepad[i] = nullptr;
     }
-    g_gamepadCount = 0;
+    for (int i = 0; i < g_pendingCloseCount; i++) {
+        if (g_pendingClose[i]) SDL_CloseGamepad(g_pendingClose[i]);
+        g_pendingClose[i] = nullptr;
+    }
+    g_pendingCloseCount = 0;
 
     if (g_gamepadSubsystemInitialized) {
         SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
@@ -780,7 +845,7 @@ bool InputSystem_IsNetplayInputActive(int player) {
 
 bool InputSystem_HasGamepad(int player) {
     if (!g_gamepadSubsystemInitialized) return false;
-    return (player >= 0 && player < g_gamepadCount && g_gamepads[player] != nullptr);
+    return (player >= 0 && player < 2 && g_playerGamepad[player] != nullptr);
 }
 
 bool InputSystem_HasXInput(int player) {
@@ -789,8 +854,8 @@ bool InputSystem_HasXInput(int player) {
 
 const char* InputSystem_GetGamepadName(int player) {
     if (!g_gamepadSubsystemInitialized) return nullptr;
-    if (player < 0 || player >= g_gamepadCount || !g_gamepads[player]) return nullptr;
-    return SDL_GetGamepadName(g_gamepads[player]);
+    if (player < 0 || player >= 2 || !g_playerGamepad[player]) return nullptr;
+    return SDL_GetGamepadName(g_playerGamepad[player]);
 }
 
 // ============================================================================
@@ -905,8 +970,8 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
     }
 
     // 2. Check gamepad buttons and axes
-    SDL_Gamepad* gp = (g_bindingPlayer >= 0 && g_bindingPlayer < g_gamepadCount)
-                      ? g_gamepads[g_bindingPlayer] : nullptr;
+    SDL_Gamepad* gp = (g_bindingPlayer >= 0 && g_bindingPlayer < 2)
+                      ? g_playerGamepad[g_bindingPlayer] : nullptr;
     if (gp) {
         // Buttons
         for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++) {
@@ -983,8 +1048,8 @@ bool InputSystem_IsBindingDown(int player, const KeyBinding_t* binding) {
         }
     }
 
-    if (player >= 0 && player < g_gamepadCount) {
-        SDL_Gamepad* gp = g_gamepads[player];
+    if (player >= 0 && player < 2) {
+        SDL_Gamepad* gp = g_playerGamepad[player];
         if (gp) {
             if (binding->gamepad_button >= 0 &&
                 SDL_GetGamepadButton(gp, (SDL_GamepadButton)binding->gamepad_button)) {

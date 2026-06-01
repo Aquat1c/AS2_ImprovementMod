@@ -16,6 +16,7 @@
 #include "patches/memory_utils.h"
 #include "patches/unlock_patch.h"
 #include "patches/input_override.h"
+#include "patches/shell_hotkey_patch.h"
 #include "patches/hook_installer.h"
 #include "patches/filesystem_patch.h"
 #include "patches/palette_asset_hook.h"
@@ -618,6 +619,18 @@ static void DeferredInit() {
 // ============================================================================
 
 extern "C" {
+
+// d3d9_proxy: call instead of CallWindowProcW(DXLib 0xFFFFxxxx). See mod/docs/SHELL_HOTKEY_POLICY.md
+__declspec(dllexport) bool ModCallGameWndProc(HWND hwnd,
+                                              UINT msg,
+                                              WPARAM wParam,
+                                              LPARAM lParam,
+                                              LRESULT* outResult) {
+    if (!outResult) {
+        return false;
+    }
+    return ShellHotkey_CallGameWndProc(hwnd, msg, wParam, lParam, outResult);
+}
 
 __declspec(dllexport) void ModSetImGuiContext(void* ctx) {
     ImGui::SetCurrentContext((ImGuiContext*)ctx);

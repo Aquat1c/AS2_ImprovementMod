@@ -5,6 +5,7 @@
 
 #include "game_console.h"
 #include "log_window.h"
+#include "as2_constants.h"
 #include "MinHook.h"
 #include <Windows.h>
 #include <stdio.h>
@@ -23,9 +24,8 @@
 // int Log_Printf(char *Format, ...)
 #define ADDR_LOG_PRINTF   0x632320
 
-// Game's debug-only flag - when 1, Log_Write outputs to OutputDebugStringA
-// Note: Setting this can cause side effects in other parts of the game
-#define ADDR_LOG_DEBUG_ONLY    0x9DB660
+// Same RAM as ADDR_GAME_WNDPROC_CUSTOM_HANDLER in as2_constants.h (wndproc + logging).
+#define ADDR_LOG_DEBUG_ONLY    ADDR_GAME_WNDPROC_CUSTOM_HANDLER
 
 // Game's file logging disabled flag - when 0, Log_Write outputs to file
 #define ADDR_LOG_FILE_DISABLED 0x9DC00C

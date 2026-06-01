@@ -242,6 +242,10 @@ static void ResetRandomScroll(uint8_t gameSlot) {
     }
 }
 
+static void ClearPaletteSlotCaches() {
+    memset(s_paletteSlotCache, 0, sizeof(s_paletteSlotCache));
+}
+
 static void DeactivateFrontend() {
     if (s_frontendNetplay && GetGameMode() == MODE_CHARSEL) {
         // Netplay tears down the palette frontend before the game fully leaves
@@ -310,6 +314,12 @@ static void BeginFrontend(bool netplay, uint8_t localGameSlot) {
     ResetNativeSelectionState(1);
 
     if (netplay) {
+        // Drop only the opponent-side cache each charsel entry. Local cache is kept
+        // for rematch on the same connection (see ResetNetplaySessionState on disconnect).
+        const uint8_t remoteGameSlot = localGameSlot == 0 ? 1 : 0;
+        memset(s_paletteSlotCache[remoteGameSlot], 0,
+               sizeof(s_paletteSlotCache[remoteGameSlot]));
+
         for (int gameSlot = 0; gameSlot < 2; ++gameSlot) {
             if (!s_pendingCatalogReceived[gameSlot]) {
                 continue;
@@ -1304,6 +1314,26 @@ void CharSelPaletteSelect_OnCharSelBegin(bool netplay, uint8_t localGameSlot) {
 
 void CharSelPaletteSelect_EndFrontend() {
     DeactivateFrontend();
+}
+
+void CharSelPaletteSelect_ResetNetplaySessionState(const char* reason) {
+    ClearPaletteSlotCaches();
+    memset(s_matchSelection, 0, sizeof(s_matchSelection));
+    memset(s_externalCustomHint, 0, sizeof(s_externalCustomHint));
+    memset(s_pendingCatalogReceived, 0, sizeof(s_pendingCatalogReceived));
+    memset(s_pendingCatalogMasks, 0, sizeof(s_pendingCatalogMasks));
+
+    if (GetGameMode() == MODE_CHARSEL) {
+        ResetNativeSelectionState(0);
+        ResetNativeSelectionState(1);
+    }
+
+    Rollback::NetplayLog_Write("CHARPAL", -1,
+        "Netplay connection palette reset (local+remote cache cleared): "
+        "frontend_active=%d netplay=%d reason=%s",
+        s_frontendActive ? 1 : 0,
+        s_frontendNetplay ? 1 : 0,
+        reason ? reason : "?");
 }
 
 void CharSelPaletteSelect_OnRemoteCatalog(const CharSelInputPayload* payload) {

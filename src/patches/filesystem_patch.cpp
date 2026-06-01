@@ -51,6 +51,9 @@ static char s_modsRoot[MAX_PATH] = {};
 static char s_configPath[MAX_PATH] = {};
 static std::vector<LoadedModEntry> s_loadedMods;
 static std::unordered_set<std::string> s_loggedOverrides;
+static bool s_startupTraceReachedTitleBin = false;
+static uint32_t s_startupTraceFileOpenCount = 0;
+static DWORD s_startupTraceBeginTick = 0;
 
 static const char kDefaultModsConfigTemplate[] =
     "; Alice Senki 2 mod loader configuration\r\n"
@@ -273,6 +276,62 @@ static bool ContainsParentTraversal(const char* path) {
     }
 
     return false;
+}
+
+static bool ContainsInsensitive(const char* haystack, const char* needle) {
+    if (!haystack || !needle || !needle[0]) {
+        return false;
+    }
+
+    const size_t needleLen = strlen(needle);
+    for (const char* p = haystack; *p; ++p) {
+        size_t i = 0;
+        while (p[i] && i < needleLen &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            ++i;
+        }
+        if (i == needleLen) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ShouldTraceStartupFileOpen(const char* path) {
+    if (!path || !path[0] || s_startupTraceReachedTitleBin) {
+        return false;
+    }
+    return ContainsInsensitive(path, "\\data\\") && ContainsInsensitive(path, ".bin");
+}
+
+static void TraceStartupFileOpen(const char* requestedPath, const char* openedPath) {
+    if (s_startupTraceReachedTitleBin || s_startupTraceFileOpenCount >= 512) {
+        return;
+    }
+
+    if (!ShouldTraceStartupFileOpen(requestedPath) && !ShouldTraceStartupFileOpen(openedPath)) {
+        return;
+    }
+
+    const bool titleHit =
+        ContainsInsensitive(requestedPath, "tit.bin") ||
+        ContainsInsensitive(openedPath, "tit.bin");
+    const DWORD elapsed = GetTickCount() - s_startupTraceBeginTick;
+
+    ++s_startupTraceFileOpenCount;
+    LOG_INFO("[STARTUPTRACE][CreateFileA] #%u +%lums req='%s' open='%s' title_hit=%d",
+             s_startupTraceFileOpenCount,
+             (unsigned long)elapsed,
+             requestedPath ? requestedPath : "",
+             openedPath ? openedPath : "",
+             titleHit ? 1 : 0);
+
+    if (titleHit) {
+        s_startupTraceReachedTitleBin = true;
+        LOG_INFO("[STARTUPTRACE] Reached title marker via CreateFileA at +%lums after %u opens",
+                 (unsigned long)elapsed,
+                 s_startupTraceFileOpenCount);
+    }
 }
 
 static void JoinPath(char* outPath, size_t outCap, const char* left, const char* right) {
@@ -792,7 +851,11 @@ void FilesystemPatch_Init(HMODULE gameModule) {
 
     JoinPath(s_modsRoot, sizeof(s_modsRoot), s_gameRoot, "mods");
     JoinPath(s_configPath, sizeof(s_configPath), s_modsRoot, "mods.ini");
+    s_startupTraceReachedTitleBin = false;
+    s_startupTraceFileOpenCount = 0;
+    s_startupTraceBeginTick = GetTickCount();
 
+    LOG_INFO("[STARTUPTRACE] Filesystem patch init (tracking CreateFileA .bin loads until tit.bin)");
     LOG_INFO("[ModLoader] Game root resolved to %s", s_gameRoot);
 
     PatchLegacySettingsPaths();
@@ -960,6 +1023,9 @@ HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName,
                                           dwCreationDisposition,
                                           dwFlagsAndAttributes,
                                           hTemplateFile);
+    if (ShouldRedirectReadOpen(dwDesiredAccess, dwCreationDisposition, dwFlagsAndAttributes)) {
+        TraceStartupFileOpen(lpFileName, pathToOpen);
+    }
     if (handle != INVALID_HANDLE_VALUE || !g_origCreateFileA) {
         return handle;
     }
