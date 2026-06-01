@@ -388,8 +388,6 @@ static bool SavePersistentSettings(const char* reason) {
         "input_guard_hotkey_trace=%d\r\n"
         "; input_guard_swallow_trace: 1 logs DInput strips and wndproc swallow classification\r\n"
         "input_guard_swallow_trace=%d\r\n"
-        "; input_guard_dinput_unacquire_test: 1 continuously unacquires DInput kb+mouse (diagnostic for Win/Alt+Shift/middle-click)\r\n"
-        "input_guard_dinput_unacquire_test=%d\r\n"
         "\r\n"
         "[GameSettings]\r\n"
         "; difficulty: 0=easy, 1=normal, 2=hard\r\n"
@@ -418,7 +416,6 @@ static bool SavePersistentSettings(const char* reason) {
         inputGuard.diag_interval_sec,
         inputGuard.hotkey_trace ? 1 : 0,
         inputGuard.swallow_trace ? 1 : 0,
-        inputGuard.dinput_unacquire_test ? 1 : 0,
         ReadMemory<uint8_t>(kGameOptionDifficulty),
         GameSettingsSync_RoundsToWin(s_persistedRoundOption),
         ReadMemory<uint8_t>(ADDR_STAGESEL_ENABLE),

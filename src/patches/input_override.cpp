@@ -67,11 +67,6 @@ static bool s_enableSystemKeyWorkarounds = true;
 static bool s_enableSwallowTrace = false;
 static bool s_enableHotkeyTraceLog = false;
 static uint32_t s_inputGuardDiagIntervalSec = 15;
-// DIAGNOSTIC EXPERIMENT: continuously Unacquire the game's DirectInput keyboard
-// + mouse devices to test whether the background DInput grab is what blocks the
-// Windows key / Alt+Shift layout switch / middle-click while the game runs.
-// Reversible; default ON for the current investigation.
-static bool s_dinputUnacquireTest = true;
 static uint32_t s_swallowTraceStripLogCount = 0;
 static uint32_t s_swallowTraceKeyboardPollCount = 0;
 static DWORD s_swallowTraceLastStripLogMs = 0;
@@ -191,7 +186,6 @@ static void SyncInputGuardIniKeys() {
     WriteInputGuardDefaultUInt(L"input_guard_diag_interval_sec", s_inputGuardDiagIntervalSec);
     WriteInputGuardDefaultBool(L"input_guard_hotkey_trace", s_enableHotkeyTraceLog);
     WriteInputGuardDefaultBool(L"input_guard_swallow_trace", s_enableSwallowTrace);
-    WriteInputGuardDefaultBool(L"input_guard_dinput_unacquire_test", s_dinputUnacquireTest);
 }
 
 void InputOverride_GetIniSnapshot(InputGuardIniSnapshot* out) {
@@ -204,7 +198,6 @@ void InputOverride_GetIniSnapshot(InputGuardIniSnapshot* out) {
     out->diag_interval_sec = s_inputGuardDiagIntervalSec;
     out->hotkey_trace = s_enableHotkeyTraceLog;
     out->swallow_trace = s_enableSwallowTrace;
-    out->dinput_unacquire_test = s_dinputUnacquireTest;
 }
 
 void InputOverride_SyncIniKeys() {
@@ -236,10 +229,6 @@ void InputOverride_LoadSettings() {
     if (s_enableHotkeyTraceLog) {
         s_enableSwallowTrace = true;
     }
-    bool foundDinputUnacq = false;
-    s_dinputUnacquireTest =
-        ReadInputGuardIniBool(L"input_guard_dinput_unacquire_test", true, &foundDinputUnacq);
-    (void)foundDinputUnacq;
 
     // Win-key stripping blocks shell behavior (Start/layout). Keep this disabled.
     if (s_enableSystemKeyWorkarounds) {
@@ -482,7 +471,6 @@ static DWORD SanitizeDInputKeyboardCooperativeFlags(DWORD flags) {
 
 static inline const void* CaptureCallerAddress();
 static void LogShellStateProvenance(const char* reason, const void* caller, bool forceLog);
-static bool IsCursorHidden();
 
 static bool ShouldRepairDInputKeyboardCooperativeLevel() {
     // Keep shell/layout fixes active even when legacy "system_keys" filtering is off.
@@ -586,135 +574,6 @@ void InputOverride_EnsureDInputKeyboardCooperativeLevel(const char* reason) {
     }
     s_lastDInputKeyboardCoopRepairMs = now;
     s_dinputKeyboardWindowMissingLogged = false;
-}
-
-// ===========================================================================
-// DIAGNOSTIC: DirectInput unacquire experiment
-//
-// Hypothesis under test: the game acquires its DInput keyboard + mouse devices
-// with DISCL_BACKGROUND|DISCL_NONEXCLUSIVE (sub_62EE80), giving DInput a global
-// grab that blocks the Windows key / Alt+Shift layout switch / middle-click
-// while the game runs. By repeatedly Unacquire()-ing both devices we can test
-// whether releasing that grab restores normal shell behavior.
-//
-// Unacquire() returns DI_OK (0) when the device WAS acquired (so the game keeps
-// re-acquiring it every poll), or DI_NOEFFECT (S_FALSE, 0x1) when it was already
-// released. Tracking that return tells us how aggressively the game re-grabs.
-// ===========================================================================
-static void* ReadDInputDevicePointerSafe(uintptr_t slotAddress) {
-    void* device = nullptr;
-    __try {
-        device = *reinterpret_cast<void**>(slotAddress);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        device = nullptr;
-    }
-    return device;
-}
-
-static void RunDInputUnacquireForDevice(const char* deviceName,
-                                        uintptr_t slotAddress,
-                                        void** lastDevice,
-                                        HRESULT* lastResult,
-                                        uint32_t* reacquireCount,
-                                        uint32_t* logBudget) {
-    void* device = ReadDInputDevicePointerSafe(slotAddress);
-    if (!device) {
-        if (*lastDevice != nullptr) {
-            LOG_INFO("[DINPUT-TEST] %s device pointer cleared (slot 0x%08lX was 0x%p -> null)",
-                     deviceName, static_cast<unsigned long>(slotAddress), *lastDevice);
-            *lastDevice = nullptr;
-        }
-        return;
-    }
-
-    DInputKeyboardDeviceVTable* vtable = GetDInputKeyboardDeviceVTable(device);
-    if (!vtable || !vtable->Unacquire) {
-        return;
-    }
-
-    HRESULT hr = E_FAIL;
-    __try {
-        hr = vtable->Unacquire(device);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hr = E_FAIL;
-    }
-
-    // DI_OK (S_OK, 0) means the device was acquired and we just released it ->
-    // the game re-acquired since our last pass; count those edges as "re-grab".
-    // DI_NOEFFECT (S_FALSE, 0x1) means it was already released.
-    const bool wasAcquired = (hr == 0);
-    if (wasAcquired) {
-        ++(*reacquireCount);
-    }
-
-    const bool deviceChanged = (device != *lastDevice);
-    const bool resultChanged = (hr != *lastResult);
-    if (deviceChanged || resultChanged || (*logBudget > 0)) {
-        if (*logBudget > 0) {
-            --(*logBudget);
-        }
-        if (deviceChanged || resultChanged || wasAcquired) {
-            LOG_INFO("[DINPUT-TEST] %s Unacquire device=0x%p hr=0x%08lX (%s) regrabs=%u%s",
-                     deviceName,
-                     device,
-                     static_cast<unsigned long>(hr),
-                     wasAcquired ? "was-acquired/re-grabbed" : (hr == 0x00000001 ? "already-released" : "other"),
-                     *reacquireCount,
-                     (deviceChanged && *lastDevice) ? " [device-ptr-changed]" : "");
-        }
-    }
-
-    *lastDevice = device;
-    *lastResult = hr;
-}
-
-void InputOverride_RunDInputUnacquireTest(const char* reason) {
-    if (!s_dinputUnacquireTest) {
-        return;
-    }
-
-    static void* s_lastKbDevice = nullptr;
-    static void* s_lastMouseDevice = nullptr;
-    static HRESULT s_lastKbHr = static_cast<HRESULT>(0xFFFFFFFF);
-    static HRESULT s_lastMouseHr = static_cast<HRESULT>(0xFFFFFFFF);
-    static uint32_t s_kbRegrabs = 0;
-    static uint32_t s_mouseRegrabs = 0;
-    // Allow a generous initial burst of per-pass logs, then fall back to
-    // change-only + re-grab-edge logging to avoid log spam.
-    static uint32_t s_kbLogBudget = 32;
-    static uint32_t s_mouseLogBudget = 32;
-    static bool s_announced = false;
-    static DWORD s_lastHeartbeatTick = 0;
-
-    if (!s_announced) {
-        s_announced = true;
-        LOG_INFO("[DINPUT-TEST] ENABLED (reason=%s): continuously unacquiring DInput keyboard(0x%08X) + mouse(0x%08X). "
-                 "Test Win key / Alt+Shift / middle-click now; set input_guard_dinput_unacquire_test=0 to disable.",
-                 reason ? reason : "n/a",
-                 ADDR_DINPUT_KB_DEVICE,
-                 ADDR_DINPUT_MOUSE_DEVICE);
-    }
-
-    RunDInputUnacquireForDevice("KEYBOARD", ADDR_DINPUT_KB_DEVICE,
-                                &s_lastKbDevice, &s_lastKbHr, &s_kbRegrabs, &s_kbLogBudget);
-    RunDInputUnacquireForDevice("MOUSE", ADDR_DINPUT_MOUSE_DEVICE,
-                                &s_lastMouseDevice, &s_lastMouseHr, &s_mouseRegrabs, &s_mouseLogBudget);
-
-    // Periodic heartbeat so we can see the re-grab rate over time.
-    const DWORD now = GetTickCount();
-    if (s_lastHeartbeatTick == 0 || (DWORD)(now - s_lastHeartbeatTick) >= 5000) {
-        s_lastHeartbeatTick = now;
-        HWND gameWindow = GetGameWindowHandle();
-        HWND foreground = GetForegroundWindow();
-        LOG_INFO("[DINPUT-TEST] heartbeat: kb_regrabs=%u mouse_regrabs=%u kb_hr=0x%08lX mouse_hr=0x%08lX "
-                 "fgIsGame=%d cursorHidden=%d",
-                 s_kbRegrabs,
-                 s_mouseRegrabs,
-                 static_cast<unsigned long>(s_lastKbHr),
-                 static_cast<unsigned long>(s_lastMouseHr),
-                 (gameWindow && (foreground == gameWindow || GetAncestor(foreground, GA_ROOT) == gameWindow)) ? 1 : 0,
-                 IsCursorHidden() ? 1 : 0);
-    }
 }
 
 static bool ClearVanillaShellHotkeySuppression() {
@@ -1165,12 +1024,7 @@ static void EnsureSystemInputGuardState(const char* reason) {
     EnsureVanillaShellHotkeysEnabled();
     EnsureImeEnabledForGameWindow();
     EnsureCursorReleasedAndVisible();
-    if (s_dinputUnacquireTest) {
-        // DIAGNOSTIC: release the DInput grab instead of (re)asserting coop level.
-        InputOverride_RunDInputUnacquireTest(reason);
-    } else {
-        InputOverride_EnsureDInputKeyboardCooperativeLevel(reason);
-    }
+    InputOverride_EnsureDInputKeyboardCooperativeLevel(reason);
     // Diagnostics are not tied to per-input-hook traffic; log from frame counter instead.
 }
 

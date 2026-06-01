@@ -30,8 +30,32 @@ static DWORD s_startupTraceBeginTick = 0;
 constexpr DWORD kMinPumpIntervalMs = 4;
 constexpr uint32_t kMaxStartupAssetTraceLines = 512;
 
+// The hooked game function sub_4A5390 is NOT a (const char*, char*, ...) asset
+// loader: its real signature is (int objPtr, char value, int structPtr, int flag).
+// That means the "archive"/"patch" arguments are frequently NOT valid string
+// pointers (e.g. the single-byte 2nd argument arrives as 0x00000001). Treating
+// them as C strings dereferences garbage/low addresses and crashes. Guard every
+// read with a range + SEH probe so a non-string argument can never fault.
+static bool IsReadableCString(const char* p) {
+    if (!p) {
+        return false;
+    }
+    // Anything below the first 64 KiB cannot be a real string pointer; the
+    // misinterpreted single-byte argument lands here (e.g. value 1).
+    if (reinterpret_cast<uintptr_t>(p) < 0x10000) {
+        return false;
+    }
+    __try {
+        volatile char probe = *p;
+        (void)probe;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
 static bool IsWinScreenArchive(const char* archive) {
-    return archive &&
+    return IsReadableCString(archive) &&
            (strstr(archive, "win") != nullptr ||
             strstr(archive, "WIN") != nullptr);
 }
@@ -45,7 +69,7 @@ static bool IsPumpableLifecycle(MatchLifecyclePhase phase) {
 }
 
 static bool ContainsInsensitive(const char* haystack, const char* needle) {
-    if (!haystack || !needle || !needle[0]) {
+    if (!IsReadableCString(haystack) || !needle || !needle[0]) {
         return false;
     }
 
@@ -85,8 +109,8 @@ static void TraceStartupAssetLoad(const char* archive,
     LOG_INFO("[STARTUPTRACE][AssetLoad] #%u +%lums archive='%s' patch='%s' asset=%d patch_idx=%d mode=%u sub=%u phase=%s title_hit=%d",
              s_startupAssetTraceCount,
              (unsigned long)elapsed,
-             archive ? archive : "",
-             patch ? patch : "",
+             IsReadableCString(archive) ? archive : "",
+             IsReadableCString(patch) ? patch : "",
              assetIndex,
              patchIndex,
              (unsigned)GetGameMode(),

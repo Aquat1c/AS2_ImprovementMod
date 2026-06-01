@@ -75,7 +75,6 @@ struct InputGuardIniSnapshot {
     uint32_t diag_interval_sec;
     bool hotkey_trace;
     bool swallow_trace;
-    bool dinput_unacquire_test;
 };
 
 void InputOverride_GetIniSnapshot(InputGuardIniSnapshot* out);
