@@ -98,6 +98,13 @@ bool s_roundResetApplied = false;
 bool s_debugLogging = false;
 bool s_actionabilityAuditLogging = false;
 
+// Actionability source used for attacker/defender recovery detection. Default to
+// the engine-derived state-class rule (every movement/neutral recovery state
+// counts, not just the hand-enumerated legacy list); switchable to LegacyActionId
+// at runtime for A/B comparison. The audit path always uses Legacy as its
+// baseline regardless of this setting.
+Training::ActionabilitySource s_actionabilitySource = Training::ActionabilitySource::StateClass;
+
 // Throttle per-frame sample logging (only log on change)
 uint32_t s_lastLoggedActionId[2] = {};
 uint8_t  s_lastLoggedAttackState[2] = {};
@@ -122,6 +129,7 @@ constexpr uintptr_t kEntityBases[2] = {
     ADDR_P2_ENTITY_BASE,
 };
 
+// Always-legacy evaluation — used only as the audit comparison baseline.
 Training::ActionabilityResult EvaluateLegacyActionability(const EntitySample& sample,
                                                           Training::ActionableContext context,
                                                           bool defenderWasAirLocked = false) {
@@ -132,10 +140,16 @@ Training::ActionabilityResult EvaluateLegacyActionability(const EntitySample& sa
         Training::ActionabilitySource::LegacyActionId);
 }
 
+// Recovery/actionability test used by the live FA state machine. Honors the
+// runtime-selected source (StateClass by default, Legacy for A/B comparison).
 bool IsFree(const EntitySample& sample,
             Training::ActionableContext context,
             bool defenderWasAirLocked = false) {
-    return EvaluateLegacyActionability(sample, context, defenderWasAirLocked).actionable;
+    return Training::EvaluateActionability(
+        sample,
+        context,
+        defenderWasAirLocked,
+        s_actionabilitySource).actionable;
 }
 
 bool IsBlockstun(uint32_t actionId) {
@@ -193,6 +207,16 @@ const char* ResultLabel(InteractionResult r) {
         case InteractionResult::Blocked: return "Blocked";
         case InteractionResult::Hit: return "Hit";
         case InteractionResult::Trade: return "Trade";
+    }
+    return "?";
+}
+
+const char* ActionabilitySourceName(Training::ActionabilitySource src) {
+    switch (src) {
+        case Training::ActionabilitySource::StateClass:          return "state_class";
+        case Training::ActionabilitySource::LegacyActionId:      return "legacy";
+        case Training::ActionabilitySource::CandidateNativeFlag: return "native";
+        case Training::ActionabilitySource::HybridValidated:     return "hybrid";
     }
     return "?";
 }
@@ -622,11 +646,11 @@ void ProcessContactEdges(uint32_t simFrame) {
         Interaction& existing = s_active[attackerIndex];
         PendingAttack& pending = s_pending[attackerIndex];
 
-        // Seed the gap tracker from the ongoing interaction's D_recover when the
-        // defender was briefly free mid-string (e.g. ProxGuard between two hits).
-        // CompleteInteraction normally writes s_lastDefenderFreeFrame, but mid-string
-        // replacements clear the old interaction without completing it, so that
-        // recovery frame is otherwise lost and the intra-string gap goes unreported.
+        // Fallback seed for the gap tracker: if this interaction is being replaced
+        // mid-string and its D_recover was somehow not yet recorded (e.g. the
+        // recovery frame was consumed by an earlier contact), recover it from the
+        // ongoing interaction. The primary record now happens at D_recover
+        // detection, so this only fires in the rare already-consumed case.
         if (existing.active &&
             existing.simFrame_D_recover != kFrameUnset &&
             s_lastDefenderFreeFrame[defenderIndex] == kFrameUnset) {
@@ -691,10 +715,11 @@ void CompleteInteraction(Interaction* interaction) {
                  SideLabel(interaction->defender));
     }
 
-    LOG_INFO("[FA] COMPLETE: %s->%s %s adv=%+d (A_recover=%u D_recover=%u contact=%u actionId=%u)",
+    LOG_INFO("[FA] COMPLETE: %s->%s %s adv=%+d src=%s (A_recover=%u D_recover=%u contact=%u actionId=%u)",
              SideLabel(interaction->attacker), SideLabel(interaction->defender),
              ResultLabel(interaction->result),
              interaction->frameAdvantage,
+             ActionabilitySourceName(s_actionabilitySource),
              interaction->simFrame_A_recover, interaction->simFrame_D_recover,
              interaction->simFrame_contact, interaction->attacker_actionId);
 
@@ -758,6 +783,12 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
         IsFree(defender.curr, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked)) {
         interaction.simFrame_D_recover = simFrame;
         interaction.lastProgressFrame = simFrame;
+        // Record the defender's free frame for gap detection. This must happen on
+        // every D_recover — not just mid-string — so the gap between two hits is
+        // still measurable when the previous interaction completes (both sides
+        // recover) before the next contact. The next contact's PublishGapDisplay
+        // consumes this; kGapMaxFrames filters out stale (non-string) values.
+        s_lastDefenderFreeFrame[interaction.defender] = simFrame;
         if (s_actionabilityAuditLogging) {
             LOG_INFO("[FAREC] frame=%u %s role=defender act=%u phase=%u aframe=%u source=legacy native676=%u D_recover=%u airLocked=%d",
                      simFrame,
@@ -988,6 +1019,24 @@ void FrameAdvantage_RenderImGui(void) {
         ImGui::Checkbox("Debug Log", &s_debugLogging);
         ImGui::SameLine();
         ImGui::Checkbox("Audit Actionability", &s_actionabilityAuditLogging);
+
+        // Recovery detection source: StateClass (engine-derived, default) vs the
+        // legacy hand-enumerated action-ID list. Switchable live for A/B testing.
+        // Changing it abandons any in-flight calculation so the next interaction
+        // is measured cleanly under the new rule.
+        bool useStateClass =
+            s_actionabilitySource == Training::ActionabilitySource::StateClass;
+        if (ImGui::Checkbox("State-class actionability", &useStateClass)) {
+            const Training::ActionabilitySource next = useStateClass
+                ? Training::ActionabilitySource::StateClass
+                : Training::ActionabilitySource::LegacyActionId;
+            if (next != s_actionabilitySource) {
+                s_actionabilitySource = next;
+                FrameAdvantage_CancelCalculation();
+                LOG_INFO("[FA] Actionability source -> %s",
+                         useStateClass ? "StateClass" : "LegacyActionId");
+            }
+        }
     }
 
     if (s_enabled && s_historyCount > 0) {

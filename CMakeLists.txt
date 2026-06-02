@@ -18,7 +18,7 @@
 
 cmake_minimum_required(VERSION 3.15)
 project(AS2_Rollback VERSION 0.6.0 LANGUAGES C CXX)
-set(AS2_MOD_VERSION "0.6-beta")
+set(AS2_MOD_VERSION "0.6")
 
 enable_testing()
 

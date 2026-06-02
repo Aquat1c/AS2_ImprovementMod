@@ -59,6 +59,61 @@ static uint16_t s_suppressedSlotEffect[EFFECT_MAX_SLOTS] = {};
 static int32_t s_suppressedSlotUntil[EFFECT_MAX_SLOTS] = {};
 static uint32_t s_drawSuppressCount = 0;
 
+// ----------------------------------------------------------------------------
+// Status-message animation smoothing across rollback.
+//
+// Each effect entry stores its age at +0x0A (set to 0 on spawn, incremented per
+// frame by Effect_Update, drives the message's pop/fade and lifetime). On a
+// rollback the message is re-spawned at the corrected frame, so its age resets
+// and the visible pop re-triggers — the same artifact the combo counter had.
+//
+// We keep a display-time age shadow per (effect_id, side) and substitute it into
+// +0x0A only for the duration of the draw, restoring the true value immediately
+// after. Effect_Update (sim phase) always sees the true age, so lifetime/despawn
+// timing and determinism are unaffected — this changes only the rendered frame.
+// ----------------------------------------------------------------------------
+static constexpr uintptr_t EFFECT_OFF_AGE = 0x0A;   // word age/animation counter
+static constexpr int kMaxMsgShadows = 16;
+static constexpr int32_t kMsgAgeMax = 0x7FFF;
+
+struct MsgAgeShadow {
+    bool     used = false;
+    uint16_t effect_id = 0;
+    uint8_t  side = 0;
+    int32_t  age = 0;
+    bool     present_last = false;
+    bool     present_this = false;
+};
+static MsgAgeShadow s_msgShadows[kMaxMsgShadows] = {};
+static uint32_t s_msgSmoothedCount = 0;
+
+static void ClearMsgAgeShadows() {
+    for (int i = 0; i < kMaxMsgShadows; ++i) {
+        s_msgShadows[i] = MsgAgeShadow{};
+    }
+}
+
+static MsgAgeShadow* FindOrCreateMsgShadow(uint16_t effect_id, uint8_t side) {
+    MsgAgeShadow* freeSlot = nullptr;
+    for (int i = 0; i < kMaxMsgShadows; ++i) {
+        if (s_msgShadows[i].used &&
+            s_msgShadows[i].effect_id == effect_id &&
+            s_msgShadows[i].side == side) {
+            return &s_msgShadows[i];
+        }
+        if (!s_msgShadows[i].used && !freeSlot) {
+            freeSlot = &s_msgShadows[i];
+        }
+    }
+    if (freeSlot) {
+        *freeSlot = MsgAgeShadow{};
+        freeSlot->used = true;
+        freeSlot->effect_id = effect_id;
+        freeSlot->side = side;
+    }
+    return freeSlot;
+}
+
 static std::vector<StatusFxEvent> s_committed;
 static std::vector<StatusFxEvent> s_pendingPredicted;
 static std::vector<StatusFxEvent> s_corrected;
@@ -321,6 +376,8 @@ void RollbackStatusFx_Init() {
     s_stats.last_load_frame = -1;
     s_stats.last_reconcile_frame = -1;
     ClearSuppressedSlots();
+    ClearMsgAgeShadows();
+    s_msgSmoothedCount = 0;
     s_drawSuppressCount = 0;
     s_initialized = true;
     NetplayLog_Write("STATUSFX", -1,
@@ -348,6 +405,8 @@ void RollbackStatusFx_OnSessionBegin(int rollback_budget) {
     s_stats.last_load_frame = -1;
     s_stats.last_reconcile_frame = -1;
     ClearSuppressedSlots();
+    ClearMsgAgeShadows();
+    s_msgSmoothedCount = 0;
     s_drawSuppressCount = 0;
     s_committed.clear();
     s_pendingPredicted.clear();
@@ -386,6 +445,8 @@ void RollbackStatusFx_OnSessionEnd(const char* reason) {
     s_pendingPredicted.clear();
     s_corrected.clear();
     ClearSuppressedSlots();
+    ClearMsgAgeShadows();
+    s_msgSmoothedCount = 0;
     s_drawSuppressCount = 0;
 }
 
@@ -665,32 +726,113 @@ int __cdecl Hook_Effect_DrawQueue(int match) {
 
     HiddenSlot hidden[EFFECT_MAX_SLOTS];
     int hiddenCount = 0;
+
+    struct SmoothedSlot {
+        uint16_t slot;
+        uint16_t true_age;
+    };
+    SmoothedSlot smoothed[EFFECT_MAX_SLOTS];
+    int smoothedCount = 0;
+
     const bool rolling = RollbackSession_IsRollingBack();
     PruneSuppressedSlots();
 
+    // Age smoothing runs only on the real display draw (post-sim, not mid-resim).
+    const bool doSmooth = !rolling;
+    if (doSmooth) {
+        for (int i = 0; i < kMaxMsgShadows; ++i) {
+            s_msgShadows[i].present_this = false;
+        }
+    }
+
     for (uint16_t slot = 0; slot < EFFECT_MAX_SLOTS; ++slot) {
-        const uintptr_t effectIdAddr = ADDR_EFFECT_ARRAY + ((uintptr_t)slot * EFFECT_ENTRY_SIZE);
-        const uint32_t effectId = ReadMemory<uint32_t>(effectIdAddr);
+        const uintptr_t base = ADDR_EFFECT_ARRAY + ((uintptr_t)slot * EFFECT_ENTRY_SIZE);
+        const uint32_t effectId = ReadMemory<uint32_t>(base);
         if (!IsMonitoredStatusFx((int)effectId)) {
             continue;
         }
 
-        if (!rolling && !IsSlotSuppressed(slot, (uint16_t)effectId)) {
+        const bool hide = rolling || IsSlotSuppressed(slot, (uint16_t)effectId);
+        if (hide) {
+            if (WriteMemory<uint32_t>(base, 0)) {
+                hidden[hiddenCount].slot = slot;
+                hidden[hiddenCount].effect_id = effectId;
+                ++hiddenCount;
+            }
             continue;
         }
 
-        if (WriteMemory<uint32_t>(effectIdAddr, 0)) {
-            hidden[hiddenCount].slot = slot;
-            hidden[hiddenCount].effect_id = effectId;
-            ++hiddenCount;
+        // Visible status message — keep its pop/fade animation continuous across
+        // rollback by substituting a display-time age for the resimulated one.
+        if (!doSmooth) {
+            continue;
+        }
+        const int16_t x = ReadMemory<int16_t>(base + 6);
+        const int16_t y = ReadMemory<int16_t>(base + 8);
+        const uint8_t side = GuessSideFromPosition(x, y);
+        const int32_t trueAge = (int32_t)ReadMemory<uint16_t>(base + EFFECT_OFF_AGE);
+        MsgAgeShadow* sh = FindOrCreateMsgShadow((uint16_t)effectId, side);
+        if (!sh) {
+            continue;
+        }
+
+        // A message present last frame keeps advancing in display time; a newly
+        // appearing one adopts the game's age so it pops normally. During normal
+        // play both stay in lockstep (no override); only a rollback that
+        // re-anchors the spawn frame makes them diverge — and then the shadow
+        // suppresses the visible re-pop.
+        int32_t newAge;
+        if (sh->present_this) {
+            // A second live slot this frame shares the same (effect_id, side)
+            // key — reuse the age already advanced so duplicates stay in sync and
+            // the shadow advances at most once per display frame.
+            newAge = sh->age;
+        } else {
+            newAge = sh->present_last ? sh->age + 1 : trueAge;
+            if (newAge < 0) newAge = 0;
+            if (newAge > kMsgAgeMax) newAge = kMsgAgeMax;
+            sh->age = newAge;
+            sh->present_this = true;
+        }
+
+        if ((uint16_t)newAge != (uint16_t)trueAge &&
+            WriteMemory<uint16_t>(base + EFFECT_OFF_AGE, (uint16_t)newAge)) {
+            smoothed[smoothedCount].slot = slot;
+            smoothed[smoothedCount].true_age = (uint16_t)trueAge;
+            ++smoothedCount;
         }
     }
 
     const int result = g_origEffectDrawQueue(match);
 
     for (int i = 0; i < hiddenCount; ++i) {
-        const uintptr_t effectIdAddr = ADDR_EFFECT_ARRAY + ((uintptr_t)hidden[i].slot * EFFECT_ENTRY_SIZE);
-        WriteMemory<uint32_t>(effectIdAddr, hidden[i].effect_id);
+        const uintptr_t base = ADDR_EFFECT_ARRAY + ((uintptr_t)hidden[i].slot * EFFECT_ENTRY_SIZE);
+        WriteMemory<uint32_t>(base, hidden[i].effect_id);
+    }
+    for (int i = 0; i < smoothedCount; ++i) {
+        const uintptr_t base = ADDR_EFFECT_ARRAY + ((uintptr_t)smoothed[i].slot * EFFECT_ENTRY_SIZE);
+        WriteMemory<uint16_t>(base + EFFECT_OFF_AGE, smoothed[i].true_age);
+    }
+
+    if (doSmooth) {
+        for (int i = 0; i < kMaxMsgShadows; ++i) {
+            if (!s_msgShadows[i].used) {
+                continue;
+            }
+            s_msgShadows[i].present_last = s_msgShadows[i].present_this;
+            if (!s_msgShadows[i].present_this) {
+                s_msgShadows[i].used = false;
+            }
+        }
+        if (smoothedCount > 0) {
+            s_msgSmoothedCount += (uint32_t)smoothedCount;
+            NetplayLog_Verbose("STATUSFX", s_currentRbFrame,
+                "DRAW_SMOOTH smoothed=%d total=%u rb=%d game=%d",
+                smoothedCount,
+                s_msgSmoothedCount,
+                s_currentRbFrame,
+                s_currentGameAbsFrame);
+        }
     }
 
     if (hiddenCount > 0) {

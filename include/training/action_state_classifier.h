@@ -16,7 +16,23 @@ enum class ActionabilitySource : uint8_t {
     LegacyActionId,
     CandidateNativeFlag,
     HybridValidated,
+    // State-class rule derived from the engine's own action-ID boundaries:
+    // actionId < 85 (not performing an attack move) and not a forced-lock /
+    // extended-recovery state. Catches every movement/neutral recovery state
+    // instead of a hand-enumerated subset. See action_state_classifier.cpp.
+    StateClass,
 };
+
+// True when the action-state ID denotes the character is performing an attack
+// move (the CharAction_* handler range). Confirmed engine boundary: states
+// 0..84 are reaction/movement/neutral; 85+ are attack moves.
+bool IsAttackMoveState(uint32_t actionId);
+
+// State-class actionability: the character is in a movement/neutral state it can
+// act out of — not in an attack move, not in a forced lock or extended recovery,
+// and not in a context-excluded landing. This mirrors how the engine itself
+// classifies states rather than enumerating individual "free" action IDs.
+bool IsStateClassActionable(uint32_t actionId, bool landingExcluded);
 
 struct ActionStateSample {
     uint32_t actionId = 0;

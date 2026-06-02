@@ -11,6 +11,8 @@
 #include "ui/netplay_hud_style.h"
 #include "as2_constants.h"
 #include "log_window.h"
+#include "patches/memory_utils.h"
+#include "rollback/rollback_session.h"
 #include "MinHook.h"
 
 #include <algorithm>
@@ -245,8 +247,115 @@ static void DrawNicknamesForMode(bool charSel) {
     DrawPlayerRight(hud, SideNickY(charSel));
 }
 
+// ============================================================================
+// Rollback combo-counter animation smoothing
+//
+// During rollback, the combo hit-reaction "pop" animation timer (entity +0x7C5)
+// is saved, restored, and resimulated along with gameplay state. Whenever a
+// rollback corrects a misprediction the timer jumps, so the combo counter
+// visibly re-pops/jitters even though the combo itself is unchanged. That timer
+// is pure presentation — it is decrement-only with no gameplay side effects (the
+// combo number lives at +0xD0 and the combo lifetime at +0x7C6, both untouched
+// here), so we can substitute a smooth display-time value for the duration of the
+// HUD render and restore the true value immediately afterward.
+//
+// The override is live only across this one render call. The deterministic
+// save/restore/checksum path runs in the simulation phase and never observes it,
+// so this cannot cause a desync. The combo NUMBER still updates to whatever the
+// rollback resimulated — only the pop ANIMATION is kept continuous. Smoothing
+// runs only while a rollback session is active and in a match; offline play is
+// untouched and renders byte-identically to vanilla.
+// ============================================================================
+
+namespace {
+
+struct SideComboSmooth {
+    int32_t  tracked_hits = 0;  // last seen combo hit count (+0xD0)
+    int32_t  smooth_pop = 0;    // display-time pop-timer shadow
+    bool     overrode = false;  // did we override +0x7C5 this frame?
+    uint8_t  true_pop = 0;      // true gameplay value to restore
+};
+
+static SideComboSmooth s_combo[2] = {};
+static bool s_smoothActive = false;
+
+static void SmoothSideBeforeRender(int side, uintptr_t entity) {
+    SideComboSmooth& st = s_combo[side];
+    st.overrode = false;
+
+    // The combo "pop" timer (+0x7C5) is gated by the combo hit count (+0xD0).
+    // During normal play smooth_pop tracks the game's timer exactly (both
+    // decrement in lockstep), so the override is a no-op. Only when a rollback
+    // re-pops the timer without the hit count actually increasing does the shadow
+    // keep decaying instead, suppressing the visible re-pop. No rollback-recency
+    // gate is needed: the shadow self-corrects to the game value on every real hit.
+    const int32_t hits = (int32_t)ReadMemory<uint8_t>(entity + ENTITY_OFF_DISPLAY_COMBO_COUNT);
+    const uint8_t gamePop = ReadMemory<uint8_t>(entity + ENTITY_OFF_HIT_REACTION_ANIM_TIMER);
+
+    if (hits <= 0) {
+        st.smooth_pop = 0;
+        st.tracked_hits = 0;
+        return;
+    }
+
+    if (hits > st.tracked_hits) {
+        // A real new hit landed this frame — take the game's fresh pop value so
+        // the animation legitimately re-triggers.
+        st.smooth_pop = gamePop;
+    } else {
+        // Same or rolled-back hit count: the game's pop may have jumped due to
+        // resim, but no new hit occurred — keep decaying smoothly.
+        st.smooth_pop = st.smooth_pop > 0 ? st.smooth_pop - 1 : 0;
+    }
+    st.tracked_hits = hits;
+    st.true_pop = gamePop;
+    st.overrode = true;
+    WriteMemory<uint8_t>(entity + ENTITY_OFF_HIT_REACTION_ANIM_TIMER, (uint8_t)st.smooth_pop);
+}
+
+static void RestoreSideAfterRender(int side, uintptr_t entity) {
+    SideComboSmooth& st = s_combo[side];
+    if (st.overrode) {
+        WriteMemory<uint8_t>(entity + ENTITY_OFF_HIT_REACTION_ANIM_TIMER, st.true_pop);
+        st.overrode = false;
+    }
+}
+
+static void RollbackHudSmooth_BeforeRender() {
+    s_smoothActive = false;
+
+    // Only smooth during an active rollback session in a live match; otherwise
+    // leave the game's presentation untouched (offline stays byte-identical).
+    if (!Rollback::RollbackSession_IsActive() || GetGameMode() != MODE_MATCH) {
+        return;
+    }
+
+    s_smoothActive = true;
+    SmoothSideBeforeRender(0, ADDR_P1_ENTITY_BASE);
+    SmoothSideBeforeRender(1, ADDR_P2_ENTITY_BASE);
+}
+
+static void RollbackHudSmooth_AfterRender() {
+    if (!s_smoothActive) {
+        return;
+    }
+    RestoreSideAfterRender(0, ADDR_P1_ENTITY_BASE);
+    RestoreSideAfterRender(1, ADDR_P2_ENTITY_BASE);
+    s_smoothActive = false;
+}
+
+} // namespace
+
 static __int16 __cdecl Hook_MatchHudRender(int game, int match) {
+    // Apply presentation smoothing around the vanilla HUD draw, then restore the
+    // true gameplay values immediately after. The override is live only across
+    // this render call; the deterministic save/restore runs in the sim phase and
+    // never sees it. (If the game renderer itself faults the process crashes, so
+    // there is no later save for an unrestored override to leak into.)
+    RollbackHudSmooth_BeforeRender();
     const __int16 result = s_origMatchHudRender ? s_origMatchHudRender(game, match) : 0;
+    RollbackHudSmooth_AfterRender();
+
     if (NetplayHudStyle::GetRenderMode() != NetplayHudStyle::HudRenderMode::Vanilla) {
         return result;
     }

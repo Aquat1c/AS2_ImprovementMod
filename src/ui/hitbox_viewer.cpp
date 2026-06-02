@@ -41,6 +41,17 @@
 // ============================================================================
 
 static bool  g_enabled         = false;
+// Per-frame logging is emitted once per *simulation* frame, not once per rendered
+// present. s_lastLoggedSimFrame tracks the last game frame we logged; s_logThisFrame
+// is recomputed at the top of each render and gates all per-frame log sites so a
+// single frame-step (paused) produces exactly one log block, and a held/paused
+// screen stops flooding at the ~60 Hz present rate.
+static uint32_t s_lastLoggedSimFrame = 0xFFFFFFFF;
+static bool  s_logThisFrame    = false;
+// Forces a single full log block on the next render regardless of per-frame
+// logging or frame advance — used by "Log Once Now" so you can capture an exact
+// (e.g. paused) frame such as a throw's active grab frame.
+static bool  s_forceLogOnce    = false;
 static bool  g_showHurtboxes   = true;
 static bool  g_showHitboxes    = true;
 static bool  g_showPushboxes   = true;
@@ -77,6 +88,8 @@ static const ImU32 COL_INVINCIBLE = IM_COL32(90, 175, 255, 255);
 static const ImU32 COL_ARMOR      = IM_COL32(255, 160, 0, 255);
 static const ImU32 COL_IMMUNE     = IM_COL32(180, 0, 255, 255);
 static const ImU32 COL_PROX_GUARD = IM_COL32(100, 220, 255, 255);
+static const ImU32 COL_THROW      = IM_COL32(255, 0, 170, 255);  // magenta — active throw/grab
+static const ImU32 COL_CLASH      = IM_COL32(255, 215, 0, 255);   // gold — clashable weapon attack
 
 // ============================================================================
 // Helpers
@@ -439,7 +452,7 @@ static void CopyAnimFrameBytes(uintptr_t entityBase, uint32_t animIdx, uint8_t* 
 }
 
 static void LogAnimFrameSnapshot(const AnimFrameSnapshot& snapshot, const char* label) {
-    if (!g_logPerFrame || !label || !label[0] || !snapshot.valid) {
+    if (!s_logThisFrame || !label || !label[0] || !snapshot.valid) {
         return;
     }
 
@@ -447,18 +460,21 @@ static void LogAnimFrameSnapshot(const AnimFrameSnapshot& snapshot, const char* 
     LOG_INFO("[HBV] %s animIdx=%u entity=0x%08X frameBase=0x%08X",
              label, snapshot.animIdx, (uint32_t)snapshot.entityBase, (uint32_t)frameBase);
 
+    // Standard box decode (hit/hurt layout: xOff@+0 yOff@+2 halfW@+4 halfH@+6).
+    // Each line is self-contained: byte offset within the frame, absolute address,
+    // the raw 8 bytes, and the decoded box, so the layout is verifiable from the log
+    // alone without re-indexing the 104B blob below.
     auto logBoxes = [&](const char* groupLabel, const BoxEntry* boxes, int count, int frameOffset) {
         for (int i = 0; i < count; i++) {
             const BoxEntry& box = boxes[i];
-            LOG_INFO("[HBV]   %s.%s box[%d] @0x%08X: off(%d,%d) half(%d,%d) %s",
-                     label,
-                     groupLabel,
-                     i,
-                     (uint32_t)(frameBase + frameOffset + ((uintptr_t)i * HURTBOX_ENTRY_SIZE)),
-                     box.xOff,
-                     box.yOff,
-                     box.halfW,
-                     box.halfH,
+            const size_t off = (size_t)frameOffset + (size_t)i * HURTBOX_ENTRY_SIZE;
+            const uint8_t* p = snapshot.rawFrame + off;
+            LOG_INFO("[HBV]   %s.%-4s[%d] off+%-3u @0x%08X raw=%02X %02X %02X %02X %02X %02X %02X %02X "
+                     "-> off(%d,%d) halfW=%d halfH=%d %s",
+                     label, groupLabel, i, (unsigned)off,
+                     (uint32_t)(frameBase + off),
+                     p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                     box.xOff, box.yOff, box.halfW, box.halfH,
                      (box.halfW > 0 && box.halfH > 0) ? "ACTIVE" : "skip");
         }
     };
@@ -467,6 +483,44 @@ static void LogAnimFrameSnapshot(const AnimFrameSnapshot& snapshot, const char* 
     logBoxes("hit", snapshot.hitBoxes, HURTBOX_COUNT_PER_FRAME, ANIM_HITBOX_OFFSET);
     logBoxes("hurt", snapshot.hurtBoxes, HURTBOX_COUNT_PER_FRAME, ANIM_HURTBOX_OFFSET);
     logBoxes("ext", snapshot.throwBoxes, HURTBOX_COUNT_PER_FRAME, ANIM_EXT_HURTBOX_OFFSET);
+
+    // --- Throw / grab interaction state (LOG-ONLY; intentionally NOT rendered) -----
+    // Confirmed against the decompilation (Entity_UpdateGrabAlignment and
+    // Entity_UpdateThrowInteraction). Throws resolve against the SAME 104B box block,
+    // using the SAME field layout as hit/hurt boxes (xOff@+0 yOff@+2 halfW@+4 halfH@+6
+    // — there is NO width/height swap; an earlier hypothesis was wrong). So the grab
+    // geometry is already printed by the standard box dump above; the mapping is:
+    //   attacker grab REACH  -> hit  slots (+8..+32)   [Entity_UpdateGrabAlignment]
+    //   defender grab CATCH  -> hurt slots (+40..+64)  [Entity_UpdateGrabAlignment]
+    //   mutual throw/tech     -> ext  slots (+72..+96)  [Entity_UpdateThrowInteraction]
+    //
+    // The decisive part the box dump can't show: Entity_UpdateGrabAlignment connects a
+    // grab when the reach/catch boxes overlap *** OR *** when the attacker's
+    // ATTACK_FLAG_CONTACT_OVERRIDE (0x20000 @ entity+0x6CC) is set, which BYPASSES the
+    // box overlap entirely. Normal proximity throws (action 103) and command throws
+    // take this flag-driven path — that is exactly why their reach/catch/tech slots are
+    // all empty in the dump above yet the throw still connects. This line surfaces the
+    // throw flags so a flag-driven grab is no longer invisible in the log.
+    const uint8_t  atkState  = ReadMemory<uint8_t>(snapshot.entityBase + ENTITY_OFF_ATTACK_STATE);
+    const uint32_t atkType   = ReadMemory<uint32_t>(snapshot.entityBase + ENTITY_OFF_ATTACK_TYPE);
+    const uint8_t  hitActive = ReadMemory<uint8_t>(snapshot.entityBase + ENTITY_OFF_HIT_ACTIVE);
+    const bool contactOverride = (atkType & ATTACK_FLAG_CONTACT_OVERRIDE) != 0;
+    const int reachActive = CountActiveBoxes(snapshot.hitBoxes, HURTBOX_COUNT_PER_FRAME);
+    const int catchActive = CountActiveBoxes(snapshot.hurtBoxes, HURTBOX_COUNT_PER_FRAME);
+    const int techActive  = CountActiveBoxes(snapshot.throwBoxes, HURTBOX_COUNT_PER_FRAME);
+    LOG_INFO("[HBV] %s THROW-STATE: atkState=%u atkType=0x%05X[%s%s%s] hitActive=%u | "
+             "grabBoxes reach(hit+%d)=%d catch(hurt+%d)=%d tech(ext+%d)=%d | grab=%s",
+             label, atkState, atkType,
+             contactOverride                       ? "CONTACT_OVERRIDE " : "",
+             (atkType & ATTACK_FLAG_PROJ_IMMUNE)   ? "PROJ_IMMUNE "      : "",
+             (atkType & ATTACK_FLAG_LOW_HIT)       ? "LOW_HIT "          : "",
+             hitActive,
+             ANIM_HITBOX_OFFSET, reachActive,
+             ANIM_HURTBOX_OFFSET, catchActive,
+             ANIM_EXT_HURTBOX_OFFSET, techActive,
+             contactOverride ? "FLAG-DRIVEN (0x20000, no box needed)"
+                             : (reachActive > 0 ? "BOX-DRIVEN (reach box present)"
+                                                : "inactive (no flag, no reach box)"));
 
     char hex[256];
     int pos = 0;
@@ -795,7 +849,7 @@ static int BuildHitDefSnapshots(AnimFrameCache* cache,
 
         char label[32];
         const char* logLabel = nullptr;
-        if (g_logPerFrame) {
+        if (s_logThisFrame) {
             snprintf(label, sizeof(label), "HitDef[%d]", i);
             logLabel = label;
         }
@@ -820,7 +874,7 @@ static void RenderBoxSet(ImDrawList* dl,
 
     const float ex = (float)(entity.posX / 10);
     const float ey = (float)(entity.posY / 10);
-    if (g_logPerFrame) {
+    if (s_logThisFrame) {
         LOG_INFO("[HBV] %s.%s pos=(%d,%d) pos/10=(%.1f,%.1f) facing=%d scroll=(%d,%d)",
                  entity.label ? entity.label : "Entity",
                  boxLabel ? boxLabel : "boxes",
@@ -848,7 +902,7 @@ static void RenderBoxSet(ImDrawList* dl,
         const float top = cy - hh - t.scrollY;
         const float bot = cy + hh - t.scrollY;
 
-        if (g_logPerFrame) {
+        if (s_logThisFrame) {
             LOG_INFO("[HBV]   %s.%s draw[%d]: centre=(%.1f,%.1f) hw=%.1f hh=%.1f -> screen L=%.1f T=%.1f R=%.1f B=%.1f",
                      entity.label ? entity.label : "Entity",
                      boxLabel ? boxLabel : "boxes",
@@ -903,7 +957,9 @@ static uint32_t GetLegacyInvincibleGateValue(const EntitySnapshot& entity) {
 }
 
 static uint32_t GetDirectInvincibleFlagBits(const EntitySnapshot& entity) {
-    return entity.maxHit.rawId & (MAX_HIT_FLAG_MELEE_INVULN | MAX_HIT_FLAG_PROJECTILE_INVULN);
+    return entity.maxHit.rawId & (MAX_HIT_FLAG_STRIKE_INVULN |
+                                  MAX_HIT_FLAG_MELEE_INVULN |
+                                  MAX_HIT_FLAG_PROJECTILE_INVULN);
 }
 
 static uint32_t GetMarkerInvincibleStateBits(const EntitySnapshot& entity) {
@@ -956,16 +1012,61 @@ static void RenderStateFlags(ImDrawList* dl,
         drawLabel(COL_CANCEL, buf);
     }
 
-    if (HasInvincibleState(entity)) {
-        drawLabel(COL_INVINCIBLE, "INVINCIBLE");
+    // Active throw / grab (researched: Entity_UpdateGrabAlignment, Entity_UpdateThrowInteraction).
+    // AS2 throws are flag-driven: the thrower carries CONTACT_OVERRIDE (0x20000), which forces the
+    // grab regardless of box geometry (there is no grab-box to draw — see THROW-STATE log). Throws
+    // that also carry PROJ_IMMUNE (0x800) pierce the defender's grab-invuln gate (+0x78C), but that
+    // interaction is left to the THROW-STATE log; the on-screen marker is just THROW on the thrower.
+    const bool throwing = (entity.attackType & ATTACK_FLAG_CONTACT_OVERRIDE) != 0;
+    if (throwing) {
+        drawLabel(COL_THROW, "THROW");
     }
 
-    if (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE) {
+    // Defensive invulnerability (verified against the decomp):
+    //   +0x78C (GetLegacyInvincibleGateValue) is FULL invuln. It is the defender gate read by BOTH the
+    //   strike path (Entity_UpdateDamageApplication @0x4A76F0, the +1932 check) AND the grab path
+    //   (Entity_UpdateGrabAlignment @0x4A4950 / ThrowInteraction / summon-grab). So it blocks strikes
+    //   AND throws even while hurtboxes stay up. (Earlier I mis-attributed the +1932 read to the throw
+    //   path; it is in the strike-damage applier, so +0x78C is genuinely full.)
+    //   Narrower, single-axis invuln sets a different flag instead:
+    //     strike-only source = the +1940 melee/projectile/special-invuln flags. They negate strikes in
+    //                          the damage/clash resolvers but are NOT read by the grab path -> the move
+    //                          stays throwable.
+    //     throw-only source  = none identified beyond +0x78C yet (see the [HBV] INVULN capture log).
+    // Combine so each state is one mutually-exclusive label: both -> FULL INVULN; strike only ->
+    // STRIKE INVULN (throwable); throw only -> THROW INVULN (hittable).
+    const bool fullInvuln   = GetLegacyInvincibleGateValue(entity) != 0;
+    const bool strikeInvuln = fullInvuln ||
+                              (GetDirectInvincibleFlagBits(entity) != 0) ||
+                              (GetMarkerInvincibleStateBits(entity) != 0);
+    const bool throwInvuln  = fullInvuln;
+    if (strikeInvuln && throwInvuln) {
+        drawLabel(COL_INVINCIBLE, "FULL INVULN");
+    } else if (strikeInvuln) {
+        drawLabel(COL_INVINCIBLE, "STRIKE INVULN");
+    } else if (throwInvuln) {
+        drawLabel(COL_INVINCIBLE, "THROW INVULN");
+    }
+
+    // Suppress the standalone PROJ IMMUNE label during a throw — the THROW "(pierces invuln)" tag
+    // already conveys it, so we don't print two overlapping labels for the same 0x800 bit.
+    if (!throwing && (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE)) {
         drawLabel(COL_IMMUNE, "PROJ IMMUNE");
     }
 
     if (entity.attackState == 1 && entity.hitActive != 0) {
         drawLabel(COL_HITBOX, "ATK");
+    }
+
+    // Clashable weapon attack: the move has armed its clash block (clash ID @ +0x788). When two
+    // clash-enabled attacks meet, Entity_ResolveAttackCollision (0x4A1000) resolves them by rank
+    // (+0x77C): equal rank -> mutual clash (SE 22, both recoil); higher rank wins (SE 21). The
+    // resolver treats clash IDs 0 and 1 as "not armed", so mirror that here. Rank is shown since it
+    // is the deciding value.
+    if (entity.clash.continuationId != 0 && entity.clash.continuationId != 1) {
+        char clashLabel[24];
+        snprintf(clashLabel, sizeof(clashLabel), "CLASH r%u", entity.clash.rank);
+        drawLabel(COL_CLASH, clashLabel);
     }
 
     // Proximity guard — cancellable, shown so players can see the window
@@ -988,7 +1089,7 @@ static void RenderHitDefs(ImDrawList* dl,
 
         activeCount++;
 
-        if (g_logPerFrame) {
+        if (s_logThisFrame) {
             LOG_INFO("[HBV] HitDef[%d] id=%u owner=%u animOwner=%u type=%u invuln=%u flag=%d pos=(%d,%d) face=%d dmg=%u animIdx=%u",
                      hitDef.index,
                      hitDef.id,
@@ -1060,7 +1161,7 @@ static void RenderHitDefs(ImDrawList* dl,
         }
     }
 
-    if (g_logPerFrame && activeCount > 0) {
+    if (s_logThisFrame && activeCount > 0) {
         LOG_INFO("[HBV] Active HitDefs: %d", activeCount);
     }
 }
@@ -1503,6 +1604,18 @@ void HitboxViewer_Render() {
     if (!g_enabled) return;
     if (!AS2_IsInMatch()) return;
 
+    // Gate per-frame logging on the simulation frame advancing. The render runs
+    // every present (~60 Hz wall clock) regardless of whether the game stepped, so
+    // logging here directly floods while paused and never aligns to frame-steps.
+    // Keying on AS2_GetFrameNumber() makes per-frame logging emit exactly once per
+    // simulated frame — one block per single-step while paused, none while held.
+    const uint32_t simFrame = AS2_GetFrameNumber();
+    s_logThisFrame = s_forceLogOnce || (g_logPerFrame && (simFrame != s_lastLoggedSimFrame));
+    if (s_logThisFrame) {
+        s_lastLoggedSimFrame = simFrame;
+        s_forceLogOnce = false;
+    }
+
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     if (!dl) return;
 
@@ -1537,6 +1650,33 @@ void HitboxViewer_Render() {
     }
     s_lastP1Anim = p1.animIdx;
     s_lastP2Anim = p2.animIdx;
+
+    // Per-frame invuln capture (research): dumps every candidate defender invuln field so a
+    // strike-only / throw-only move can be mapped to the exact flag it sets. gate(+0x78C) is the
+    // confirmed FULL-invuln gate; the rest are candidates for the narrower single-axis states.
+    if (s_logThisFrame) {
+        auto logInvuln = [](const EntitySnapshot& e) {
+            const uint32_t gate   = GetLegacyInvincibleGateValue(e);   // +0x78C  (FULL invuln gate)
+            const uint32_t direct = GetDirectInvincibleFlagBits(e);    // +1940 & (melee|projectile)
+            const uint32_t marker = GetMarkerInvincibleStateBits(e);   // special invuln (+1948-gated)
+            const bool full   = gate != 0;
+            const bool strike = full || direct != 0 || marker != 0;
+            const char* verdict = (strike && full) ? "FULL" : (strike ? "STRIKE" : (full ? "THROW" : "none"));
+            const int hc = e.animFrame ? CountActiveBoxes(e.animFrame->hurtBoxes,  HURTBOX_COUNT_PER_FRAME) : -1;
+            const int ec = e.animFrame ? CountActiveBoxes(e.animFrame->throwBoxes, HURTBOX_COUNT_PER_FRAME) : -1;
+            LOG_INFO("[HBV] %s INVULN: act=%u gate(+0x78C)=0x%X raw1940(+0x794)=0x%X direct=0x%X marker=0x%X "
+                     "clashId(+0x788)=0x%X m1948=%u m1949=%u maxHit[B/C/D]=%u/%u/%u clash[A/B/C/D]=%d/%d/%d/%d "
+                     "hurt=%d ext=%d -> %s",
+                     e.label, e.actionId,
+                     gate, e.maxHit.rawId, direct, marker,
+                     e.clash.continuationId, e.maxHit.marker1948, e.maxHit.marker1949,
+                     e.maxHit.rawB, e.maxHit.rawC, e.maxHit.rawD,
+                     e.clash.rawA, e.clash.rawB, e.clash.rawC, e.clash.rawD,
+                     hc, ec, verdict);
+        };
+        logInvuln(p1);
+        logInvuln(p2);
+    }
 
     HitDefSnapshot hitDefs[SUMMON_MAX_SLOTS] = {};
     int hitDefCount = 0;
@@ -1616,6 +1756,7 @@ void HitboxViewer_RenderControls() {
     if (ImGui::Button("Log Once Now")) {
         s_lastP1Anim = 0xFFFFFFFF;
         s_lastP2Anim = 0xFFFFFFFF;
+        s_forceLogOnce = true;  // emit one full block on the next render, even paused
         LOG_INFO("[HBV] --- Manual one-shot log triggered ---");
     }
 }

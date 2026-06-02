@@ -79,6 +79,39 @@ bool IsContactStartState(uint32_t actionId) {
     return IsBlockstun(actionId) || IsHitstun(actionId);
 }
 
+bool IsAttackMoveState(uint32_t actionId) {
+    // Engine boundary (decomp: throw/state handlers branch on actionId < 85):
+    // 0..84 are reaction/movement/neutral states, 85+ are the CharAction_*
+    // attack-move handlers.
+    return actionId >= 85;
+}
+
+bool IsStateClassActionable(uint32_t actionId, bool landingExcluded) {
+    // Performing an attack move — not actionable until it returns to a state < 85.
+    if (IsAttackMoveState(actionId)) {
+        return false;
+    }
+    // Forced locks: blockstun/hitstun (64,65,67,68,70,71,72,73) and
+    // knockdown/launch/tech (74..82).
+    if (IsForcedDefenderLock(actionId)) {
+        return false;
+    }
+    // Extended throw-receive / post-knockdown recovery states (83,84) observed
+    // being assigned to the opponent during throw/special interactions. Treated
+    // as locked until proven actionable by audit.
+    if (actionId == 83 || actionId == 84) {
+        return false;
+    }
+    // Landing (23) per context (excluded for defender recovery after air states).
+    if (landingExcluded) {
+        return false;
+    }
+    // Everything else < 85 is a movement/neutral state the character can act out
+    // of: stand/crouch/walk/jump/air, proximity guard (63/66/69), etc. — including
+    // states not present in the hand-enumerated legacy free list.
+    return true;
+}
+
 const char* ActionCategory(uint32_t actionId) {
     if (IsProximityGuard(actionId)) return "ProxGuard";
     if (IsBlockstun(actionId)) return "Blockstun";
@@ -128,6 +161,14 @@ ActionabilityResult EvaluateActionability(const ActionStateSample& sample,
         case ActionabilitySource::HybridValidated:
             out.actionable = out.legacyActionable || out.nativeCandidate;
             out.reason = out.actionable ? "hybrid" : "hybrid_locked";
+            break;
+
+        case ActionabilitySource::StateClass:
+            // Forced locks and landing exclusion were already resolved above; this
+            // recomputes from the engine's state-class boundaries so any
+            // movement/neutral recovery state counts, not just the legacy list.
+            out.actionable = IsStateClassActionable(sample.actionId, out.landingExcluded);
+            out.reason = out.actionable ? "state_class" : "state_class_locked";
             break;
 
         case ActionabilitySource::LegacyActionId:

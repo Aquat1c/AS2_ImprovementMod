@@ -438,6 +438,12 @@
 //   Entity_UpdateGrabAlignment: attacker hitbox@8 vs defender hurtbox@40 (0x4A4950)
 //   Entity_UpdateDamageApplication: attacker hitbox@8 vs defender ext-hurtbox@72 (0x4A76F0)
 //   Both dispatch to same character-specific handler table (dword_73E070).
+//   NOTE: grab boxes use the SAME field layout as hit/hurt (xOff,yOff,halfW,halfH; no
+//   swap). Entity_UpdateGrabAlignment ALSO connects when the attacker's
+//   ATTACK_FLAG_CONTACT_OVERRIDE (0x20000 @ entity+0x6CC) is set, which bypasses the
+//   box overlap entirely — so normal proximity throws (action 103) and command throws
+//   connect with these grab-box slots EMPTY. Empty hit/hurt/ext slots during a throw
+//   are therefore expected; the connection is flag-driven, not box-driven.
 #define ANIM_COLLISION_OFFSET   0         // frame offset: collision/push box (1 entry)
 #define ANIM_HITBOX_OFFSET      8         // frame offset: attack/hitbox set (4 entries)
 #define ANIM_HURTBOX_OFFSET     40        // frame offset: hurtbox/vulnerable set (4 entries)
@@ -486,11 +492,16 @@
 
 // Max-hit / collision-state flag bits (+1940).
 // This block behaves like a copied defense/frame-state mask in the collision helpers:
+//   0x0200 cleanly NEGATES an incoming strike: sub_4A5D30 (case 6 of the strike resolver dispatched
+//          from Entity_UpdateDamageApplication) returns 8 ("no hit", skipped at 107480) when the
+//          defender has it, unless the attack carries 0x80000. This is the primary per-move
+//          strike-invuln flag (the move keeps its hurtboxes but strikes do not connect).
 //   0x2000 is checked as a direct melee-invuln gate in sub_4A5EF0.
 //   0x4000 suppresses the normal follow-through branch in sub_4A6030.
 //   0x8000 / 0x10000 are special invuln states that still require +1948.
 #define CLASH_ID_FLAG_INVINCIBLE         0x10000
 #define CLASH_ID_FLAG_SPECIAL_INVULN     0x08000
+#define MAX_HIT_FLAG_STRIKE_INVULN       0x00200
 #define MAX_HIT_FLAG_MELEE_INVULN        0x02000
 #define MAX_HIT_FLAG_PROJECTILE_INVULN   0x04000
 #define MAX_HIT_FLAG_INVINCIBLE          0x10000
