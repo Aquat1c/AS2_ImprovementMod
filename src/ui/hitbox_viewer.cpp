@@ -30,6 +30,7 @@
 #include "as2_constants.h"
 #include "log_window.h"
 #include "game_state.h"
+#include "rollback/rollback_session.h"
 #include "imgui.h"
 #include <cstdarg>
 #include <cmath>
@@ -1601,8 +1602,30 @@ void HitboxViewer_Init() {
 }
 
 void HitboxViewer_Render() {
+    // The hitbox viewer is an OFFLINE-ONLY tool. Two safeguards keep it from ever bleeding into
+    // netplay (it previously could on the first online frames, before the rollback session flag is
+    // set, if it had been left enabled from a prior offline session):
+    const bool inMatch = AS2_IsInMatch();
+    const bool online  = Rollback::RollbackSession_IsActive() || IsNetplay();
+
+    // 1) Force the flag off in any online/netplay context.
+    if (g_enabled && online) {
+        g_enabled = false;
+        LOG_INFO("[HBV] Force-disabled: hitbox viewer is offline-only (online/netplay context)");
+    }
+    // 2) Auto-disable on the gameplay-exit edge (was in match, now not) even offline, so the flag
+    //    never silently resumes on the next match — which may be online. Done before the g_enabled
+    //    early-out so it still fires while enabled.
+    static bool s_wasInMatch = false;
+    if (g_enabled && s_wasInMatch && !inMatch) {
+        g_enabled = false;
+        LOG_INFO("[HBV] Auto-disabled on gameplay exit (offline-only tool)");
+    }
+    s_wasInMatch = inMatch;
+
     if (!g_enabled) return;
-    if (!AS2_IsInMatch()) return;
+    if (!inMatch) return;
+    if (online) return;
 
     // Gate per-frame logging on the simulation frame advancing. The render runs
     // every present (~60 Hz wall clock) regardless of whether the game stepped, so
@@ -1728,11 +1751,25 @@ void HitboxViewer_Render() {
     }
 }
 
-void HitboxViewer_SetEnabled(bool enabled) { g_enabled = enabled; }
+// Offline-only tool: enabling is refused in any online/netplay context (see HitboxViewer_Render).
+static bool HitboxViewer_OfflineAllowed() {
+    return !(Rollback::RollbackSession_IsActive() || IsNetplay());
+}
+
+void HitboxViewer_SetEnabled(bool enabled) { g_enabled = enabled && HitboxViewer_OfflineAllowed(); }
 bool HitboxViewer_IsEnabled() { return g_enabled; }
-void HitboxViewer_ToggleEnabled() { g_enabled = !g_enabled; }
+void HitboxViewer_ToggleEnabled() { g_enabled = !g_enabled && HitboxViewer_OfflineAllowed(); }
 
 void HitboxViewer_RenderControls() {
+    if (!HitboxViewer_OfflineAllowed()) {
+        g_enabled = false;
+        ImGui::BeginDisabled();
+        bool disabledState = false;
+        ImGui::Checkbox("Enable Hitbox Viewer", &disabledState);
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Offline only - unavailable during netplay.");
+        return;
+    }
     ImGui::Checkbox("Enable Hitbox Viewer", &g_enabled);
     if (!g_enabled) return;
 

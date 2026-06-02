@@ -355,7 +355,8 @@ void NetplayHud_Render() {
         return;
     }
 
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // Use the shared overlay draw list so the mod menu stays on top when it's open.
+    ImDrawList* dl = ModMenu_OverlayDrawList();
     if (!dl) {
         return;
     }

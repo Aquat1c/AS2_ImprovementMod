@@ -48,6 +48,7 @@
 #include "mod_main.h"
 #include "memory_utils.h"
 #include "log_window.h"
+#include "ui/mod_menu.h"
 #include "imgui.h"
 #include <cmath>
 #include <cstdio>
@@ -197,7 +198,7 @@ void HitboxDisplay_Init() {
 void HitboxDisplay_Render() {
     if (!g_enabled) return;
     
-    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    ImDrawList* drawList = ModMenu_OverlayDrawList();  // stays below the mod menu when it's open
     if (!drawList) return;
     
     ImGuiIO& io = ImGui::GetIO();

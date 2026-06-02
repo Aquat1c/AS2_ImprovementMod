@@ -14,6 +14,7 @@
 #include "rollback/game_snapshot.h"
 #include "rollback/resimulation.h"
 #include "ui/log_window.h"
+#include "ui/mod_menu.h"
 
 #include "MinHook.h"
 #include "imgui.h"
@@ -2203,7 +2204,7 @@ static void RenderReplayMatchHud() {
         return;
     }
 
-    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    ImDrawList* drawList = ModMenu_OverlayDrawList();  // stays below the mod menu when it's open
     if (!drawList) {
         return;
     }

@@ -470,6 +470,13 @@ bool ModMenu_IsOpen() {
     return IsMenuActuallyOpen();
 }
 
+ImDrawList* ModMenu_OverlayDrawList() {
+    // While the menu is open, route overlays to the background list so the menu windows draw on
+    // top of them; otherwise keep them on the foreground list (above the game).
+    return IsMenuActuallyOpen() ? ImGui::GetBackgroundDrawList()
+                                : ImGui::GetForegroundDrawList();
+}
+
 void ModMenu_Render() {
     if (!IsMenuActuallyOpen()) return;
 
