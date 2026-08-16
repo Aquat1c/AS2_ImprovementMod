@@ -9,10 +9,12 @@
 #include "net/netplay_menu_controller.h"
 #include "net/mode_ownership.h"
 #include "net/session_manager.h"
+#include "net/transition_barrier.h"
 #include "net/session_types.h"
 #include "net/nat_traversal.h"
 #include "net/netplay_menu_ui.h"
 #include "net/charsel_sync.h"
+#include "net/continue_flow.h"
 #include "net/frontend_input_sync.h"
 #include "net/pregame_sync.h"
 #include "net/winscreen_sync.h"
@@ -115,6 +117,7 @@ static bool          s_spectatorsEnabled = true;
 static uint16_t      s_spectatorListenPort = 10701;
 static bool          s_paletteSyncEnabled = true;
 static bool          s_remotePalettePreviewEnabled = false;
+static bool          s_continueScreenEnabled = true;
 static bool          s_debugLoggingEnabled = false;
 static bool          s_joinSpectatorProbeActive = false;
 static char          s_joinSpectatorFailureReason[128] = "";
@@ -217,6 +220,7 @@ static bool             s_autoConnectReleasePending = false;
 static bool             s_autoConnectStageGridPressed = false;
 static bool             s_autoConnectStageConfirmPressed = false;
 static bool             s_autoConnectWinScreenPressed = false;
+static bool             s_autoConnectContinuePressed = false;
 static int              s_autoConnectCompletedMatches = 0;
 static bool             s_autoRematchCleanupApplied = false;
 static DWORD            s_autoRematchLastAttemptAt = 0;
@@ -277,6 +281,7 @@ static void SaveSettings() {
     fprintf(f, "spectator_port=%u\n", s_spectatorListenPort);
     fprintf(f, "palette_sync=%d\n", s_paletteSyncEnabled ? 1 : 0);
     fprintf(f, "remote_palette_preview=%d\n", s_remotePalettePreviewEnabled ? 1 : 0);
+    fprintf(f, "continue_screen=%d\n", s_continueScreenEnabled ? 1 : 0);
     fprintf(f, "debug_logging=%d\n", s_debugLoggingEnabled ? 1 : 0);
     NetplayHudStyle::Settings hudStyle{};
     NetplayHudStyle::GetLocal(&hudStyle);
@@ -403,6 +408,8 @@ static void LoadSettings() {
             s_paletteSyncEnabled = (atoi(val) != 0);
         } else if (_stricmp(key, "remote_palette_preview") == 0) {
             s_remotePalettePreviewEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "continue_screen") == 0) {
+            s_continueScreenEnabled = (atoi(val) != 0);
         } else if (_stricmp(key, "debug_logging") == 0 ||
                    _stricmp(key, "verbose_logging") == 0) {
             s_debugLoggingEnabled = (atoi(val) != 0);
@@ -503,6 +510,14 @@ static void ApplyPaletteSettingsToRuntime(const char* reason) {
         reason ? reason : "unspecified",
         s_paletteSyncEnabled ? 1 : 0,
         s_remotePalettePreviewEnabled ? 1 : 0);
+}
+
+static void ApplyContinueScreenSettingToRuntime(const char* reason) {
+    Net::ContinueFlow_SetEnabled(s_continueScreenEnabled);
+    LOG_NETPLAY(LOG_INFO,
+        "[NetMenu] Applied continue screen setting (%s): enabled=%d",
+        reason ? reason : "unspecified",
+        s_continueScreenEnabled ? 1 : 0);
 }
 
 // ============================================================================
@@ -1168,6 +1183,14 @@ static bool ShouldAttemptJoinSpectatorProbe(const char* errorText) {
         return false;
     }
 
+    // "Connection timed out" is the pre-session ENet connect timeout: the host
+    // never answered at all, so probing the spectator port on the same host
+    // just burns another 3s per retry. Only probe when the gameplay connect
+    // actually reached a peer (refusal, busy disconnect, handshake failure).
+    if (ContainsInsensitive(errorText, "connection timed out")) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1727,6 +1750,7 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
 
     if (next == AutoConnectState::ConfirmingWinScreen) {
         s_autoConnectWinScreenPressed = false;
+        s_autoConnectContinuePressed = false;
     }
 
     if (next == AutoConnectState::InMatch) {
@@ -2180,7 +2204,11 @@ static void HandleAutoConnect() {
         }
 
         case AutoConnectState::ConfirmingWinScreen:
-            if (mode == MODE_CHARSEL || mode == MODE_MENU) {
+            // MODE_PREMATCH_INTRO/MODE_MATCH: continue-screen rematch fast
+            // path launched the next match directly (no charsel).
+            // WaitingForCharSel already handles MODE_MATCH -> InMatch.
+            if (mode == MODE_CHARSEL || mode == MODE_MENU ||
+                mode == MODE_PREMATCH_INTRO || mode == MODE_MATCH) {
                 const int targetMatches = s_autoConnect.matchCount > 0 ? s_autoConnect.matchCount : 1;
                 s_autoConnectCompletedMatches++;
                 LOG_NETPLAY(LOG_INFO,
@@ -2225,6 +2253,15 @@ static void HandleAutoConnect() {
                              (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
                 AutoConnectInjectPress(INPUT_A, "confirm win screen");
                 s_autoConnectWinScreenPressed = true;
+            }
+
+            // Continue prompt (sub 4, ContinueFlow): a fresh tap locks YES
+            // (cursor defaults to YES). The prompt requires a release before
+            // the lock edge, which the tap-style injection provides.
+            if (sub == 4 && (!s_autoConnectContinuePressed ||
+                             (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
+                AutoConnectInjectPress(INPUT_A, "lock continue YES");
+                s_autoConnectContinuePressed = true;
             }
 
             if (s_autoConnectStateFrames > 1800) {
@@ -2624,6 +2661,14 @@ static bool LaunchNetplayCharSel() {
 static void TryAutoRestartPregameFromPostMatchCharSel() {
     if (MenuVisible()) return;
 
+    // Continue-screen rematch in flight: the fast path owns the restart (the
+    // game never reaches CharSel), so the charsel auto-restart must not race
+    // it. Once the fast path is running, PregameSync_IsActive() below covers
+    // the remaining window (ConfigExchange onward is an active phase).
+    if (Net::ContinueFlow_IsRematchLatched()) {
+        return;
+    }
+
     const uint32_t mode = GetGameMode();
     if (mode != MODE_CHARSEL) {
         s_autoRematchCleanupApplied = false;
@@ -2667,9 +2712,23 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
         Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::PostMatchRoute ||
         Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::ReturningToCharSel;
 
-    if (!staleGameplayHandoff && !lifecycleSuggestsPostMatch) {
+    // Wire-driven signatures (M4): the local heuristics above have ~one-frame
+    // lifetimes and can be destroyed by aborts; the peer's winscreen-exit
+    // barrier and rematch intent arrive over the wire and cannot be missed.
+    const bool wireSuggestsRematch =
+        Net::TransitionBarrier_IsCommitted(Net::NetTransitionKind::WinScreenExit) ||
+        (Net::TransitionBarrier_RemoteProposed(Net::NetTransitionKind::PostMatchDecision) &&
+         Net::TransitionBarrier_GetRemoteIntent(Net::NetTransitionKind::PostMatchDecision) ==
+             (uint8_t)Net::PostMatchIntentWire::Rematch);
+
+    if (!staleGameplayHandoff && !lifecycleSuggestsPostMatch && !wireSuggestsRematch) {
         return;
     }
+
+    // Announce our own rematch intent so the peer's restart doesn't depend on
+    // ITS local heuristics either.
+    Net::TransitionBarrier_Propose(Net::NetTransitionKind::PostMatchDecision,
+                                   (uint8_t)Net::PostMatchIntentWire::Rematch, 0);
 
     const DWORD now = GetTickCount();
     if ((now - s_autoRematchLastAttemptAt) < 250) {
@@ -2689,6 +2748,9 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
     if (Net::PregameSync_Begin()) {
         LOG_NETPLAY(LOG_INFO,
             "[NetMenu] Auto-rematch pregame restart started on CharSel");
+        // Retire this boundary's barriers so the next match starts clean.
+        Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::WinScreenExit);
+        Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::PostMatchDecision);
     } else {
         LOG_NETPLAY(LOG_WARNING,
             "[NetMenu] Auto-rematch pregame restart deferred (phase=%s lifecycle=%s)",
@@ -3257,7 +3319,14 @@ static void SyncSpectatorClientState() {
                         errorBuf[0] ? errorBuf : "unknown");
                     ClearJoinSpectatorProbe("failure");
                 }
-                OpenDisconnectError(errorBuf);
+                // A failed spectator PROBE is not a player-session loss —
+                // routing it through OpenDisconnectError added a full
+                // error-screen cycle to every join retry. Return to the join
+                // screen with the reason shown instead.
+                SetError("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
+                SetStatus("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::JoinEntry, "join spectator probe failed");
                 return;
             }
             if (spectator.error[0]) {
@@ -3281,7 +3350,10 @@ static void SyncSpectatorClientState() {
                         activeEndpoint[0] ? activeEndpoint : "(unset)",
                         errorBuf[0] ? errorBuf : "idle_without_result");
                     ClearJoinSpectatorProbe("idle_without_result");
-                    OpenDisconnectError(errorBuf);
+                    SetError("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
+                    SetStatus("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
+                    s_selectedIndex = 0;
+                    TransitionTo(MenuState::JoinEntry, "join spectator probe failed");
                     return;
                 }
                 if (spectator.error[0]) {
@@ -3925,17 +3997,23 @@ static void ActivateCurrentSelection() {
         case MenuState::PostMatch:
             if (s_selectedIndex == 0) {
                 // Rematch
+                Net::TransitionBarrier_Propose(Net::NetTransitionKind::PostMatchDecision,
+                                               (uint8_t)Net::PostMatchIntentWire::Rematch, 0);
                 Net::MatchLifecycle_OnRematch();
                 Rollback::OnlineWiring_OnRematch();
                 LaunchNetplayCharSel();
             } else if (s_selectedIndex == 1) {
                 // Return to menu
+                Net::TransitionBarrier_Propose(Net::NetTransitionKind::PostMatchDecision,
+                                               (uint8_t)Net::PostMatchIntentWire::ReturnToSession, 0);
                 Net::MatchLifecycle_OnReturnToSession();
                 Rollback::OnlineWiring_OnReturnToSession();
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::ConnectedSession, "post-match return");
             } else {
                 // Disconnect
+                Net::TransitionBarrier_Propose(Net::NetTransitionKind::PostMatchDecision,
+                                               (uint8_t)Net::PostMatchIntentWire::Disconnect, 0);
                 Net::MatchLifecycle_OnDisconnect("Disconnected after match.");
                 Net::Session_Cancel();
                 OpenDisconnectError("Disconnected after match.");
@@ -4068,6 +4146,7 @@ void Init() {
     ApplyNatSettingsToService("menu init");
     ApplySpectatorSettingsToRuntime("menu init");
     ApplyPaletteSettingsToRuntime("menu init");
+    ApplyContinueScreenSettingToRuntime("menu init");
     LoadAutoConnectConfig();
     s_autoRematchCleanupApplied = false;
     s_autoRematchLastAttemptAt = 0;

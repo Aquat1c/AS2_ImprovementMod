@@ -55,6 +55,10 @@ bool Transport_IsHostActive();
 ENetPeer* Transport_Connect(const char* host, uint16_t port);
 
 /// Gracefully disconnect a peer. ENet will flush and then emit DISCONNECT event.
+// Apply netplay-tuned timeout/ping/throttle settings to a freshly connected
+// peer (call on ENET_EVENT_TYPE_CONNECT for both roles).
+void Transport_ConfigurePeerResilience(ENetPeer* peer);
+
 void Transport_DisconnectPeer(ENetPeer* peer, uint32_t data = 0);
 
 /// Force-disconnect a peer immediately (no flush).
@@ -86,6 +90,9 @@ bool Transport_GetBoundPort(uint16_t* outPort);
 bool Transport_GetHostBoundPort(ENetHost* host, uint16_t* outPort);
 
 /// Start/stop the autopunch-compatible UDP rendezvous helper.
+/// While peerConnected, Service switches to a low-rate authenticated
+/// keepalive that maintains the NAT mapping and lets the remote intercept
+/// heal a mid-match NAT port rebind (ENet drops rebound sources itself).
 /// Calls must stay on the transport owner thread.
 void Transport_AutopunchStart(const char* relayHost, uint16_t relayPort,
                               uint16_t localPort,
@@ -134,5 +141,22 @@ float Transport_GetPeerRTT(ENetPeer* peer);
 
 /// Get packet loss percentage for a peer.
 float Transport_GetPeerLoss(ENetPeer* peer);
+
+// ============================================================================
+// Fault injection (M6 verification tooling)
+// ============================================================================
+
+/// True when the outbound fault-injection layer is active. Configured via
+/// environment variables read once at Transport_GlobalInit:
+///   AS2_NET_INJECT_DROP_PCT            0-100 random per-packet egress drop
+///   AS2_NET_INJECT_BLACKOUT_MS         blackout window length (ms)
+///   AS2_NET_INJECT_BLACKOUT_PERIOD_MS  blackout repeat period (ms, > window)
+///   AS2_NET_INJECT_DELAY_MS            parsed but NOT implemented (warns)
+/// Injection applies to OUTBOUND application packets only (Transport_Send /
+/// Transport_SendTyped); each instance shapes its own egress, so simulating
+/// bidirectional loss requires the env vars on BOTH instances. Autopunch
+/// keepalives and ENet protocol internals are unaffected by design.
+/// See docs/RESILIENCE_TESTING.md.
+bool Transport_FaultInjectionActive();
 
 } // namespace Net

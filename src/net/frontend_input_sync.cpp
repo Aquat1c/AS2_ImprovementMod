@@ -717,14 +717,29 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         return;
     }
     if (type != s_packetType) {
-        FrontendInputSync_RequestRecovery("frontend frame-input packet type mismatched active phase");
+        // In-flight packet from the previous screen crossing a phase edge
+        // (e.g. a CharSel frame arriving after StageSel began). Pure ordering
+        // artifact on a healthy link — drop it; latching recovery here killed
+        // live sessions.
+        Rollback::NetplayLog_Verbose(
+            "FRONTEND", -1,
+            "Dropped frame input of mismatched packet type: got=%s active=%s phase=%s",
+            PacketTypeName(type),
+            PacketTypeName(s_packetType),
+            FrontendSyncPhaseName(s_phase));
         return;
     }
     if (!s_inputPhaseActive) {
         return;
     }
     if (inputCount == 0 || inputCount > FRONTEND_INPUT_REDUNDANCY) {
-        FrontendInputSync_RequestRecovery("frontend packet carried invalid input redundancy");
+        // Malformed or stale packet — drop it rather than killing the session.
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Dropped frame input with invalid redundancy: count=%u max=%u type=%s",
+            inputCount,
+            (unsigned)FRONTEND_INPUT_REDUNDANCY,
+            PacketTypeName(type));
         return;
     }
     const DWORD now = NowMs();
@@ -1401,11 +1416,25 @@ void FrontendInputSync_OnRemotePhaseBarrier(const FrontendPhaseBarrierPayload* p
                                                      "phase barrier")) {
         return;
     }
+    if (s_localPhaseBarrierSent &&
+        s_barrierNextPhase != (FrontendSyncPhase)p->next_phase &&
+        s_barrierNextPhase != FrontendSyncPhase::None) {
+        // An in-flight barrier crossing a phase edge disagrees with ours.
+        // Drop it and keep waiting — the frontend starvation timeout still
+        // backstops a genuine divergence. (M4 replaces this with an explicit
+        // resync handshake.) Latching recovery here killed live sessions on
+        // pure packet ordering.
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Ignored phase barrier with mismatched next-phase: local=%s remote=%s epoch=%u serial=%u",
+            FrontendSyncPhaseName(s_barrierNextPhase),
+            FrontendSyncPhaseName((FrontendSyncPhase)p->next_phase),
+            s_epochId,
+            s_phaseSerial);
+        return;
+    }
     s_remotePhaseBarrierSeen = true;
     s_remoteBarrierFrame = p->last_completed_frame;
-    if (s_localPhaseBarrierSent && s_barrierNextPhase != (FrontendSyncPhase)p->next_phase) {
-        FrontendInputSync_RequestRecovery("frontend phase barrier next-phase mismatch");
-    }
     s_barrierNextPhase = (FrontendSyncPhase)p->next_phase;
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
@@ -1444,8 +1473,18 @@ void FrontendInputSync_SendBoundaryDigest(const FrontendBoundaryDigestPayload* p
     }
     const FrontendDigestKind localKind = (FrontendDigestKind)sendPayload.digest_kind;
     if (s_remoteDigestSeen && s_digestKind != FrontendDigestKind::None && s_digestKind != localKind) {
-        FrontendInputSync_RequestRecovery("frontend digest kind mismatch");
-        return;
+        // The previously-received remote digest belongs to a different
+        // boundary kind (in-flight packet crossing a phase edge). Discard the
+        // stale remote digest and continue; killing the session here was a
+        // pure ordering casualty.
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Discarding stale remote digest of different kind: had=%s now_sending=%s",
+            FrontendDigestKindName(s_digestKind),
+            FrontendDigestKindName(localKind));
+        s_remoteDigestSeen = false;
+        s_digestMatch = false;
+        s_digestMismatch = false;
     }
     s_localDigestSent = true;
     s_digestKind = localKind;
@@ -1488,12 +1527,18 @@ void FrontendInputSync_OnRemoteBoundaryDigest(const FrontendBoundaryDigestPayloa
                                                      "boundary digest")) {
         return;
     }
-    s_remoteDigestSeen = true;
-    s_remoteDigest = p->digest;
     if (s_localDigestSent && s_digestKind != (FrontendDigestKind)p->digest_kind) {
-        FrontendInputSync_RequestRecovery("frontend digest kind mismatch");
+        // In-flight digest for a different boundary kind — drop it before
+        // recording anything; our own digest state stands.
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Ignored remote digest of mismatched kind: local=%s remote=%s",
+            FrontendDigestKindName(s_digestKind),
+            FrontendDigestKindName((FrontendDigestKind)p->digest_kind));
         return;
     }
+    s_remoteDigestSeen = true;
+    s_remoteDigest = p->digest;
     s_digestKind = (FrontendDigestKind)p->digest_kind;
     s_digestMatch = s_localDigestSent && (s_localDigest == s_remoteDigest);
     s_digestMismatch = s_localDigestSent && !s_digestMatch;

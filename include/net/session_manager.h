@@ -61,6 +61,15 @@ bool Session_StartJoin(const SessionConfig* config);
 /// Cancel the current session (from any state). Returns to Idle.
 void Session_Cancel();
 
+// Best-effort goodbye for the WM_CLOSE fast-exit path: sends a Disconnect
+// packet to the peer and waits briefly (bounded) for delivery.
+void Session_NotifyGameExit();
+
+// Milliseconds since ANY packet arrived from the peer (any channel/type).
+// Returns 0xFFFFFFFF if nothing was ever received. Used to keep handshake
+// timeouts from killing a peer that is provably alive.
+uint32_t Session_GetMsSinceLastInbound();
+
 /// Signal that this peer is ready (transitions Connected -> Ready when both ready).
 void Session_SignalReady();
 

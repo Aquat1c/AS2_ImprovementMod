@@ -205,18 +205,30 @@ Gekko::MessageSystem::MessageSystem()
     session_events = SessionEventSystem();
 }
 
-void Gekko::MessageSystem::Init(u8 num_players, u32 input_size)
+void Gekko::MessageSystem::Init(u8 num_players, u32 input_size,
+                                u64 disconnect_timeout_ms, u64 interrupt_timeout_ms)
 {
     _num_players = num_players;
 	_input_size = input_size;
 
+    // AS2 patch: configurable liveness timeouts (0 = library defaults).
+    _disconnect_timeout = disconnect_timeout_ms != 0
+        ? disconnect_timeout_ms
+        : (u64)NetStats::DISCONNECT_TIMEOUT;
+    _interrupt_timeout = interrupt_timeout_ms != 0
+        ? interrupt_timeout_ms
+        : (u64)NetStats::INTERRUPT_TIMEOUT;
+
     _net_player_queue.resize(num_players);
     _netout_aggregate_by_peer.clear();
     _netin_aggregate_by_peer.clear();
-    LOG_GEKKO_INFO("[Gekko][MessageSystem] Init players=%u input_size=%u input_retry_interval_ms=%llu",
+    LOG_GEKKO_INFO("[Gekko][MessageSystem] Init players=%u input_size=%u input_retry_interval_ms=%llu "
+        "interrupt_timeout_ms=%llu disconnect_timeout_ms=%llu",
         num_players,
         input_size,
-        (unsigned long long)NetStats::INPUT_RETRY_INTERVAL);
+        (unsigned long long)NetStats::INPUT_RETRY_INTERVAL,
+        (unsigned long long)_interrupt_timeout,
+        (unsigned long long)_disconnect_timeout);
 
 }
 
@@ -561,6 +573,11 @@ std::deque<std::unique_ptr<u8[]>>& Gekko::MessageSystem::GetNetPlayerQueue(Handl
 
 void Gekko::MessageSystem::HandleTooFarBehindActors(bool spectator)
 {
+    // AS2 patch: three-state peer liveness.
+    //   silence >= _interrupt_timeout  -> Interrupted (peer stays Connected,
+    //       resends keep flowing, PlayerInterrupted emitted once)
+    //   silence >= _disconnect_timeout -> Disconnected (existing path)
+    // Any packet from an interrupted peer clears the flag (see ParsePacket).
     const u64 now = TimeSinceEpoch();
 	for (auto& actor : spectator ? spectators : remotes) {
 		if (actor->GetStatus() == Connected) {
@@ -571,11 +588,24 @@ void Gekko::MessageSystem::HandleTooFarBehindActors(bool spectator)
             }
             // check whether messages are being sent if not disconnect.
             const u64 msg_diff = now - actor->stats.last_received_message;
-			if (msg_diff > NetStats::DISCONNECT_TIMEOUT) {
+			if (msg_diff >= _disconnect_timeout) {
                 session_events.AddPlayerDisconnectedEvent(actor->handle);
                 actor->SetStatus(Disconnected);
                 actor->sync_num = 0;
+                actor->interrupted = false;
+                LOG_GEKKO_WARN("[Gekko][MessageSystem] Actor DISCONNECTED handle=%d silence_ms=%llu timeout_ms=%llu",
+                               actor->handle,
+                               (unsigned long long)msg_diff,
+                               (unsigned long long)_disconnect_timeout);
 			}
+            else if (msg_diff >= _interrupt_timeout && !actor->interrupted) {
+                actor->interrupted = true;
+                session_events.AddPlayerInterruptedEvent(actor->handle);
+                LOG_GEKKO_WARN("[Gekko][MessageSystem] Actor INTERRUPTED handle=%d silence_ms=%llu timeout_ms=%llu",
+                               actor->handle,
+                               (unsigned long long)msg_diff,
+                               (unsigned long long)_interrupt_timeout);
+            }
 		}
 	}
 }
@@ -685,6 +715,14 @@ void Gekko::MessageSystem::ParsePacket(NetAddress& addr, NetPacket& pkt, u32 pac
 
         for (auto& player : *current) {
             if (player->address.Equals(addr)) {
+                // AS2 patch: first packet from an interrupted peer resumes it.
+                if (player->interrupted) {
+                    player->interrupted = false;
+                    session_events.AddPlayerResumedEvent(player->handle);
+                    LOG_GEKKO_INFO("[Gekko][MessageSystem] Actor RESUMED handle=%d silence_ms=%llu",
+                                   player->handle,
+                                   (unsigned long long)(now - player->stats.last_received_message));
+                }
                 player->stats.last_received_message = now;
                 player->stats.bytes_received_accum += packet_size;
             }

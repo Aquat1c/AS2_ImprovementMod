@@ -233,6 +233,29 @@ void LogWindow_Flush(void) {
     if (g_gekkoLogFile) {
         fflush(g_gekkoLogFile);
     }
+    g_logLinesSinceFlush = 0;
+    g_pktLinesSinceFlush = 0;
+    g_netLinesSinceFlush = 0;
+    g_gekkoLinesSinceFlush = 0;
+}
+
+void LogWindow_PeriodicFlush(void) {
+    // The line-count flush policy (128/256/512 lines) can leave a quiet tail
+    // buffered for minutes; a crash or fast exit then loses it and every
+    // capture looks like an abrupt mid-gameplay cutoff. Flush dirty files at
+    // most once per second.
+    static DWORD s_lastPeriodicFlushTick = 0;
+    const bool dirty = g_logLinesSinceFlush || g_pktLinesSinceFlush ||
+                       g_netLinesSinceFlush || g_gekkoLinesSinceFlush;
+    if (!dirty) {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (s_lastPeriodicFlushTick != 0 && (now - s_lastPeriodicFlushTick) < 1000) {
+        return;
+    }
+    s_lastPeriodicFlushTick = now;
+    LogWindow_Flush();
 }
 
 void LogWindow_Shutdown(void) {
@@ -300,57 +323,49 @@ void LogWindow_LogV(LogLevel level, const char* fmt, va_list args) {
 
 
     
-    // Check for duplicate message suppression
-    bool is_duplicate = false;
-    if (g_suppressDuplicates && g_lastMessage == msgBuf && g_lastLevel == level) {
-        is_duplicate = true;
-        g_lastRepeatCount++;
-        
-        // Update the last entry's repeat count in the log buffer
-        std::lock_guard<std::mutex> lock(g_logMutex);
-        if (!g_logEntries.empty()) {
-            g_logEntries.back().repeat_count = g_lastRepeatCount;
-        }
-        // Don't write duplicates to file/console - they'll show the count when a new message comes
-        return;
-    }
-    
-    // If we had repeats and this is a new message, flush the repeat info
-    if (g_lastRepeatCount > 1) {
-        // The count is already in the last log entry, nothing extra needed
-    }
-    
-    // Reset tracking for new message
-    g_lastMessage = msgBuf;
-    g_lastLevel = level;
-    g_lastRepeatCount = 1;
-    
-    // Create entry
-    LogEntry entry;
-    entry.level = level;
-    entry.category = LOG_CAT_GENERAL;  // Default category for standard logs
-    entry.timestamp = timeBuf;
-    entry.message = msgBuf;
-    entry.color = g_levelColors[level];
-    entry.repeat_count = 1;
-    
-    // Add to buffer (thread-safe)
+    // Duplicate suppression, entry push and file write all share g_logMutex:
+    // this path is hit from both the game thread and the ENet worker thread,
+    // and g_lastMessage is a std::string (unsynchronized compare/assign races
+    // corrupt the heap).
     {
         std::lock_guard<std::mutex> lock(g_logMutex);
-        
+
+        if (g_suppressDuplicates && g_lastLevel == level && g_lastMessage == msgBuf) {
+            g_lastRepeatCount++;
+            if (!g_logEntries.empty()) {
+                g_logEntries.back().repeat_count = g_lastRepeatCount;
+            }
+            // Don't write duplicates to file/console - they'll show the count when a new message comes
+            return;
+        }
+
+        // Reset tracking for new message
+        g_lastMessage = msgBuf;
+        g_lastLevel = level;
+        g_lastRepeatCount = 1;
+
+        // Create entry
+        LogEntry entry;
+        entry.level = level;
+        entry.category = LOG_CAT_GENERAL;  // Default category for standard logs
+        entry.timestamp = timeBuf;
+        entry.message = msgBuf;
+        entry.color = g_levelColors[level];
+        entry.repeat_count = 1;
+
         // Remove oldest entries if at capacity
         while ((int)g_logEntries.size() >= g_maxEntries) {
             g_logEntries.pop_front();
         }
-        
+
         g_logEntries.push_back(entry);
         g_scrollToBottom = g_autoScroll;
-    }
-    
-    // Also write to file
-    if (g_logFile) {
-        fprintf(g_logFile, "[%s] [%s] %s\n", timeBuf, g_levelNames[level], msgBuf);
-        FlushIfNeeded(g_logFile, level, &g_logLinesSinceFlush, 128);
+
+        // Also write to file
+        if (g_logFile) {
+            fprintf(g_logFile, "[%s] [%s] %s\n", timeBuf, g_levelNames[level], msgBuf);
+            FlushIfNeeded(g_logFile, level, &g_logLinesSinceFlush, 128);
+        }
     }
     
     // Output to console (stdout) with ANSI colors

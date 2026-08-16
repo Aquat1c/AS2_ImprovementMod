@@ -68,6 +68,8 @@ void LogWindow_Shutdown(void);
 // Force logs to hit disk immediately while debugging startup crashes.
 void LogWindow_SetForceFlush(bool enabled);
 void LogWindow_Flush(void);
+// Flushes any buffered log lines at most once per second; call once per frame.
+void LogWindow_PeriodicFlush(void);
 
 // Standard logging
 void LogWindow_Log(LogLevel level, const char* fmt, ...);

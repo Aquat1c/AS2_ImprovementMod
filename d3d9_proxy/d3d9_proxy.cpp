@@ -1265,7 +1265,7 @@ static void DisplayConfig_Save() {
 // If we later centralize versioning, these can move into a shared header.
 static const wchar_t* kAs2GameVersion = L"1.060B";
 static const wchar_t* kAs2ModName = L"ImprovementMod";
-static const wchar_t* kAs2ModVersion = L"0.6";
+static const wchar_t* kAs2ModVersion = L"0.7-beta";
 
 static HWND g_titleWindow = nullptr;
 static bool g_titleApplied = false;
@@ -1961,7 +1961,7 @@ void InitConsole() {
         
         printf("\033[36m");
         printf("========================================\n");
-        printf("  Alice Senki 2 - Improvement Mod 0.6\n");
+        printf("  Alice Senki 2 - Improvement Mod 0.7-beta\n");
         printf("  Debug Console\n");
         printf("========================================\n");
         printf("\033[0m\n");
@@ -4048,7 +4048,7 @@ void RenderImGui() {
         ImGui::PushStyleColor(ImGuiCol_PopupBg,
             ImVec4(popupBg.x, popupBg.y, popupBg.z, 0.94f));
         if (ImGui::BeginMainMenuBar()) {
-            ImGui::Text("Alice Senki 2 - Improvement Mod 0.6");
+            ImGui::Text("Alice Senki 2 - Improvement Mod 0.7-beta");
             ImGui::Separator();
             if (ImGui::BeginMenu("Options")) {
                 if (ImGui::MenuItem("Settings", nullptr, false, g_pModToggleMenu != nullptr)) {
@@ -6234,7 +6234,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             InitConsole();
             
             ProxyLog("========================================");
-            ProxyLog("Alice Senki 2 - D3D9 Proxy 0.6");
+            ProxyLog("Alice Senki 2 - D3D9 Proxy 0.7-beta");
             ProxyLog("Build: %s %s", __DATE__, __TIME__);
             ProxyLog("Crash handler installed!");
             ProxyLog("========================================");

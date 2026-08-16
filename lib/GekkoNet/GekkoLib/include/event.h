@@ -83,6 +83,11 @@ namespace Gekko {
 
         void AddPlayerDisconnectedEvent(Handle handle);
 
+        // AS2 patch: interrupted/resumed liveness events.
+        void AddPlayerInterruptedEvent(Handle handle);
+
+        void AddPlayerResumedEvent(Handle handle);
+
         void AddSessionStartedEvent();
 
         void AddSpectatorPausedEvent();

@@ -28,6 +28,8 @@
 #include "net/frontend_input_sync.h"
 #include "net/match_bootstrap.h"
 #include "net/session_manager.h"
+#include "net/connection_supervisor.h"
+#include "net/transition_barrier.h"
 #include "net/session_types.h"
 #include "net/protocol.h"
 #include "net/sync_policy.h"
@@ -248,6 +250,12 @@ static void LogGameplayPacketAnomaly(const char* reason,
 /// During gameplay, GameplayInput/StateDigest are dispatched here.
 /// All other packets are forwarded to the pregame handler.
 static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t payloadLen) {
+    // Wire-acknowledged transition barriers must be reachable regardless of
+    // which callback owns the slot — winscreen-exit proposals arrive exactly
+    // while this handler is installed.
+    if (Net::TransitionBarrier_OnPacket(type, payload, payloadLen)) {
+        return;
+    }
     switch (type) {
         case Net::PacketType::GekkoData: {
             // GekkoNet internal protocol data — buffer for GekkoNet to drain
@@ -1167,15 +1175,24 @@ void OnlineWiring_FrameUpdate() {
             s_gameplayActive && s_rollbackActive,
             RollbackSession_GetCurrentFrame());
         const bool pollOk = RollbackSession_PollSession();
-        if (!pollOk) {
+        // Session death gating (M3): tear down only when Gekko reports the
+        // session broken (20s disconnect timeout fired) or the
+        // ConnectionSupervisor has reached its Dead verdict. A supervisor
+        // Interrupted state is a freeze-and-wait condition, never a teardown.
+        const bool supervisorDead = Net::ConnectionSupervisor_IsDead();
+        if (!pollOk || supervisorDead) {
             s_backgroundPollFailures++;
             NetplayLog_Write("GEKKO", RollbackSession_GetCurrentFrame(),
-                "Background poll FAILED: count=%u failures=%u phase=%s",
+                "Background poll FAILED: count=%u failures=%u poll_ok=%d supervisor_dead=%d phase=%s",
                 s_backgroundPollCount,
                 s_backgroundPollFailures,
+                pollOk ? 1 : 0,
+                supervisorDead ? 1 : 0,
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
             if (Net::MatchLifecycle_GetPhase() != Net::MatchLifecyclePhase::DisconnectRecovery) {
-                Net::MatchLifecycle_OnDisconnect("Rollback session poll failure");
+                Net::MatchLifecycle_OnDisconnect(supervisorDead
+                    ? "Connection supervisor declared peer dead"
+                    : "Rollback session poll failure");
             }
         } else if (s_backgroundPollCount <= 5 || (s_backgroundPollCount % 300) == 0) {
             NetplayLog_Verbose("GEKKO", RollbackSession_GetCurrentFrame(),

@@ -122,11 +122,20 @@ namespace Gekko {
     };
 
     struct NetStats {
+        // AS2 patch: DISCONNECT_TIMEOUT is now only the DEFAULT; the effective
+        // timeout is instance-configurable (see disconnect_timeout below and
+        // MessageSystem::Init). INTERRUPT_TIMEOUT is the default silence
+        // threshold for the new Interrupted (freeze & keep resending) state.
         static const u64 DISCONNECT_TIMEOUT = 5000;
+        static const u64 INTERRUPT_TIMEOUT = 3000;
         static const u64 SYNC_MSG_DELAY = 200;
         static const u64 NET_CHECK_DELAY = 500;
         static const u64 INPUT_RETRY_INTERVAL = 50;
         static const u32 RTT_HISTORY_SIZE = 32;
+
+        // AS2 patch: instance-configurable liveness timeouts (ms).
+        u64 disconnect_timeout = DISCONNECT_TIMEOUT;
+        u64 interrupt_timeout = INTERRUPT_TIMEOUT;
 
         Frame last_acked_frame = -1;
         u64 last_sent_sync_message = 0;

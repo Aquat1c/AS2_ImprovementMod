@@ -20,6 +20,7 @@
 #include "net/session_types.h"
 #include "net/protocol.h"
 #include "net/sync_trace.h"
+#include "net/transition_barrier.h"
 #include "net/mode_ownership.h"
 #include "net/netplay_menu_controller.h"
 #include "net/game_settings_sync.h"
@@ -75,6 +76,11 @@ static bool            s_syncConfirmSent     = false;
 static bool            s_remoteSyncConfirmed = false;
 static uint8_t         s_syncRoundOption     = 0;
 static bool            s_haveSyncRoundOption = false;
+
+// Continue-screen rematch fast path: skips FrontendCharSel/StageSel entirely
+// and rebuilds the locked config from the previous match's snapshot.
+static bool              s_rematchFastPath  = false;
+static LockedMatchConfig s_rematchSnapshot  = {};
 
 // Phase timeout tracking
 static DWORD           s_phaseStartTime      = 0;
@@ -143,6 +149,32 @@ static bool PhaseTimedOut(DWORD timeoutMs) {
     return (GetTickCount() - s_phaseStartTime) >= timeoutMs;
 }
 
+// Hard cap for a handshake whose peer is alive but not progressing. Observed
+// failure mode without this gate: the peer is stuck in its winscreen still
+// streaming (stale-epoch) frame inputs, and the 10s announce timer kills a
+// provably-live session. Any inbound traffic counts as liveness.
+constexpr DWORD HANDSHAKE_LIVENESS_CAP_MS = 45000;
+
+static bool HandshakeTimedOut(DWORD baseTimeoutMs, const char* what) {
+    if (!PhaseTimedOut(baseTimeoutMs)) return false;
+    const uint32_t inboundSilenceMs = Session_GetMsSinceLastInbound();
+    if (inboundSilenceMs < 2000 && !PhaseTimedOut(HANDSHAKE_LIVENESS_CAP_MS)) {
+        static DWORD s_lastAliveWaitLogTick = 0;
+        const DWORD now = GetTickCount();
+        if (s_lastAliveWaitLogTick == 0 || (now - s_lastAliveWaitLogTick) >= 2000) {
+            s_lastAliveWaitLogTick = now;
+            LOG_NETPLAY(LOG_WARNING,
+                "[PregameSync] %s exceeded %lums but peer is alive (inbound %ums ago) — extending up to %lums",
+                what ? what : "handshake",
+                (unsigned long)baseTimeoutMs,
+                inboundSilenceMs,
+                (unsigned long)HANDSHAKE_LIVENESS_CAP_MS);
+        }
+        return false;
+    }
+    return true;
+}
+
 static uint8_t GetOutgoingSyncRoundOption(const char* reason) {
     if (Session_GetRole() == SessionRole::Host) {
         if (!s_haveSyncRoundOption) {
@@ -204,7 +236,18 @@ static void UpdateBootstrapFreezeForBoundary() {
         s_phase == PregamePhase::BootstrapBaseline ||
         s_phase == PregamePhase::BootstrapReady;
 
-    if (!inBootstrap) {
+    // Rematch fast path: with no charsel to absorb the handshake time, the
+    // game can reach the Mode 8 gameplay boundary while the pregame handshake
+    // is still in the Sync*/Config* phases — extend the freeze coverage there.
+    const bool fastPathPreBootstrap =
+        s_rematchFastPath &&
+        (s_phase == PregamePhase::SyncAnnounce ||
+         s_phase == PregamePhase::SyncExchange ||
+         s_phase == PregamePhase::SyncConfirmed ||
+         s_phase == PregamePhase::ConfigExchange ||
+         s_phase == PregamePhase::ConfigAgreed);
+
+    if (!inBootstrap && !fastPathPreBootstrap) {
         InputSyncHooks_SetLoadBarrierFreeze(false);
         return;
     }
@@ -324,6 +367,17 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
     switch (type) {
         case PacketType::SyncAnnounce:
             if (payloadLen >= sizeof(SyncAnnouncePayload)) {
+                // After an abort the phase is Idle but this callback stays
+                // registered; a plain HandleSyncAnnounce would set a latch
+                // nothing reads (FrameUpdate early-returns in Idle) and the
+                // peer's restart announce would be silently swallowed until
+                // its announce timeout killed the session. Route terminal
+                // phases through the cross-phase restart path instead.
+                if ((s_phase == PregamePhase::Idle ||
+                     s_phase == PregamePhase::GameplayHandoff) &&
+                    PregameSync_HandleCrossPhaseSessionPacket(type, payload, payloadLen)) {
+                    break;
+                }
                 HandleSyncAnnounce(static_cast<const SyncAnnouncePayload*>(payload));
             } else {
                 LogPregamePacketAnomaly("Short SyncAnnounce", type, payloadLen, sizeof(SyncAnnouncePayload));
@@ -332,6 +386,11 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
 
         case PacketType::SyncConfirm:
             if (payloadLen >= sizeof(SyncConfirmPayload)) {
+                if ((s_phase == PregamePhase::Idle ||
+                     s_phase == PregamePhase::GameplayHandoff) &&
+                    PregameSync_HandleCrossPhaseSessionPacket(type, payload, payloadLen)) {
+                    break;
+                }
                 HandleSyncConfirm(static_cast<const SyncConfirmPayload*>(payload));
             } else {
                 LogPregamePacketAnomaly("Short SyncConfirm", type, payloadLen, sizeof(SyncConfirmPayload));
@@ -507,6 +566,9 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
 
         default:
             // Handle cross-phase packets that can arrive at any time
+            if (TransitionBarrier_OnPacket(type, payload, payloadLen)) {
+                break;
+            }
             if (type == PacketType::PauseQuit) {
                 PauseHandler_OnRemotePauseQuit();
                 break;
@@ -631,7 +693,7 @@ static void UpdateSyncAnnounce() {
         return;
     }
 
-    if (PhaseTimedOut(SYNC_TIMEOUT_MS)) {
+    if (HandshakeTimedOut(SYNC_TIMEOUT_MS, "sync announce")) {
         SetErrorFmt("Session sync timed out waiting for announce");
         SetPhase(PregamePhase::Error, "sync announce timeout");
     }
@@ -671,11 +733,21 @@ static void UpdateSyncExchange() {
             SetPhase(PregamePhase::Error, "frontend delay negotiation failed");
             return;
         }
+        // A successful negotiation supersedes any recovery request latched
+        // during the adoption window (e.g. a winscreen Begin racing the
+        // cross-phase reset). Leaving it latched killed healthy sessions a
+        // few phases later.
+        if (FrontendInputSync_HasRecoveryRequest()) {
+            LOG_NETPLAY(LOG_INFO,
+                "[PregameSync] Clearing stale frontend recovery request after successful negotiation: %s",
+                FrontendInputSync_GetRecoveryReason());
+            FrontendInputSync_ClearRecoveryRequest();
+        }
         SetStatusFmt("Session sync confirmed.");
         SetPhase(PregamePhase::SyncConfirmed, "both confirmed");
     }
 
-    if (PhaseTimedOut(SYNC_TIMEOUT_MS)) {
+    if (HandshakeTimedOut(SYNC_TIMEOUT_MS, "sync confirm")) {
         SetErrorFmt("Session sync timed out waiting for confirm");
         SetPhase(PregamePhase::Error, "sync confirm timeout");
     }
@@ -699,6 +771,33 @@ static void UpdateSyncConfirmed() {
         role == SessionRole::Host ? "Host" : "Join",
         s_syncRoundOption,
         GameSettingsSync_RoundsToWin(s_syncRoundOption));
+
+    if (s_rematchFastPath) {
+        // Continue-screen rematch: rebuild the locked config from the
+        // previous match snapshot (the UpdateFrontendLocked construction, but
+        // without any CharSelSync involvement). Chars/palettes/stage/host_side
+        // are preserved; the host mints fresh seeds and the round option.
+        s_lockedConfig = s_rematchSnapshot;
+        if (role == SessionRole::Host) {
+            s_lockedConfig.rng_seed = GetTickCount() ^ 0xDEADBEEF;
+            s_lockedConfig.session_seed = s_sessionId;
+            s_lockedConfig.round_count = GetOutgoingSyncRoundOption("rematch fast path");
+            s_lockedConfig.time_limit = 0;
+            GameSettingsSync_ApplyLockedConfig(&s_lockedConfig, "rematch fast path host build");
+        }
+
+        Rollback::NetplayLog_Write("PREGAME", -1,
+            "Rematch fast path config: p1=%u/%u p2=%u/%u stage=%u host_side=%u session=0x%08X",
+            s_lockedConfig.p1_character, s_lockedConfig.p1_palette,
+            s_lockedConfig.p2_character, s_lockedConfig.p2_palette,
+            s_lockedConfig.stage_id, s_lockedConfig.host_side,
+            s_sessionId);
+
+        SetStatusFmt("Rematch! Exchanging match config...");
+        SetPhase(PregamePhase::ConfigExchange, "rematch fast path");
+        MatchBootstrap_BeginConfigExchange(&s_lockedConfig);
+        return;
+    }
 
     CharSelSync_Begin();
     SetStatusFmt("Character select...");
@@ -850,7 +949,7 @@ static void UpdateConfigExchange() {
         SetPhase(PregamePhase::Error, "config exchange failed");
     }
 
-    if (PhaseTimedOut(CONFIG_TIMEOUT_MS)) {
+    if (HandshakeTimedOut(CONFIG_TIMEOUT_MS, "config exchange")) {
         SetErrorFmt("Config exchange timed out");
         SetPhase(PregamePhase::Error, "config timeout");
     }
@@ -1009,6 +1108,8 @@ static void ResetTrackingStateForNewRun() {
     s_configAgreed = false;
     s_configHash = 0;
     LockedMatchConfig_Clear(&s_lockedConfig);
+    // Cross-phase adoption is the charsel path — never the rematch fast path.
+    s_rematchFastPath = false;
     s_errorText[0] = '\0';
     s_localCharSelLocked = false;
     s_remoteCharSelLocked = false;
@@ -1092,6 +1193,13 @@ void PregameSync_FrameUpdate() {
         return;
     }
 
+    // Rematch fast path: the Sync*/Config* handlers below don't drive the
+    // freeze themselves, but the game may already be racing toward the Mode 8
+    // gameplay boundary (no charsel absorbs the handshake time).
+    if (s_rematchFastPath) {
+        UpdateBootstrapFreezeForBoundary();
+    }
+
     switch (s_phase) {
         case PregamePhase::SyncAnnounce:      UpdateSyncAnnounce();      break;
         case PregamePhase::SyncExchange:      UpdateSyncExchange();      break;
@@ -1112,8 +1220,11 @@ void PregameSync_FrameUpdate() {
     }
 }
 
+static bool s_beginInProgress = false;
+
 bool PregameSync_Begin() {
     if (!s_initialized) return false;
+    if (s_beginInProgress) return false;
     if (s_phase != PregamePhase::Idle) {
         // Rematch flow reaches CharSel with PregameSync still in terminal
         // GameplayHandoff from the previous match. Allow an explicit restart.
@@ -1141,11 +1252,7 @@ bool PregameSync_Begin() {
         return false;
     }
 
-    // Register our packet handler
-    Rollback::NetplayLog_Write("PREGAME", -1,
-        "Registering pregame packet callback");
-    Rollback::NetplayLog_Flush();
-    Session_SetPacketCallback(OnPregamePacket);
+    s_beginInProgress = true;
 
     // Reset all tracking state
     s_logTickCounter = 0;
@@ -1153,6 +1260,8 @@ bool PregameSync_Begin() {
     s_configAgreed = false;
     s_configHash = 0;
     LockedMatchConfig_Clear(&s_lockedConfig);
+    s_rematchFastPath = false;
+    LockedMatchConfig_Clear(&s_rematchSnapshot);
     s_errorText[0] = '\0';
     s_localCharSelLocked = false;
     s_remoteCharSelLocked = false;
@@ -1184,7 +1293,50 @@ bool PregameSync_Begin() {
     SetStatusFmt("Synchronizing session...");
     SetPhase(PregamePhase::SyncAnnounce, "begin");
 
+    // Register the packet handler LAST: installing it synchronously flushes
+    // any deferred control packets into OnPregamePacket, and doing that
+    // before the state reset above wiped the remote-announce latch the flush
+    // had just set (a first-announce drop). With the phase already at
+    // SyncAnnounce, flushed announces are handled normally.
+    Rollback::NetplayLog_Write("PREGAME", -1,
+        "Registering pregame packet callback");
+    Rollback::NetplayLog_Flush();
+    Session_SetPacketCallback(OnPregamePacket);
+
+    s_beginInProgress = false;
     LOG_NETPLAY(LOG_INFO, "[PregameSync] Pre-game sync started (session=0x%08X)", s_sessionId);
+    return true;
+}
+
+bool PregameSync_BeginRematch(const LockedMatchConfig* previousConfig) {
+    if (!s_initialized || !previousConfig) {
+        return false;
+    }
+
+    // Copy before Begin(): previousConfig routinely aliases s_lockedConfig,
+    // which Begin's reset clears.
+    const LockedMatchConfig snapshot = *previousConfig;
+
+    if (!PregameSync_Begin()) {
+        LOG_NETPLAY(LOG_WARNING,
+            "[PregameSync] BeginRematch: Begin() failed (phase=%s)",
+            PregamePhaseName(s_phase));
+        return false;
+    }
+
+    // Begin() cleared the flag — arm the fast path after the shared reset.
+    s_rematchSnapshot = snapshot;
+    s_rematchFastPath = true;
+    SetStatusFmt("Rematch! Synchronizing session...");
+
+    Rollback::NetplayLog_Write("PREGAME", -1,
+        "Rematch fast path armed: p1=%u/%u p2=%u/%u stage=%u host_side=%u session=0x%08X",
+        snapshot.p1_character, snapshot.p1_palette,
+        snapshot.p2_character, snapshot.p2_palette,
+        snapshot.stage_id, snapshot.host_side,
+        s_sessionId);
+    LOG_NETPLAY(LOG_INFO,
+        "[PregameSync] Rematch fast path armed (frontend charsel skipped)");
     return true;
 }
 
@@ -1204,6 +1356,7 @@ void PregameSync_Abort(const char* reason) {
     SetErrorFmt("%s", reason ? reason : "Pre-game sync aborted");
     SetPhase(PregamePhase::Idle, "aborted");
 
+    s_rematchFastPath = false;
     s_configAgreed = false;
     s_configHash = 0;
     s_localCharSelLocked = false;
@@ -1303,7 +1456,33 @@ bool PregameSync_HandleCrossPhaseSessionPacket(PacketType type,
 
     const SessionRole role = Session_GetRole();
     if (role != SessionRole::Join) {
-        return false;
+        // Host: the join peer is announcing a pregame (re)start that our own
+        // local restart heuristics missed (e.g. the GameplayHandoff signature
+        // was destroyed by an abort). Previously the host had no wire-driven
+        // wakeup at all and the peer timed out. Restart our own pregame sync:
+        // Begin() mints the authoritative session id and announces it, and
+        // the join side adopts it at confirm.
+        Rollback::NetplayLog_Write(
+            "PREGAME", -1,
+            "Cross-phase session sync as HOST — restarting pregame: type=%s phase=%s lifecycle=%s",
+            PacketTypeName(type),
+            PregamePhaseName(s_phase),
+            MatchLifecyclePhaseName(MatchLifecycle_GetPhase()));
+        Rollback::NetplayLog_Flush();
+
+        Rollback::OnlineWiring_OnRematch();
+        if (s_phase == PregamePhase::GameplayHandoff) {
+            InputSyncHooks_SetLoadBarrierFreeze(false);
+            CharSelSync_Abort();
+            MatchBootstrap_Abort();
+            SetPhase(PregamePhase::Idle, "cross-phase host restart");
+        }
+        const bool restarted = PregameSync_Begin();
+        LOG_NETPLAY(LOG_INFO,
+            "[PregameSync] Host pregame restart via cross-phase %s: %s",
+            PacketTypeName(type),
+            restarted ? "started" : "FAILED");
+        return restarted;
     }
 
     Rollback::NetplayLog_Write(

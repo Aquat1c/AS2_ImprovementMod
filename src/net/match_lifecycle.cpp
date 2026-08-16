@@ -561,10 +561,14 @@ void MatchLifecycle_OnDisconnect(const char* reason) {
 
 void MatchLifecycle_OnRematch() {
     if (!s_initialized) return;
+    // WinScreenActive: the continue-screen rematch resolves while Mode 9 is
+    // still up — the intent routes through PostMatchRoute once the mode moves.
     if (s_phase == MatchLifecyclePhase::PostMatchRoute ||
-        s_phase == MatchLifecyclePhase::MatchEnd) {
+        s_phase == MatchLifecyclePhase::MatchEnd ||
+        s_phase == MatchLifecyclePhase::WinScreenActive) {
         s_postMatchIntent = PostMatchIntent::Rematch;
-        LOG_NETPLAY(LOG_INFO, "[MatchLife] Post-match intent: Rematch");
+        LOG_NETPLAY(LOG_INFO, "[MatchLife] Post-match intent: Rematch (phase=%s)",
+            MatchLifecyclePhaseName(s_phase));
     }
 }
 

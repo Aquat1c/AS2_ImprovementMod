@@ -20,6 +20,7 @@
 #include "input/input_system.h"
 #include "ui/log_window.h"
 #include "net/session_manager.h"
+#include "net/continue_flow.h"
 #include "net/match_lifecycle.h"
 #include "net/netplay_menu_state.h"
 
@@ -225,11 +226,33 @@ static int __cdecl Hook_SetGameMode(int mode, char fade) {
             LOG_NETPLAY(LOG_INFO, "[ModeOwn] Intercepted MODE_MENU -> MODE_LOBBY");
             NetMenu::HandleNetworkSelected();
             return 0;
+        } else if (hasSession) {
+            // The game engine is leaving netplay context on its own; end the
+            // session with an honest reason (this is a local navigation
+            // event, not a network failure).
+            LOG_NETPLAY(LOG_WARNING, "[ModeOwn] Intercepted mode %u -> MODE_LOBBY with active session", sourceMode);
+            NetMenu::HandleDisconnection("Session closed (game left netplay context)");
+            return 0;
         } else {
-            LOG_NETPLAY(LOG_WARNING, "[ModeOwn] Intercepted mode %u -> MODE_LOBBY (vanilla fallback)", sourceMode);
-            NetMenu::HandleDisconnection("Connection lost (vanilla lobby redirect intercepted)");
+            // No session — a stray vanilla lobby redirect. Block it quietly
+            // instead of surfacing a fake "Connection lost" error.
+            LOG_NETPLAY(LOG_WARNING, "[ModeOwn] Blocked mode %u -> MODE_LOBBY (no session, vanilla fallback)", sourceMode);
             return 0;
         }
+    }
+
+    // Continue-screen rematch (both locked YES): mode 9 sub 36 under
+    // gametype 2 ignores the continue cursor and always routes
+    // WinScreen -> CharSel. Redirect to the pre-match intro instead —
+    // Mode 7 re-reads the live charsel globals (P1/P2 char+palette, stage,
+    // rounds), which the rematch resolution left untouched. Never route this
+    // through the netplay charsel launch/reset helpers.
+    if (s_interceptEnabled && sourceMode == MODE_WINSCREEN && mode == MODE_CHARSEL &&
+        Net::ContinueFlow_IsRematchLatched()) {
+        Net::ContinueFlow_ConsumeRematchLatch();
+        LOG_NETPLAY(LOG_INFO,
+            "[ModeOwn] Continue rematch latched — redirecting WinScreen->CharSel to PrematchIntro(7)");
+        return s_origSetGameMode ? s_origSetGameMode(MODE_PREMATCH_INTRO, 1) : 0;
     }
 
     // Graceful quit from CharSel with active session

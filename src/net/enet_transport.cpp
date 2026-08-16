@@ -12,6 +12,7 @@
 
 #include <mutex>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
 
@@ -26,10 +27,18 @@ static ENetHost*  s_enetHost       = nullptr;
 
 namespace {
 
-constexpr uint32_t AUTOPUNCH_REGISTER_INTERVAL_MS = 500;
-constexpr uint32_t AUTOPUNCH_LOOKUP_INTERVAL_MS   = 500;
-constexpr uint32_t AUTOPUNCH_DIRECT_INTERVAL_MS   = 125;
-constexpr uint32_t AUTOPUNCH_ACTIVE_WINDOW_MS     = 10000;
+constexpr uint32_t AUTOPUNCH_REGISTER_INTERVAL_MS  = 500;
+constexpr uint32_t AUTOPUNCH_LOOKUP_INTERVAL_MS    = 500;
+constexpr uint32_t AUTOPUNCH_DIRECT_INTERVAL_MS    = 125;
+constexpr uint32_t AUTOPUNCH_ACTIVE_WINDOW_MS      = 10000;
+constexpr uint32_t AUTOPUNCH_KEEPALIVE_INTERVAL_MS = 2000;
+
+// Keepalive wire format: [magic 4 | connectID 4 | reserved 4]. The leading
+// 0xFF 0xFF parses on a pre-keepalive build as peerID 0xFFF with the
+// COMPRESSED header flag set, which ENet discards silently when no compressor
+// is installed — old builds ignore these packets without side effects.
+constexpr uint8_t AUTOPUNCH_KEEPALIVE_MAGIC[4]    = {0xFF, 0xFF, 'A', 'K'};
+constexpr size_t  AUTOPUNCH_KEEPALIVE_PACKET_SIZE = 12;
 
 struct AutopunchState {
     ENetHost*   host;
@@ -49,10 +58,14 @@ struct AutopunchState {
     uint32_t    last_register_ms;
     uint32_t    last_lookup_ms;
     uint32_t    last_direct_ms;
+    uint32_t    last_keepalive_ms;
     uint32_t    relay_register_sent;
     uint32_t    relay_lookup_sent;
     uint32_t    direct_punch_sent;
     uint32_t    relay_mappings_received;
+    uint32_t    keepalive_sent;
+    uint32_t    keepalive_received;
+    uint32_t    rebind_heals;
 };
 
 static std::mutex s_autopunchMutex;
@@ -343,6 +356,104 @@ static void AutopunchApplyRelayMapping(AutopunchState& state,
     }
 }
 
+static ENetPeer* FindSingleConnectedPeer(ENetHost* host) {
+    if (!host) {
+        return nullptr;
+    }
+    ENetPeer* found = nullptr;
+    for (size_t i = 0; i < host->peerCount; i++) {
+        ENetPeer* peer = &host->peers[i];
+        if (peer->state != ENET_PEER_STATE_CONNECTED) {
+            continue;
+        }
+        if (found) {
+            return nullptr;  // Ambiguous: refuse rather than guess.
+        }
+        found = peer;
+    }
+    return found;
+}
+
+static bool AutopunchSendKeepalive(AutopunchState& state, ENetPeer* peer) {
+    if (!peer || peer->connectID == 0) {
+        return false;
+    }
+
+    uint8_t payload[AUTOPUNCH_KEEPALIVE_PACKET_SIZE] = {};
+    memcpy(payload, AUTOPUNCH_KEEPALIVE_MAGIC, sizeof(AUTOPUNCH_KEEPALIVE_MAGIC));
+    const uint32_t connectId = peer->connectID;
+    memcpy(payload + sizeof(AUTOPUNCH_KEEPALIVE_MAGIC), &connectId, sizeof(connectId));
+
+    const int sent = RawSendToAddress(
+        state,
+        peer->address,
+        payload,
+        sizeof(payload),
+        "Autopunch keepalive");
+    if (sent == (int)sizeof(payload)) {
+        state.keepalive_sent++;
+        char target[96] = {};
+        Rollback::NetplayLog_Verbose("ENET", -1,
+            "%s Autopunch keepalive sent: target=%s connect_id=0x%08X total=%u",
+            AutopunchLabel(state),
+            FormatEnetAddress(peer->address, target, sizeof(target)),
+            (unsigned)connectId,
+            state.keepalive_sent);
+        return true;
+    }
+    return false;
+}
+
+static void AutopunchHandleKeepalive(AutopunchState& state,
+                                     ENetHost* host,
+                                     const ENetAddress& from,
+                                     uint32_t connectId) {
+    state.keepalive_received++;
+
+    // Rebind healing is restricted to the gameplay host with exactly one
+    // connected peer; spectator hosts multiplex peers and a wrong heal there
+    // could hijack an unrelated client's slot.
+    if (host != s_enetHost) {
+        return;
+    }
+
+    ENetPeer* peer = FindSingleConnectedPeer(host);
+    if (!peer || peer->connectID == 0 || peer->connectID != connectId) {
+        return;
+    }
+
+    if (from.host == peer->address.host && from.port == peer->address.port) {
+        return;  // Endpoint unchanged: plain keepalive.
+    }
+
+    // connectID travels in cleartext, so it is not strong enough to accept a
+    // full IP migration; heal only same-IP port rebinds.
+    if (from.host != peer->address.host) {
+        char fromText[96] = {};
+        Rollback::NetplayLog_Write("ENET", -1,
+            "%s Autopunch keepalive from foreign IP ignored: from=%s connect_id=0x%08X",
+            AutopunchLabel(state),
+            FormatEnetAddress(from, fromText, sizeof(fromText)),
+            (unsigned)connectId);
+        return;
+    }
+
+    const ENetAddress oldAddress = peer->address;
+    peer->address = from;
+    state.rebind_heals++;
+
+    char oldText[96] = {};
+    char newText[96] = {};
+    Rollback::NetplayLog_Write("ENET", -1,
+        "%s NAT rebind healed: peer=%p endpoint %s -> %s connect_id=0x%08X heals=%u",
+        AutopunchLabel(state),
+        peer,
+        FormatEnetAddress(oldAddress, oldText, sizeof(oldText)),
+        FormatEnetAddress(from, newText, sizeof(newText)),
+        (unsigned)connectId,
+        state.rebind_heals);
+}
+
 static int ENET_CALLBACK AutopunchIntercept(ENetHost* host, ENetEvent*) {
     if (!host || !host->receivedData || host->receivedDataLength == 0) {
         return 0;
@@ -365,6 +476,14 @@ static int ENET_CALLBACK AutopunchIntercept(ENetHost* host, ENetEvent*) {
             AutopunchLabel(*state),
             FormatEnetAddress(from, fromText, sizeof(fromText)));
         return 1;
+    }
+
+    if (len == AUTOPUNCH_KEEPALIVE_PACKET_SIZE &&
+        memcmp(data, AUTOPUNCH_KEEPALIVE_MAGIC, sizeof(AUTOPUNCH_KEEPALIVE_MAGIC)) == 0) {
+        uint32_t connectId = 0;
+        memcpy(&connectId, data + sizeof(AUTOPUNCH_KEEPALIVE_MAGIC), sizeof(connectId));
+        AutopunchHandleKeepalive(*state, host, from, connectId);
+        return 1;  // Ours either way — never let ENet parse it.
     }
 
     const bool fromRelay =
@@ -404,6 +523,193 @@ static int ENET_CALLBACK AutopunchIntercept(ENetHost* host, ENetEvent*) {
 } // namespace
 
 // ============================================================================
+// Fault injection (M6 verification) — OUTBOUND application packets only.
+//
+// Controlled by environment variables read ONCE at Transport_GlobalInit:
+//   AS2_NET_INJECT_DROP_PCT            0-100, random per-packet egress drop
+//   AS2_NET_INJECT_BLACKOUT_MS         blackout window length (ms)
+//   AS2_NET_INJECT_BLACKOUT_PERIOD_MS  blackout repeat period (ms, > window)
+//   AS2_NET_INJECT_DELAY_MS            parsed, NOT implemented (see below)
+//
+// The hook lives in Transport_Send only; Transport_SendTyped funnels through
+// it, so both entry points are covered by one check. A dropped packet is
+// swallowed BEFORE enet_packet_create and reported as success to the caller —
+// simulated loss must be invisible to the sender, exactly like the real wire.
+//
+// Deliberately NOT affected by injection:
+//   - Autopunch keepalives / punch bursts / relay traffic: those ride
+//     RawSendToAddress → enet_socket_send, below this layer.
+//   - ENet protocol internals (acks, pings, connection management): generated
+//     inside enet_host_service, never pass through Transport_Send.
+// This is intentional — the ConnectionSupervisor measures APPLICATION inbound
+// silence (Session-level receive events), so app-egress blackout on the peer
+// produces a genuine supervisor-visible outage here even though ENet's own
+// low-level channel stays up.
+//
+// Caveat: RELIABLE packets dropped here are lost permanently (ENet never saw
+// them, so it cannot retransmit). Real wire loss of a reliable packet heals
+// via ENet retransmission. Blackout tests remain valid (a cable pull also
+// stops retransmits from crossing), but sustained DROP_PCT is harsher than
+// real loss for reliable control traffic. Documented in
+// docs/RESILIENCE_TESTING.md.
+//
+// AS2_NET_INJECT_DELAY_MS is intentionally NOT implemented: Transport_Send
+// executes on the network worker thread, so an inline wait would block
+// servicing; a correct fixed delay needs a timed egress queue drained in
+// Transport_Service with cross-frame ENetPeer lifetime handling (stale-peer
+// hazard on host teardown), which exceeds this additive hook's budget. The
+// variable is detected and a warning is logged so a configured-but-ignored
+// delay is never silent.
+//
+// Each instance shapes only its own egress. Simulating bidirectional loss
+// requires the env vars set on BOTH game instances. Blackout scheduling uses
+// raw GetTickCount() modulo the period — GetTickCount is ms-since-boot, so
+// two instances on the SAME machine share one clock and their blackout
+// windows align automatically.
+//
+// Thread model: state is written by InjectInitFromEnv (Transport_GlobalInit)
+// and afterwards touched only from Transport_Send, whose calls are serialized
+// on the transport owner thread per this file's contract. No lock needed.
+// Default: fully OFF — with no env vars set, the only added cost in
+// Transport_Send is a single bool test.
+// ============================================================================
+
+namespace {
+
+struct FaultInjectState {
+    bool     enabled;               // any injection configured
+    uint32_t drop_pct;              // 0-100 random egress drop
+    uint32_t blackout_ms;           // blackout window length
+    uint32_t blackout_period_ms;    // blackout repeat period
+    bool     in_blackout;           // edge tracking for enter/exit logs
+    uint32_t blackout_entered_ms;   // tick at window entry (for exit log)
+    uint32_t blackout_entered_drop; // dropped_blackout at window entry
+    uint32_t rng;                   // LCG state (MSVC rand constants)
+    uint32_t dropped_random;        // lifetime counters
+    uint32_t dropped_blackout;
+};
+
+static FaultInjectState s_inject = {};
+
+static uint32_t InjectReadEnvU32(const char* name, bool* outPresent) {
+    char buf[32] = {};
+    const DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+    if (outPresent) {
+        *outPresent = (n > 0 && n < sizeof(buf));
+    }
+    if (n == 0 || n >= sizeof(buf)) {
+        return 0;
+    }
+    const long v = strtol(buf, nullptr, 10);
+    return v > 0 ? (uint32_t)v : 0;
+}
+
+static void InjectInitFromEnv() {
+    memset(&s_inject, 0, sizeof(s_inject));
+
+    bool present = false;
+    s_inject.drop_pct = InjectReadEnvU32("AS2_NET_INJECT_DROP_PCT", &present);
+    if (s_inject.drop_pct > 100) {
+        s_inject.drop_pct = 100;
+    }
+    s_inject.blackout_ms        = InjectReadEnvU32("AS2_NET_INJECT_BLACKOUT_MS", &present);
+    s_inject.blackout_period_ms = InjectReadEnvU32("AS2_NET_INJECT_BLACKOUT_PERIOD_MS", &present);
+
+    // Blackout needs both knobs and a period strictly larger than the window.
+    if (s_inject.blackout_ms != 0 &&
+        (s_inject.blackout_period_ms == 0 ||
+         s_inject.blackout_period_ms <= s_inject.blackout_ms)) {
+        LOG_WARN("[Net] Fault injection: invalid blackout config (window=%ums period=%ums) -- blackout disabled",
+                 s_inject.blackout_ms, s_inject.blackout_period_ms);
+        Rollback::NetplayLog_Write("INJECT", -1,
+            "Blackout config invalid: window=%u period=%u (need period > window) -- blackout disabled",
+            s_inject.blackout_ms, s_inject.blackout_period_ms);
+        s_inject.blackout_ms = 0;
+        s_inject.blackout_period_ms = 0;
+    }
+
+    bool delayPresent = false;
+    const uint32_t delayMs = InjectReadEnvU32("AS2_NET_INJECT_DELAY_MS", &delayPresent);
+    if (delayPresent && delayMs > 0) {
+        LOG_WARN("[Net] Fault injection: AS2_NET_INJECT_DELAY_MS=%u is NOT implemented and will be ignored "
+                 "(no non-blocking delay point on the transport worker)", delayMs);
+        Rollback::NetplayLog_Write("INJECT", -1,
+            "AS2_NET_INJECT_DELAY_MS=%u ignored: delay injection not implemented", delayMs);
+    }
+
+    s_inject.enabled = (s_inject.drop_pct > 0) ||
+                       (s_inject.blackout_ms > 0 && s_inject.blackout_period_ms > 0);
+    if (!s_inject.enabled) {
+        return;  // Fully off: zero log noise, single bool check per send.
+    }
+
+    s_inject.rng = GetTickCount() ^ (GetCurrentProcessId() << 16) ^ 0x5F3759DFu;
+
+    LOG_WARN("[Net] FAULT INJECTION ACTIVE (outbound only): drop_pct=%u blackout=%ums/%ums",
+             s_inject.drop_pct, s_inject.blackout_ms, s_inject.blackout_period_ms);
+    Rollback::NetplayLog_Write("INJECT", -1,
+        "Fault injection active: drop_pct=%u blackout_window_ms=%u blackout_period_ms=%u "
+        "(outbound app packets only; autopunch keepalives and ENet acks/pings unaffected)",
+        s_inject.drop_pct, s_inject.blackout_ms, s_inject.blackout_period_ms);
+}
+
+// Decide whether to swallow the current outbound packet. Called only when
+// s_inject.enabled. Blackout enter/exit logging is edge-triggered here, so
+// window boundaries are logged at the first send attempt inside/outside the
+// window (not at the exact wall-clock boundary) — good enough for test logs.
+static bool InjectShouldDropOutbound() {
+    if (s_inject.blackout_ms != 0) {
+        const uint32_t now = GetTickCount();
+        const bool black = (now % s_inject.blackout_period_ms) < s_inject.blackout_ms;
+        if (black != s_inject.in_blackout) {
+            s_inject.in_blackout = black;
+            if (black) {
+                s_inject.blackout_entered_ms   = now;
+                s_inject.blackout_entered_drop = s_inject.dropped_blackout;
+                LOG_WARN("[Net] Injection blackout ENTER (window=%ums period=%ums)",
+                         s_inject.blackout_ms, s_inject.blackout_period_ms);
+                Rollback::NetplayLog_Write("INJECT", -1,
+                    "Blackout ENTER: window=%ums period=%ums tick=%u",
+                    s_inject.blackout_ms, s_inject.blackout_period_ms, now);
+            } else {
+                LOG_WARN("[Net] Injection blackout EXIT after ~%ums (%u packets swallowed)",
+                         now - s_inject.blackout_entered_ms,
+                         s_inject.dropped_blackout - s_inject.blackout_entered_drop);
+                Rollback::NetplayLog_Write("INJECT", -1,
+                    "Blackout EXIT: held ~%ums swallowed=%u total_blackout_drops=%u",
+                    now - s_inject.blackout_entered_ms,
+                    s_inject.dropped_blackout - s_inject.blackout_entered_drop,
+                    s_inject.dropped_blackout);
+            }
+        }
+        if (black) {
+            s_inject.dropped_blackout++;
+            return true;
+        }
+    }
+
+    if (s_inject.drop_pct != 0) {
+        s_inject.rng = s_inject.rng * 214013u + 2531011u;
+        if (((s_inject.rng >> 16) % 100u) < s_inject.drop_pct) {
+            s_inject.dropped_random++;
+            if ((s_inject.dropped_random % 500u) == 1u) {
+                Rollback::NetplayLog_Write("INJECT", -1,
+                    "Random egress drops so far: %u (drop_pct=%u)",
+                    s_inject.dropped_random, s_inject.drop_pct);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+bool Transport_FaultInjectionActive() {
+    return s_inject.enabled;
+}
+
+// ============================================================================
 // Global init / deinit
 // ============================================================================
 
@@ -419,6 +725,10 @@ bool Transport_GlobalInit() {
     Rollback::NetplayLog_Write("ENET", -1,
         "ENet initialized: version=%d.%d.%d",
         ENET_VERSION_MAJOR, ENET_VERSION_MINOR, ENET_VERSION_PATCH);
+
+    // M6 injection hook: read AS2_NET_INJECT_* env vars once. No-op (single
+    // bool per send) when none are set.
+    InjectInitFromEnv();
     return true;
 }
 
@@ -718,13 +1028,16 @@ void Transport_AutopunchStopForHost(ENetHost* enetHost, const char* reason) {
         }
 
         Rollback::NetplayLog_Write("ENET", -1,
-            "%s Autopunch stop: reason=%s registers=%u lookups=%u direct=%u mappings=%u",
+            "%s Autopunch stop: reason=%s registers=%u lookups=%u direct=%u mappings=%u keepalives=%u/%u heals=%u",
             AutopunchLabel(*it),
             reason && reason[0] ? reason : "?",
             it->relay_register_sent,
             it->relay_lookup_sent,
             it->direct_punch_sent,
-            it->relay_mappings_received);
+            it->relay_mappings_received,
+            it->keepalive_sent,
+            it->keepalive_received,
+            it->rebind_heals);
         if (enetHost && enetHost->intercept == AutopunchIntercept) {
             enetHost->intercept = nullptr;
         }
@@ -750,11 +1063,24 @@ void Transport_AutopunchServiceForHost(ENetHost* enetHost,
         if (!state->connected_logged) {
             state->connected_logged = true;
             Rollback::NetplayLog_Write("ENET", -1,
-                "%s Autopunch peer connected; keeping relay helper quiet",
-                AutopunchLabel(*state));
+                "%s Autopunch peer connected; relay helper quiet, keepalive every %ums",
+                AutopunchLabel(*state),
+                AUTOPUNCH_KEEPALIVE_INTERVAL_MS);
+        }
+        // Low-rate keepalive while connected: keeps the NAT mapping warm and
+        // gives the remote intercept authenticated datagrams to detect a NAT
+        // rebind from (ENet itself drops packets from a changed source).
+        if (state->last_keepalive_ms == 0 ||
+            nowMs - state->last_keepalive_ms >= AUTOPUNCH_KEEPALIVE_INTERVAL_MS) {
+            state->last_keepalive_ms = nowMs;
+            if (ENetPeer* peer = FindSingleConnectedPeer(state->host)) {
+                AutopunchSendKeepalive(*state, peer);
+            }
         }
         return;
     }
+
+    state->last_keepalive_ms = 0;
 
     const uint32_t ageMs = nowMs - state->started_ms;
     if (ageMs > AUTOPUNCH_ACTIVE_WINDOW_MS) {
@@ -799,6 +1125,31 @@ void Transport_AutopunchServiceForHost(ENetHost* enetHost,
     }
 }
 
+void Transport_ConfigurePeerResilience(ENetPeer* peer) {
+    if (!peer) return;
+
+    // ENet defaults were never tuned for netplay: the 5s timeout minimum
+    // meant ~5s of sustained loss killed the link, and the 500ms ping
+    // interval starts the death clock late. 10s minimum / 30s maximum with a
+    // 150ms ping keeps ENet's own verdict well behind the mod's
+    // ConnectionSupervisor, which owns liveness.
+    enet_peer_timeout(peer, 0, 10000, 30000);
+    enet_peer_ping_interval(peer, 150);
+
+    // Disable ENet's unreliable-packet throttle. Under sustained RTT growth
+    // it deliberately drops unreliable packets locally — for rollback input
+    // traffic (redundant by design) that just manufactures loss during ping
+    // spikes.
+    enet_peer_throttle_configure(peer, ENET_PEER_PACKET_THROTTLE_INTERVAL, 0, 0);
+    peer->packetThrottle = ENET_PEER_PACKET_THROTTLE_SCALE;
+    peer->packetThrottleLimit = ENET_PEER_PACKET_THROTTLE_SCALE;
+
+    LOG_INFO("[Net] Peer resilience configured: timeout=10000/30000ms ping=150ms throttle=off");
+    Rollback::NetplayLog_Write("ENET", -1,
+        "Peer resilience configured: peer=%p timeout_min=10000 timeout_max=30000 ping_interval=150 throttle=disabled",
+        peer);
+}
+
 void Transport_DisconnectPeer(ENetPeer* peer, uint32_t data) {
     if (!peer) return;
     enet_peer_disconnect(peer, data);
@@ -821,6 +1172,14 @@ void Transport_ForceDisconnectPeer(ENetPeer* peer) {
 
 bool Transport_Send(ENetPeer* peer, uint8_t channel, const void* data, size_t length, bool reliable) {
     if (!peer || !data || length == 0) return false;
+
+    // M6 injection hook: swallow the packet before ENet sees it and report
+    // success — simulated loss must look like real wire loss to the caller.
+    // Covers Transport_SendTyped too (it funnels through here). Autopunch
+    // keepalives and ENet acks/pings do not pass through this path.
+    if (s_inject.enabled && InjectShouldDropOutbound()) {
+        return true;
+    }
 
     uint32_t flags = reliable ? ENET_PACKET_FLAG_RELIABLE : ENET_PACKET_FLAG_UNSEQUENCED;
     if (!reliable && channel == CHANNEL_GAMEPLAY) {

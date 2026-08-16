@@ -153,11 +153,20 @@ static void UpdateStats(bool hostActive, ENetPeer* peer) {
         s_stats.rtt_variance_ms = (float)peer->roundTripTimeVariance;
         s_stats.packets_sent = peer->packetsSent;
         s_stats.packets_lost = peer->packetsLost;
+        // ENet-level liveness: lastReceiveTime advances on ANY inbound
+        // command (acks of our pings included), in host serviceTime units.
+        ENetHost* host = Transport_GetHost();
+        if (host && host->serviceTime >= peer->lastReceiveTime) {
+            s_stats.enet_silence_ms = host->serviceTime - peer->lastReceiveTime;
+        } else {
+            s_stats.enet_silence_ms = 0;
+        }
     } else {
         s_stats.rtt_ms = 0.0f;
         s_stats.rtt_variance_ms = 0.0f;
         s_stats.packets_sent = 0;
         s_stats.packets_lost = 0;
+        s_stats.enet_silence_ms = 0xFFFFFFFFu;
     }
 }
 
@@ -367,6 +376,7 @@ static void WorkerThreadMain() {
                 case ENET_EVENT_TYPE_CONNECT: {
                     activePeer = ev.peer;
                     transportConnected = true;
+                    Transport_ConfigurePeerResilience(ev.peer);
                     Transport_AutopunchService(GetTickCount(), true);
                     NetworkThreadEvent out{};
                     out.type = NetworkThreadEventType::Connected;

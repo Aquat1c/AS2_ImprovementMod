@@ -17,8 +17,8 @@
 #   - autopunch: https://github.com/delthas/autopunch (protocol-compatible local client behavior)
 
 cmake_minimum_required(VERSION 3.15)
-project(AS2_Rollback VERSION 0.6.0 LANGUAGES C CXX)
-set(AS2_MOD_VERSION "0.6")
+project(AS2_Rollback VERSION 0.7.0 LANGUAGES C CXX)
+set(AS2_MOD_VERSION "0.7-beta")
 
 enable_testing()
 
@@ -363,6 +363,7 @@ set(TESTING_HEADERS
     include/testing/test_scenarios.h
     include/testing/autoconnect_harness.h
     include/testing/harness_shared_memory.h
+    include/testing/rematch_soak.h
 )
 
 set(TRAINING_HEADERS
@@ -445,6 +446,9 @@ set(ROLLBACK_SOURCES
 
 set(NET_SOURCES
     src/net/baseline_sync.cpp
+    src/net/connection_supervisor.cpp
+    src/net/continue_flow.cpp
+    src/net/transition_barrier.cpp
     src/net/enet_transport.cpp
     src/net/frontend_input_sync.cpp
     src/net/network_thread.cpp
@@ -486,6 +490,7 @@ set(TESTING_SOURCES
     src/testing/scripted_input_runner.cpp
     src/testing/test_scenarios.cpp
     src/testing/autoconnect_harness.cpp
+    src/testing/rematch_soak.cpp
 )
 
 set(TRAINING_SOURCES

@@ -91,4 +91,14 @@ void WinScreenSync_OnRemoteFrameInput(const WinScreenFrameInputPayload* p);
 /// Handle incoming legacy WinScreenConfirm packet.
 void WinScreenSync_OnRemoteConfirm();
 
+// ============================================================================
+// Continue Flow Integration
+// ============================================================================
+
+/// Finalize the lockstep phase from a continue-flow rematch resolution (the
+/// decline path finalizes through the normal handoff barrier instead). Both
+/// peers resolve on the same consumed frame, so this skips the phase-barrier
+/// handshake.
+void WinScreenSync_FinalizeFromContinueFlow(const char* reason);
+
 } // namespace Net

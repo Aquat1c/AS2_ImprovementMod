@@ -1,7 +1,10 @@
 #include "net/barrier_protocol.h"
 #include "net/delay_policy.h"
 #include "net/frontend_input_sync.h"
+#include "net/match_lifecycle.h"
+#include "net/pregame_sync.h"
 #include "net/session_manager.h"
+#include "net/transition_barrier.h"
 #include "net/stagesel_sync.h"
 #include "net/stage_watchdog_tracker.h"
 #include "net/winscreen_sync.h"
@@ -698,6 +701,18 @@ void Session_GetStats(ConnectionStats* out) {
         *out = g_sessionStats;
     }
 }
+
+PregamePhase PregameSync_GetPhase() { return PregamePhase::Idle; }
+MatchLifecyclePhase MatchLifecycle_GetPhase() { return MatchLifecyclePhase::Inactive; }
+void TransitionBarrier_Propose(NetTransitionKind, uint8_t, uint32_t) {}
+
+// ContinueFlow stubs (winscreen_sync.cpp references these; the continue flow
+// itself is not under test here — stubs keep the legacy finalize path).
+void ContinueFlow_Reset(const char*) {}
+void ContinueFlow_OnWinScreenAdvance() {}
+void ContinueFlow_OnConsumedFrame(uint16_t, uint16_t) {}
+bool ContinueFlow_IsPromptActive() { return false; }
+bool ContinueFlow_ShouldHoldWinScreenFinalize() { return false; }
 
 } // namespace Net
 

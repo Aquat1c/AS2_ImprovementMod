@@ -135,6 +135,11 @@ bool RollbackSession_IsRollingBack();
 /// Whether GekkoNet has completed its initial sync and is producing game events.
 bool RollbackSession_IsSessionRunning();
 
+/// True while GekkoNet reports the remote peer as interrupted (inbound silence
+/// past the interrupt timeout, but before the disconnect timeout). Non-fatal:
+/// gameplay should freeze-and-wait; cleared automatically on PlayerResumed.
+bool RollbackSession_IsPeerInterrupted();
+
 /// GekkoNet's frame advantage metric for timesync decisions.
 float RollbackSession_FramesAhead();
 

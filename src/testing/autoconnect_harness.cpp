@@ -7,6 +7,7 @@
 
 #include "testing/autoconnect_harness.h"
 #include "testing/harness_shared_memory.h"
+#include "testing/rematch_soak.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "core/mod_main.h"
@@ -247,12 +248,19 @@ bool AutoConnectHarness_Init(bool isHost, const char* nickname, int matchDuratio
     LOG_INFO("[Harness] Initialized: role=%s duration=%ds",
              isHost ? "Host" : "Client", matchDurationSec);
     ShmLog("Harness initialized: %s", isHost ? "Host" : "Client");
+
+    // M6: arm the rematch soak monitor if soak_rematches / AS2_SOAK_REMATCHES
+    // is configured (no-op otherwise).
+    RematchSoak_Init(isHost);
     return true;
 }
 
 void AutoConnectHarness_Update(const char* phaseName, uint32_t phaseOrdinal, uint32_t frameCounter) {
     if (!s_active) return;
     FlushToSharedMemory(phaseName, phaseOrdinal, frameCounter);
+
+    // M6: rematch soak observation (no-op unless armed).
+    RematchSoak_FrameUpdate(phaseName, frameCounter);
 }
 
 uint16_t AutoConnectHarness_RunFightingAI(bool isHost, uint32_t matchFrame) {
@@ -430,6 +438,10 @@ void AutoConnectHarness_Shutdown() {
 
     LOG_INFO("[Harness] Shutting down");
     ShmLog("Harness shutting down");
+
+    // M6: flush the soak verdict (fails any in-flight iteration, emits the
+    // summary exactly once).
+    RematchSoak_Finish("harness shutdown");
 
     InputSystem_ClearOverride(0);
     DestroySharedMemory();

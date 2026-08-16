@@ -8,7 +8,9 @@
 #include "net/netplay_pacing.h"
 #include "net/netplay_phase_runtime.h"
 #include "net/session_manager.h"
+#include "net/connection_supervisor.h"
 #include "net/charsel_sync.h"
+#include "net/continue_flow.h"
 #include "net/delay_policy.h"
 #include "net/frontend_input_sync.h"
 #include "net/match_lifecycle.h"
@@ -2282,7 +2284,10 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
 
             InputSyncHooks_SetTimesyncFreeze(true);
             Net::Session_Update();
-            if (!Net::Session_IsConnected()) {
+            // Session death is the ConnectionSupervisor's call (Dead) or a
+            // genuine session teardown; a mere interruption keeps the session
+            // connected and holds here (freeze) until resume or Dead.
+            if (Net::ConnectionSupervisor_IsDead() || !Net::Session_IsConnected()) {
                 InputSyncHooks_SetTimesyncFreeze(false);
                 return AbortRollbackDispatcher("Peer disconnected during startup interactive barrier");
             }
@@ -2384,8 +2389,13 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
             }
             Net::Session_Update();
-            if (!Rollback::RollbackSession_PollSession()) {
-                return AbortRollbackDispatcher("Peer disconnected during startup barrier");
+            {
+                // Abort only on true session death: Gekko-side broken (20s
+                // disconnect fired) or supervisor Dead. Interrupted = hold.
+                const bool pollOk = Rollback::RollbackSession_PollSession();
+                if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
+                    return AbortRollbackDispatcher("Peer disconnected during startup barrier");
+                }
             }
             return -1;
         }
@@ -2734,8 +2744,11 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     s_startupBias,
                     s_aheadThrottleCooldown);
                 Net::Session_Update();
-                if (!Rollback::RollbackSession_PollSession()) {
-                    return AbortRollbackDispatcher("Peer disconnected during ahead-side throttle hold");
+                {
+                    const bool pollOk = Rollback::RollbackSession_PollSession();
+                    if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
+                        return AbortRollbackDispatcher("Peer disconnected during ahead-side throttle hold");
+                    }
                 }
                 return -1;
             }
@@ -3016,9 +3029,16 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             }
             InputSyncHooks_SetTimesyncFreeze(true);
             Net::Session_Update();
-            if (!Rollback::RollbackSession_PollSession()) {
-                InputSyncHooks_SetTimesyncFreeze(false);
-                return AbortRollbackDispatcher("Peer disconnected during startup barrier");
+            {
+                // Abort only on true session death: Gekko-side broken (20s
+                // disconnect fired) or supervisor Dead verdict. While the
+                // supervisor merely reports Interrupted this stays in the
+                // existing freeze-hold (TSYNC pulse) and keeps pumping.
+                const bool pollOk = Rollback::RollbackSession_PollSession();
+                if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
+                    InputSyncHooks_SetTimesyncFreeze(false);
+                    return AbortRollbackDispatcher("Peer disconnected during startup barrier");
+                }
             }
             ResetVanillaTimeoutCounters();
             return -1;
@@ -3117,9 +3137,15 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 }
                 InputSyncHooks_SetTimesyncFreeze(true);
                 Net::Session_Update();
-                if (!Rollback::RollbackSession_PollSession()) {
-                    InputSyncHooks_SetTimesyncFreeze(false);
-                    return AbortRollbackDispatcher("Peer disconnected during stall hold");
+                {
+                    // Interrupted peers freeze here (stall-hold already keeps
+                    // the game paused); only Gekko-broken (20s) or supervisor
+                    // Dead aborts the dispatcher.
+                    const bool pollOk = Rollback::RollbackSession_PollSession();
+                    if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
+                        InputSyncHooks_SetTimesyncFreeze(false);
+                        return AbortRollbackDispatcher("Peer disconnected during stall hold");
+                    }
                 }
                 ResetVanillaTimeoutCounters();
                 return -1;
@@ -3594,10 +3620,14 @@ int __cdecl Hook_InputProcess(int gameState) {
          subState == MATCH_SUB_END &&
          Net::MatchLifecycle_GetPhase() == Net::MatchLifecyclePhase::MatchEnd);
 
+    // ContinueFlow rematch latched: the winscreen lockstep was already
+    // finalized at resolution and PregameSync owns the new epoch — restarting
+    // a winscreen input phase during the mode-9 fade would stomp it.
     if (winScreenRoute &&
         !Net::WinScreenSync_IsActive() &&
         Net::MatchLifecycle_IsMatchOwned() &&
-        Net::Session_IsConnected()) {
+        Net::Session_IsConnected() &&
+        !Net::ContinueFlow_IsRematchLatched()) {
         Rollback::NetplayLog_Write("WINLOCK", -1,
             "InputProcess activating winscreen lockstep on-demand (mode=%u sub=%u phase=%s)",
             gameMode,
@@ -3690,6 +3720,16 @@ int __cdecl Hook_InputProcess(int gameState) {
 
         s_winscreenDispatchCount++;
         s_winscreenWaitCount = 0;
+
+        // Continue prompt suppression: strip the prompt-owned bits
+        // (LEFT/RIGHT/A/C while the prompt is active so sub_601BB0 never
+        // self-transitions; A/C during the post-resolution carry gate so the
+        // held confirm can't leak into the next screen). ContinueFlow already
+        // consumed the unmasked frame inside WinScreenSync_ConsumeCurrentFrame.
+        if (const uint16_t suppress = Net::ContinueFlow_GetSuppressMask()) {
+            p1 = (uint16_t)(p1 & (uint16_t)~suppress);
+            p2 = (uint16_t)(p2 & (uint16_t)~suppress);
+        }
 
         if (!writeInputsToGame) {
             clearLiveInputBuffers();

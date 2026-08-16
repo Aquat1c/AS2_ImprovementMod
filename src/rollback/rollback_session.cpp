@@ -432,6 +432,11 @@ static int              s_eventIdx     = 0;
 static bool             s_frameStarted = false;
 static bool             s_sessionBroken = false;
 static char             s_sessionError[128] = "";
+// True between GekkoPlayerInterrupted and GekkoPlayerResumed for the remote
+// peer. Interruption is NOT fatal: gameplay freezes (stall-hold) and Gekko
+// keeps resending; only the 20s Gekko disconnect / supervisor Dead verdict
+// tears the session down.
+static bool             s_peerInterrupted = false;
 
 // Current advance event inputs (valid after ProcessNextEvent returns Advance)
 static uint16_t s_advP1 = 0;
@@ -896,6 +901,10 @@ static void HandleSessionEvents() {
                 break;
 
             case GekkoPlayerDisconnected:
+                // With disconnect_timeout_ms=20000 this only fires after the
+                // ConnectionSupervisor has already reached its Dead verdict
+                // (same 20s default) — it is the terminal path, not the first
+                // responder.
                 NetplayLog_Write("GEKKO", -1,
                     "SESSION: Player %d disconnected",
                     ev->data.disconnected.handle);
@@ -907,6 +916,27 @@ static void HandleSessionEvents() {
                         "Rollback peer disconnected (handle=%d)",
                         ev->data.disconnected.handle);
                 }
+                break;
+
+            case GekkoPlayerInterrupted:
+                // Non-fatal: peer went silent past the interrupt threshold.
+                // Freeze-and-wait; do NOT mark the session broken.
+                s_peerInterrupted = true;
+                NetplayLog_Write("GEKKO", -1,
+                    "SESSION: Player %d INTERRUPTED (silence >= interrupt timeout; "
+                    "freezing, resends continue)",
+                    ev->data.interrupted.handle);
+                LOG_WARN("[RollbackSession] GekkoNet: Player %d interrupted — holding session",
+                    ev->data.interrupted.handle);
+                break;
+
+            case GekkoPlayerResumed:
+                s_peerInterrupted = false;
+                NetplayLog_Write("GEKKO", -1,
+                    "SESSION: Player %d RESUMED (packet received after interruption)",
+                    ev->data.resumed.handle);
+                LOG_INFO("[RollbackSession] GekkoNet: Player %d resumed",
+                    ev->data.resumed.handle);
                 break;
 
             case GekkoSessionStarted:
@@ -992,6 +1022,12 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     gkConfig.limited_saving = false;
     gkConfig.desync_detection = true;
     gkConfig.check_distance = 60;  // Check every 60 frames
+    // Peer liveness (M3): Gekko no longer kills the session at 5s of silence.
+    // Interrupted (freeze & keep resending) at 3s — matches the supervisor's
+    // Interrupted threshold; Gekko-side Disconnected only at 20s — matches
+    // the ConnectionSupervisor Dead default, which owns session teardown.
+    gkConfig.disconnect_timeout_ms = 20000;
+    gkConfig.interrupt_timeout_ms = 3000;
 
 #ifndef NDEBUG
     assert((int)gkConfig.input_prediction_window == config.rollback_budget);
@@ -1079,6 +1115,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_frameStarted = false;
     s_sessionBroken = false;
     s_sessionError[0] = '\0';
+    s_peerInterrupted = false;
 
     // Reset stats
     s_totalRollbacks    = 0;
@@ -1189,6 +1226,7 @@ void RollbackSession_End() {
     s_hasInjectedInput = false;
     s_sessionBroken = false;
     s_sessionError[0] = '\0';
+    s_peerInterrupted = false;
     s_cachedFramesAhead = 0.0f;
     s_cachedCurrentRbFrame = 0;
     s_cachedConfirmedRbFrame = -1;
@@ -1563,6 +1601,10 @@ bool RollbackSession_IsRollingBack() {
 
 bool RollbackSession_IsSessionRunning() {
     return s_active && s_sessionRunning;
+}
+
+bool RollbackSession_IsPeerInterrupted() {
+    return s_active && s_peerInterrupted;
 }
 
 float RollbackSession_FramesAhead() {

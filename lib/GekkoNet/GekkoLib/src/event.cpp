@@ -133,6 +133,23 @@ void Gekko::SessionEventSystem::AddPlayerDisconnectedEvent(Handle handle)
     AddEvent(ev);
 }
 
+// AS2 patch: interrupted/resumed liveness events (mirror PlayerDisconnected).
+void Gekko::SessionEventSystem::AddPlayerInterruptedEvent(Handle handle)
+{
+    auto ev = _event_buffer.GetEvent();
+    ev->type = GekkoPlayerInterrupted;
+    ev->data.interrupted.handle = handle;
+    AddEvent(ev);
+}
+
+void Gekko::SessionEventSystem::AddPlayerResumedEvent(Handle handle)
+{
+    auto ev = _event_buffer.GetEvent();
+    ev->type = GekkoPlayerResumed;
+    ev->data.resumed.handle = handle;
+    AddEvent(ev);
+}
+
 void Gekko::SessionEventSystem::AddSessionStartedEvent()
 {
     auto ev = _event_buffer.GetEvent();

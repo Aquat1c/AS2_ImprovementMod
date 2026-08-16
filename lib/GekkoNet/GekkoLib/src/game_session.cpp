@@ -27,7 +27,9 @@ void Gekko::GameSession::Init(GekkoConfig* config)
     _sync.Init(_config.num_players, _config.input_size);
 
     // setup message system.
-    _msg.Init(_config.num_players, _config.input_size);
+    // AS2 patch: plumb configurable liveness timeouts (0 = defaults).
+    _msg.Init(_config.num_players, _config.input_size,
+              _config.disconnect_timeout_ms, _config.interrupt_timeout_ms);
 
     // setup game event system
     _game_events.Init(_config.input_size * _config.num_players);
@@ -516,7 +518,10 @@ void Gekko::GameSession::HandleReceivedInputs()
             const Frame last_recv = _sync.GetLastReceivedFrom(handle) + 1;
             const Frame last_added = _msg.GetLastAddedInputFrom(handle);
 
-            assert(last_added - last_recv <= 128); // more then 128 frames behind sounds incorrect.
+            // AS2 patch: bound matches MAX_INPUT_QUEUE_SIZE (1800); a resume
+            // burst after a long interruption can legitimately deliver far
+            // more than the old 128-frame window in one poll.
+            assert(last_added - last_recv <= 1800);
 
             auto& input_q = _msg.GetNetPlayerQueue(handle);
             const Frame min_frame = last_added - (i32)input_q.size() + 1;

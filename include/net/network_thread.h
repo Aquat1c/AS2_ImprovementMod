@@ -55,6 +55,10 @@ struct NetworkThreadStats {
     DWORD    last_inbound_packet_tick_ms;
     DWORD    last_outbound_packet_tick_ms;
     DWORD    last_service_tick_ms;
+    // ENet-protocol-level inbound silence (acks/pings count, not just app
+    // packets). This is the true liveness signal: an idle-but-healthy link
+    // shows ~0 here while app-level silence grows. 0xFFFFFFFF = no peer.
+    DWORD    enet_silence_ms;
 };
 
 bool NetworkThread_Init();

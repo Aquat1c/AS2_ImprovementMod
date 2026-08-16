@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -88,9 +89,33 @@ static uint16_t                s_remoteHintPort = 0;
 static std::deque<NatSignalMessage> s_outboundSignals;
 static std::deque<NatSignalMessage> s_inboundSignals;
 static std::thread             s_worker;
-static std::atomic<bool>       s_workerRunning{false};
-static std::atomic<bool>       s_stopRequested{false};
 static bool                    s_runtimeInitialized = false;
+
+// Per-worker control block. Workers can sit multiple seconds inside blocking
+// discovery calls (upnpDiscover/IGD HTTP, pcp_wait) that cannot be interrupted,
+// so stopping must never join from the game thread while one is busy: the
+// worker is signaled via `stop`, parked on the retired list, and reaped once
+// it flags `done` on its own.
+struct WorkerControl {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> done{false};
+};
+static std::shared_ptr<WorkerControl> s_workerCtl;  // guarded by s_mutex
+
+struct RetiredWorkerList {
+    // guarded by s_mutex
+    std::vector<std::pair<std::thread, std::shared_ptr<WorkerControl>>> entries;
+    ~RetiredWorkerList() {
+        // Process teardown: detach anything still winding down so a joinable
+        // std::thread destructor cannot std::terminate() the exit path.
+        for (auto& entry : entries) {
+            if (entry.first.joinable()) {
+                entry.first.detach();
+            }
+        }
+    }
+};
+static RetiredWorkerList       s_retiredWorkers;
 
 #if defined(AS2_HAVE_MINIUPNPC)
 static UPNPUrls                s_upnpUrls{};
@@ -746,15 +771,49 @@ static bool LocalIPv6Available() {
     return true;
 }
 
-static void WorkerMain() {
+static bool AnyRetiredWorkerBusyLocked() {
+    for (const auto& entry : s_retiredWorkers.entries) {
+        if (entry.second && !entry.second->done.load()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void WorkerMain(std::shared_ptr<WorkerControl> ctl) {
     NatRuntimeConfig cfg{};
     uint16_t internalPort = 0;
     std::string remoteHintHost;
     bool runtimeWine = false;
     bool runtimeProton = false;
 
+    // Retired predecessors may still be inside blocking discovery calls, and
+    // the UPnP globals are written outside s_mutex (UPNP_GetValidIGD), so two
+    // workers must never overlap. Wait here on the worker thread instead of
+    // joining on the game thread.
+    bool waitedForPredecessor = false;
+    for (;;) {
+        if (ctl->stop.load()) {
+            ctl->done.store(true);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            if (!AnyRetiredWorkerBusyLocked()) {
+                break;
+            }
+        }
+        waitedForPredecessor = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
     {
         std::lock_guard<std::mutex> lock(s_mutex);
+        if (waitedForPredecessor) {
+            // The predecessor's wind-down may have overwritten the snapshot
+            // Nat_StartServices just reset; rebuild it before publishing status.
+            ResetRuntimeStateLocked();
+        }
         cfg = s_config;
         internalPort = s_internalPort;
         remoteHintHost = s_remoteHintHost;
@@ -802,7 +861,9 @@ static void WorkerMain() {
         runtimeProton ? 1 : 0);
 
 #if defined(AS2_HAVE_MINIUPNPC)
-    if (cfg.enable_upnp) {
+    // Each discovery phase below can block for seconds; re-check the stop flag
+    // between phases so an abandoned worker winds down at the next boundary.
+    if (cfg.enable_upnp && !ctl->stop.load()) {
         TryUpnpMapping(internalPort);
     } else {
         std::lock_guard<std::mutex> lock(s_mutex);
@@ -818,7 +879,7 @@ static void WorkerMain() {
 #endif
 
 #if defined(AS2_HAVE_PCPNATPMP)
-    if (cfg.enable_pcp_fallback) {
+    if (cfg.enable_pcp_fallback && !ctl->stop.load()) {
         bool shouldTryPcp = true;
         {
             std::lock_guard<std::mutex> lock(s_mutex);
@@ -872,7 +933,7 @@ static void WorkerMain() {
 
 #if defined(AS2_HAVE_LIBJUICE)
     juice_agent_t* agent = nullptr;
-    if (cfg.enable_stun || cfg.enable_turn) {
+    if ((cfg.enable_stun || cfg.enable_turn) && !ctl->stop.load()) {
         ConfigureJuiceLogLevel(cfg.traversal_log_verbosity);
 
         juice_config_t jc{};
@@ -939,7 +1000,7 @@ static void WorkerMain() {
     bool connectTimerStarted = false;
     auto connectStart = std::chrono::steady_clock::now();
 
-    while (!s_stopRequested.load()) {
+    while (!ctl->stop.load()) {
         NatSignalMessage msg{};
         while (true) {
             {
@@ -1028,8 +1089,8 @@ static void WorkerMain() {
         }
 
         std::unique_lock<std::mutex> lock(s_mutex);
-        s_cv.wait_for(lock, std::chrono::milliseconds(20), [] {
-            return s_stopRequested.load() || !s_inboundSignals.empty();
+        s_cv.wait_for(lock, std::chrono::milliseconds(20), [&ctl] {
+            return ctl->stop.load() || !s_inboundSignals.empty();
         });
     }
 
@@ -1038,9 +1099,9 @@ static void WorkerMain() {
         agent = nullptr;
     }
 #else
-    while (!s_stopRequested.load()) {
+    while (!ctl->stop.load()) {
         std::unique_lock<std::mutex> lock(s_mutex);
-        s_cv.wait_for(lock, std::chrono::milliseconds(50), [] { return s_stopRequested.load(); });
+        s_cv.wait_for(lock, std::chrono::milliseconds(50), [&ctl] { return ctl->stop.load(); });
     }
 #endif
 
@@ -1054,7 +1115,11 @@ static void WorkerMain() {
 
     {
         std::lock_guard<std::mutex> lock(s_mutex);
-        if (s_snapshot.traversal_state != NatTraversalState::Connected &&
+        // Only settle final state while still the current worker; a parked
+        // worker exiting late must not overwrite a snapshot the owner already
+        // reset for the next session.
+        if (s_workerCtl == ctl &&
+            s_snapshot.traversal_state != NatTraversalState::Connected &&
             s_snapshot.traversal_state != NatTraversalState::TimedOut &&
             s_snapshot.traversal_state != NatTraversalState::Failed &&
             s_snapshot.traversal_state != NatTraversalState::Disabled) {
@@ -1063,7 +1128,9 @@ static void WorkerMain() {
             const bool stunOk = (s_snapshot.stun_status == StunStatus::Available);
             s_snapshot.traversal_state = (mapped || stunOk) ? NatTraversalState::Connected : NatTraversalState::Idle;
         }
-        UpdateStatusTextLocked();
+        if (s_workerCtl == ctl) {
+            UpdateStatusTextLocked();
+        }
     }
 
     Rollback::NetplayLog_Write("NAT", -1,
@@ -1074,19 +1141,64 @@ static void WorkerMain() {
         StunStatusName(s_snapshot.stun_status),
         s_snapshot.stun_endpoint);
 
-    s_workerRunning.store(false);
+    // Must be the last shared-state touch: once `done` is visible the thread
+    // may be joined or a successor may start using the UPnP globals.
+    ctl->done.store(true);
 }
 
+static void ReapRetiredWorkersLocked() {
+    for (size_t i = s_retiredWorkers.entries.size(); i > 0; --i) {
+        auto& entry = s_retiredWorkers.entries[i - 1];
+        if (entry.second && !entry.second->done.load()) {
+            continue;
+        }
+        if (entry.first.joinable()) {
+            entry.first.join();  // worker already flagged done; returns promptly
+        }
+        s_retiredWorkers.entries.erase(s_retiredWorkers.entries.begin() + (ptrdiff_t)(i - 1));
+    }
+}
+
+// Runs on the game thread (join start, failure cleanup, session cancel), so it
+// must never wait out a worker stuck in a multi-second blocking discovery
+// call: after a short grace window the thread is parked on the retired list
+// and reaped once it finishes on its own.
 static void StopWorkerThread() {
-    if (!s_workerRunning.load() && !s_worker.joinable()) {
+    std::shared_ptr<WorkerControl> ctl;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        ctl = s_workerCtl;
+        s_workerCtl.reset();
+        ReapRetiredWorkersLocked();
+    }
+
+    if (!s_worker.joinable()) {
         return;
     }
-    s_stopRequested.store(true);
-    s_cv.notify_all();
-    if (s_worker.joinable()) {
-        s_worker.join();
+
+    if (ctl) {
+        ctl->stop.store(true);
     }
-    s_workerRunning.store(false);
+    s_cv.notify_all();
+
+    constexpr std::chrono::milliseconds kStopGrace{50};
+    const auto graceStart = std::chrono::steady_clock::now();
+    while (ctl && !ctl->done.load() &&
+           (std::chrono::steady_clock::now() - graceStart) < kStopGrace) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (!ctl || ctl->done.load()) {
+        s_worker.join();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        s_retiredWorkers.entries.emplace_back(std::move(s_worker), ctl);
+    }
+    Rollback::NetplayLog_Write("NAT", -1,
+        "Traversal worker parked for async wind-down (busy in a blocking discovery call)");
 }
 
 } // namespace
@@ -1106,6 +1218,9 @@ void Nat_ApplyRuntimeConfig(const NatRuntimeConfig* config) {
 }
 
 void Nat_StartServices(uint16_t internalPort) {
+    StopWorkerThread();
+
+    std::shared_ptr<WorkerControl> ctl = std::make_shared<WorkerControl>();
     {
         std::lock_guard<std::mutex> lock(s_mutex);
         EnsureRuntimeDefaultsLocked();
@@ -1113,13 +1228,12 @@ void Nat_StartServices(uint16_t internalPort) {
         s_outboundSignals.clear();
         s_inboundSignals.clear();
         ResetRuntimeStateLocked();
+        s_workerCtl = ctl;
     }
 
-    StopWorkerThread();
-
-    s_stopRequested.store(false);
-    s_workerRunning.store(true);
-    s_worker = std::thread(WorkerMain);
+    // The new worker itself waits for any parked predecessor before touching
+    // shared discovery state, so this never blocks the game thread.
+    s_worker = std::thread(WorkerMain, std::move(ctl));
 }
 
 void Nat_StopServices() {

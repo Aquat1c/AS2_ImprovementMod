@@ -40,6 +40,9 @@
 #include "net/netplay_palette_runtime.h"
 #include "net/enet_transport.h"
 #include "net/session_manager.h"
+#include "net/connection_supervisor.h"
+#include "net/continue_flow.h"
+#include "net/transition_barrier.h"
 #include "net/mode_ownership.h"
 #include "net/netplay_menu_controller.h"
 #include "net/pregame_sync.h"
@@ -498,6 +501,17 @@ static void DeferredInit() {
     LogInitStep("Session_Init", "BEGIN");
     Net::Session_Init();
     LogInitStep("Session_Init", "END");
+    LogInitStep("ConnectionSupervisor_Init", "BEGIN");
+    Net::ConnectionSupervisor_Init();
+    LogInitStep("ConnectionSupervisor_Init", "END");
+    LogInitStep("TransitionBarrier_Init", "BEGIN");
+    Net::TransitionBarrier_Init();
+    LogInitStep("TransitionBarrier_Init", "END");
+    // No FrameUpdate — the continue flow is driven by WinScreenSync's
+    // lockstep consume path.
+    LogInitStep("ContinueFlow_Init", "BEGIN");
+    Net::ContinueFlow_Init();
+    LogInitStep("ContinueFlow_Init", "END");
     LogInitStep("NetplayPaletteRuntime_Init", "BEGIN");
     Net::NetplayPaletteRuntime_Init();
     LogInitStep("NetplayPaletteRuntime_Init", "END");
@@ -650,7 +664,7 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
     timeBeginPeriod(1);
 
     LOG_INFO("========================================");
-    LOG_INFO("Alice Senki 2 - Mod 0.6");
+    LOG_INFO("Alice Senki 2 - Mod 0.7-beta");
     LOG_INFO("Build: %s %s", __DATE__, __TIME__);
     LOG_INFO("========================================");
     LOG_INFO("Game module: 0x%p", gameModule);
@@ -711,6 +725,9 @@ __declspec(dllexport) void ModShutdown() {
         Net::SpectatorRuntime_Shutdown();
         PaletteAssetHook_Shutdown();
         Net::NetplayPaletteRuntime_Shutdown();
+        Net::ContinueFlow_Shutdown();
+        Net::TransitionBarrier_Shutdown();
+        Net::ConnectionSupervisor_Shutdown();
         Net::Session_Shutdown();
         Net::GameSettingsSync_Shutdown();
         Net::Transport_GlobalDeinit();
@@ -737,8 +754,23 @@ __declspec(dllexport) void ModOnGameExit(int exitCode, const char* reason) {
         LOG_ERROR("[EXIT] Game CRASHED! Exit code: %d", exitCode);
         LOG_ERROR("[EXIT] Reason: %s", reason ? reason : "Unknown");
     }
+
+    // Tell the peer we're going away; a fast exit otherwise looks like a
+    // crash/link-death on their side. Skipped on crash paths (exitCode != 0)
+    // where process state may be unreliable.
+    if (exitCode == 0 && g_initialized) {
+        Net::Session_NotifyGameExit();
+    }
+
+    // The fast-exit path terminates without running ModShutdown; flush every
+    // buffered log now or the tail (up to 256 KB) is lost and the capture
+    // looks like an abrupt mid-gameplay cutoff.
+    if (g_initialized) {
+        Rollback::NetplayLog_Flush();
+    }
     LOG_INFO("=====================================================");
     LOG_INFO("[EXIT] Cleanup complete");
+    LogWindow_Flush();
 }
 
 __declspec(dllexport) void ModOnFrame() {
@@ -746,6 +778,9 @@ __declspec(dllexport) void ModOnFrame() {
         DeferredInit();
     }
     if (!g_initialized) return;
+
+    // Keep log files current so crashes/fast exits don't lose the tail.
+    LogWindow_PeriodicFlush();
 
     // Apply content unlocks after config.dat has been loaded
     {
@@ -760,6 +795,10 @@ __declspec(dllexport) void ModOnFrame() {
     }
 
     Net::GameSettingsSync_FrameUpdate();
+
+    // Liveness verdict must be fresh before any netplay layer consumes it.
+    Net::ConnectionSupervisor_FrameUpdate();
+    Net::TransitionBarrier_FrameUpdate();
 
     // Update netplay menu controller (pumps session, handles input, renders menu)
     ModeOwnership::FrameUpdate();
@@ -1050,6 +1089,23 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     out->spectator_mode = false;
     out->show_connection_stats = true;
     out->status_text[0] = '\0';
+
+    // Continue prompt: one status line sourced only from continue_flow state
+    // (single source of truth for both players' choice status).
+    if (Net::ContinueFlow_IsPromptActive()) {
+        const auto choiceLabel = [](Net::ContinueChoiceState st) -> const char* {
+            switch (st) {
+                case Net::ContinueChoiceState::LockedYes: return "YES";
+                case Net::ContinueChoiceState::LockedNo:  return "NO";
+                default:                                  return "DECIDING";
+            }
+        };
+        _snprintf_s(out->status_text, sizeof(out->status_text), _TRUNCATE,
+            "REMATCH?  You: %s   Opponent: %s",
+            choiceLabel(Net::ContinueFlow_GetLocalChoiceState()),
+            choiceLabel(Net::ContinueFlow_GetRemoteChoiceState()));
+        out->show_connection_stats = false;
+    }
 
     // --- Names: P1 = game P1, P2 = game P2 ---
     // Get local and remote nicknames

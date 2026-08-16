@@ -7,9 +7,11 @@
 
 #include "net/winscreen_sync.h"
 
+#include "net/continue_flow.h"
 #include "net/frontend_input_sync.h"
 #include "net/match_lifecycle.h"
 #include "net/session_manager.h"
+#include "net/transition_barrier.h"
 #include "core/game_state.h"
 #include "input/input_system.h"
 #include "rollback/netplay_log.h"
@@ -90,6 +92,10 @@ static void FinalizeLockstep(const char* reason) {
     FrontendInputSync_ClearPhaseBarrier();
     ResetState();
     s_handoffComplete = true;
+    // Wire-acknowledged winscreen exit (M4): tells the peer we released the
+    // winscreen. The commit doubles as a wire-driven rematch-restart
+    // signature on the other side, replacing coincidence-based local ones.
+    TransitionBarrier_Propose(NetTransitionKind::WinScreenExit, 0, 0);
     LOG_NETPLAY(LOG_INFO, "[WinScreenSync] Finalized (%s)", reason ? reason : "?");
 }
 
@@ -192,8 +198,19 @@ void WinScreenSync_Begin() {
         return;
     }
     if (!FrontendInputSync_IsDelayNegotiated()) {
-        FrontendInputSync_RequestRecovery("winscreen began without a negotiated frontend delay");
-        LOG_NETPLAY(LOG_WARNING, "[WinScreenSync] Begin rejected: no negotiated frontend delay");
+        // Transient window during cross-phase rematch adoption: the adopt
+        // reset clears the negotiated delay one tick before SyncConfirm
+        // re-establishes it. Latching a recovery request here killed healthy
+        // rematches (observed 4x on 2026-08-16); instead defer — callers
+        // retry Begin() every frame while the winscreen route is active, and
+        // it succeeds as soon as negotiation lands.
+        static DWORD s_lastDeferLogTick = 0;
+        const DWORD now = GetTickCount();
+        if (s_lastDeferLogTick == 0 || (now - s_lastDeferLogTick) >= 1000) {
+            s_lastDeferLogTick = now;
+            LOG_NETPLAY(LOG_WARNING,
+                "[WinScreenSync] Begin deferred: frontend delay not negotiated yet");
+        }
         return;
     }
 
@@ -203,6 +220,7 @@ void WinScreenSync_Begin() {
     s_handoffComplete = false;
     s_handoffPending = false;
     s_activeSinceMs = GetTickCount();
+    ContinueFlow_Reset("winscreen begin");
     FrontendInputSync_BeginInputPhase(
         FrontendSyncPhase::WinScreen,
         PacketType::WinScreenFrameInput,
@@ -239,10 +257,18 @@ void WinScreenSync_Abort() {
     FrontendInputSync_StopWinScreenInputPhase("winscreen abort");
     FrontendInputSync_ClearPhaseBarrier();
     ResetState();
+    // A live abort mid-prompt means the continue decision can no longer be
+    // driven from consumed frames — fail closed. (The rematch path never gets
+    // here: its finalize already deactivated the sync, so Abort early-outs
+    // above and the rematch latch survives for mode_ownership.)
+    ContinueFlow_Reset("winscreen abort");
     if (abandonedLockstep) {
         // Timeout/recovery abort — allow post-match routing without blocking rematch.
         s_handoffComplete = true;
     }
+    // We are leaving the winscreen either way — let the peer know (M4 exit
+    // barrier), so its rematch restart doesn't depend on local heuristics.
+    TransitionBarrier_Propose(NetTransitionKind::WinScreenExit, 0, 0);
     LOG_NETPLAY(LOG_INFO, "[WinScreenSync] Abort");
 }
 
@@ -263,11 +289,20 @@ bool WinScreenSync_FrameUpdate() {
     FrontendInputSync_FrameUpdate();
 
     if (FrontendInputSync_BothAdvanceObserved() && !s_handoffPending && !s_handoffComplete) {
-        s_handoffPending = true;
-        FrontendInputSync_SendPhaseBarrier(
-            FrontendSyncPhase::None,
-            1,
-            "win screen both confirmed");
+        if (ContinueFlow_ShouldHoldWinScreenFinalize()) {
+            // Continue prompt owns the winscreen exit: force the continue
+            // screen instead of finalizing, and keep the lockstep phase alive
+            // through subs 4/5/8. Finalize happens on decline (once the carry
+            // gate clears, via this barrier), on rematch (directly from the
+            // resolution), or through the existing abort paths.
+            ContinueFlow_OnWinScreenAdvance();
+        } else {
+            s_handoffPending = true;
+            FrontendInputSync_SendPhaseBarrier(
+                FrontendSyncPhase::None,
+                1,
+                "win screen both confirmed");
+        }
     }
 
     if (s_handoffPending &&
@@ -331,8 +366,10 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
     }
 
     // Offline either player can skip; mirror that in netplay by propagating one
-    // side's skip intent to both synchronized input streams.
-    if (localAdvance || remoteAdvance) {
+    // side's skip intent to both synchronized input streams. Disabled while the
+    // continue prompt is active — propagating there would lock the peer's
+    // choice with our confirm (it stays for the sub-3 win-pose skip).
+    if ((localAdvance || remoteAdvance) && !ContinueFlow_IsPromptActive()) {
         if (!s_loggedSkipPropagate) {
             s_loggedSkipPropagate = true;
             Rollback::NetplayLog_Write(
@@ -353,6 +390,12 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         *outP1 = remoteInput;
         *outP2 = localInput;
     }
+
+    // Continue flow steps exactly once per consumed lockstep frame — the only
+    // place its edge state may come from (determinism: confirmed inputs only).
+    // Runs before the caller injects the words, so a suppression mask decided
+    // here already applies to this same frame.
+    ContinueFlow_OnConsumedFrame(*outP1, *outP2);
     return true;
 }
 
@@ -406,6 +449,12 @@ void WinScreenSync_OnRemoteConfirm() {
         return;
     }
     FrontendInputSync_ReportRemoteAdvanceIntent(1);
+}
+
+void WinScreenSync_FinalizeFromContinueFlow(const char* reason) {
+    // Continue-flow resolution point: both peers call this on the same
+    // consumed frame, so the phase-barrier handshake is unnecessary here.
+    FinalizeLockstep(reason ? reason : "continue flow finalize");
 }
 
 } // namespace Net

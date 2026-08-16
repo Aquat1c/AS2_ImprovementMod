@@ -143,6 +143,14 @@ void PregameSync_FrameUpdate();
 /// Returns false if session is not in a valid state.
 bool PregameSync_Begin();
 
+/// Begin the continue-screen rematch fast path: same reset as Begin(), but
+/// the frontend charsel/stagesel phases are skipped — at SyncConfirmed the
+/// locked config is rebuilt from `previousConfig` (chars/palettes/stage/
+/// host_side preserved; host mints fresh seeds) and goes straight to
+/// ConfigExchange. `previousConfig` is copied before the reset, so passing
+/// PregameSync_GetLockedConfig() is safe.
+bool PregameSync_BeginRematch(const LockedMatchConfig* previousConfig);
+
 /// Abort pre-game sync (e.g. on disconnect or player quit).
 /// Returns to Idle.
 void PregameSync_Abort(const char* reason);

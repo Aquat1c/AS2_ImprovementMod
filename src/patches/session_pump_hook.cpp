@@ -33,31 +33,41 @@ constexpr uint32_t kMaxStartupAssetTraceLines = 512;
 // The hooked game function sub_4A5390 is NOT a (const char*, char*, ...) asset
 // loader: its real signature is (int objPtr, char value, int structPtr, int flag).
 // That means the "archive"/"patch" arguments are frequently NOT valid string
-// pointers (e.g. the single-byte 2nd argument arrives as 0x00000001). Treating
-// them as C strings dereferences garbage/low addresses and crashes. Guard every
-// read with a range + SEH probe so a non-string argument can never fault.
-static bool IsReadableCString(const char* p) {
-    if (!p) {
+// pointers (e.g. the single-byte 2nd argument arrives as 0x00000001). A
+// single-byte probe is not enough: vsnprintf/strstr walk the pointer until a
+// NUL and can cross into an unmapped page. Copy the string into a local
+// buffer entirely under SEH; only the copy is ever formatted or scanned.
+static bool SafeCopyCString(const char* src, char* dst, size_t cap) {
+    dst[0] = '\0';
+    if (!src || cap < 2) {
         return false;
     }
     // Anything below the first 64 KiB cannot be a real string pointer; the
     // misinterpreted single-byte argument lands here (e.g. value 1).
-    if (reinterpret_cast<uintptr_t>(p) < 0x10000) {
+    if (reinterpret_cast<uintptr_t>(src) < 0x10000) {
         return false;
     }
     __try {
-        volatile char probe = *p;
-        (void)probe;
+        size_t i = 0;
+        for (; i + 1 < cap; ++i) {
+            const char c = src[i];
+            dst[i] = c;
+            if (c == '\0') {
+                return true;
+            }
+        }
+        dst[cap - 1] = '\0';
+        return true;  // truncated but readable
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        dst[0] = '\0';
         return false;
     }
-    return true;
 }
 
-static bool IsWinScreenArchive(const char* archive) {
-    return IsReadableCString(archive) &&
-           (strstr(archive, "win") != nullptr ||
-            strstr(archive, "WIN") != nullptr);
+static bool IsWinScreenArchive(const char* safeArchive) {
+    return safeArchive[0] != '\0' &&
+           (strstr(safeArchive, "win") != nullptr ||
+            strstr(safeArchive, "WIN") != nullptr);
 }
 
 static bool IsPumpableLifecycle(MatchLifecyclePhase phase) {
@@ -68,8 +78,9 @@ static bool IsPumpableLifecycle(MatchLifecyclePhase phase) {
            phase == MatchLifecyclePhase::ReturningToMenu;
 }
 
+// haystack must be a SafeCopyCString-produced local buffer.
 static bool ContainsInsensitive(const char* haystack, const char* needle) {
-    if (!IsReadableCString(haystack) || !needle || !needle[0]) {
+    if (!haystack || !haystack[0] || !needle || !needle[0]) {
         return false;
     }
 
@@ -92,8 +103,8 @@ static bool ContainsInsensitive(const char* haystack, const char* needle) {
     return false;
 }
 
-static void TraceStartupAssetLoad(const char* archive,
-                                  const char* patch,
+static void TraceStartupAssetLoad(const char* safeArchive,
+                                  const char* safePatch,
                                   int assetIndex,
                                   int patchIndex) {
     if (s_startupTraceReachedTitle || s_startupAssetTraceCount >= kMaxStartupAssetTraceLines) {
@@ -101,16 +112,16 @@ static void TraceStartupAssetLoad(const char* archive,
     }
 
     const bool titleHit =
-        ContainsInsensitive(archive, "tit.bin") ||
-        ContainsInsensitive(patch, "tit.bin");
+        ContainsInsensitive(safeArchive, "tit.bin") ||
+        ContainsInsensitive(safePatch, "tit.bin");
     const DWORD elapsed = GetTickCount() - s_startupTraceBeginTick;
 
     ++s_startupAssetTraceCount;
     LOG_INFO("[STARTUPTRACE][AssetLoad] #%u +%lums archive='%s' patch='%s' asset=%d patch_idx=%d mode=%u sub=%u phase=%s title_hit=%d",
              s_startupAssetTraceCount,
              (unsigned long)elapsed,
-             IsReadableCString(archive) ? archive : "",
-             IsReadableCString(patch) ? patch : "",
+             safeArchive,
+             safePatch,
              assetIndex,
              patchIndex,
              (unsigned)GetGameMode(),
@@ -198,8 +209,16 @@ int __cdecl Hook_Asset_LoadFromArchive(const char* archive,
                                         int assetIndex,
                                         int patchIndex) {
     ++s_assetCallCount;
-    TraceStartupAssetLoad(archive, patch, assetIndex, patchIndex);
-    const bool isWinScreenContext = IsWinScreenArchive(archive);
+
+    // Copy both possibly-garbage pointers exactly once, under SEH; everything
+    // downstream only ever touches the local copies.
+    char archiveBuf[96];
+    char patchBuf[96];
+    SafeCopyCString(archive, archiveBuf, sizeof(archiveBuf));
+    SafeCopyCString(patch, patchBuf, sizeof(patchBuf));
+
+    TraceStartupAssetLoad(archiveBuf, patchBuf, assetIndex, patchIndex);
+    const bool isWinScreenContext = IsWinScreenArchive(archiveBuf);
 
     MaybePumpSession("before", isWinScreenContext, assetIndex, patchIndex);
 

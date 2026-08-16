@@ -6,6 +6,8 @@
 #include <windows.h>
 
 #include "net/session_manager.h"
+#include "net/connection_supervisor.h"
+#include "net/transition_barrier.h"
 #include "net/network_thread.h"
 #include "net/nat_traversal.h"
 #include "net/game_settings_sync.h"
@@ -91,6 +93,15 @@ static void SetState(SessionState newState) {
     );
     s_state = newState;
     s_stateEnteredAt = GetTickCount();
+
+    // The supervisor owns liveness for the life of the peer connection.
+    if (newState == SessionState::Connected) {
+        ConnectionSupervisor_OnSessionStart();
+    } else if (newState == SessionState::Idle ||
+               newState == SessionState::Failed) {
+        ConnectionSupervisor_OnSessionEnd(SessionStateName(newState));
+        TransitionBarrier_Reset(SessionStateName(newState));
+    }
 }
 
 static void SetError(const char* msg) {
@@ -1211,6 +1222,25 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
     NotePacketReceived(channelID, type, payloadLen);
 
     switch (type) {
+        case PacketType::Ping: {
+            // Supervisor heartbeat — answer so the sender's app-level silence
+            // clears too. Handled here so no packet-callback owner has to.
+            if (payloadLen >= sizeof(PingPayload)) {
+                const PingPayload* ping = static_cast<const PingPayload*>(payload);
+                PongPayload pong{};
+                pong.ping_id = ping->ping_id;
+                pong.original_send_time_ms = ping->send_time_ms;
+                pong.responder_time_ms = GetTickCount();
+                Session_SendPacket(CHANNEL_CONTROL, PacketType::Pong,
+                                   &pong, sizeof(pong), true);
+            }
+            return;
+        }
+
+        case PacketType::Pong:
+            // Liveness evidence only; inbound timestamps already updated.
+            return;
+
         case PacketType::Hello:
             if (s_state == SessionState::Handshaking || s_state == SessionState::Connecting) {
                 if (s_state == SessionState::Connecting) {
@@ -1409,7 +1439,11 @@ static void UpdateStats() {
          s_state == SessionState::Handshaking) &&
         s_peerToken != 0 &&
         !netStats.peer_connected &&
-        stateAgeMs >= 250 &&
+        // 5s, not 250ms: at 250ms this raced the worker's own event delivery
+        // (peer cleared on the worker thread before the disconnect event was
+        // drained on the game thread) and killed live sessions. A real
+        // detach also produces a drained disconnect event long before 5s.
+        stateAgeMs >= 5000 &&
         netStats.worker_running &&
         s_activeSessionToken != 0) {
         Rollback::NetplayLog_Write("NTHREAD", -1,
@@ -1885,6 +1919,55 @@ void Session_Cancel() {
     s_activeSessionToken = 0;
     Nat_StopServices();
     ResetState();
+}
+
+uint32_t Session_GetMsSinceLastInbound() {
+    NetworkThreadStats netStats{};
+    NetworkThread_GetStats(&netStats);
+
+    // Prefer ENet-protocol-level silence: acks of our own pings count, so an
+    // idle-but-healthy link reads ~0 even with zero app traffic. (Field bug
+    // 2026-08-17: app-level-only silence killed a healthy session parked on
+    // the config screen — one side heartbeated, the other only received.)
+    if (netStats.peer_connected && netStats.enet_silence_ms != 0xFFFFFFFFu) {
+        return netStats.enet_silence_ms;
+    }
+
+    if (netStats.last_inbound_packet_tick_ms == 0) {
+        return 0xFFFFFFFFu;  // never received anything
+    }
+    const DWORD now = GetTickCount();
+    return (now >= netStats.last_inbound_packet_tick_ms)
+               ? (uint32_t)(now - netStats.last_inbound_packet_tick_ms)
+               : 0;
+}
+
+void Session_NotifyGameExit() {
+    // Called from the WM_CLOSE fast-exit path. Without this the peer gets no
+    // disconnect at all and only finds out via silence timeouts, which is
+    // indistinguishable from a crash or link death on their side.
+    if (s_state == SessionState::Idle) return;
+
+    const uint32_t token = s_activeSessionToken;
+    if (token != 0 &&
+        (s_state == SessionState::Connected ||
+         s_state == SessionState::Ready ||
+         s_state == SessionState::Handshaking)) {
+        LOG_INFO("[Session] Sending goodbye on game exit (state=%s)", SessionStateName(s_state));
+        DisconnectPayload dp;
+        dp.reason_code = static_cast<uint16_t>(DisconnectReason::UserCancel);
+        strncpy(dp.message, "Peer closed the game", sizeof(dp.message) - 1);
+        dp.message[sizeof(dp.message) - 1] = '\0';
+        QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect, &dp, sizeof(dp), true, "game-exit");
+        NetworkThread_RequestDisconnect(
+            token,
+            static_cast<uint32_t>(DisconnectReason::UserCancel),
+            false);
+        // The worker services ENet every ~2ms; give it a moment to deliver the
+        // goodbye before the process dies. Bounded, so a wedged worker cannot
+        // hang the exit.
+        Sleep(150);
+    }
 }
 
 void Session_SignalReady() {

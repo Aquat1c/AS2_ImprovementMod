@@ -101,6 +101,13 @@ enum class PacketType : uint16_t {
     FrameSyncStatus = 33,   // Lightweight frame-progress telemetry
     SyncTrace       = 35,   // Synchronized diagnostics trace, debug channel
     ChurnPause      = 36,   // Peer-visible device I/O pause hint (debug channel)
+
+    // Wire-acknowledged phase transitions (reliable, channel 0) — 0.7 rework.
+    // Cross-peer state transitions at match boundaries commit only after a
+    // proposal/ack round trip; stale seqs are re-acked idempotently.
+    PhaseTransitionProposal = 60,
+    PhaseTransitionAck      = 61,
+    ResyncRequest           = 62,  // "my frontend state diverged — re-sync instead of dying"
 };
 
 enum class FrameTimingMode : uint8_t {
@@ -197,6 +204,46 @@ struct StateDigestPayload {
     uint32_t frame_number;
     uint32_t crc32;
 };
+
+// ============================================================================
+// Wire-acknowledged phase transitions (0.7 rework, M4)
+// ============================================================================
+
+enum class NetTransitionKind : uint8_t {
+    None             = 0,
+    WinScreenExit    = 1,  // both sides release winscreen lockstep together
+    PostMatchDecision= 2,  // intent carries the post-match route
+    RematchStart     = 3,  // begin pregame sync for the next match
+    GameplayStart    = 4,  // enter the match handoff
+    SessionCancel    = 5,  // graceful teardown with reason
+};
+
+enum class PostMatchIntentWire : uint8_t {
+    None             = 0,
+    Rematch          = 1,
+    ReturnToSession  = 2,
+    Disconnect       = 3,
+};
+
+struct PhaseTransitionPayload {
+    uint32_t transition_seq;  // monotonic per session, minted by the proposer
+    uint8_t  kind;            // NetTransitionKind
+    uint8_t  intent;          // PostMatchIntentWire for PostMatchDecision, else 0
+    uint16_t _pad;
+    uint32_t session_id;      // pregame session id context (0 if none)
+};
+
+inline const char* NetTransitionKindName(NetTransitionKind kind) {
+    switch (kind) {
+        case NetTransitionKind::None:              return "None";
+        case NetTransitionKind::WinScreenExit:     return "WinScreenExit";
+        case NetTransitionKind::PostMatchDecision: return "PostMatchDecision";
+        case NetTransitionKind::RematchStart:      return "RematchStart";
+        case NetTransitionKind::GameplayStart:     return "GameplayStart";
+        case NetTransitionKind::SessionCancel:     return "SessionCancel";
+    }
+    return "?";
+}
 
 struct FrameSyncStatusPayload {
     int32_t  rb_frame_current;              // Sender's current rollback-session-relative frame
@@ -673,6 +720,9 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::FrameSyncStatus:return "FrameSyncStatus";
         case PacketType::SyncTrace:      return "SyncTrace";
         case PacketType::ChurnPause:     return "ChurnPause";
+        case PacketType::PhaseTransitionProposal: return "PhaseTransitionProposal";
+        case PacketType::PhaseTransitionAck:      return "PhaseTransitionAck";
+        case PacketType::ResyncRequest:           return "ResyncRequest";
         default:                         return "Unknown";
     }
 }

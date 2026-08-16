@@ -173,6 +173,16 @@
 #define ADDR_SCROLL_Y           (ADDR_MATCH_BASE + MATCH_OFF_SCROLL_Y)  // 0x76CD3E
 
 // ============================================================================
+// Mode 9 continue screen (sub 4, handler sub_601BB0 @ 0x601BB0)
+// ============================================================================
+
+// byte_8EA3B0 — continue-screen cursor (0 = YES, 1 = NO). Decomp: sub_601BB0
+// toggles it on either player's LEFT/RIGHT just-pressed words and confirms on
+// A/C; no countdown. Banners/SEs (handles 0x8EA3C4..D0, SEs 0x8EA450/54) are
+// loaded unconditionally by sub_5FBEE0 for every mode-9 entry.
+#define ADDR_CONTINUE_CURSOR    0x8EA3B0
+
+// ============================================================================
 // Netplay state addresses (vanilla)
 // ============================================================================
 

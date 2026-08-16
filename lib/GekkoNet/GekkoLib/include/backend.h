@@ -80,6 +80,12 @@ namespace Gekko {
 
 		u16 session_magic;
 
+		// AS2 patch: parallel liveness flag. True while inbound silence has
+		// exceeded the interrupt timeout but not yet the disconnect timeout.
+		// Status stays Connected so address/magic/sync state and resends
+		// survive the interruption; cleared on the first packet received.
+		bool interrupted = false;
+
 		NetStats stats;
 
 		NetAddress address;
@@ -129,7 +135,10 @@ namespace Gekko {
 	public:
 		MessageSystem();
 
-        void Init(u8 num_players, u32 input_size);
+        // AS2 patch: timeouts are configurable per session (0 = defaults:
+        // NetStats::DISCONNECT_TIMEOUT / NetStats::INTERRUPT_TIMEOUT).
+        void Init(u8 num_players, u32 input_size,
+                  u64 disconnect_timeout_ms = 0, u64 interrupt_timeout_ms = 0);
 
 		void AddInput(Frame input_frame, Handle player, u8 input[], bool remote = false);
 
@@ -215,7 +224,13 @@ namespace Gekko {
         void OnNetworkHealth(NetAddress& addr, NetPacket& pkt);
 
 	private:
-		const u32 MAX_INPUT_QUEUE_SIZE = 128;
+		// AS2 patch: raised 128 -> 1800 (30s at 60fps). This caps a
+		// std::deque of per-frame heap inputs (input_size bytes each), not a
+		// fixed array, so worst case is ~1800 * (ptr + small alloc) per queue
+		// — well under 100 KB. It bounds the unacked resend window; 128
+		// (~2.1s) silently dropped unacked inputs during interruptions longer
+		// than ~2s, permanently corrupting the stream on resume.
+		const u32 MAX_INPUT_QUEUE_SIZE = 1800;
 	    const u32 NUM_TO_SYNC = 4;
 
 		u32 _input_size;
@@ -223,6 +238,10 @@ namespace Gekko {
 		u16 _session_magic;
 
         u8  _num_players;
+
+        // AS2 patch: effective liveness timeouts for this session (ms).
+        u64 _disconnect_timeout = NetStats::DISCONNECT_TIMEOUT;
+        u64 _interrupt_timeout = NetStats::INTERRUPT_TIMEOUT;
 
         // input queue for each player for either sending or receiving
         std::vector<NetInputQueue> _net_player_queue;

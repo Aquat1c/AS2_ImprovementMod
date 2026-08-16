@@ -71,6 +71,12 @@ typedef struct GekkoConfig {
     bool limited_saving;
     bool desync_detection;
     unsigned int check_distance;
+    // AS2 patch: peer-liveness timeouts in milliseconds. 0 = library default
+    // (disconnect: 5000, interrupt: 3000). Silence >= interrupt_timeout_ms
+    // emits GekkoPlayerInterrupted (peer stays Connected, resends continue);
+    // silence >= disconnect_timeout_ms emits GekkoPlayerDisconnected.
+    unsigned long long disconnect_timeout_ms;
+    unsigned long long interrupt_timeout_ms;
 } GekkoConfig;
 
 typedef enum GekkoPlayerType {
@@ -141,7 +147,10 @@ typedef enum GekkoSessionEventType {
     GekkoSessionStarted,
     GekkoSpectatorPaused,
     GekkoSpectatorUnpaused,
-    GekkoDesyncDetected
+    GekkoDesyncDetected,
+    // AS2 patch: appended so existing numbering is unchanged.
+    GekkoPlayerInterrupted, // = 7: silence >= interrupt timeout, peer still Connected
+    GekkoPlayerResumed      // = 8: packet received from an interrupted peer
 } GekkoSessionEventType;
 
 typedef struct GekkoSessionEvent {
@@ -159,6 +168,13 @@ typedef struct GekkoSessionEvent {
         struct GekkoDisconnected {
             int handle;
         } disconnected;
+        // AS2 patch: PlayerInterrupted / PlayerResumed payloads.
+        struct GekkoInterrupted {
+            int handle;
+        } interrupted;
+        struct GekkoResumed {
+            int handle;
+        } resumed;
         struct GekkoDesynced {
             int frame;
             unsigned int local_checksum;
