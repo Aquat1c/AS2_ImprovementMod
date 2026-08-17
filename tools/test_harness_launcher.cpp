@@ -433,7 +433,8 @@ static void AnalyzeCurrentLogs(const char* gameDir, DWORD pid, const char* label
                 strstr(line, "Begin: start_frame=") ||
                 strstr(line, "=== SESSION BEGIN ===") ||
                 strstr(line, "[RollbackSession] BEGIN:") ||
-                strstr(line, "GekkoNet session started"))
+                strstr(line, "engine2 session begin") ||   // re0.7 engine2 adapter
+                strstr(line, "GekkoNet session started"))  // AS2_WITH_GEKKO fallback
                 rollbackStart = true;
             if (strstr(line, "FSYNC")) {
                 frameSync = true;
@@ -1089,7 +1090,7 @@ static const char* ModeStr(uint32_t m) {
 
 static void PrintSlotLine(const char* tag, const HarnessSharedData* d) {
     if (!d) { printf("  %-6s [not connected]\n", tag); return; }
-    printf("  %-6s phase=%-12s mode=%-7s sub=%u f=%u gekko[L=%d R=%d ahead=%.1f adv=%u] "
+    printf("  %-6s phase=%-12s mode=%-7s sub=%u f=%u rb[L=%d R=%d ahead=%.1f adv=%u] "
             "rb=%u/%u ld=%u tsync=%u p1=%d p2=%d rtt=%.0f pkt=%u/%u dsync=%u warn=%u\n",
         tag,
         PhaseStr(d->phase),
@@ -1288,7 +1289,7 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
     // Print final summary from shared memory
     printf("\n--- Final State ---\n");
     if (hostSlot.valid && hostSlot.data) {
-        printf("  HOST:   frames=%u gekko[L=%d R=%d ahead=%.1f adv=%u] rb=%u(max %u) saves=%u loads=%u desyncs=%u "
+        printf("  HOST:   frames=%u rb[L=%d R=%d ahead=%.1f adv=%u] rb=%u(max %u) saves=%u loads=%u desyncs=%u "
                     "rtt=%.1f/%.1fms anomalies=%u\n",
             hostSlot.data->total_frames,
             hostSlot.data->rb_local_frame, hostSlot.data->rb_remote_frame,
@@ -1300,7 +1301,7 @@ static void RunConsoleMonitor(const LauncherConfig* cfg, HANDLE hHost, HANDLE hC
                 hostSlot.data->frame_counter_anomalies);
     }
     if (clientSlot.valid && clientSlot.data) {
-        printf("  CLIENT: frames=%u gekko[L=%d R=%d ahead=%.1f adv=%u] rb=%u(max %u) saves=%u loads=%u desyncs=%u "
+        printf("  CLIENT: frames=%u rb[L=%d R=%d ahead=%.1f adv=%u] rb=%u(max %u) saves=%u loads=%u desyncs=%u "
                     "rtt=%.1f/%.1fms anomalies=%u\n",
             clientSlot.data->total_frames,
             clientSlot.data->rb_local_frame, clientSlot.data->rb_remote_frame,

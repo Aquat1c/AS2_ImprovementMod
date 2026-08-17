@@ -1777,3 +1777,223 @@ session) would destroy the §8.3 partial-fallback option.
 8. `kCatchupBudgetStepGap`/`kCatchupBudgetMax`/`ComputeAutoCatchupScale`
    deleted from spectator_playback.cpp — grep-verified zero remaining
    references at edit time.
+
+---
+
+## 2026-08-17 — M8 (soak & field acceptance: code/tooling side — FINAL milestone)
+
+Scope split per the M8 brief: the in-game acceptance gates (two-instance
+soaks, LE-1 field-log replication, perf p99, hash-clean replay, min-spec
+benchmarks) are FIELD RUNS the user performs; this session implemented the
+tooling, assertions, and documentation that judge them. **GekkoNet stays**
+until those runs pass (§8 criteria recorded in the runbook, not executed).
+
+### M8-1: Rematch soak upgraded for the re0.7 backend (M6/M7 obligations)
+
+- **Files:** `src/testing/rematch_soak.cpp`, `include/testing/rematch_soak.h`.
+- **Done:**
+  - **Epoch assertions (M6 obligation):** per-frame monitor of
+    `PregameSync_GetCurrentEpoch()` — any regression = FAIL; every rematch
+    `GameplayHandoff` entry must carry a STRICTLY higher epoch than the
+    previous handoff (§2.5 rotation) or the iteration FAILs.
+  - **Canonical-counter assertion (INV-15, M6 obligation):**
+    `RollbackSession_GetCurrentFrame()` must be monotonic. On engine2 the
+    high-water persists across match boundaries (the engine stays armed
+    through suspend/rotate); on the `AS2_WITH_GEKKO` fallback config the
+    check is `#if`-relaxed to continuous-activity windows (per-match engine
+    lifetime — the target-wide `AS2_WITH_GEKKO=1` define selects the branch).
+  - **Route labeling:** iterations are tagged `path=fastpath` (no frontend
+    phase seen — YES,YES EpochAlign(None) route) vs `path=charsel` (any-NO);
+    PASS lines carry epoch/path/canonical; SUMMARY gains
+    `fastpath= charsel= epoch_max= canonical_max=` fields. The PASS edge
+    itself (GameplayHandoff re-entry) was verified still correct against
+    match_setup's phase machine — both rematch routes leave and re-enter
+    GameplayHandoff (match_setup.cpp lines 1361/1844/2161-2201).
+  - **F-7 (M7 obligation):** no dedicated probe needed — the contradiction
+    terminal tears the session down (ProtocolViolation), which the existing
+    disconnect-shaped FAIL detection catches; the explicit
+    zero-`F-7 TERMINAL` grep is a gated criterion in `analyze_stat.py` and
+    the runbook checklist. Documented in the soak header.
+
+### M8-2: Autoconnect driver — continue-prompt NO driving
+
+- **Files:** `src/net/netplay_menu_controller.cpp`.
+- **Done:** new `[autoconnect]` key **`continue_no_every = K`** — every Kth
+  continue prompt is answered NO (one INPUT_RIGHT tap toggles the cursor,
+  then INPUT_A locks >= 20 frames later; both taps are rising-edge
+  injections matching ContinueFlow's lock semantics). Deterministic across
+  peers (the completed-match counter advances in lockstep on both drivers);
+  a single side answering NO also routes both to charsel. YES remains the
+  default (unchanged logic). Config log line extended with
+  `continue_no_every=`. This closes the §7.4 "100 YES cycles + mixed NO
+  cycles" driving gap — the driver already handled the fast path
+  (`MODE_PREMATCH_INTRO`/`MODE_MATCH` in ConfirmingWinScreen) and charsel
+  re-entry.
+
+### M8-3: `tools/analyze_stat.py` — the §7.5 field-run judge (new)
+
+- **Files:** `tools/analyze_stat.py` (new, Python 3 stdlib only).
+- **Done:** parses the frozen STAT format (regex mirrors
+  `NetplayLog_Stat`/async_log prefix exactly; format untouched) and outputs
+  PASS/FAIL verdicts per §7.5: hold-cause breakdown + zero-holds gates
+  (gameplay holds never excusable; `--allow-lifecycle N` documented escape
+  for human-paced screens only), present p99 vs 17.2 ms (offline) / 18.0 ms
+  (online), sim rate vs cadence +/-0.02 (proper_60/compat_58,
+  auto-detected), rollback/rb_max gates per profile (offline=0; LE-1
+  rb_max <= 8), slew bounds (|ppm| <= 25000 cap; 0 offline), debt/silence
+  report, STAT-gap (log-loss/stall) detection, and an incident scan
+  (`F-7 TERMINAL`, INV-8 `BeginInputPhase while phase`,
+  `Sent ResyncRequest` — hard-zero in clean profiles per the M5 note —
+  `ConfirmedDesync`, `REPLAY DESYNC`, `PacingClockDead`, soak verdict
+  echo). Profiles: `offline`, `online-clean`, `le1`, `lossy`, `degraded`,
+  `report`; `--json` for machines; exit codes 0/1/2. Verified against
+  synthetic logs (PASS, FAIL via injected F-7 line, NO-DATA path).
+
+### M8-4: `docs/re0.7/M8_ACCEPTANCE_RUNBOOK.md` (new)
+
+- Self-contained field-run manual: prerequisites (both build configs, unit
+  suite, min-spec definition, separate-folder rule), instrument reference,
+  shaping-tool guidance — including the **INV-14 injection caveat**:
+  app-egress `AS2_NET_INJECT_*` no longer moves supervisor bands (ENet
+  acks/pings keep flowing), so burst/liveness rows need external shaping —
+  the full §7 run matrix with run IDs, exact configs, expected outcomes and
+  judge commands (R-OFF, R-CLEAN-*, **R-LE1**, R-POL, R-LOSS-*, R-DEG,
+  R-UNDER with the INV-4 field pin, R-BURST-*, R-ONEWAY, R-WEDGE,
+  R-SOAK-100, R-DET, R-SPEC, R-REPLAY, R-BENCH-* incl. the deferred 1.5 ms
+  savestate-p99 min-spec judgment and depth-8 <= 10 ms), the §7.5 release
+  checklist, a log-grep checklist (palette re-arm per epoch, LADDER order,
+  SetTracker continuity, deferred-Begin), the §5 edge-matrix -> coverage
+  map (the §7.4 "test id column", realized here), **§6 GekkoNet-removal
+  criteria + removal task list**, and **§7 0.7-fallback criteria** (§8.3
+  verbatim incl. the partial-fallback option).
+- `docs/RESILIENCE_TESTING.md`: prepended an M8 update banner (supervisor
+  threshold changes, the INV-14 injection semantic change that invalidates
+  its §2 supervisor expectations, backend default change, soak/driver
+  additions) pointing at the runbook as the M8 authority. **Deviation from
+  §7.4's letter** ("matrix table gains a test id column in
+  RESILIENCE_TESTING.md"): that doc never contained the §5 matrix; the
+  coverage map lives in the runbook to keep one authoritative M8 document,
+  with the pointer note in RESILIENCE_TESTING.md.
+
+### M8-5: T-ENG-9 grep half closed (M4-8 deviation)
+
+- **Files:** `docs/re0.7/M4_AUDITS.md` (new section + M6-closure note on the
+  old open item).
+- **Done:** full-tree budget-reader sweep documented: the single gating
+  comparison (`engine2.cpp` NextAction, marked INV-4) plus five audited
+  legitimate reader classes (config validation/logging; §2.8.3 catch-up
+  headroom; observational run-state/telemetry; INV-6/INV-23 policy/UI/
+  advisory surface incl. PressureReport `adv_rollback`; fx journal sizing).
+  Verdict: INV-4 holds. Ride-along finding: root-level `temp_session.cpp`
+  is a dead scratch file (not in any CMake target, references the old Gekko
+  config) — flagged for deletion with the GekkoNet-removal commit.
+
+### M8-6: Harness/launcher retired-concept sweep
+
+- **Files:** `tools/test_harness_launcher.cpp`,
+  `include/testing/harness_shared_memory.h` (comment).
+- **Done:** launcher log triage now recognizes the engine2 session-begin
+  line (`engine2 session begin`) alongside the legacy Gekko strings (kept —
+  the ON fallback config still emits them); status/summary labels
+  `gekko[...]` -> `rb[...]`. SHM struct comment updated. The harness SHM
+  layout/version is untouched (rbSnap fields it reads all survived the M5
+  facade renames; epoch/canonical visibility comes from the soak log lines,
+  not a breaking SHM change). `autoconnect_harness.cpp` itself needed no
+  changes (already facade-clean; grep-verified zero retired symbols in
+  `src/testing/`).
+
+### M8-7: Deferred-obligation decisions (logged per the plan rule)
+
+- **Per-phase STAT rollup (M2/M6/M7 note): REMAINS DEFERRED, by decision.**
+  The STAT format is the frozen §7 instrument (M0: "do not change");
+  frontend waits are labeled LifecycleBoundary since M6 and the
+  hold-episode ledger gives per-phase visibility. A separate PSTAT line
+  stays an option IF the M8 field analysis shows a need — no field data
+  exists yet, so adding it now would be speculative surface. Recorded in
+  the runbook caveats.
+- **compat_58 oneway-frames review (M6-4 deviation): REVIEWED, RETAINED.**
+  The fixed 16 667 us conversion under compat_58 overestimates required
+  coverage by <= 2% — errs toward MORE delay/rollback margin (the safe
+  direction, QOH99 lesson 15). Analyzer takes `--cadence 58.8` for the
+  sim-rate target; no code change.
+- **GekkoNet removal: NOT EXECUTED (per brief).** Both `AS2_WITH_GEKKO`
+  configs still compile; removal criteria + one-commit task list are §6 of
+  the runbook, gated on the field runs.
+- **Baseline retry with real asset reload (M5-1 dev. 2): remains deferred**
+  (M7 decision stands; no director reload machinery exists and the
+  recapture retry satisfies §2.5's semantics).
+
+### Build-system summary (M8)
+
+- **No CMakeLists.txt changes.** No sources added/removed; edits touch
+  existing TUs (`rematch_soak.cpp`, `netplay_menu_controller.cpp`,
+  `test_harness_launcher.cpp`) plus a standalone Python tool and docs.
+  Both `AS2_WITH_GEKKO` configs chased: the soak's INV-15 branch is the
+  only config-sensitive edit (`#if defined(AS2_WITH_GEKKO)`, define
+  already target-wide on the ON config); everything else is
+  config-independent.
+
+### Compile risks to check first (M8 build session)
+
+1. `rematch_soak.cpp` now includes `rollback/rollback_session.h` — check
+   for LOG_*/macro collisions with `ui/log_window.h` in that TU (the same
+   pairing already exists in autoconnect_harness.cpp, so low risk).
+2. The soak's new `#if defined(AS2_WITH_GEKKO)` branches: the OFF config
+   must not reference the define; the ON config picks the relaxed branch —
+   build BOTH configs once.
+3. `netplay_menu_controller.cpp`: the ConfirmingWinScreen sub==4 block was
+   restructured (single `if (sub == 4)` with YES/NO arms) — verify no
+   dangling reference to the old one-liner, and that the two new statics
+   (`s_autoConnectContinueNoToggled/ToggleFrame`) reset in
+   `AutoConnectTransition`.
+4. `test_harness_launcher.cpp` printf label edits changed no argument
+   lists (labels only) — format-string/arg mismatch risk is nil, but the
+   tool target should still be compiled once.
+5. `analyze_stat.py` is not in the build; run it against any real field
+   log if the STAT format is ever suspected to have drifted — the regex is
+   intentionally strict.
+
+---
+
+## REBUILD COMPLETION SUMMARY (M0-M8, 2026-08-17)
+
+All eight milestones of `RE07_MASTER_REBUILD_PLAN.md` are **code-complete**
+on branch `re0.7`. What exists now:
+
+- **Backend:** `transport2` (ENet worker, protocol-silence metric, INV-14)
+  -> `session2` (5-step nonce handshake, teardown funnel, preserved
+  `Session_*` facade) -> `packet_router` (single dispatch owner, both
+  regimes) -> `match_setup` (host-minted epochs, EpochAlign, recovery
+  ladder, preserved `PregameSync_*`) -> `match_director` (INV-9 match-end
+  ladder, engine suspend/rotate across matches, preserved `OnlineWiring_*`)
+  -> **`engine2`** (custom rollback: capture-once, delay-as-relabel,
+  hold-last prediction, earliest-mismatch correction, confirmed-frame seam,
+  SyncHash, fail-closed terminals; sole R reader = the INV-4 comparison) ->
+  `FrameScheduler` (absolute-deadline pacing, limiter detour, pinned tick,
+  one-sided pace slew, CadenceDebt, frozen STAT instrument).
+- **Survivors intact (G6):** frontend/menu, frontend lockstep under
+  `(epoch, phase_id)` identity, continue_flow rematch (fast path + any-NO),
+  palettes, spectator (confirmed-only + elastic pacing + hash verify),
+  replay (confirmed pipeline + AS2RCFM1 chapters + playback verification),
+  training, NAT stack, supervisor (+ProgressDeadline) + barriers +
+  kill-path CI gate.
+- **Deleted:** GekkoNet from the default config (fallback compiles behind
+  `AS2_WITH_GEKKO=ON`), netplay_pacing controller/classifier/debt,
+  network_thread, session_manager/pregame_sync/match_bootstrap/
+  online_wiring internals, gameplay_bridge, frame_lineage, delay
+  negotiation, the serial allocator, legacy Hello/HelloAck.
+- **Wire:** protocol v20 (v18/19 refused at handshake with named reason).
+- **Verification in-tree:** unit suites T-ENG-1..12 (+wrap/epoch/cadence),
+  T-SCHED-1..4, T-TB-1..7 (+T-LADDER barrier half), frontend identity +
+  interrogation tests, 100k-frame socket-free lossy soak, microbench,
+  kill-path gate; field-side: the upgraded rematch soak (epoch/INV-15
+  asserts, NO-cycle driving), the STAT analyzer, and the M8 acceptance
+  runbook.
+
+**What remains is not code:** execute `docs/re0.7/M8_ACCEPTANCE_RUNBOOK.md`
+on real builds (the first actual compile of the tree included — builds were
+forbidden throughout; every milestone entry carries its compile-risk list,
+M0 first). Ship/merge decision = runbook §3 checklist; GekkoNet removal =
+runbook §6; fallback to `0.7` = runbook §7. The product bar remains plan
+§1 G1: a 155 ms / 0% loss link at a flat 60.00 fps with zero holds —
+judged by `python tools/analyze_stat.py --profile le1`.

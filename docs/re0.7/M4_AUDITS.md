@@ -96,3 +96,44 @@ the M4 conservative stand-in in `rollback_session_engine2.cpp`
 (`RefreshLifecycleWindow`), which treats only non-(mode 8, substate 3) ticks
 as exact and therefore never predicts across ANY mode change — safe but one
 frame more conservative than the audited minimum at match end.
+*(Closed at M6-1/M6-3: the director now derives `match_exit_pending` from
+MatchLifecycle and mirrors it via `RollbackSession_SetMatchExitPending`.)*
+
+## T-ENG-9 grep half — INV-4 "no other code path reads R" audit (M8)
+
+The executable half of T-ENG-9 (exactly R speculative frames before the first
+`Stall(PredictionLimit)`) is pinned in `tests/engine2_tests.cpp`. This section
+is the deferred grep/review half (journal M4-8 deviation): a full-tree sweep
+of every reader of the rollback budget (`max_rollback` / `rollback_budget` /
+`R_local` / `RollbackSession_GetRollbackBudget`), classified. Date:
+2026-08-17 (M8), engine2 default config.
+
+**The single gating comparison** — `src/rollback/engine2.cpp` `NextAction()`:
+
+```cpp
+if (SpeculativeFrames() >= config_.max_rollback)   // marked INV-4 in-source
+```
+
+No other comparison, scaling, or clamp against the budget exists anywhere in
+a sim/hold decision. Every other reader falls into one of five audited-and-
+legitimate classes:
+
+| Class | Readers | Why legal under INV-4 |
+|---|---|---|
+| 1. Config validation / arm logging | `engine2.cpp` Arm (range check 1..15, arm log), adapter clamps in `rollback_session_engine2.cpp` / `rollback_session.cpp` (facade config → EngineConfig) | Input validation before the engine owns the value; never re-read after arm. |
+| 2. Hidden catch-up headroom (§2.8.3, plan-mandated) | `input_override.cpp` (`telemetry.rollback_budget − depth − 1` fed to `FrameScheduler_TryTakeCatchupFrame`; `frame_scheduler.h` documents the caller-computed contract) | The plan's own formula `k = min(debt, 2, R − depth − 1)`. Bounds HIDDEN extra work; cannot cause a hold or shrink the budget available before `Stall` (the −1 reserves the visible frame, INV-21). |
+| 3. Observational run-state / telemetry | `engine2.cpp` (`ClassifyRunState` input `local_max_rollback`; `Stats.max_rollback_depth`), `run_state.h` warning band, snapshot fills (`rollback_budget`, `max_rollback_distance`) | Classification and HUD/STAT reporting only; §2.10 says observational, no decision consumes RunState. |
+| 4. Policy / UI / advisory (INV-6/INV-23 surface) | `delay_policy.cpp` (directional coverage `D_peer + R_local`, recommendation, remote-advisory `max_rollback`), `netplay_menu_controller.cpp` / `netplay_menu_state.h` (config screen), `rollback_debug.cpp` (ImGui + debug skew thresholds), `desync_dump.cpp` (evidence print), PressureReport `adv_rollback` (engine2.cpp egress — advisory to the PEER, never applied locally) | The coverage/recommendation math is exactly what INV-6 requires the UI to show; nothing here feeds `NextAction`. |
+| 5. Fx journal sizing | `RollbackAudio/ComboFx/StatusFx_OnSessionBegin(rollback_budget)` (director fan-out) | Buffer sizing for suppression journals; §2.6.1 contract. |
+
+Also checked: zero remaining references to the retired budget-shrinking
+vocabulary (`NETCLASS`, `stall_threshold` / `protection_window` consumers —
+snapshot fields survive pinned to 0 for shape stability, no reader acts on
+them), and no test/harness code reads the budget into a pacing decision.
+`temp_session.cpp` (repo root) references a Gekko config but is not in any
+CMake target — dead scratch file, flagged for deletion with the Gekko
+removal commit.
+
+**Verdict: INV-4 holds.** The engine uses all R frames before holding, and
+nothing outside the single marked comparison can shrink or scale the
+effective budget.

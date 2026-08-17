@@ -27,6 +27,7 @@
 #include "net/netplay_menu_state.h"
 #include "net/enet_transport.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rollback_session.h"
 #include "ui/log_window.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -61,6 +62,18 @@ struct SoakState {
     bool     prevPhaseValid;
     Net::PregamePhase prevPhase;
     bool     sessionWasLive;  // saw Connected/Ready at least once
+
+    // re0.7 M8 assertions (M6 obligation: epoch strictly increasing AND
+    // canonical frame counter monotonic across the whole session).
+    uint32_t epochMaxSeen;        // highest PregameSync epoch observed (0 = none)
+    uint32_t epochAtLastHandoff;  // epoch when GameplayHandoff was last entered
+    bool     epochHandoffValid;   // epochAtLastHandoff is meaningful
+    bool     sawFrontendPhase;    // charsel/stagesel seen inside current iteration
+    int      fastPathPasses;      // PASS iterations with no frontend phase (YES,YES)
+    int      charselPasses;       // PASS iterations that routed through charsel (any NO)
+    bool     canonValid;          // canonMax holds a real sample
+    bool     canonWasActive;      // rollback session active on the previous frame
+    int32_t  canonMax;            // highest canonical rb frame observed
 };
 
 SoakState s_soak = {};
@@ -166,14 +179,19 @@ void EmitSummary(const char* reason) {
 
     const int notRun = s_soak.target - s_soak.passCount - s_soak.failCount;
     const bool pass = (s_soak.passCount >= s_soak.target && s_soak.failCount == 0);
-    SoakLog("SUMMARY (%s): verdict=%s target=%d passed=%d failed=%d not_run=%d baseline_matches=%d",
+    SoakLog("SUMMARY (%s): verdict=%s target=%d passed=%d failed=%d not_run=%d baseline_matches=%d "
+            "fastpath=%d charsel=%d epoch_max=%u canonical_max=%d",
             reason ? reason : "?",
             pass ? "SOAK-PASS" : "SOAK-FAIL",
             s_soak.target,
             s_soak.passCount,
             s_soak.failCount,
             notRun > 0 ? notRun : 0,
-            s_soak.handoffCount > 0 ? 1 : 0);
+            s_soak.handoffCount > 0 ? 1 : 0,
+            s_soak.fastPathPasses,
+            s_soak.charselPasses,
+            s_soak.epochMaxSeen,
+            s_soak.canonValid ? s_soak.canonMax : -1);
     Rollback::NetplayLog_Flush();
 }
 
@@ -223,29 +241,106 @@ void RematchSoak_Init(bool isHost) {
 void RematchSoak_FrameUpdate(const char* autoconnectStateName, uint32_t frameCounter) {
     if (!s_soak.enabled || s_soak.finished) return;
 
+    // ---- 0. re0.7 M8 continuous assertions ---------------------------------
+    // (a) Epoch is a host-minted, strictly increasing session generation
+    //     (§2.5, INV-15 companion). Any observed regression is structural.
+    const uint32_t epoch = Net::PregameSync_GetCurrentEpoch();
+    if (epoch != 0) {
+        if (s_soak.epochMaxSeen != 0 && epoch < s_soak.epochMaxSeen) {
+            FailSoak("epoch regressed: %u -> %u (must be strictly increasing, plan §2.5)",
+                     s_soak.epochMaxSeen, epoch);
+            EmitSummary("epoch regression");
+            return;
+        }
+        if (epoch > s_soak.epochMaxSeen) s_soak.epochMaxSeen = epoch;
+    }
+
+    // (b) Canonical frame counter never goes backward (INV-15). On the
+    //     engine2 backend the engine stays armed across matches (suspend +
+    //     rotate), so the counter must be monotonic for the WHOLE session.
+    //     On the Gekko fallback config the engine lifetime is per-match, so
+    //     the assertion only holds while the session is continuously active.
+    {
+        const bool rbActive = Rollback::RollbackSession_IsActive();
+        if (rbActive) {
+            const int32_t rb = Rollback::RollbackSession_GetCurrentFrame();
+#if defined(AS2_WITH_GEKKO)
+            const bool comparable = s_soak.canonValid && s_soak.canonWasActive;
+#else
+            const bool comparable = s_soak.canonValid;
+#endif
+            if (comparable && rb < s_soak.canonMax) {
+                FailSoak("canonical frame counter regressed: %d -> %d (INV-15)",
+                         s_soak.canonMax, rb);
+                EmitSummary("canonical counter regression");
+                return;
+            }
+            if (!s_soak.canonValid || rb > s_soak.canonMax) {
+                s_soak.canonMax = rb;
+                s_soak.canonValid = true;
+            }
+        }
+#if defined(AS2_WITH_GEKKO)
+        if (!rbActive) {
+            // Per-match engine lifetime: forget the high-water across gaps.
+            s_soak.canonValid = false;
+        }
+#endif
+        s_soak.canonWasActive = rbActive;
+    }
+
     // ---- 1. PASS edges: pregame phase reaching GameplayHandoff -------------
     const Net::PregamePhase phase = Net::PregameSync_GetPhase();
+
+    // Track which route the in-flight iteration took: the YES,YES fast path
+    // never enters a frontend phase (EpochAlign(None) -> ConfigExchange);
+    // any-NO routes through charsel (§2.5 deterministic phase schedule).
+    if (s_soak.iterationOpen &&
+        (phase == Net::PregamePhase::FrontendCharSel ||
+         phase == Net::PregamePhase::FrontendStageSel)) {
+        s_soak.sawFrontendPhase = true;
+    }
 
     if (s_soak.prevPhaseValid &&
         phase == Net::PregamePhase::GameplayHandoff &&
         s_soak.prevPhase != Net::PregamePhase::GameplayHandoff) {
         s_soak.handoffCount++;
         if (s_soak.handoffCount == 1) {
-            SoakLog("Baseline match reached GameplayHandoff (frame=%u) -- soak of %d rematches begins after it",
-                    frameCounter, s_soak.target);
+            SoakLog("Baseline match reached GameplayHandoff (frame=%u epoch=%u) -- soak of %d rematches begins after it",
+                    frameCounter, epoch, s_soak.target);
         } else {
             const int iter = s_soak.handoffCount - 1;
             const uint32_t durMs = s_soak.iterationOpen
                 ? (GetTickCount() - s_soak.iterationStartMs) : 0;
+
+            // M8 assertion: every rematch handoff must carry a HIGHER epoch
+            // than the previous handoff (rotation per cycle, §2.5/§4.4).
+            if (s_soak.epochHandoffValid && epoch != 0 &&
+                epoch <= s_soak.epochAtLastHandoff) {
+                FailSoak("epoch did not increase across rematch: handoff epoch %u after %u",
+                         epoch, s_soak.epochAtLastHandoff);
+                EmitSummary("epoch not rotated");
+                return;
+            }
+
+            const char* path = s_soak.sawFrontendPhase ? "charsel" : "fastpath";
+            if (s_soak.sawFrontendPhase) s_soak.charselPasses++;
+            else                          s_soak.fastPathPasses++;
+
             s_soak.passCount++;
             s_soak.iterationOpen = false;
-            SoakLog("PASS iteration=%d/%d: new pregame sync completed (GameplayHandoff) in %ums",
-                    iter, s_soak.target, durMs);
+            SoakLog("PASS iteration=%d/%d: new pregame sync completed (GameplayHandoff) in %ums epoch=%u path=%s canonical=%d",
+                    iter, s_soak.target, durMs, epoch, path,
+                    s_soak.canonValid ? s_soak.canonMax : -1);
             if (s_soak.passCount >= s_soak.target) {
                 s_soak.finished = true;
                 EmitSummary("target reached");
                 return;
             }
+        }
+        if (epoch != 0) {
+            s_soak.epochAtLastHandoff = epoch;
+            s_soak.epochHandoffValid = true;
         }
     }
 
@@ -258,9 +353,10 @@ void RematchSoak_FrameUpdate(const char* autoconnectStateName, uint32_t frameCou
         !s_soak.iterationOpen) {
         s_soak.iterationOpen = true;
         s_soak.iterationStartMs = GetTickCount();
-        SoakLog("Iteration %d/%d begin (pregame left GameplayHandoff -> %s, frame=%u)",
+        s_soak.sawFrontendPhase = false;
+        SoakLog("Iteration %d/%d begin (pregame left GameplayHandoff -> %s, frame=%u epoch=%u)",
                 s_soak.handoffCount, s_soak.target,
-                Net::PregamePhaseName(phase), frameCounter);
+                Net::PregamePhaseName(phase), frameCounter, epoch);
     }
 
     s_soak.prevPhase = phase;

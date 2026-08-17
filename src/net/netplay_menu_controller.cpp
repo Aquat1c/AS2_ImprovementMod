@@ -209,6 +209,7 @@ struct AutoConnectConfig {
     int      palette;
     int      matchDurationSec;
     int      matchCount;
+    int      continueNoEvery;   // M8 soak: answer NO on every Nth continue prompt (0 = always YES)
 };
 
 static AutoConnectConfig s_autoConnect = {};
@@ -221,6 +222,8 @@ static bool             s_autoConnectStageGridPressed = false;
 static bool             s_autoConnectStageConfirmPressed = false;
 static bool             s_autoConnectWinScreenPressed = false;
 static bool             s_autoConnectContinuePressed = false;
+static bool             s_autoConnectContinueNoToggled = false;
+static int              s_autoConnectContinueToggleFrame = 0;
 static int              s_autoConnectCompletedMatches = 0;
 static bool             s_autoRematchCleanupApplied = false;
 static DWORD            s_autoRematchLastAttemptAt = 0;
@@ -1751,6 +1754,8 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
     if (next == AutoConnectState::ConfirmingWinScreen) {
         s_autoConnectWinScreenPressed = false;
         s_autoConnectContinuePressed = false;
+        s_autoConnectContinueNoToggled = false;
+        s_autoConnectContinueToggleFrame = 0;
     }
 
     if (next == AutoConnectState::InMatch) {
@@ -1905,6 +1910,13 @@ static void LoadAutoConnectConfig() {
             s_autoConnect.matchDurationSec = atoi(val);
         } else if (_stricmp(key, "match_count") == 0) {
             s_autoConnect.matchCount = atoi(val);
+        } else if (_stricmp(key, "continue_no_every") == 0) {
+            // M8 soak knob: answer NO on every Nth continue prompt so the
+            // rematch soak exercises the any-NO charsel route as well as the
+            // YES,YES fast path. Deterministic on both peers when both cfgs
+            // carry the same value (the match counter advances in lockstep);
+            // a single side answering NO also routes both to charsel.
+            s_autoConnect.continueNoEvery = atoi(val);
         }
     }
 
@@ -1930,7 +1942,7 @@ static void LoadAutoConnectConfig() {
     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
 
     LOG_NETPLAY(LOG_INFO,
-        "[AutoConnect] Loaded %s (from %s): role=%s nick='%s' port=%u target=%s delay=%d char=%d pal=%d duration=%d matches=%d",
+        "[AutoConnect] Loaded %s (from %s): role=%s nick='%s' port=%u target=%s delay=%d char=%d pal=%d duration=%d matches=%d continue_no_every=%d",
         kAutoConnectFile,
         parseSource,
         s_autoConnect.isHost ? "Host" : "Join",
@@ -1941,7 +1953,8 @@ static void LoadAutoConnectConfig() {
         s_autoConnect.characterGridIndex,
         s_autoConnect.palette,
         s_autoConnect.matchDurationSec,
-        s_autoConnect.matchCount);
+        s_autoConnect.matchCount,
+        s_autoConnect.continueNoEvery);
 
     // Initialize the test harness SHM so the launcher can see real-time state
     AutoConnectHarness_Init(s_autoConnect.isHost, s_autoConnect.nickname,
@@ -2258,10 +2271,23 @@ static void HandleAutoConnect() {
             // Continue prompt (sub 4, ContinueFlow): a fresh tap locks YES
             // (cursor defaults to YES). The prompt requires a release before
             // the lock edge, which the tap-style injection provides.
-            if (sub == 4 && (!s_autoConnectContinuePressed ||
-                             (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
-                AutoConnectInjectPress(INPUT_A, "lock continue YES");
-                s_autoConnectContinuePressed = true;
+            // M8: with continue_no_every = K configured, every Kth prompt is
+            // answered NO instead (LEFT/RIGHT toggles the cursor to NO, then
+            // A locks it) so soak runs cover the any-NO charsel route too.
+            if (sub == 4) {
+                const bool answerNo = s_autoConnect.continueNoEvery > 0 &&
+                    ((s_autoConnectCompletedMatches + 1) % s_autoConnect.continueNoEvery == 0);
+                if (answerNo && !s_autoConnectContinueNoToggled) {
+                    AutoConnectInjectPress(INPUT_RIGHT, "continue cursor -> NO");
+                    s_autoConnectContinueNoToggled = true;
+                    s_autoConnectContinueToggleFrame = s_autoConnectStateFrames;
+                } else if ((!answerNo ||
+                            s_autoConnectStateFrames >= s_autoConnectContinueToggleFrame + 20) &&
+                           (!s_autoConnectContinuePressed ||
+                            (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
+                    AutoConnectInjectPress(INPUT_A, answerNo ? "lock continue NO" : "lock continue YES");
+                    s_autoConnectContinuePressed = true;
+                }
             }
 
             if (s_autoConnectStateFrames > 1800) {

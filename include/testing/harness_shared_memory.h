@@ -107,7 +107,7 @@ struct HarnessSharedData {
     uint32_t rng_jumps;
     uint32_t frame_counter_anomalies;
 
-    // ---- GekkoNet Rollback State ----
+    // ---- Rollback State (engine2; Gekko on the AS2_WITH_GEKKO fallback) ----
     int32_t  rb_local_frame;
     int32_t  rb_remote_frame;
     float    rb_frames_ahead;
