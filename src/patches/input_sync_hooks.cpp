@@ -16,7 +16,9 @@
 #include "patches/memory_utils.h"
 #include "as2_constants.h"
 #include "log_window.h"
+#include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rollback_session.h"
 #include "net/session_manager.h"
 #include "net/charsel_sync.h"
 #include "replay/replay_runtime.h"
@@ -36,6 +38,7 @@ typedef void (__cdecl *RecvInputPacket_t)();
 typedef int  (__cdecl *GetSyncInput_t)(int frame, int16_t* out);
 typedef int  (__cdecl *AdvanceFrame_t)();
 typedef int  (__cdecl *MatchSyncInit_t)();
+typedef char (__cdecl *MatchUpdateScoreStats_t)();
 
 // ============================================================================
 // Original function pointers
@@ -46,6 +49,7 @@ static RecvInputPacket_t g_origRecvInputPacket = nullptr;
 static GetSyncInput_t    g_origGetSyncInput    = nullptr;
 static AdvanceFrame_t    g_origAdvanceFrame     = nullptr;
 static MatchSyncInit_t   g_origMatchSyncInit   = nullptr;
+static MatchUpdateScoreStats_t g_origMatchUpdateScoreStats = nullptr;
 
 // ============================================================================
 // Internal state
@@ -61,6 +65,38 @@ static bool s_load_barrier_freeze = false;
 // Runtime freeze — gameplay timesync intentionally pauses local advancement
 // when the simulator is too far ahead of confirmed remote input.
 static bool s_timesync_freeze = false;
+
+// ── Render-phase RNG isolation (SAVESTATE_AUDIT F2, P0) ─────────────────────
+// The mode-8 render phase (Game_Update_MatchLoop post-loop: sub_4C47C0 super
+// backgrounds — 15 rand() call sites — plus everything up to the next pass)
+// shares the single CRT LCG with the sim. Render cadence is not sim cadence:
+// a rollback resim runs N sim frames inside one outer pass → 1 render, while
+// the straight-through peer rendered N times; the local "background off"
+// option even changes consumption at 1:1 cadence. Any render rand() therefore
+// permanently diverges the shared stream.
+//
+// Isolation contract (per DECOMP_TIMING_STUDY §1.2): Frame_AdvanceSimulation
+// (hooked below) is called exactly once per outer pass, AFTER the sim
+// while-loop and immediately BEFORE the render-phase gate — so the seed
+// captured there is the post-sim seed. The next sim-side code to run is the
+// next pass's first Input_TryGetNextFrame dispatch (sim work only happens
+// inside the while-loop), so restoring the captured seed at dispatcher entry
+// erases every rand() consumed by the render phase / present / frontend from
+// the sim's stream. Net effect: the sim RNG stream on both peers is exactly
+// "as if render never called rand()" — cadence-independent — while the
+// render still gets naturally varying (cosmetic-only, per-peer) values.
+// This is the least-invasive equivalent of the audit's private-cosmetic-PRNG
+// recommendation: no new PRNG, no binary patch, two existing hook points.
+static bool     s_renderRngPending = false;
+static uint32_t s_renderRngSeed = 0;
+
+static inline bool RenderRngIsolationActive() {
+    // Netplay mode-8 only: offline play keeps vanilla behavior (the offline
+    // forced-rollback determinism harness runs under an active session and
+    // is covered). CharSel stepped passes also reach Hook_AdvanceFrame —
+    // the mode gate keeps them out.
+    return Rollback::RollbackSession_IsActive() && GetGameMode() == MODE_MATCH;
+}
 
 // ============================================================================
 // Helpers
@@ -134,6 +170,19 @@ static int __cdecl Hook_GetSyncInput(int frame, int16_t* out) {
  * Do not suppress Frame_AdvanceSimulation for active in-match rollback.
  */
 static int __cdecl Hook_AdvanceFrame() {
+    // F2 render-RNG isolation: this hook runs once per outer pass, after the
+    // last sim iteration and before the render phase (see block comment at
+    // the state above). Belt-and-braces restore first (normally a no-op —
+    // the dispatcher already restored at pass entry), then capture the
+    // post-sim seed for the upcoming render phase. Runs on the suppressed
+    // path too: a 0-sim hold pass still renders (match+11 stays 1) and an
+    // active super background still consumes rand() while frozen.
+    InputSyncHooks_RestoreRenderRngIfPending();
+    if (RenderRngIsolationActive()) {
+        s_renderRngSeed = DetVer_GetRngSeed();
+        s_renderRngPending = true;
+    }
+
     const bool loadBarrierFreeze = s_load_barrier_freeze;
     const bool timesyncFreeze = s_timesync_freeze;
     const bool practiceFreeze = PracticeTools_ShouldFreezeFrame();
@@ -219,9 +268,54 @@ static int __cdecl Hook_MatchSyncInit() {
     return g_origMatchSyncInit ? g_origMatchSyncInit() : 0;
 }
 
+/**
+ * Hook for sub_55BCD0 - Match_UpdateScoreStats (SAVESTATE_AUDIT F6, P2).
+ *
+ * Called on the round-end commit tick (transition timer == 25). Its `+=`
+ * score/rank/arcade-continuation writes live OUTSIDE every snapshot region,
+ * so a rollback across the commit tick would re-apply them on resim
+ * (double-count persisted to config.dat). The commit tick sits inside the
+ * predicted window by design (M4-7 keeps no round-boundary exact window).
+ *
+ * Suppression rule: skip while the engine is replaying (IsRollingBack). The
+ * speculative first pass over the commit tick applied the stats; the resim
+ * pass over the same tick is the double-apply, so skipping it nets exactly
+ * one application. Frames beyond the pre-rollback frontier run as normal
+ * advances (not rolling back) and apply fresh.
+ *
+ * Accepted residuals (audit "accept and document" clause): (a) if a
+ * misprediction inside the replay window changes the round outcome, the
+ * speculatively-applied stats stand for the superseded outcome — cosmetic
+ * persistence noise, no sim-state impact (no mode-8 sim reader exists);
+ * (b) offline manual savestate F6-load can still replay a commit tick and
+ * re-apply — offline practice tooling, out of netplay scope.
+ */
+static char __cdecl Hook_MatchUpdateScoreStats() {
+    if (Rollback::RollbackSession_IsRollingBack()) {
+        Rollback::NetplayLog_Write("ROLLBACK",
+            Rollback::RollbackSession_GetCurrentFrame(),
+            "Match_UpdateScoreStats SUPPRESSED during resim (F6 double-apply guard)");
+        return 0;
+    }
+    return g_origMatchUpdateScoreStats ? g_origMatchUpdateScoreStats() : 0;
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
+
+void InputSyncHooks_RestoreRenderRngIfPending() {
+    if (!s_renderRngPending) {
+        return;
+    }
+    s_renderRngPending = false;
+    // Only restore while the session that captured is still the owner: if
+    // the session ended mid-pass the capture is stale and the offline RNG
+    // stream must not be rewound.
+    if (Rollback::RollbackSession_IsActive()) {
+        DetVer_SetRngSeed(s_renderRngSeed);
+    }
+}
 
 bool InputSyncHooks_IsModOwnedSync() {
     if (Net::CharSelSync_IsLockstepActive()) return true;
@@ -241,11 +335,12 @@ bool InputSyncHooks_Install() {
     };
 
     HookEntry hooks[] = {
-        { ADDR_SEND_INPUT,      (void*)&Hook_SendInputPacket, (void**)&g_origSendInputPacket, "SendInputPacket" },
-        { ADDR_RECV_INPUT,      (void*)&Hook_RecvInputPacket, (void**)&g_origRecvInputPacket, "RecvInputPacket" },
-        { ADDR_GET_SYNC_INPUT,  (void*)&Hook_GetSyncInput,    (void**)&g_origGetSyncInput,    "GetSyncInput"    },
-        { ADDR_ADVANCE_FRAME,   (void*)&Hook_AdvanceFrame,    (void**)&g_origAdvanceFrame,    "AdvanceFrame"    },
-        { ADDR_MATCH_SYNC_INIT, (void*)&Hook_MatchSyncInit,   (void**)&g_origMatchSyncInit,   "MatchSyncInit"   },
+        { ADDR_SEND_INPUT,        (void*)&Hook_SendInputPacket,       (void**)&g_origSendInputPacket,       "SendInputPacket" },
+        { ADDR_RECV_INPUT,        (void*)&Hook_RecvInputPacket,       (void**)&g_origRecvInputPacket,       "RecvInputPacket" },
+        { ADDR_GET_SYNC_INPUT,    (void*)&Hook_GetSyncInput,          (void**)&g_origGetSyncInput,          "GetSyncInput"    },
+        { ADDR_ADVANCE_FRAME,     (void*)&Hook_AdvanceFrame,          (void**)&g_origAdvanceFrame,          "AdvanceFrame"    },
+        { ADDR_MATCH_SYNC_INIT,   (void*)&Hook_MatchSyncInit,         (void**)&g_origMatchSyncInit,         "MatchSyncInit"   },
+        { ADDR_MATCH_SCORE_STATS, (void*)&Hook_MatchUpdateScoreStats, (void**)&g_origMatchUpdateScoreStats, "Match_UpdateScoreStats" },
     };
 
     for (auto& h : hooks) {

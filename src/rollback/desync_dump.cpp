@@ -31,6 +31,47 @@ static int   s_dumpCount      = 0;
 static constexpr DWORD kDumpCooldownMs = 10000; // 10 seconds real-time
 
 // ============================================================================
+// Shared region table (diagnostics view of the snapshot capture membership;
+// this table never drives capture/restore — see game_snapshot.cpp for that)
+// ============================================================================
+
+static const DesyncRegionInfo s_regionTable[] = {
+    { "match_header",   ADDR_MATCH_BASE, 16 },
+    { "match_context",  ADDR_MATCH_BASE + 16,
+                        ADDR_EFFECT_ARRAY - (ADDR_MATCH_BASE + 16) },
+    { "effect_array",   ADDR_EFFECT_ARRAY, ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY },
+    { "effect_index",   ADDR_EFFECT_INDEX, sizeof(uint32_t) },
+    { "summon_array",   ADDR_SUMMON_ARRAY, ADDR_P1_ENTITY_BASE - ADDR_SUMMON_ARRAY },
+    { "p1_entity",      ADDR_P1_ENTITY_BASE, (size_t)ENTITY_SIZE },
+    { "p2_entity",      ADDR_P2_ENTITY_BASE, (size_t)ENTITY_SIZE },
+    { "pre_match_gap",  ADDR_PRE_MATCH_GAP, (size_t)PRE_MATCH_GAP_SIZE },
+    { "p1_inputbuf",    ADDR_P1_INPUT_BUFFER, (size_t)INPUT_BUFFER_SIZE },
+    { "p2_inputbuf",    ADDR_P2_INPUT_BUFFER, (size_t)INPUT_BUFFER_SIZE },
+    { "per_frame_temp", ADDR_MATCH_PER_FRAME_TEMP, (size_t)MATCH_PER_FRAME_TEMP_SIZE },
+};
+
+size_t DesyncDump_GetRegionTable(const DesyncRegionInfo** out) {
+    if (out) *out = s_regionTable;
+    return sizeof(s_regionTable) / sizeof(s_regionTable[0]);
+}
+
+void DesyncDump_WriteRegionCRCsMachine(FILE* f) {
+    if (!f) return;
+    const DesyncRegionInfo* regions = nullptr;
+    const size_t n = DesyncDump_GetRegionTable(&regions);
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t crc = 0;
+        __try {
+            crc = CalcCRC32((const void*)regions[i].addr, regions[i].size);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            crc = 0xDEADDEAD;
+        }
+        fprintf(f, "REGION name=%s addr=0x%08X size=%zu crc=0x%08X\n",
+                regions[i].name, (uint32_t)regions[i].addr, regions[i].size, crc);
+    }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -366,48 +407,18 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
     }
 
     // ====== PER-REGION CRC BREAKDOWN ======
+    // (single shared table — the machine `REGION` lines use the same one)
     fprintf(f, "\n--- Region CRC Breakdown ---\n");
     {
-        constexpr uintptr_t matchBase = ADDR_MATCH_BASE;
-        constexpr size_t matchHdrSize = 16;
-        constexpr size_t matchCtxSize = ADDR_EFFECT_ARRAY - (ADDR_MATCH_BASE + 16);
-        constexpr size_t effectSize   = ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY;
-        constexpr size_t summonSize   = ADDR_P1_ENTITY_BASE - ADDR_SUMMON_ARRAY;
-
-        fprintf(f, "  Match Header  (0x%08X, %5zu B): 0x%08X\n",
-                (uint32_t)matchBase, matchHdrSize,
-                CalcCRC32((const void*)matchBase, matchHdrSize));
-        fprintf(f, "  Match Context (0x%08X, %5zu B): 0x%08X\n",
-                (uint32_t)(matchBase + 16), matchCtxSize,
-                CalcCRC32((const void*)(matchBase + 16), matchCtxSize));
-        fprintf(f, "  Effect Array  (0x%08X, %5zu B): 0x%08X\n",
-                (uint32_t)ADDR_EFFECT_ARRAY, effectSize,
-                CalcCRC32((const void*)ADDR_EFFECT_ARRAY, effectSize));
-        fprintf(f, "  Effect Index  (0x%08X, %5u B): 0x%08X value=%u\n",
-                (uint32_t)ADDR_EFFECT_INDEX, 4u,
-                CalcCRC32((const void*)ADDR_EFFECT_INDEX, sizeof(uint32_t)),
+        const DesyncRegionInfo* regions = nullptr;
+        const size_t regionCount = DesyncDump_GetRegionTable(&regions);
+        for (size_t i = 0; i < regionCount; ++i) {
+            fprintf(f, "  %-15s (0x%08X, %6zu B): 0x%08X\n",
+                    regions[i].name, (uint32_t)regions[i].addr, regions[i].size,
+                    CalcCRC32((const void*)regions[i].addr, regions[i].size));
+        }
+        fprintf(f, "  effect_index value=%u\n",
                 ReadMemory<uint32_t>(ADDR_EFFECT_INDEX));
-        fprintf(f, "  Summon Array  (0x%08X, %5zu B): 0x%08X\n",
-                (uint32_t)ADDR_SUMMON_ARRAY, summonSize,
-                CalcCRC32((const void*)ADDR_SUMMON_ARRAY, summonSize));
-        fprintf(f, "  P1 Entity     (0x%08X, %5zu B): 0x%08X\n",
-                (uint32_t)ADDR_P1_ENTITY_BASE, (size_t)ENTITY_SIZE,
-                CalcCRC32((const void*)ADDR_P1_ENTITY_BASE, ENTITY_SIZE));
-        fprintf(f, "  P2 Entity     (0x%08X, %5zu B): 0x%08X\n",
-                (uint32_t)ADDR_P2_ENTITY_BASE, (size_t)ENTITY_SIZE,
-                CalcCRC32((const void*)ADDR_P2_ENTITY_BASE, ENTITY_SIZE));
-        fprintf(f, "  Pre-Match Gap (0x%08X, %5d B): 0x%08X\n",
-                (uint32_t)ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE,
-                CalcCRC32((const void*)ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE));
-        fprintf(f, "  P1 InputBuf   (0x%08X, %5d B): 0x%08X\n",
-                (uint32_t)ADDR_P1_INPUT_BUFFER, INPUT_BUFFER_SIZE,
-                CalcCRC32((const void*)ADDR_P1_INPUT_BUFFER, INPUT_BUFFER_SIZE));
-        fprintf(f, "  P2 InputBuf   (0x%08X, %5d B): 0x%08X\n",
-                (uint32_t)ADDR_P2_INPUT_BUFFER, INPUT_BUFFER_SIZE,
-                CalcCRC32((const void*)ADDR_P2_INPUT_BUFFER, INPUT_BUFFER_SIZE));
-        fprintf(f, "  PerFrame Temp (0x%08X, %5d B): 0x%08X\n",
-                (uint32_t)ADDR_MATCH_PER_FRAME_TEMP, MATCH_PER_FRAME_TEMP_SIZE,
-                CalcCRC32((const void*)ADDR_MATCH_PER_FRAME_TEMP, MATCH_PER_FRAME_TEMP_SIZE));
     }
 
     // ====== SCATTERED GLOBALS (savestate) ======
@@ -516,6 +527,70 @@ bool DesyncDump_TryDump(int32_t frame,
 
     fclose(f);
     LOG_INFO("[DesyncDump] State dump #%d written: %s", s_dumpCount, path);
+    return true;
+}
+
+bool DesyncDump_TryDumpWithDiagnostics(int32_t frame,
+                                       uint32_t local_crc,
+                                       uint32_t remote_crc,
+                                       const char* source,
+                                       const char* detail,
+                                       const DesyncDiagRing* ring,
+                                       const DesyncEvidence* evidence) {
+    DWORD now = GetTickCount();
+    if (s_dumpCount > 0 && (now - s_lastDumpTickMs) < kDumpCooldownMs)
+        return false;
+
+    const char* logDir = LogWindow_GetLogDir();
+    if (!logDir || !logDir[0]) return false;
+
+    DWORD pid = GetCurrentProcessId();
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE,
+                "%s\\desync_dump_%lu_f%d.txt", logDir, pid, frame);
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || !f) {
+        LOG_ERROR("[DesyncDump] Failed to write desync dump: %s", path);
+        return false;
+    }
+
+    s_lastDumpTickMs = now;
+    s_dumpCount++;
+
+    // ====== MACHINE-READABLE DIAGNOSTICS (written FIRST, so a truncated
+    // file still carries the comparator's input; see
+    // tools/compare_desync_dumps.py) ======
+    fprintf(f, "================================================================================\n");
+    fprintf(f, "  DESYNC DIAGNOSTICS (machine-readable; tools/compare_desync_dumps.py)\n");
+    fprintf(f, "================================================================================\n");
+    fprintf(f, "DIAG source=%s rb_frame=%d local_crc=0x%08X remote_crc=0x%08X\n",
+            source ? source : "unknown", frame, local_crc, remote_crc);
+    if (evidence) {
+        DesyncDiag_WriteEvidence(f, *evidence);
+    } else {
+        fprintf(f, "EVIDENCE none\n");
+    }
+    if (ring) {
+        DesyncDiag_WriteRing(f, *ring);
+    } else {
+        fprintf(f, "RINGCOUNT n=0\n");
+    }
+    DesyncDump_WriteRegionCRCsMachine(f);
+    fprintf(f, "\n");
+
+    // ====== FULL HUMAN-READABLE DUMP ======
+    DesyncDumpParams params{};
+    params.frame       = frame;
+    params.local_crc   = local_crc;
+    params.remote_crc  = remote_crc;
+    params.dump_number = s_dumpCount;
+    params.source      = source;
+    params.detail      = detail;
+    DesyncDump_WriteFullDump(f, params);
+
+    fclose(f);
+    LOG_INFO("[DesyncDump] Diagnostics dump #%d written: %s", s_dumpCount, path);
     return true;
 }
 

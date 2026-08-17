@@ -143,6 +143,7 @@ bool RollbackEngine::Arm(const EngineConfig& config, uint32_t epoch) {
     in_rollback_ = false;
     replay_inputs_pending_ = false;
     pending_mismatch_valid_ = false;
+    desync_evidence_ = DesyncEvidence{};
     advance_plan_valid_ = false;
     lifecycle_exact_next_ = false;
     producer_fenced_ = false;
@@ -814,6 +815,20 @@ HashVerify RollbackEngine::ReceiveSyncHash(const Net::SyncHashPayload& p) {
         // rng/hp are the first diagnostic to read from the dump.
         if (lh->hash != p.gameplay_hash || lh->rng_state != p.rng_state ||
             lh->hp0 != p.hp0 || lh->hp1 != p.hp1) {
+            // Capture the failing pair — every field, both sides — for the
+            // adapter's evidence dump (diagnostics only; nothing in the
+            // decision path reads it).
+            desync_evidence_.valid = true;
+            desync_evidence_.frame = p.frame;
+            desync_evidence_.epoch = p.epoch;
+            desync_evidence_.local_hash = lh->hash;
+            desync_evidence_.peer_hash = p.gameplay_hash;
+            desync_evidence_.local_rng = lh->rng_state;
+            desync_evidence_.peer_rng = p.rng_state;
+            desync_evidence_.local_hp0 = lh->hp0;
+            desync_evidence_.local_hp1 = lh->hp1;
+            desync_evidence_.peer_hp0 = p.hp0;
+            desync_evidence_.peer_hp1 = p.hp1;
             SetTerminal(EngineTerminal::ConfirmedDesync,
                         "sync hash mismatch: frame=%u local=%016llx peer=%016llx "
                         "rng=%08x/%08x hp=%u,%u/%u,%u",

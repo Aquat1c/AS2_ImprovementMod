@@ -1903,6 +1903,13 @@ static uint32_t s_spectatorDispatchCount = 0;
 int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     if (!outputInputs) return -1;
 
+    // F2 render-RNG isolation (SAVESTATE_AUDIT): first sim-side code of a new
+    // outer pass — restore the pre-render CRT rand() seed captured by
+    // Hook_AdvanceFrame so the render phase's rand() consumption never
+    // reaches the sim stream. Must run before any BeginFrame/capture below.
+    // No-op unless a netplay pass captured (see input_sync_hooks.cpp).
+    InputSyncHooks_RestoreRenderRngIfPending();
+
     const uint32_t gameMode = GetGameMode();
     const uint32_t subState = GetSubstate();
 

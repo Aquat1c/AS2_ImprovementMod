@@ -14,7 +14,25 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "rollback/desync_diag.h"
+
 namespace Rollback {
+
+/// One gameplay-state region (mirrors the snapshot CAPTURE membership —
+/// diagnostics only, this table never drives capture/restore).
+struct DesyncRegionInfo {
+    const char* name;   // token-safe (no spaces): machine lines + comparator
+    uintptr_t   addr;
+    size_t      size;
+};
+
+/// The shared region table used by both the human "Region CRC Breakdown"
+/// section and the machine `REGION` lines. Returns entry count.
+size_t DesyncDump_GetRegionTable(const DesyncRegionInfo** out);
+
+/// Machine-greppable per-region CRC lines of live game memory:
+///   REGION name=<token> addr=0x<08X> size=<zu> crc=0x<08X>
+void DesyncDump_WriteRegionCRCsMachine(FILE* f);
 
 /// Parameters for a desync dump.
 struct DesyncDumpParams {
@@ -67,6 +85,23 @@ bool DesyncDump_TryDump(int32_t frame,
 
 /// Writes a dedicated baseline-mismatch dump file with bootstrap context.
 bool DesyncDump_TryBaselineMismatchDump(const BaselineMismatchDumpParams& params);
+
+/// ConfirmedDesync evidence dump (re0.7 post-M8 divergence diagnostics):
+/// writes a machine-readable section FIRST — the failing SyncHash pair
+/// (`EVIDENCE`/`FIRSTDIVERGENT`), the confirmed-frame diagnostic ring
+/// (`RING`, oldest first), and per-region live CRCs (`REGION`) — then the
+/// full human-readable state dump. Both sides of a desync produce one
+/// (detector via ReportEngineTerminal, survivor via the goodbye hook);
+/// feed the two files to tools/compare_desync_dumps.py.
+/// `ring` and `evidence` may be null (sections degrade gracefully).
+/// Same cooldown discipline as DesyncDump_TryDump.
+bool DesyncDump_TryDumpWithDiagnostics(int32_t frame,
+                                       uint32_t local_crc,
+                                       uint32_t remote_crc,
+                                       const char* source,
+                                       const char* detail,
+                                       const DesyncDiagRing* ring,
+                                       const DesyncEvidence* evidence);
 
 /// Feed a per-frame checksum into the dump module's local ring buffer.
 /// Call from rollback_debug each frame so dumps can show nearby checksums.

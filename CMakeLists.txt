@@ -292,6 +292,7 @@ set(ROLLBACK_HEADERS
     include/rollback/rollback_telemetry.h
     include/rollback/run_state.h
     include/rollback/rollback_debug.h
+    include/rollback/desync_diag.h
     include/rollback/desync_dump.h
     include/rollback/netplay_log.h
     include/rollback/rollback_audio.h
@@ -420,6 +421,7 @@ set(ROLLBACK_SOURCES
     src/rollback/prediction.cpp
     src/rollback/resimulation.cpp
     src/rollback/rollback_debug.cpp
+    src/rollback/desync_diag.cpp
     src/rollback/desync_dump.cpp
     src/rollback/netplay_log.cpp
     src/rollback/rollback_audio.cpp
@@ -615,6 +617,7 @@ add_test(NAME transition_barrier_tests COMMAND transition_barrier_tests)
 add_executable(engine2_tests
     tests/engine2_tests.cpp
     src/rollback/engine2.cpp
+    src/rollback/desync_diag.cpp
 )
 
 target_include_directories(engine2_tests PRIVATE

@@ -15,6 +15,9 @@
  *   6. Per-frame temp scratch region (match+0x700, 68 bytes)
  *   7. Input buffers (P1 + P2 current input state, 208 bytes each)
  *   8. Match phase timer (intro lock countdown)
+ *   9. AI pattern-learning statics (0x76C5D8..E7, SAVESTATE_AUDIT F1)
+ *  10. Frame_Display sim counter (0x816494, SAVESTATE_AUDIT F3 — distinct
+ *      from the render-loop counter 0x81635C)
  *
  * FPU state (x87 CW, MXCSR) is NOT saved/restored — diagnostic only.
  * A comment marks where it could be added if desync evidence points there.

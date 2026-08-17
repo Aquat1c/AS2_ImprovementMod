@@ -35,6 +35,7 @@
 
 #include "net/frame_arithmetic.h"
 #include "net/protocol.h"
+#include "rollback/desync_diag.h"
 #include "rollback/input_timeline.h"
 #include "rollback/prediction.h"
 #include "rollback/run_state.h"
@@ -293,6 +294,16 @@ public:
     /// after confirmation advances (adapter: once per pass).
     HashVerify PumpSyncHashVerify();
 
+    /// Evidence of the failing SyncHash pair (local vs peer, ALL fields),
+    /// captured at the instant the ConfirmedDesync terminal was set.
+    /// Additive diagnostics: nothing in the decision path reads it.
+    /// Returns false until a mismatch has occurred (cleared at Arm).
+    bool GetDesyncEvidence(DesyncEvidence* out) const {
+        if (!desync_evidence_.valid) return false;
+        if (out) *out = desync_evidence_;
+        return true;
+    }
+
     // ── Wire building (§3.2) ────────────────────────────────────────────────
 
     /// Redundant window anchored at peer_ack_through+1 — exactly the
@@ -427,6 +438,9 @@ private:
 
     bool     pending_mismatch_valid_ = false;
     uint32_t pending_mismatch_ = 0;
+
+    // ConfirmedDesync evidence (diagnostics only; see GetDesyncEvidence).
+    DesyncEvidence desync_evidence_{};
 
     // Advance plan seal (NextAction -> CommitAdvance).
     bool     advance_plan_valid_ = false;

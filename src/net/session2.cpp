@@ -39,6 +39,7 @@
 #include "patches/tick_hooks.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
+#include "rollback/rollback_session.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -182,6 +183,18 @@ static void SetError(const char* msg) {
     TickHooks_ClearFrameLimiter60FpsSessionOverride(msg ? msg : "session error");
     Nat_StopServices();
     SetState(SessionState::Failed);
+}
+
+// fnv1a32 of a typed terminal reason name — the wire's `reason_id` (M4 §3.2
+// terminal shape). Shared by the goodbye builder in Session2_Terminate and
+// the Disconnect-receive classifier.
+static uint32_t Fnv1a32(const char* s) {
+    uint32_t hash = 2166136261u;
+    for (const char* c = s; *c; ++c) {
+        hash ^= (uint8_t)*c;
+        hash *= 16777619u;
+    }
+    return hash;
 }
 
 static bool IsCompatibilityDisconnectData(uint32_t data) {
@@ -1652,6 +1665,16 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
             Rollback::NetplayLog_Write("SESSION", -1,
                 "Remote Disconnect received: code=%u reason_id=0x%08X human=%s",
                 code, reasonId, reason);
+            // Peer-detected ConfirmedDesync (post-M8 divergence diagnostics):
+            // the surviving side dumps ITS diagnostic ring + region CRCs for
+            // the same frame window before teardown completes, so both dump
+            // files exist for tools/compare_desync_dumps.py. Bounded file
+            // write; the teardown below proceeds unchanged (no new kill path).
+            if (reasonId != 0 &&
+                reasonId == Fnv1a32(Session2TerminalReasonName(
+                    Session2TerminalReason::ConfirmedDesync))) {
+                Rollback::RollbackSession_NotifyPeerDesyncGoodbye(reason);
+            }
             if (s_activeSessionToken != 0) {
                 Transport2_RequestDisconnect(s_activeSessionToken, 0, true);
                 Transport2_RequestDestroyHost(s_activeSessionToken);
@@ -2011,15 +2034,7 @@ void Session2_Terminate(Session2TerminalReason reason, const char* detail) {
         // hash of the typed reason name + bounded human string.
         DisconnectPayload dp{};
         dp.code = static_cast<uint8_t>(disconnectData);
-        {
-            const char* name = Session2TerminalReasonName(reason);
-            uint32_t hash = 2166136261u;
-            for (const char* c = name; *c; ++c) {
-                hash ^= (uint8_t)*c;
-                hash *= 16777619u;
-            }
-            dp.reason_id = hash;
-        }
+        dp.reason_id = Fnv1a32(Session2TerminalReasonName(reason));
         strncpy(dp.human, text, sizeof(dp.human) - 1);
         dp.human[sizeof(dp.human) - 1] = '\0';
         QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect,

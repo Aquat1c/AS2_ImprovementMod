@@ -127,7 +127,7 @@ keep the window covering the rematch boundaries — §7.5#2 is end-to-end.
 |---|---|---|---|
 | **R-SOAK-100** | Two instances, autoconnect: `match_count=101`, `soak_rematches=100`, `continue_no_every=4` (≈75 fast-path + ≈25 charsel cycles), `AS2_NET_INJECT_DROP_PCT=3` both sides | Both logs end `verdict=SOAK-PASS`. The soak itself now asserts: epoch strictly increasing per handoff, no epoch regression, canonical counter monotonic across the WHOLE session (INV-15), session never dies. | both `SOAK` summaries + §4 grep checklist |
 | **R-SOAK-YES** (optional pure-fast-path) | as above, no `continue_no_every` | 100 fast-path cycles (`fastpath=100` in SUMMARY) | same |
-| **R-DET** | Harness two-instance scripted run, 15k+ battle frames, StressHooks 3% drop + delivery-delay jitter | zero desyncs, hash chain clean (reference bar: QOH99's 13 230 frames / 0 mismatches at 40±15 ms + 3% loss); determinism_verify + debug resim self-check enabled | launcher final summary: `dsync=0`; no `ConfirmedDesync` |
+| **R-DET** | Harness two-instance scripted run, 15k+ battle frames, StressHooks 3% drop + delivery-delay jitter | zero desyncs, hash chain clean (reference bar: QOH99's 13 230 frames / 0 mismatches at 40±15 ms + 3% loss); determinism_verify + debug resim self-check enabled | launcher final summary: `dsync=0`; no `ConfirmedDesync`. If one DOES fire: both sides now write a `desync_dump_*` (detector + goodbye-survivor) — run `python tools/compare_desync_dumps.py <A> <B>` to get the first divergent confirmed frame, field, region-CRC diff, and input context |
 | **R-SPEC** (M7 gate) | Spectate a full 3-match rematch session; include a late join mid-match and a starve test (block the sidecar feed briefly) | late join: deep-backlog catch-up ladder, joins cleanly; starve: elastic slow-motion (950/850/700‰), NEVER freeze-then-sprint; prime ≈4 s cushion is by design | `SPLAY` log: prime/rebuffer/elastic transitions + S-4 `ACQUIRED` line; zero spectator desync exits |
 | **R-REPLAY** (M7 gate) | Replay the R-SPEC session's files | plays back hash-clean | zero `REPLAY DESYNC` lines (`incident_replay_desync` gate) |
 
@@ -221,7 +221,7 @@ suites; `harness` = covered by a §2 run; `manual` = §2.6 spot check.
 | F-5..F-7 | R-SOAK-100 with `continue_no_every` (simultaneous resolution, AFK timeout via one side idle, F-7 guard silent) |
 | F-8 | R-SOAK-100 fast-path cycles (freeze-coverage window) |
 | F-9..F-12 | R-SOAK-100 + F-10 manual; F-12 needs a deliberate content mismatch (edit a data file on one side → one retry then `BaselineMismatch` terminal) |
-| D-1..D-5 | R-DET + StressHooks forced mismatches (D-1 evidence dumps both sides); D-5 debug build resim self-check |
+| D-1..D-5 | R-DET + StressHooks forced mismatches (D-1 evidence dumps both sides: the detector dumps from `ReportEngineTerminal`, the survivor dumps on the `ConfirmedDesync` goodbye; each file opens with the machine section — `EVIDENCE`/`FIRSTDIVERGENT`, 64-frame confirmed `RING`, per-region `REGION` CRCs — feed BOTH files to `tools/compare_desync_dumps.py` to localize the first divergent confirmed frame + field); D-5 debug build resim self-check |
 | S-1..S-6 | R-SPEC + R-REPLAY |
 | B-1..B-7 | R-SOAK-100 (B-1/B-4/B-5 arise naturally) + manual B-2/B-6/B-7 |
 

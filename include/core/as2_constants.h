@@ -92,6 +92,11 @@
 #define ADDR_MATCH_HUD_RENDER     (GAME_BASE + 0x0C05B0) // sub_4C05B0 — match HUD (nickname bars)
 #define ADDR_NAME_BAR_TEXTURE     0x816038               // dword_816038 — gradient bar texture
 #define ADDR_SE_PLAY            (GAME_BASE + 0x0C3C00)  // sub_4C3C00 — SE_Play (actual sound effect trigger)
+#define ADDR_MATCH_SCORE_STATS  (GAME_BASE + 0x15BCD0)  // sub_55BCD0 — Match_UpdateScoreStats: cumulative
+                                                        // score/rank/continuation `+=` globals OUTSIDE the snapshot
+                                                        // regions, called on the round-end commit tick. Hooked so a
+                                                        // rollback resim across the commit cannot double-apply
+                                                        // (SAVESTATE_AUDIT F6).
 
 // Legacy aliases (kept for backward compatibility / reference)
 #define ADDR_SOUND_TRIGGER      ADDR_EFFECT_SET_PARAMS   // DEPRECATED: was misidentified as sound trigger
@@ -115,6 +120,14 @@
 
 // Debug/Logging
 #define ADDR_QUIT_FLAG          0x816358
+// NAMING TRAP (SAVESTATE_AUDIT §1): ADDR_FRAME_COUNTER (0x81635C) is the
+// RENDER-LOOP frame counter (++ once per Game_MainLoop pass, presentation
+// side, TIMING — excluded from the gameplay digest). Its near-namesake
+// ADDR_FRAME_DISPLAY (0x816494, `Frame_Display`) is SIM state: incremented
+// once per SIM tick by Frame_AdvanceDisplay and read by sim logic every tick
+// (215900 forced-draw check, replay-end check). Do not confuse the two —
+// 0x816494 is captured/restored/HASHED by GameSnapshot; 0x81635C is
+// captured/restored but never hashed.
 #define ADDR_FRAME_COUNTER      0x81635C
 #define ADDR_SIM_FRAME_COUNTER  0x816490
 #define ADDR_LAST_FRAME_TIME    0x816360
@@ -128,7 +141,9 @@
 // ============================================================================
 
 #define ADDR_FRAME_SIMULATION   0x816490
-#define ADDR_FRAME_DISPLAY      0x816494
+#define ADDR_FRAME_DISPLAY      0x816494  // `Frame_Display` — SIM state (see naming-trap
+                                          // note at ADDR_FRAME_COUNTER above): ++ per sim
+                                          // tick, sim-read (215900 forced-draw check).
 #define ADDR_FRAME_WRITE_IDX    0x816498
 #define ADDR_FRAME_NET_IDX      0x81649C
 #define ADDR_REMOTE_FRAME       0x87FC20
@@ -395,6 +410,24 @@
 #define ADDR_PRE_MATCH_GAP      0x76C5EC
 #define PRE_MATCH_GAP_SIZE      12        // 0x76C5EC to 0x76C5F7 inclusive
 
+// AI pattern-learning cross-frame statics (SAVESTATE_AUDIT F1): four dwords
+// immediately below ADDR_EFFECT_INDEX — dword_76C5D8/dword_76C5DC
+// (AI_ExecutePattern, decomp L101691) and dword_76C5E0/dword_76C5E4
+// (AI_RecordPattern, decomp L101854). They gate CRT rand() consumption and
+// persist across matches, so they are captured, restored AND hashed by
+// GameSnapshot (SIM region). Zeroed at the netplay startup handoff so both
+// peers hash identical values from frame 0.
+#define ADDR_AI_LEARN_STATICS   0x76C5D8
+#define AI_LEARN_STATICS_SIZE   16        // 0x76C5D8 .. 0x76C5E7 inclusive
+
+// AI learning master gate: the config.dat "CPU learning" option byte
+// (`AI_PatternModeEnabled` = byte_8E940D, loaded at decomp L200417). Gates
+// AI_RecordPattern (runs for HUMAN players too, twice per sim tick), the
+// substate-0 learning-block load (sub_49FE50) and the match-end save/free
+// (sub_4A0A90). Forced to 0 for the duration of a netplay session by the
+// match director (SAVESTATE_AUDIT F1 fix).
+#define ADDR_AI_PATTERN_MODE    0x8E940D
+
 #define ADDR_EFFECT_ARRAY       0x76E328  // dword_76E328[] - Effect entity pointers
 #define ADDR_EFFECT_INDEX       0x76C5E8  // dword_76C5E8 - Current write index (wraps at 200)
 #define ADDR_EFFECT_TYPE        0x76E32C  // byte_76E32C[] - Effect type per slot
@@ -652,6 +685,28 @@
 #define ENTITY_OFF_RENDER_FLASH_FLAG     0x01B4  // +436, BYTE, extra flash/afterimage draw flag
 #define ENTITY_OFF_RENDER_TINT_STATE     0x01B8  // +440, DWORD, 1 disables extra tint pass in sub_4C6B60
 #define ENTITY_OFF_RENDER_TINT_TIMER     0x01BC  // +444, DWORD
+// +440/+444 are advanced/terminated by the RENDER-phase player renderer
+// (sub_4C6B60, once per render frame) but live inside the hashed main_state
+// region → digest-MASKED (captured/restored, never hashed). SAVESTATE_AUDIT F5.
+#define ENTITY_RENDER_TINT_MASK_SIZE     8       // +440..+447 (both dwords)
+
+// Super/stage animated-background scratch (SAVESTATE_AUDIT F2): the render
+// phase (sub_4C47C0, post-loop) dispatches on the sim-set state dword at
+// entity+1244 and mutates the per-player particle field block around
+// entity+1248..+1850 at RENDER cadence (and calls rand() — see the render-RNG
+// isolation in input_sync_hooks.cpp). Digest-MASKED per the audit fix list
+// (mask +1244..+1850, both players); mask end rounded up to the +1852 dword
+// boundary so the last mutated field (+1850) is fully covered.
+#define ENTITY_OFF_SUPERBG_STATE         0x04DC  // +1244, DWORD — dispatch state (sim-set)
+#define ENTITY_SUPERBG_SCRATCH_MASK_SIZE 0x0260  // 608 B: +1244 .. +1851 inclusive
+
+// Character voice bookkeeping (SAVESTATE_AUDIT F4): 3 dwords per entity at
+// +107084 driven by Entity_UpdateAudio (sub_4C38F0) — [0] requested voice id
+// (sim-written), [1] priority latch, [2] last-played id. [1]/[2] writes are
+// gated by Audio_IsPlaying (live DSound buffer status = wall clock), so the
+// block is captured/restored but digest-MASKED.
+#define ENTITY_OFF_VOICE_BOOKKEEPING     0x1A24C // +107084 .. +107095
+#define ENTITY_VOICE_BOOKKEEPING_SIZE    12
 #define ENTITY_OFF_RENDER_MAIN_SPRITE    0x0818  // +2072, DWORD, main sprite/texture index
 #define ENTITY_OFF_RENDER_GROUP          0x081C  // +2076, DWORD, render group/mode
 #define ENTITY_OFF_RENDER_OVERLAY_SPRITE 0x0820  // +2080, DWORD, -1 or overlay sprite index

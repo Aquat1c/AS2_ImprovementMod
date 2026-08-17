@@ -691,6 +691,138 @@ void TestSyncHashCadence() {
     TEST_CHECK(q.Terminal() == EngineTerminal::HashQueueOverflow, "overflow terminal");
 }
 
+// ── Desync divergence diagnostics (post-M8): ring, evidence, formatting ─────
+
+void TestDesyncDiagnostics() {
+    // Ring semantics: capacity 64, oldest-first indexing, overwrite oldest.
+    DesyncDiagRing ring;
+    TEST_CHECK(ring.Count() == 0, "fresh ring empty");
+    DesyncDiagEntry probe{};
+    TEST_CHECK(!ring.At(0, &probe), "At() on empty ring fails");
+
+    for (uint32_t i = 0; i < 100; ++i) {
+        DesyncDiagEntry e{};
+        e.frame = i;
+        e.epoch = 1;
+        e.gameplay_hash = 0x1000ull + i;
+        e.rng = 0xAB000000u + i;
+        e.hp0 = (uint16_t)(500 - i);
+        e.hp1 = (uint16_t)(400 - i);
+        e.p1_input = (uint16_t)(i & 0x3FFF);
+        e.p2_input = (uint16_t)((i * 3) & 0x3FFF);
+        ring.Push(e);
+    }
+    TEST_CHECK(ring.Count() == DESYNC_DIAG_RING_CAPACITY, "ring capped at 64");
+    TEST_CHECK(ring.At(0, &probe) && probe.frame == 36,
+               "oldest retained is frame 36 (100 pushed - 64)");
+    TEST_CHECK(ring.At(63, &probe) && probe.frame == 99, "newest is frame 99");
+    TEST_CHECK(!ring.At(64, &probe), "At(capacity) fails");
+    ring.Reset();
+    TEST_CHECK(ring.Count() == 0 && !ring.At(0, &probe), "Reset empties");
+
+    // Formatting pins: deterministic content, no wall clock anywhere.
+    DesyncDiagEntry fe{};
+    fe.frame = 209;
+    fe.epoch = 3;
+    fe.gameplay_hash = 0x0123456789ABCDEFull;
+    fe.rng = 0xDEADBEEFu;
+    fe.hp0 = 500;
+    fe.hp1 = 32;
+    fe.p1_input = 0x0005;
+    fe.p2_input = 0x2001;
+    char line[192];
+    DesyncDiag_FormatRingEntry(fe, line, sizeof(line));
+    TEST_CHECK(std::strcmp(line,
+        "RING frame=209 epoch=3 hash=0123456789abcdef rng=deadbeef "
+        "hp0=500 hp1=32 p1=0x0005 p2=0x2001") == 0,
+        "ring line format pinned");
+
+    DesyncEvidence ev{};
+    ev.valid = true;
+    ev.frame = 209;
+    ev.epoch = 3;
+    ev.local_hash = 0x1111111111111111ull;
+    ev.peer_hash  = 0x2222222222222222ull;
+    ev.local_rng = 0x00000010u;
+    ev.peer_rng  = 0x00000010u;
+    ev.local_hp0 = 100; ev.peer_hp0 = 100;
+    ev.local_hp1 = 50;  ev.peer_hp1 = 50;
+    char eline[320];
+    DesyncDiag_FormatEvidence(ev, eline, sizeof(eline));
+    TEST_CHECK(std::strcmp(eline,
+        "EVIDENCE frame=209 epoch=3 local_hash=1111111111111111 "
+        "peer_hash=2222222222222222 local_rng=00000010 peer_rng=00000010 "
+        "local_hp0=100 local_hp1=50 peer_hp0=100 peer_hp1=50 "
+        "first_divergent=hash") == 0,
+        "evidence line format pinned");
+
+    // First-divergent-field priority mirrors ReceiveSyncHash comparison
+    // order: hash (authoritative) > rng > hp0 > hp1.
+    TEST_CHECK(std::strcmp(DesyncEvidence_FirstDivergentField(ev), "hash") == 0,
+               "hash diff wins");
+    ev.peer_hash = ev.local_hash;
+    ev.peer_rng = 0x00000011u;
+    TEST_CHECK(std::strcmp(DesyncEvidence_FirstDivergentField(ev), "rng") == 0,
+               "rng next");
+    ev.peer_rng = ev.local_rng;
+    ev.peer_hp0 = 99;
+    TEST_CHECK(std::strcmp(DesyncEvidence_FirstDivergentField(ev), "hp0") == 0,
+               "hp0 next");
+    ev.peer_hp0 = ev.local_hp0;
+    ev.peer_hp1 = 49;
+    TEST_CHECK(std::strcmp(DesyncEvidence_FirstDivergentField(ev), "hp1") == 0,
+               "hp1 last");
+    ev.peer_hp1 = ev.local_hp1;
+    TEST_CHECK(std::strcmp(DesyncEvidence_FirstDivergentField(ev), "none") == 0,
+               "all-equal is none");
+    DesyncEvidence inv{};
+    TEST_CHECK(std::strcmp(DesyncEvidence_FirstDivergentField(inv), "none") == 0,
+               "invalid evidence is none");
+
+    // Engine capture: the ConfirmedDesync terminal must leave the FULL
+    // failing pair readable (all SyncHash fields, both sides).
+    RollbackEngine e;
+    e.Arm(MakeConfig(0, 0, 8), 1);
+    DesyncEvidence pre{};
+    TEST_CHECK(!e.GetDesyncEvidence(&pre), "no evidence before any mismatch");
+    for (uint32_t f = 0; f < 30; ++f) {
+        e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+        e.ReceiveRemoteInput(f, 0x0000);
+        const EngineAction a = e.NextAction();
+        e.CommitAdvance(a.frame, 0xAB00 + f,
+                        /*rng=*/0x11110000u + f,
+                        /*hp0=*/(uint16_t)(300 + f),
+                        /*hp1=*/(uint16_t)(200 + f));
+    }
+    Net::SyncHashPayload p{};
+    p.epoch = 1;
+    p.frame = 29;
+    p.gameplay_hash = 0xAB00 + 29;           // matches local
+    p.rng_state = 0x22220000u;               // diverges
+    p.hp0 = (uint16_t)(300 + 29);
+    p.hp1 = (uint16_t)(200 + 29);
+    TEST_CHECK(e.ReceiveSyncHash(p) == HashVerify::Mismatch, "mismatch fires");
+    TEST_CHECK(e.Terminal() == EngineTerminal::ConfirmedDesync,
+               "ConfirmedDesync terminal");
+    DesyncEvidence got{};
+    TEST_CHECK(e.GetDesyncEvidence(&got), "evidence captured");
+    TEST_CHECK(got.frame == 29 && got.epoch == 1, "evidence frame/epoch");
+    TEST_CHECK(got.local_hash == 0xAB00 + 29 && got.peer_hash == 0xAB00 + 29,
+               "hashes recorded (equal here)");
+    TEST_CHECK(got.local_rng == 0x11110000u + 29 && got.peer_rng == 0x22220000u,
+               "rng pair recorded");
+    TEST_CHECK(got.local_hp0 == 300 + 29 && got.peer_hp0 == 300 + 29 &&
+               got.local_hp1 == 200 + 29 && got.peer_hp1 == 200 + 29,
+               "hp pairs recorded");
+    TEST_CHECK(std::strcmp(DesyncEvidence_FirstDivergentField(got), "rng") == 0,
+               "localizes the divergent field (rng)");
+
+    // Re-arm clears the evidence (fresh session, fresh diagnostics).
+    e.Disarm();
+    e.Arm(MakeConfig(0, 0, 8), 2);
+    TEST_CHECK(!e.GetDesyncEvidence(nullptr), "Arm clears evidence");
+}
+
 // ── Lifecycle window predicate (INV-25 / M4-7) ──────────────────────────────
 
 void TestLifecycleWindow() {
@@ -870,6 +1002,7 @@ int main() {
     TestWrapSafety();           // T-ENG-10
     TestEpochRotation();        // T-ENG-11
     TestSyncHashCadence();      // T-ENG-12
+    TestDesyncDiagnostics();    // post-M8 divergence diagnostics
     TestLifecycleWindow();      // INV-25 / M4-7 predicate
     SoakRun();                  // §7.2 socket-free soak (M4 exit gate)
     Microbench();               // §7.5 #4

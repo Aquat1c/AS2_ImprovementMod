@@ -129,6 +129,13 @@ void RollbackSession_OnInputStreamPacket(const void* data, size_t len);
 /// verification). Feeds the engine's hash queue.
 void RollbackSession_OnSyncHashPacket(const void* data, size_t len);
 
+/// The peer's goodbye named ConfirmedDesync (session2 Disconnect-receive
+/// path): dump the surviving side's diagnostic ring + per-region CRCs for
+/// the same confirmed-frame window before teardown completes. Bounded
+/// (one cooldown-guarded file write); introduces no new kill path.
+/// `human` is the peer's human-readable reason string (may be null).
+void RollbackSession_NotifyPeerDesyncGoodbye(const char* human);
+
 // ============================================================================
 // Queries
 // ============================================================================

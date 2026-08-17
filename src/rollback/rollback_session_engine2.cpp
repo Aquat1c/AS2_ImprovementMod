@@ -34,6 +34,7 @@
 #include "patches/frame_scheduler.h"
 #include "rollback/determinism_verify.h"
 #include "patches/memory_utils.h"
+#include "rollback/desync_diag.h"
 #include "rollback/desync_dump.h"
 #include "rollback/engine2.h"
 #include "rollback/lifecycle_window.h"
@@ -112,6 +113,14 @@ constexpr DWORD kIdleResendMs = 50;   // §2.7.3-X
 uint32_t s_localInputsSent = 0;
 uint32_t s_remoteInputsRecv = 0;
 
+// Rolling diagnostic ring (post-M8 divergence diagnostics): the last
+// DESYNC_DIAG_RING_CAPACITY confirmed frames' hash/rng/hp/inputs, fed from
+// the confirm seam — cheap, always on during netplay. Adapter-owned (the
+// engine stays free of dump concerns); dumped on either side's
+// ConfirmedDesync so tools/compare_desync_dumps.py can localize the
+// divergent frame/field from the two files.
+DesyncDiagRing s_diagRing;
+
 int32_t RbFrame(uint32_t canonical) {
     return (int32_t)(canonical - s_engine.FirstFrame());
 }
@@ -159,9 +168,29 @@ void ReportEngineTerminal() {
     switch (t) {
         case EngineTerminal::ConfirmedDesync: {
             // Evidence dump BEFORE terminating (D-1: whoever detects, decides).
-            DesyncDump_TryDump(RbFrame(s_engine.ConfirmedFrontier()),
-                               ComputeLiveChecksumInternal(), 0,
-                               "engine2-synchash", s_engine.TerminalDetail());
+            // The engine captured the failing SyncHash pair; name the first
+            // divergent field (hash > rng > hp) and the confirmed frame, then
+            // dump the diagnostic ring + per-region CRCs alongside it.
+            DesyncEvidence ev{};
+            const bool haveEv = s_engine.GetDesyncEvidence(&ev);
+            if (haveEv) {
+                NetplayLog_Write("ROLLBACK", RbFrame(ev.frame),
+                    "CONFIRMED DESYNC localization: frame=%u (rb %d) "
+                    "first_divergent=%s local_hash=%016llx peer_hash=%016llx "
+                    "local_rng=%08x peer_rng=%08x local_hp=%u,%u peer_hp=%u,%u",
+                    ev.frame, RbFrame(ev.frame),
+                    DesyncEvidence_FirstDivergentField(ev),
+                    (unsigned long long)ev.local_hash,
+                    (unsigned long long)ev.peer_hash,
+                    ev.local_rng, ev.peer_rng,
+                    ev.local_hp0, ev.local_hp1, ev.peer_hp0, ev.peer_hp1);
+                NetplayLog_Flush();
+            }
+            DesyncDump_TryDumpWithDiagnostics(
+                haveEv ? RbFrame(ev.frame) : RbFrame(s_engine.ConfirmedFrontier()),
+                ComputeLiveChecksumInternal(), 0,
+                "engine2-synchash", s_engine.TerminalDetail(),
+                &s_diagRing, haveEv ? &ev : nullptr);
             Net::Session2_Terminate(Net::Session2TerminalReason::ConfirmedDesync,
                                     s_sessionError);
             break;
@@ -228,6 +257,22 @@ void DrainConfirmSeam() {
     while (s_engine.PopConfirmedFrame(&cf)) {
         const int32_t rb = RbFrame(cf.frame);
         DesyncDump_StoreChecksum(rb, (uint32_t)cf.pre_state_hash);
+
+        // Divergence-diagnostics ring (post-M8): confirmed frames only —
+        // exactly the values a SyncHash exchange compares, plus the
+        // canonical input pair, so both sides can localize a desync.
+        {
+            DesyncDiagEntry de{};
+            de.frame = cf.frame;
+            de.epoch = cf.epoch;
+            de.gameplay_hash = cf.pre_state_hash;
+            de.rng = cf.rng_state;
+            de.hp0 = cf.hp0;
+            de.hp1 = cf.hp1;
+            de.p1_input = cf.inputs[0];
+            de.p2_input = cf.inputs[1];
+            s_diagRing.Push(de);
+        }
 
         // Match-relative numbering (0-based per epoch): the sidecar protocol
         // and the replay tape keep the per-match frame identity the 0.6
@@ -368,6 +413,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
                 StateHistory_Reset();
                 StateHistory_SetTagContext(s_epoch, /*phase=*/(uint32_t)MODE_MATCH);
                 DesyncDump_Reset();
+                s_diagRing.Reset();
 
                 // Delay may have changed between matches (peer-local knob).
                 const int delay = config.initial_delay < 0 ? 0
@@ -440,6 +486,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     StateHistory_Reset();
     StateHistory_SetTagContext(s_epoch, /*phase=*/(uint32_t)MODE_MATCH);
     DesyncDump_Reset();
+    s_diagRing.Reset();
 
     ApplyStressHooks(s_engine);
 
@@ -995,6 +1042,33 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
 
 uint32_t RollbackSession_ComputeLiveStateChecksum() {
     return ComputeLiveChecksumInternal();
+}
+
+void RollbackSession_NotifyPeerDesyncGoodbye(const char* human) {
+    // The PEER detected the ConfirmedDesync and its goodbye names it; dump
+    // OUR matching half of the evidence (ring + region CRCs for the same
+    // confirmed-frame window) before teardown completes, so both files
+    // exist for tools/compare_desync_dumps.py. Bounded: one cooldown-guarded
+    // file write + a log line — no termination logic lives here (the
+    // existing Disconnect-receive path proceeds unchanged).
+    if (!s_active && !s_suspended) {
+        return;  // nothing recorded — no session ring to dump
+    }
+    const int32_t rbConfirmed = RbFrame(s_engine.ConfirmedFrontier());
+    NetplayLog_Write("ROLLBACK", rbConfirmed,
+        "peer goodbye reason=ConfirmedDesync — dumping surviving-side "
+        "diagnostics (confirmed=%d, peer said: %s)",
+        rbConfirmed, (human && human[0]) ? human : "?");
+    NetplayLog_Flush();
+
+    // This side usually never saw a mismatch (its verify raced the peer's),
+    // but include local evidence when it exists (both-sides-detect race).
+    DesyncEvidence ev{};
+    const bool haveEv = s_engine.GetDesyncEvidence(&ev);
+    DesyncDump_TryDumpWithDiagnostics(rbConfirmed,
+                                      ComputeLiveChecksumInternal(), 0,
+                                      "peer-synchash-goodbye", human,
+                                      &s_diagRing, haveEv ? &ev : nullptr);
 }
 
 } // namespace Rollback

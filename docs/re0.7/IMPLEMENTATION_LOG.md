@@ -2151,3 +2151,208 @@ lands alongside it.
 5. Deleted `LogWindow_LogGekko`: grep proved zero live callers, but the
    mod-menu/log-window ImGui panel should be compiled to confirm no
    stragglers behind macros.
+
+## 2026-08-17 — Post-M8: desync divergence diagnostics (audit + upgrade)
+
+### Question answered
+
+**Could both sides localize a ConfirmedDesync from what they recorded?**
+No. Audit findings:
+
+- The detector's dump (`ReportEngineTerminal` → `DesyncDump_TryDump`) carried
+  the peer's failing SyncHash values only inside the 160-char terminal-detail
+  string (`remote_crc` was passed as 0); no structured local-vs-peer pair.
+- No record existed of the confirmed-frame hash chain the SyncHash exchange
+  actually compares: `DesyncDump_StoreChecksum` was a no-op stub, the dump's
+  "Checksum History" is rollback_debug's live-frame CRC32 (a different
+  digest), and its "Input History" is the game's raw ring — indices, not
+  canonical confirmed frames, not guaranteed final values.
+- The engine's cadence ring held only every 30th confirmed frame and had no
+  external accessor.
+- **The surviving side dumped nothing**: the `Disconnect` goodbye carries
+  `reason_id` (fnv1a32 of the reason name) + human text, but the receive
+  path in session2.cpp went straight to `SetError` — one-sided evidence,
+  no way to diff.
+- The per-region CRC breakdown existed only in human format, duplicated
+  inline, with no machine counterpart to diff across peers.
+
+### What was added (diagnostics only; capture membership untouched; wire pins intact — zero new/changed packets)
+
+- **`include/rollback/desync_diag.h` + `src/rollback/desync_diag.cpp`** (new,
+  pure: no Win32/game memory/clock): `DesyncDiagRing` (64 confirmed frames of
+  `{frame, epoch, gameplay_hash, rng, hp0, hp1, p1_input, p2_input}` — spans
+  two SyncHash cadence intervals), `DesyncEvidence` (the failing pair, all
+  fields both sides), `DesyncEvidence_FirstDivergentField` (hash > rng >
+  hp0 > hp1, mirroring `ReceiveSyncHash` comparison order), and deterministic
+  `RING`/`EVIDENCE`/`FIRSTDIVERGENT` line formatters (timestamps live only in
+  dump file headers).
+- **engine2** (additive, still clock-free): `ReceiveSyncHash` captures the
+  full failing pair into `desync_evidence_` when setting the ConfirmedDesync
+  terminal; `GetDesyncEvidence()` accessor; cleared at `Arm`.
+- **Adapter** (`rollback_session_engine2.cpp`): `s_diagRing` fed from the
+  confirm seam in `DrainConfirmSeam` (always on during netplay, reset on
+  Begin/rotation). ConfirmedDesync path now logs the localization line
+  (first divergent field + frame) and writes
+  `DesyncDump_TryDumpWithDiagnostics` (machine section first: EVIDENCE +
+  FIRSTDIVERGENT + 64-entry RING + per-region REGION CRCs, then the full
+  human dump). New `RollbackSession_NotifyPeerDesyncGoodbye()` dumps the
+  surviving side's ring + regions.
+- **session2.cpp**: fnv1a32 helper factored out of `Session2_Terminate`; the
+  `Disconnect`-receive path calls the goodbye hook when
+  `reason_id == fnv1a32("ConfirmedDesync")` — bounded single file write
+  before the unchanged teardown (no new kill path).
+- **desync_dump**: region table factored into one shared
+  `DesyncDump_GetRegionTable` (11 regions, token names) used by both the
+  human breakdown and the new machine `REGION` writer.
+- **`tools/compare_desync_dumps.py`** (new): takes both sides' dumps, prints
+  first divergent confirmed frame, divergent fields, region-CRC diff table,
+  and the ±8-frame input context (flags canonical-input disagreement, which
+  would mean the input stream itself broke).
+- **engine2_tests**: `TestDesyncDiagnostics()` pins ring capacity/order/wrap,
+  both line formats byte-exact, first-divergent priority, engine evidence
+  capture on a real mismatch terminal, and Arm-clears-evidence.
+- **M8_ACCEPTANCE_RUNBOOK.md**: R-DET row + D-1..D-5 row now reference the
+  two-sided dumps and the comparator.
+
+### Files
+
+- new: `include/rollback/desync_diag.h`, `src/rollback/desync_diag.cpp`,
+  `tools/compare_desync_dumps.py`
+- modified: `include/rollback/engine2.h`, `src/rollback/engine2.cpp`,
+  `include/rollback/desync_dump.h`, `src/rollback/desync_dump.cpp`,
+  `src/rollback/rollback_session_engine2.cpp`,
+  `include/rollback/rollback_session.h`, `src/net/session2.cpp`,
+  `tests/engine2_tests.cpp`, `CMakeLists.txt`,
+  `docs/re0.7/M8_ACCEPTANCE_RUNBOOK.md`
+
+### Verification
+
+Release build clean. Suites all green: frontend_sync 495/0,
+frame_arithmetic 31/0, frame_scheduler 44/0, engine2 293/0 (includes the new
+TestDesyncDiagnostics pins), transition_barrier PASS, determinism 608/0.
+Comparator smoke-tested against synthetic two-sided dumps (divergence at a
+known frame localized correctly; region diff and input context render).
+
+## 2026-08-17 — Post-M8: SAVESTATE_AUDIT fix pass (F1–F6 + doc nits)
+
+Implements the full prioritized fix list from `SAVESTATE_AUDIT.md` (the
+mode-8 write-set vs GameSnapshot coverage audit). All six findings closed;
+mechanisms below, `FIXED:` blocks inline in the audit doc, verified
+constraints recorded in its new §8.
+
+### F1 (P0) — AI-learning statics 0x76C5D8–0x76C5E7 / byte_8E940D
+
+- **Session guard** (`match_director.cpp` `AiLearnGuard_Force/Restore`):
+  `byte_8E940D` (AI_PatternModeEnabled) saved + forced to 0 at the startup
+  handoff, restored only on SESSION teardown (every path that reaches
+  `RollbackSession_End`: StopRollbackSession(teardown), disconnect,
+  shutdown). **Home rationale**: NOT `RollbackSession_Begin` — the
+  deterministic intro runs sim ticks (and therefore `AI_RecordPattern`,
+  which runs for human players twice per tick) BEFORE the engine arms;
+  `PrepareBaselineForInteractiveRelease` is the last director-owned point
+  before any mod-owned sim tick. Staying forced across match boundaries
+  kills the rematch substate-0 learning-block load at its single gate. The
+  guard also zeroes the four statics AFTER the baseline restore so both
+  peers hash identical values from frame 0 (each peer otherwise carries
+  stale statics from its own offline matches → first-frame false desync).
+- **Belt-and-braces capture** (offline forced-rollback determinism runs
+  exercise savestates too): new `GameSnapshot.ai_learn[16]` SIM region
+  (`ADDR_AI_LEARN_STATICS`), captured/restored/hashed. A dedicated region,
+  not a `pre_match_gap` extension — that region is digest-excluded RENDER,
+  and these bytes gate rand() so INV-22 makes them SIM.
+
+### F2 (P0) — render-phase rand() in sub_4C47C0 (super backgrounds)
+
+Two independent violations, two mechanisms:
+
+- **RNG stream corruption → render-phase RNG isolation.** Reasoning against
+  the DECOMP_TIMING_STUDY loop structure: `Frame_AdvanceSimulation` (already
+  hooked, `Hook_AdvanceFrame`) runs exactly once per outer pass, after the
+  sim while-loop and immediately before the `*(match+11)==1` render gate;
+  the next sim-side code to execute is the next pass's first
+  `Input_TryGetNextFrame` dispatch (all sim work lives inside the
+  while-loop). So: capture the CRT seed at `Hook_AdvanceFrame` (post-sim
+  value; also on 0-sim hold passes, which still render), restore it at the
+  next dispatcher entry (`InputSyncHooks_RestoreRenderRngIfPending`, called
+  at the top of `Hook_InputDispatcher`). Every rand() consumed between the
+  two points — all 15 sub_4C47C0 sites, present, frontend — is erased from
+  the sim stream. **Proof of the invariant the audit demands** (rolled-back
+  peer vs straight-through peer): the sim RNG stream becomes exactly "as if
+  render never called rand()" on BOTH peers, for ANY render:sim cadence
+  (N-frame resim → 1 render vs N renders) and independent of the local
+  background-off option, because the erased window covers the entire
+  non-sim portion of every pass. Equivalent to the audit's private cosmetic
+  PRNG (renderer consumes throwaway continuations of the sim stream) with
+  no new PRNG, no sub_4C47C0 hook, no binary patch. Netplay-gated
+  (`RollbackSession_IsActive() && MODE_MATCH`); the session-inactive path
+  drops a stale capture instead of rewinding the offline stream.
+- **Render-cadence writes into hashed entity scratch → digest masks.**
+  entity+1244..+1851 (gate dword +1244 through last mutated field +1850,
+  rounded to the dword boundary), both entities, masked from the digest.
+
+### F3 (P1) — Frame_Display (0x816494)
+
+New `GameSnapshot.frame_display` (SIM): captured, restored (resim
+re-increments from the rewound value instead of drifting by rollback depth),
+hashed in the SimHeader of both digest paths. Naming trap vs 0x81635C
+annotated at `ADDR_FRAME_COUNTER`/`ADDR_FRAME_DISPLAY` in as2_constants.h.
+
+### F4/F5 (P1/P2) — voice bookkeeping + tint timers: digest masks
+
+`kMainDigestMasks` (game_snapshot.cpp): per entity, entity+440..+447 (tint
+state/timer, F5), entity+1244..+1851 (F2), entity+107084..+107095 (voice
+bookkeeping, F4) — captured+restored (they live inside `main_state`), but
+skipped by BOTH `GameSnapshot_HashGameplay` and
+`GameSnapshot_HashGameplayLive` through the shared `HashMainMasked` walker
+(Block64's tail fold makes segmentation part of the value, so both paths
+MUST use the same table — pinned by a constexpr sorted/disjoint/in-bounds
+static_assert). Follows the existing display_frame captured-but-not-hashed
+pattern. F5's possible sim read-back of +440 stays an open audit item
+(audit §8 residual).
+
+### F6 (P2) — Match_UpdateScoreStats double-apply on resim
+
+Hooked 0x55BCD0 (`Hook_MatchUpdateScoreStats`, input_sync_hooks.cpp,
+MinHook entry alongside the vanilla-netplay suppression hooks) — skipped
+while `RollbackSession_IsRollingBack()`: the dispatcher/adapter already
+exposes rollback-vs-normal advance (`s_rollingBack` holds through the game's
+execution of each replay tick), so the speculative first pass applies the
+`+=` once and the resim replay of the same commit tick is dropped. Residuals
+accepted per the audit: outcome-changing mispredictions inside the replay
+window leave superseded stats applied (persistence noise, no sim reader);
+offline manual F6-load replays can still re-apply.
+
+### Doc nits (P3)
+
+M4_AUDITS main_state size "~243 KB" → 0x3F288 = 259,720 B (~253.6 KB), plus
+mask/f3/f1 rows and the rng_seed cosmetic-consumer correction;
+SAVESTATE_AUDIT gained per-finding FIXED blocks, a Status column in §7, and
+§8 "verified constraints" (Block-table adjacency warning: any main-region
+end extension past 0x7AB880 would swallow the live AI-block heap pointers
+at 0x7AB762–0x7AC160; the still-owed sub_4AB0F0 one-off disassembly check).
+
+### Engine cleanliness
+
+engine2 untouched — stays socket/clock/game-memory-free. All new game-memory
+and wall-clock-adjacent logic lives in the adapter ring (director, patches,
+game_snapshot). GameSnapshot grew 20 B (frame_display + ai_learn); layout
+pinned by a new compositional static_assert in game_snapshot.h (68-byte
+scalar prefix + four regions). The engine2 microbench sizes itself off
+sizeof(GameSnapshot) and needed no change.
+
+### Files
+
+- modified: `include/core/as2_constants.h`,
+  `include/rollback/game_snapshot.h`, `src/rollback/game_snapshot.cpp`,
+  `src/rollback/match_director.cpp`, `include/patches/input_sync_hooks.h`,
+  `src/patches/input_sync_hooks.cpp`, `src/patches/input_override.cpp`,
+  `include/rollback/savestate.h`, `docs/re0.7/SAVESTATE_AUDIT.md`,
+  `docs/re0.7/M4_AUDITS.md`
+
+### Verification
+
+Release build clean. Suites all green: frontend_sync 495/0,
+frame_arithmetic 31/0, frame_scheduler 44/0, engine2 293/0 (microbench
+snapshot=253 KB, save p99 4 µs / restore p99 3 µs / hash p99 99 µs),
+transition_barrier PASS, determinism 608/0 (includes the forced-rollback
+and multi-epoch savestate-path cells).

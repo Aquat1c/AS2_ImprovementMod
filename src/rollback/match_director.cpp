@@ -267,6 +267,73 @@ void OnlineWiring_HandleEngineDataPacket(const void* payload, size_t payloadLen)
 }
 
 // ============================================================================
+// AI-learning session guard (SAVESTATE_AUDIT F1, P0)
+// ============================================================================
+// The "CPU learning" config byte (AI_PatternModeEnabled, 0x8E940D) gates
+// AI_RecordPattern — which runs for HUMAN players too, twice per sim tick,
+// and consumes CRT rand() data-dependently off four cross-frame statics
+// (0x76C5D8..0x76C5E7) and per-matchup learning blocks loaded from each
+// peer's LOCAL <A>vs<B> files. Divergent local files/statics therefore
+// diverge the shared RNG stream — desync class F1, the worst in the audit.
+//
+// Fix: force the byte to 0 for the DURATION of the netplay session.
+//
+// Why the guard lives in the match director and arms at the startup handoff
+// (not at RollbackSession_Begin): the deterministic intro runs sim ticks
+// BEFORE the engine is armed (PrepareBaselineForInteractiveRelease →
+// intro → TryStartRollbackSession), and AI_RecordPattern already runs during
+// those ticks. Arming at Begin would leave the intro exposed and the peers
+// could diverge before frame 0. The handoff is the last director-owned point
+// before any mod-owned sim tick.
+//
+// The guard also zeroes the four statics: they are hashed by GameSnapshot
+// now (they gate rand(), so INV-22 makes them SIM), and each peer carries
+// stale values from its own offline matches — without normalization the very
+// first SyncHash would false-alarm. Zeroing runs AFTER the baseline restore
+// (the baseline slot may hold pre-guard values). With the byte forced to 0
+// nothing reads or writes the statics for the whole session, so both peers
+// hold zeros throughout.
+//
+// Restore happens on SESSION teardown only (StopRollbackSession(teardown),
+// disconnect, shutdown) — never at match boundaries, so rematch substate-0
+// learning-block loads are killed at their single gate too. Known accepted
+// residuals (documented in SAVESTATE_AUDIT §8): (a) the FIRST match's
+// substate-0 block load precedes the handoff and may leave inert blocks
+// loaded — every reader/writer is behind the forced-0 gate, and the blocks
+// are recovered by the next offline match-end save/free after restore;
+// (b) opening the vanilla options menu mid-session and saving would re-write
+// the byte — not reachable while a netplay session owns the frontend.
+static bool    s_aiLearnForced = false;
+static uint8_t s_aiLearnSavedByte = 0;
+
+static void AiLearnGuard_Force(const char* where) {
+    if (!s_aiLearnForced) {
+        s_aiLearnSavedByte = ReadMemory<uint8_t>(ADDR_AI_PATTERN_MODE);
+        s_aiLearnForced = true;
+        WriteMemory<uint8_t>(ADDR_AI_PATTERN_MODE, 0);
+        NetplayLog_Write("HANDOFF", -1,
+            "AI-learning guard ARMED (%s): byte_8E940D %u -> 0 for the session (F1)",
+            where ? where : "?", (unsigned)s_aiLearnSavedByte);
+    }
+    // Always (re-)zero the statics: a baseline restore may have re-written
+    // them from a pre-guard capture, and the first hashed capture must see
+    // the normalized values on both peers.
+    static const uint8_t zeros[AI_LEARN_STATICS_SIZE] = {};
+    WriteMemoryBlockSafe((void*)ADDR_AI_LEARN_STATICS, zeros, sizeof(zeros));
+}
+
+static void AiLearnGuard_Restore(const char* why) {
+    if (!s_aiLearnForced) {
+        return;
+    }
+    s_aiLearnForced = false;
+    WriteMemory<uint8_t>(ADDR_AI_PATTERN_MODE, s_aiLearnSavedByte);
+    NetplayLog_Write("TEARDOWN", -1,
+        "AI-learning guard RESTORED (%s): byte_8E940D -> %u",
+        why ? why : "?", (unsigned)s_aiLearnSavedByte);
+}
+
+// ============================================================================
 // Bootstrap → Rollback Handoff
 // ============================================================================
 
@@ -327,6 +394,10 @@ static bool PrepareBaselineForInteractiveRelease() {
             "WARNING: Baseline restore FAILED before intro handoff");
         LOG_WARN("[MatchDirector] Baseline restore failed before intro handoff");
     }
+
+    // F1 guard: after the baseline restore (which may re-write the statics
+    // from a pre-guard capture), before the deterministic intro's first tick.
+    AiLearnGuard_Force("startup handoff");
 
     ResetStartupBarrierState("interactive release armed");
     s_liveReleaseArmed = true;
@@ -522,7 +593,10 @@ static void StopRollbackSession(const char* reason, bool sessionTeardown) {
     if (sessionTeardown) {
         RollbackSession_End();
         Net::PlayerMapping_Clear();
+        AiLearnGuard_Restore(reason ? reason : "session teardown");
     } else {
+        // Match boundary: the session lives on — the F1 guard stays armed so
+        // the rematch's substate-0 learning-block load is killed at its gate.
         RollbackSession_SuspendBetweenMatches(reason ? reason : "match boundary");
     }
     FrameScheduler_OnSessionReset(reason ? reason : "rollback stop");
@@ -1043,6 +1117,7 @@ void OnlineWiring_Shutdown() {
     } else {
         // A suspended engine still holds resources — end it on shutdown.
         RollbackSession_End();
+        AiLearnGuard_Restore("mod shutdown");
     }
     Net::ChurnPause_Shutdown();
     s_liveReleaseArmed = false;
@@ -1335,6 +1410,7 @@ void OnlineWiring_OnDisconnect(const char* reason) {
         // A suspended engine (between matches) still ends with the session.
         RollbackSession_End();
         Net::PlayerMapping_Clear();
+        AiLearnGuard_Restore(effectiveReason);
     }
 
     if (boundaryCleanupNeeded) {
