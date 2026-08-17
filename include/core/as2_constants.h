@@ -722,14 +722,35 @@
 #define ENTITY_OFF_HIT_REACTION_ANIM_TIMER 0x07C5
 #define ENTITY_OFF_HIT_REACTION_LIFE_TIMER 0x07C6
 #define ENTITY_OFF_HIT_REACTION_KEEP_FLAG  0x07C7
-// F7h (run 19-42-5x f3299): a STATIC persistent divergence appeared at
-// p1_entity+0x1A650..+0x1A68F the moment P2 hit 50 hp (KO announcer
-// voice trigger) — 0x404 past the F4 voice-bookkeeping mask, i.e. another
-// audio-event-gated block in the entity tail (F4 class: wall-clock audio
-// timing is per-side). Masked as a 64-byte window; FINEENT covers
-// [+0x1A640,+0x1A6C0) for byte evidence if a neighbor fires.
+// F7h. Originally sized empirically: a static divergence appeared at
+// p1_entity+0x1A650..+0x1A68F the moment P2 hit 50 hp (KO announcer voice),
+// and a 64-byte window covered it. The STRUCTURE is now known, and 64 bytes
+// was far too small — it covered only the first 14 entries of a table of up
+// to 99.
+//
+//   +0x1A64C/0x1A650/0x1A654  Entity_UpdateAudio's per-entity audio state
+//                             (decomp:114100-114123)
+//   +0x1A658 .. +0x1A658+4*N  the entity's VOICE HANDLE TABLE, filled by
+//                             sub_54AA00 at MODE_MATCH substate 0
+//                             (decomp:117591-117610), N = dword_73DC9C[charId]
+//
+// N ranges 49..99 across the 22 characters (decomp:14586), so the table can
+// reach +0x1A658 + 396 = +0x1A7E4. Every entry is a handle carrying the
+// process-global allocation serial `dword_9D0454++` (decomp:321907-321935) —
+// no reset site anywhere — so two peers whose processes have loaded a
+// different NUMBER of sounds hold different VALUES for the identical voice.
+// Same defect class as the F9 announcer-handle mask; invisible to
+// same-machine testing, where both instances share an allocation history.
+//
+// Masking the whole table is safe: a decomp-wide scan for any reader or
+// writer of entity+[0x1A658,0x1A7E4) — match+[149192,149588) P1 and
+// +[258004,258400) P2, by match-relative, dword-scaled and absolute forms —
+// returns ONLY the filler above. The simulation never reads a handle value;
+// it asks Audio_IsPlaying, which rollback_audio answers from the canonical
+// voice model (these handles are class 0x10000000, so they are in scope).
+// Table end 0x1A7E4 sits 296 B inside ENTITY_SIZE 0x1A90C.
 #define ENTITY_VOICE_TAIL_MASK_OFF   0x1A650
-#define ENTITY_VOICE_TAIL_MASK_SIZE  0x40
+#define ENTITY_VOICE_TAIL_MASK_SIZE  0x194   // 0x1A7E4 - 0x1A650
 
 // F7e: the four hit-reaction DISPLAY bytes above are HUD/render-cadence
 // bookkeeping (combo-pop animation; the mod's rollback_combo_fx owns their
