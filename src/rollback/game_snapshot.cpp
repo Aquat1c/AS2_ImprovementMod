@@ -176,7 +176,11 @@ uint32_t SnapshotChecksum(const uint8_t* mainState, size_t mainSize, uint32_t ef
     // Four-lane digest, not the byte-at-a-time CRC32 this used to run: the
     // CRC was a serial chain over the full 253 KB on EVERY capture — roughly
     // 400 us, against ~18 us of actual simulation per replayed frame.
-    parts.main_crc = StateFingerprint32(mainState, mainSize);
+    // Must skip the same bytes GameSnapshot_Restore leaves alone, so that a
+    // checksum captured here still matches one recomputed from LIVE memory
+    // after a restore.
+    (void)mainSize;
+    parts.main_crc = ::Rollback::GameSnapshot_MainFingerprintSkippingExcluded(mainState);
     parts.effect_index = effectIndex;
     return StateFingerprint32(&parts, sizeof(parts));
 }
@@ -295,6 +299,27 @@ constexpr size_t kDisplayExpiryByteP1 = kP1EntityOff + ENTITY_RENDER_ANIM_TIMER_
 constexpr size_t kDisplayExpiryByteP2 = kP2EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF;
 static_assert(ENTITY_RENDER_ANIM_TIMER_MASK_OFF == 0x01A4,
               "display expiry byte offset moved");
+
+size_t GameSnapshot_RestoreExcludedRun(size_t mainOffset) {
+    if (mainOffset == kDisplayExpiryByteP1 || mainOffset == kDisplayExpiryByteP2) {
+        return 1;
+    }
+    return 0;
+}
+
+uint32_t GameSnapshot_MainFingerprintSkippingExcluded(const uint8_t* mainBytes) {
+    if (!mainBytes) return 0;
+    // Two one-byte holes; hash the three spans between them so a captured
+    // buffer and live memory agree even though the restore skips those bytes.
+    const size_t a = kDisplayExpiryByteP1 < kDisplayExpiryByteP2
+                         ? kDisplayExpiryByteP1 : kDisplayExpiryByteP2;
+    const size_t b = kDisplayExpiryByteP1 < kDisplayExpiryByteP2
+                         ? kDisplayExpiryByteP2 : kDisplayExpiryByteP1;
+    uint64_t h = Block64(mainBytes, a);
+    h = Block64_Update(h, mainBytes + a + 1, b - (a + 1));
+    h = Block64_Update(h, mainBytes + b + 1, kMainSize - (b + 1));
+    return Block64_Fold32(h);
+}
 
 bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
     if (!snapshot || !snapshot->valid) {

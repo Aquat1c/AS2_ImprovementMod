@@ -3053,7 +3053,27 @@ int __cdecl Hook_InputProcess(int gameState) {
         s_winscreenOwnerlessFrames = 0;
     }
 
+    // The lockstep may only be (re-)armed while the screen can still take a
+    // DECISION: the mode-8 match-end tail, or mode 9 up to the continue prompt
+    // (sub <= 4). The exit fades — sub 5 (rematch), sub 8 (decline), sub 36
+    // (mode change) — are past the decision and must never start a new phase.
+    //
+    // Re-arming at sub 8 is a real, observed failure (phase-1 run 02-14, match
+    // 3): after DECLINE resolved and the phase finalized correctly, both sides
+    // armed a NEW winscreen phase during the decline fade. Each restarted its
+    // own consume at 0 while receiving the peer's frames numbered 33+, so each
+    // starved waiting for an index the other would never send; 3 s later the
+    // cross-phase deferral exhausted and one side left through recovery while
+    // the other took the normal fade — the two reached character select at
+    // visibly different times. The rematch path was already guarded by
+    // IsRematchLatched(); the decline path had no equivalent, because
+    // ContinueFlow is reset to Idle at resolution.
+    const bool winScreenDecisionPhase =
+        (gameMode == MODE_MATCH) ||
+        (gameMode == MODE_WINSCREEN && subState <= (uint32_t)STORY_SUB_DIALOGUE_END);
+
     if (winScreenRoute &&
+        winScreenDecisionPhase &&
         !Net::WinScreenSync_IsActive() &&
         Net::MatchLifecycle_IsMatchOwned() &&
         Net::Session_IsConnected() &&

@@ -112,4 +112,15 @@ uint64_t GameSnapshot_HashGameplay(const GameSnapshot* snapshot);
 /// false (and *outHash=0) if the regions fault.
 bool GameSnapshot_HashGameplayLive(uint64_t* outHash);
 
+/// Number of bytes at `mainOffset` that GameSnapshot_Restore deliberately does
+/// NOT write back (render-owned display timers, see game_snapshot.cpp), or 0.
+/// Any checksum that compares a captured snapshot against LIVE memory after a
+/// restore must skip these, or it reports a mismatch that is not one.
+size_t GameSnapshot_RestoreExcludedRun(size_t mainOffset);
+
+/// 32-bit fingerprint of the main region with the restore-excluded bytes
+/// normalised out. `mainBytes` may be a captured snapshot buffer or live
+/// memory; both produce the same value for the same logical state.
+uint32_t GameSnapshot_MainFingerprintSkippingExcluded(const uint8_t* mainBytes);
+
 } // namespace Rollback

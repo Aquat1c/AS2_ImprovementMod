@@ -148,7 +148,13 @@ static uint32_t ComputeMainChecksum() {
             uint32_t effect_index;
         } parts{};
 
-        parts.main_crc = CalcCRC32((const void*)ADDR_MATCH_BASE, Rollback::GAME_SNAPSHOT_MAIN_SIZE);
+        // Skips the bytes GameSnapshot_Restore deliberately leaves alone
+        // (render-owned display timers). Comparing a captured checksum against
+        // live memory without that skip reported a CHECKSUM MISMATCH error on
+        // every baseline restore -- a false alarm, but one that made a clean
+        // acceptance log look broken.
+        parts.main_crc = Rollback::GameSnapshot_MainFingerprintSkippingExcluded(
+            (const uint8_t*)ADDR_MATCH_BASE);
         parts.effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
         return CalcCRC32(&parts, sizeof(parts));
     } __except (EXCEPTION_EXECUTE_HANDLER) {

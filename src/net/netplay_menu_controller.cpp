@@ -21,6 +21,7 @@
 #include "net/winscreen_sync.h"
 #include "net/match_lifecycle.h"
 #include "rollback/rollback_session.h"
+#include "rollback/rollback_debug.h"
 #include "net/sync_policy.h"
 #include "net/set_tracker.h"
 #include "net/delay_policy.h"
@@ -2380,6 +2381,35 @@ static void HandleAutoConnect() {
             }
 
             if (mode == MODE_WINSCREEN) {
+                // Per-game acceptance report. One machine-greppable line per
+                // match carrying the health counters that matter, so an
+                // unattended run can be audited game by game instead of by
+                // scrolling raw logs.
+                {
+                    Rollback::RollbackSessionSnapshot rb{};
+                    Rollback::RollbackSession_GetSnapshot(&rb);
+                    Rollback::ForcedRollbackLiveStats fr{};
+                    Rollback::RollbackSession_GetForcedStats(&fr);
+                    Net::DelayPolicySnapshot dp{};
+                    Net::DelayPolicy_GetSnapshot(&dp);
+                    Rollback::NetplayLog_Write("GAMEREPORT", -1,
+                        "match=%d/%d frames=%u rtt=%.1fms delay=%d budget=%d "
+                        "rollbacks=%d maxdepth=%d mispredictions=%d "
+                        "replay_verified=%u replay_bad=%u desync=%d",
+                        s_autoConnectCompletedMatches + 1,
+                        s_autoConnect.matchCount > 0 ? s_autoConnect.matchCount : 1,
+                        s_autoConnectMatchFrame,
+                        dp.measurement_valid ? dp.measured_avg_ping_ms : 0.0f,
+                        Net::DelayPolicy_GetActiveDelay(),
+                        rb.rollback_budget,
+                        rb.rollback_count,
+                        rb.max_rollback_distance,
+                        rb.total_mispredictions,
+                        fr.replay_verifications,
+                        fr.replay_mismatches,
+                        Rollback::RollbackDebug_IsDesyncDetected() ? 1 : 0);
+                    Rollback::NetplayLog_Flush();
+                }
                 LOG_NETPLAY(LOG_INFO, "[AutoConnect] Match reached win screen after %u frames",
                     s_autoConnectMatchFrame);
                 AutoConnectTransition(AutoConnectState::ConfirmingWinScreen, "entered win screen");
