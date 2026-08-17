@@ -220,6 +220,20 @@ static uint32_t         s_autoConnectMatchFrame = 0;
 static bool             s_autoConnectReleasePending = false;
 static bool             s_autoConnectStageGridPressed = false;
 static bool             s_autoConnectStageConfirmPressed = false;
+// Character-select navigation and the mirror-palette escape (2026-08-17).
+// The driver used to press ONLY confirm: characterGridIndex was parsed,
+// logged, and never consumed, so both instances confirmed the default cell -
+// a mirror match the configs were written specifically to avoid. Then the
+// second slot to reach the palette stage was rejected forever by the
+// same-vanilla-palette rule ("Palette lock rejected: ... other slot already
+// locked same vanilla palette", every press, for 30 s, SOAK-FAIL) because
+// nothing ever varied the selection after a rejection.
+static int              s_autoConnectNavDownRemaining = 0;
+static int              s_autoConnectNavRightRemaining = 0;
+static int              s_autoConnectConfirmAttempts = 0;
+static bool             s_autoConnectEscapeStepPending = false;
+// The visible select grid is 3 columns, row-major (top-left is index 0).
+static const int        kAutoConnectCharGridColumns = 3;
 static bool             s_autoConnectWinScreenPressed = false;
 static bool             s_autoConnectContinuePressed = false;
 static bool             s_autoConnectContinueNoToggled = false;
@@ -1751,6 +1765,25 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
         s_autoConnectStageConfirmPressed = false;
     }
 
+    if (next == AutoConnectState::SelectingCharacter) {
+        // Walk plan for the CONFIGURED character: row-major 3-column grid,
+        // so index -> (index/3) DOWN taps + (index%3) RIGHT taps from the
+        // default top-left cursor. Every rematch charsel re-enters this
+        // state, so the plan resets with it.
+        const int grid = s_autoConnect.characterGridIndex > 0
+            ? s_autoConnect.characterGridIndex : 0;
+        s_autoConnectNavDownRemaining = grid / kAutoConnectCharGridColumns;
+        s_autoConnectNavRightRemaining = grid % kAutoConnectCharGridColumns;
+        s_autoConnectConfirmAttempts = 0;
+        s_autoConnectEscapeStepPending = false;
+        if (grid > 0) {
+            LOG_NETPLAY(LOG_INFO,
+                "[AutoConnect] CharSel navigation plan: grid=%d -> down=%d right=%d",
+                grid, s_autoConnectNavDownRemaining,
+                s_autoConnectNavRightRemaining);
+        }
+    }
+
     if (next == AutoConnectState::ConfirmingWinScreen) {
         s_autoConnectWinScreenPressed = false;
         s_autoConnectContinuePressed = false;
@@ -2117,10 +2150,52 @@ static void HandleAutoConnect() {
             }
 
             if (mode == MODE_CHARSEL &&
-                (sub == CHARSEL_SUB_SELECT || sub == CHARSEL_SUB_CONFIRM) &&
-                (s_autoConnectStateFrames == 31 ||
-                 (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
-                AutoConnectInjectPress(INPUT_A, "confirm character");
+                (sub == CHARSEL_SUB_SELECT || sub == CHARSEL_SUB_CONFIRM)) {
+                // Navigation taps run on a fast cadence; confirm keeps the
+                // original slow one. Taps are spaced (not every frame)
+                // because each must be a fresh press edge.
+                const bool navPending =
+                    s_autoConnectNavDownRemaining > 0
+                    || s_autoConnectNavRightRemaining > 0;
+                const bool navTick = navPending
+                    && s_autoConnectStateFrames >= 31
+                    && (s_autoConnectStateFrames % 20) == 0;
+                const bool confirmTick = !navPending
+                    && (s_autoConnectStateFrames == 31
+                        || (s_autoConnectStateFrames > 300
+                            && (s_autoConnectStateFrames % 120) == 0));
+                if (navTick && sub == CHARSEL_SUB_SELECT) {
+                    if (s_autoConnectNavDownRemaining > 0) {
+                        AutoConnectInjectPress(INPUT_DOWN, "navigate to configured character");
+                        s_autoConnectNavDownRemaining--;
+                    } else {
+                        AutoConnectInjectPress(INPUT_RIGHT, "navigate to configured character");
+                        s_autoConnectNavRightRemaining--;
+                    }
+                } else if (confirmTick) {
+                    // ── THE MIRROR-PALETTE ESCAPE ─────────────────────────
+                    // A confirm press that leaves local_confirmed at 0 was
+                    // REJECTED - in a mirror match the same-vanilla-palette
+                    // rule refuses the second slot's lock, and pressing the
+                    // identical confirm forever is what hung the 2026-08-17
+                    // soak on both peers. After two rejected confirms,
+                    // interleave one RIGHT: at the palette stage it steps to
+                    // the next color, at the grid it steps to the next
+                    // character - either way the next confirm asks for
+                    // something the other slot has not locked, so this
+                    // converges regardless of which side locked first.
+                    if (!csSnap.local_confirmed
+                        && s_autoConnectConfirmAttempts >= 2
+                        && !s_autoConnectEscapeStepPending) {
+                        AutoConnectInjectPress(INPUT_RIGHT,
+                            "step selection (confirm rejected; mirror palette conflict)");
+                        s_autoConnectEscapeStepPending = true;
+                    } else {
+                        AutoConnectInjectPress(INPUT_A, "confirm character");
+                        s_autoConnectConfirmAttempts++;
+                        s_autoConnectEscapeStepPending = false;
+                    }
+                }
             }
 
             if (s_autoConnectStateFrames > 1800) {
