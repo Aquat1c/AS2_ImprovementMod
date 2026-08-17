@@ -3192,8 +3192,8 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 pacingSnap.current_scale,
                 postTelemetry.rb_frame_last_remote_received,
                 postTelemetry.rb_frame_last_confirmed,
-                postTelemetry.gekko_avg_ping,
-                postTelemetry.gekko_jitter,
+                postTelemetry.link_avg_ping,
+                postTelemetry.link_jitter,
                 Net::MatchRollbackPhaseName(rollbackPhase));
         }
 

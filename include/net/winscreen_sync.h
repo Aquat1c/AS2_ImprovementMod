@@ -88,9 +88,6 @@ uint32_t WinScreenSync_GetRemoteLatestFrame();
 /// Handle incoming winscreen frame-input packet.
 void WinScreenSync_OnRemoteFrameInput(const WinScreenFrameInputPayload* p);
 
-/// Handle incoming legacy WinScreenConfirm packet.
-void WinScreenSync_OnRemoteConfirm();
-
 // ============================================================================
 // Continue Flow Integration
 // ============================================================================

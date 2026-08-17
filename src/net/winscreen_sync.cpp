@@ -369,7 +369,17 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
     // side's skip intent to both synchronized input streams. Disabled while the
     // continue prompt is active — propagating there would lock the peer's
     // choice with our confirm (it stays for the sub-3 win-pose skip).
-    if ((localAdvance || remoteAdvance) && !ContinueFlow_IsPromptActive()) {
+    //
+    // Held as a LEVEL, not an edge: once either side's advance intent has been
+    // observed, the confirm stays asserted on every subsequent consumed frame
+    // until native Mode 9 exits (or the continue prompt takes ownership). The
+    // native win screen samples the button per substate frame; an edge-only
+    // pulse released the skip on exactly one frame and stranded the peers in
+    // later substates (pre-existing test failure: winscreen confirm-hold).
+    const bool advanceGateOpen =
+        FrontendInputSync_LocalAdvanceObserved() ||
+        FrontendInputSync_RemoteAdvanceObserved();
+    if (advanceGateOpen && !ContinueFlow_IsPromptActive()) {
         if (!s_loggedSkipPropagate) {
             s_loggedSkipPropagate = true;
             Rollback::NetplayLog_Write(
@@ -442,13 +452,6 @@ void WinScreenSync_OnRemoteFrameInput(const WinScreenFrameInputPayload* p) {
         return;
     }
     FrontendInputSync_OnRemoteWinScreenFrameInput(p);
-}
-
-void WinScreenSync_OnRemoteConfirm() {
-    if (!s_active) {
-        return;
-    }
-    FrontendInputSync_ReportRemoteAdvanceIntent(1);
 }
 
 void WinScreenSync_FinalizeFromContinueFlow(const char* reason) {

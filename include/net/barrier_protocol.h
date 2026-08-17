@@ -26,7 +26,7 @@
  *     → All reliable, CHANNEL_CONTROL
  *
  *   GAMEPLAY STREAM (rollback_session.cpp):
- *     - GameplayInput: rollback input sync
+ *     - InputStream: rollback input sync
  *     → Unreliable sequenced, CHANNEL_GAMEPLAY
  *     → Redundant input batch for packet loss resilience
  *
@@ -64,7 +64,6 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         case PacketType::HelloAck:
         case PacketType::Ready:
         case PacketType::Disconnect:
-        case PacketType::SessionMeta:
 
         // Sync barriers — always reliable
         case PacketType::SyncAnnounce:
@@ -95,9 +94,11 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
             return true;
 
         // Gameplay stream — unreliable (redundancy handles loss)
-        case PacketType::GameplayInput:
+        case PacketType::InputStream:
         case PacketType::CharSelFrameInput:
         case PacketType::WinScreenFrameInput:
+        case PacketType::TimeProbe:
+        case PacketType::TimeProbeAck:
             return false;
 
         // Diagnostics — unreliable
@@ -116,9 +117,11 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
 /// Get the correct ENet channel for a packet type.
 inline uint8_t BarrierProtocol_GetChannel(PacketType type) {
     switch (type) {
-        case PacketType::GameplayInput:
+        case PacketType::InputStream:
         case PacketType::CharSelFrameInput:
         case PacketType::WinScreenFrameInput:
+        case PacketType::TimeProbe:
+        case PacketType::TimeProbeAck:
             return CHANNEL_GAMEPLAY;
 
         case PacketType::Ping:

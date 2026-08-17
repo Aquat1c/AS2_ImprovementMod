@@ -2,7 +2,6 @@
 
 #include "net/barrier_protocol.h"
 #include "net/delay_policy.h"
-#include "net/pregame_sync.h"
 #include "net/winscreen_sync.h"
 #include "core/game_state.h"
 #if !defined(AS2_FRONTEND_SYNC_TESTING)
@@ -52,6 +51,9 @@ static uint32_t          s_phaseSerial = 0;
 static FrontendSyncPhase s_phase = FrontendSyncPhase::None;
 static PacketType        s_packetType = PacketType::CharSelFrameInput;
 static bool              s_inputPhaseActive = false;
+// Injected winscreen send gate (M0 dependency inversion — replaces the upward
+// PregameSync_GetPhase() include). Null = sends allowed.
+static FrontendWinScreenSendGate s_winScreenSendGate = nullptr;
 
 static uint32_t          s_consumeFrame = 0;
 static uint32_t          s_localInputFrame = 0;
@@ -432,8 +434,9 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
         if (s_phase != FrontendSyncPhase::WinScreen || !WinScreenSync_IsActive()) {
             return false;
         }
-        const PregamePhase prePhase = PregameSync_GetPhase();
-        if (prePhase != PregamePhase::Idle && prePhase != PregamePhase::GameplayHandoff) {
+        // Injected predicate (M0 dependency inversion): pregame_sync registers
+        // its phase-based gate; a null gate allows sends (test harness default).
+        if (s_winScreenSendGate && !s_winScreenSendGate()) {
             return false;
         }
     }
@@ -921,6 +924,10 @@ void FrontendInputSync_Shutdown() {
     }
     ClearEpochState();
     s_initialized = false;
+}
+
+void FrontendInputSync_SetWinScreenSendGate(FrontendWinScreenSendGate gate) {
+    s_winScreenSendGate = gate;
 }
 
 int FrontendInputSync_ComputeDelayProposal() {

@@ -12,7 +12,7 @@ namespace Net {
 namespace {
 
 constexpr uint32_t kResendIntervalMs = 250;
-constexpr size_t   kMaxKinds = 6;  // NetTransitionKind range (None..SessionCancel)
+constexpr size_t   kMaxKinds = 7;  // NetTransitionKind range (None..EpochAlign)
 
 struct BarrierSlot {
     bool     localProposed  = false;

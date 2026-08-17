@@ -4,7 +4,6 @@
 #include <cstdio>
 
 #include "net/session_manager.h"
-#include "net/network_thread.h"
 #include "net/netplay_menu_controller.h"
 #include "net/protocol.h"
 #include "rollback/netplay_log.h"

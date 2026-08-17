@@ -219,7 +219,7 @@ static bool GekkoPayloadPrefersReliableDelivery(const char* data, int length) {
 }
 
 /// Called by GekkoNet to send data to the remote peer.
-/// We wrap it in a GekkoData packet and send via ENet.
+/// We wrap it in an InputStream packet (id 23) and send via ENet.
 static void AdapterSendData(GekkoNetAddress* /*addr*/, const char* data, int length) {
     if (!Net::Session_IsConnected()) return;
     if (length <= 0 || !data) return;
@@ -228,7 +228,7 @@ static void AdapterSendData(GekkoNetAddress* /*addr*/, const char* data, int len
 
     Net::Session_SendPacket(
         Net::CHANNEL_GAMEPLAY,
-        Net::PacketType::GekkoData,
+        Net::PacketType::InputStream,
         data, (size_t)length,
         reliable
     );
@@ -774,7 +774,7 @@ static void HandleAdvanceEvent(GekkoGameEvent* ev) {
         NetplayLog_Write("GEKKO", rbFrame,
             "SDL->Rollback bridge ACTIVE: local_slot=P%d remote_slot=P%d "
             "local_input_sourced_from=PlayerMapping_ReadLocalInput "
-            "remote_input_sourced_from=GekkoData stream",
+            "remote_input_sourced_from=InputStream stream",
             s_localPlayer + 1,
             s_remotePlayer + 1);
     }
@@ -1707,8 +1707,8 @@ void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
     }
     out->predicted_frames_outstanding = predictedOutstanding;
     out->frames_ahead = framesAhead;
-    out->gekko_avg_ping = s_cachedAvgPing;
-    out->gekko_jitter = s_cachedJitter;
+    out->link_avg_ping = s_cachedAvgPing;
+    out->link_jitter = s_cachedJitter;
     out->rtt_last_ms = s_cachedLastPing;
     out->rtt_avg_ms = s_cachedAvgPing;
     out->rtt_p90_ms = s_cachedRttP90;

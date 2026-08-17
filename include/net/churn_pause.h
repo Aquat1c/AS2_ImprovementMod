@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #include "net/netplay_phase_runtime.h"
-#include "rollback/rollback_session.h"
+#include "rollback/rollback_telemetry.h"
 
 namespace Net {
 

@@ -76,4 +76,33 @@ void NetplayLog_ValueChange(const char* tag, int32_t frame,
 /// Request an async flush. Shutdown performs a blocking drain.
 void NetplayLog_Flush();
 
+// ============================================================================
+// STAT line (re0.7 §2.10) — structured per-second telemetry rollup
+// ============================================================================
+
+/// One second of pacing/engine telemetry. Holds are bucketed by the closed
+/// HoldCause set (rollback/run_state.h); fields with no producer yet (present
+/// percentiles, slew before the M2 scheduler lands) are reported as zero.
+struct NetplayStatSample {
+    float    sim_fps;             // canonical sim frames advanced this second
+    uint32_t present_p50_us;      // present interval p50 (0 until FrameScheduler)
+    uint32_t present_p99_us;      // present interval p99 (0 until FrameScheduler)
+    uint32_t holds_prediction;    // HoldCause::PredictionLimit passes
+    uint32_t holds_lifecycle;     // HoldCause::LifecycleBoundary passes
+    uint32_t holds_local_input;   // HoldCause::LocalInputMissing passes
+    uint32_t holds_external;      // HoldCause::ExternalSuspension passes
+    uint32_t rollbacks;           // corrections applied this second
+    uint32_t rollback_max_depth;  // deepest correction this second
+    int32_t  slew_ppm;            // active pace slew (0 until FrameScheduler)
+    int32_t  debt_frames;         // owed hidden frames (CadenceDebt / legacy debt)
+    uint32_t silence_ms;          // supervisor inbound protocol silence
+};
+
+/// Emit the frozen-format STAT line. The acceptance harness parses exactly
+/// this shape for the whole 0.7 cycle:
+///   STAT sim_fps=<f2> present_p50_us=<u> present_p99_us=<u> hold_pred=<u>
+///   hold_life=<u> hold_input=<u> hold_ext=<u> rollbacks=<u> rb_max=<u>
+///   slew_ppm=<d> debt=<d> silence_ms=<u>
+void NetplayLog_Stat(int32_t frame, const NetplayStatSample& sample);
+
 } // namespace Rollback

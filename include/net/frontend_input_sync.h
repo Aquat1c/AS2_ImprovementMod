@@ -125,6 +125,12 @@ struct FrontendInputSyncSnapshot {
 void FrontendInputSync_Init();
 void FrontendInputSync_Shutdown();
 
+/// Predicate gating win-screen frame-input sends (true = sends allowed).
+/// Injected by the pregame/session layer so this module never reaches upward
+/// into pregame state (M0 dependency inversion). Null (default) allows sends.
+typedef bool (*FrontendWinScreenSendGate)();
+void FrontendInputSync_SetWinScreenSendGate(FrontendWinScreenSendGate gate);
+
 int  FrontendInputSync_ComputeDelayProposal();
 void FrontendInputSync_BeginEpoch(SessionRole role, uint32_t epochId, uint16_t localDelayProposal, const char* reason);
 void FrontendInputSync_RebindEpoch(uint32_t epochId, const char* reason);

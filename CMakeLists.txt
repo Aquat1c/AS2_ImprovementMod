@@ -307,6 +307,8 @@ set(ROLLBACK_HEADERS
     include/rollback/prediction.h
     include/rollback/resimulation.h
     include/rollback/rollback_session.h
+    include/rollback/rollback_telemetry.h
+    include/rollback/run_state.h
     include/rollback/rollback_debug.h
     include/rollback/desync_dump.h
     include/rollback/netplay_log.h
@@ -324,7 +326,9 @@ set(NET_HEADERS
     include/net/session_types.h
     include/net/baseline_sync.h
     include/net/enet_transport.h
+    include/net/frame_arithmetic.h
     include/net/frontend_input_sync.h
+    include/net/gameplay_packet_router.h
     include/net/network_thread.h
     include/net/session_manager.h
     include/net/spectator_protocol.h
@@ -451,6 +455,7 @@ set(NET_SOURCES
     src/net/transition_barrier.cpp
     src/net/enet_transport.cpp
     src/net/frontend_input_sync.cpp
+    src/net/gameplay_packet_router.cpp
     src/net/network_thread.cpp
     src/net/session_manager.cpp
     src/net/spectator_protocol.cpp
@@ -536,6 +541,26 @@ set_target_properties(frontend_sync_tests PROPERTIES
 )
 
 add_test(NAME frontend_sync_tests COMMAND frontend_sync_tests)
+
+add_executable(frame_arithmetic_tests
+    tests/frame_arithmetic_tests.cpp
+)
+
+target_include_directories(frame_arithmetic_tests PRIVATE
+    include
+)
+
+target_compile_definitions(frame_arithmetic_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(frame_arithmetic_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME frame_arithmetic_tests COMMAND frame_arithmetic_tests)
 
 add_executable(async_log_tests
     tests/async_log_tests.cpp

@@ -1,6 +1,7 @@
 #include "net/netplay_pacing.h"
 
 #include "net/churn_pause.h"
+#include "net/connection_supervisor.h"
 #include "net/delay_policy.h"
 #include "patches/tick_hooks.h"
 #include "rollback/netplay_log.h"
@@ -84,11 +85,75 @@ static bool s_pacingHaywireWarned = false;
 static int32_t s_lastPacingSlowLogRb = -1000000;
 static int32_t s_lastPacingHaywireLogRb = -1000000;
 
+// §2.10 STAT rollup state (M0: fed from the legacy pacing telemetry; the M2
+// scheduler and M4 engine re-feed the same frozen line format from the typed
+// HoldCause plan — the format must not change).
+static DWORD    s_statWindowStartMs = 0;
+static int32_t  s_statWindowStartRb = -1;
+static int32_t  s_statWindowStartRollbacks = 0;
+static uint32_t s_statHoldsPrediction = 0;
+static int32_t  s_statMaxReplayLen = 0;
+
 static constexpr float kPacingSlowThreshold = 0.98f;
 static constexpr float kPacingSlowRecoverThreshold = 0.985f;
 static constexpr float kPacingHaywireThreshold = 0.5f;
 static constexpr int32_t kPacingSlowRepeatRb = 120;
 static constexpr int32_t kPacingHaywireRepeatRb = 60;
+
+static void ResetStatRollup() {
+    s_statWindowStartMs = 0;
+    s_statWindowStartRb = -1;
+    s_statWindowStartRollbacks = 0;
+    s_statHoldsPrediction = 0;
+    s_statMaxReplayLen = 0;
+}
+
+// Per-second §2.10 STAT emission, driven entirely by existing telemetry.
+// Present percentiles and slew report 0 until the M2 FrameScheduler owns the
+// clock; lifecycle/local-input/external hold buckets report 0 until the M4
+// engine plans holds with typed causes (legacy pacing cannot distinguish them
+// — all its freezes are network-attributed and land in hold_pred).
+static void UpdateStatRollup(const Rollback::RollbackTimesyncTelemetry& telemetry) {
+    const DWORD now = GetTickCount();
+    const bool needAnchor =
+        s_statWindowStartMs == 0 ||
+        s_statWindowStartRb < 0 ||
+        telemetry.rb_frame_current < s_statWindowStartRb;
+    if (needAnchor) {
+        s_statWindowStartMs = now;
+        s_statWindowStartRb = telemetry.rb_frame_current;
+        s_statWindowStartRollbacks = telemetry.rollback_count;
+        s_statHoldsPrediction = 0;
+        s_statMaxReplayLen = 0;
+        return;
+    }
+
+    if (telemetry.last_rollback_replay_length > s_statMaxReplayLen) {
+        s_statMaxReplayLen = telemetry.last_rollback_replay_length;
+    }
+
+    const DWORD elapsed = now - s_statWindowStartMs;
+    if (elapsed < 1000) {
+        return;
+    }
+
+    Rollback::NetplayStatSample sample{};
+    sample.sim_fps =
+        (float)(telemetry.rb_frame_current - s_statWindowStartRb) * 1000.0f / (float)elapsed;
+    sample.holds_prediction = s_statHoldsPrediction;
+    const int32_t rollbacks = telemetry.rollback_count - s_statWindowStartRollbacks;
+    sample.rollbacks = rollbacks > 0 ? (uint32_t)rollbacks : 0u;
+    sample.rollback_max_depth = rollbacks > 0 ? (uint32_t)s_statMaxReplayLen : 0u;
+    sample.debt_frames = s_predictionDebt;
+    sample.silence_ms = Net::ConnectionSupervisor_GetInboundSilenceMs();
+    Rollback::NetplayLog_Stat(telemetry.rb_frame_current, sample);
+
+    s_statWindowStartMs = now;
+    s_statWindowStartRb = telemetry.rb_frame_current;
+    s_statWindowStartRollbacks = telemetry.rollback_count;
+    s_statHoldsPrediction = 0;
+    s_statMaxReplayLen = 0;
+}
 
 static void ResetPacingScaleMonitorState() {
     s_lastWarnedPacingTarget = 1.0f;
@@ -222,10 +287,10 @@ static Net::NetQuality ClassifyQuality(const Rollback::RollbackTimesyncTelemetry
                                        bool* avgOnlyOut) {
     const float rttAvg = telemetry.rtt_avg_ms > 0.0f
         ? telemetry.rtt_avg_ms
-        : telemetry.gekko_avg_ping;
+        : telemetry.link_avg_ping;
     const float jitterAvg = telemetry.jitter_avg_ms > 0.0f
         ? telemetry.jitter_avg_ms
-        : telemetry.gekko_jitter;
+        : telemetry.link_jitter;
     const bool havePercentiles = telemetry.rtt_p90_ms > 0.0f || telemetry.rtt_p95_ms > 0.0f;
     const float rttP90 = telemetry.rtt_p90_ms > 0.0f ? telemetry.rtt_p90_ms : rttAvg;
     const float rttP95 = telemetry.rtt_p95_ms > 0.0f ? telemetry.rtt_p95_ms : (rttAvg + jitterAvg);
@@ -310,10 +375,10 @@ static void LogNetClassIfNeeded(const Rollback::RollbackTimesyncTelemetry& telem
         telemetry.rb_frame_current,
         Net::NetQualityName(s_quality),
         s_profileSourceAvgOnly ? "avg_only" : "p95",
-        telemetry.rtt_avg_ms > 0.0f ? telemetry.rtt_avg_ms : telemetry.gekko_avg_ping,
+        telemetry.rtt_avg_ms > 0.0f ? telemetry.rtt_avg_ms : telemetry.link_avg_ping,
         telemetry.rtt_p90_ms,
         telemetry.rtt_p95_ms,
-        telemetry.jitter_p95_ms > 0.0f ? telemetry.jitter_p95_ms : telemetry.gekko_jitter,
+        telemetry.jitter_p95_ms > 0.0f ? telemetry.jitter_p95_ms : telemetry.link_jitter,
         telemetry.packet_loss_ewma,
         telemetry.loss_burst_max);
 }
@@ -352,7 +417,7 @@ static void LogAsymDelayIfNeeded(const Rollback::RollbackTimesyncTelemetry& tele
 
     const float rttForOneWay = telemetry.rtt_p90_ms > 0.0f
         ? telemetry.rtt_p90_ms
-        : (telemetry.rtt_avg_ms > 0.0f ? telemetry.rtt_avg_ms : telemetry.gekko_avg_ping);
+        : (telemetry.rtt_avg_ms > 0.0f ? telemetry.rtt_avg_ms : telemetry.link_avg_ping);
     const float oneWayP90Frames = (rttForOneWay * 0.5f) / Net::FRAME_TIME_MS;
     const float localPredictsRemote =
         (std::max)(0.0f, oneWayP90Frames - (float)snap.effective_remote_delay);
@@ -642,6 +707,7 @@ void NetplayPacing_ResetSession(const char* reason) {
     s_lastDebtLogRb = -1000000;
     s_lastDecisionLogRb = -1000000;
     s_lastAsymDelayLogRb = -1000000;
+    ResetStatRollup();
 }
 
 void NetplayPacing_NotifyLocalMode() {
@@ -874,6 +940,7 @@ void NetplayPacing_OnSessionSample(
         LogEnable(telemetry);
     }
     LogUpdate(telemetry);
+    UpdateStatRollup(telemetry);
 }
 
 void NetplayPacing_OnHoldSample(
@@ -891,6 +958,11 @@ void NetplayPacing_OnHoldSample(
     }
 
     ApplyTickSlew(telemetry, true, NetplayPacingActionName(holdKind));
+
+    // Legacy pacing cannot label hold causes; every freeze it takes is
+    // network-attributed (hold_pred) until the typed-cause engine lands.
+    s_statHoldsPrediction++;
+    UpdateStatRollup(telemetry);
 
     NetplayTickState tickState{};
     GetNetplayTickState(&tickState);

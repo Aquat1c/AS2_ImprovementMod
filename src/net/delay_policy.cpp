@@ -238,9 +238,9 @@ void DelayPolicy_FrameUpdate() {
     if (Rollback::RollbackSession_IsActive()) {
         Rollback::RollbackTimesyncTelemetry telemetry{};
         Rollback::RollbackSession_GetTimesyncTelemetry(&telemetry);
-        if (telemetry.gekko_avg_ping > 0.0f) {
-            DelayPolicy_UpdateNetworkMeasurement(telemetry.gekko_avg_ping,
-                                                 telemetry.gekko_jitter,
+        if (telemetry.link_avg_ping > 0.0f) {
+            DelayPolicy_UpdateNetworkMeasurement(telemetry.link_avg_ping,
+                                                 telemetry.link_jitter,
                                                  telemetry.rtt_p90_ms,
                                                  telemetry.rtt_p95_ms,
                                                  telemetry.jitter_p95_ms);

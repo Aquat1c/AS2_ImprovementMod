@@ -573,22 +573,18 @@ static void OnPregamePacket(PacketType type, const void* payload, size_t payload
                 PauseHandler_OnRemotePauseQuit();
                 break;
             }
-            if (type == PacketType::WinScreenConfirm) {
-                WinScreenSync_OnRemoteConfirm();
-                break;
-            }
             // Gameplay/debug packets that can arrive during handoff transition
             // — silently ignore rather than spam warnings
-            if (type == PacketType::GameplayInput ||
-                type == PacketType::FrameSyncStatus ||
+            if (type == PacketType::FrameSyncStatus ||
                 type == PacketType::StateDigest ||
                 type == PacketType::Ping ||
                 type == PacketType::Pong ||
-                // GekkoData / GekkoReady can race in on the same tick that
-                // TryStartRollbackSession() switches the callback to OnGameplayPacket.
-                // If OnPregamePacket still handles the packet, ignore silently;
-                // OnlineWiring's startup barrier resend path will re-assert READY.
-                type == PacketType::GekkoData ||
+                // InputStream / GekkoReady can race in on the same tick that
+                // TryStartRollbackSession() switches the callback to the
+                // gameplay packet router. If OnPregamePacket still handles the
+                // packet, ignore silently; OnlineWiring's startup barrier
+                // resend path will re-assert READY.
+                type == PacketType::InputStream ||
                 type == PacketType::GekkoReady) {
                 Rollback::NetplayLog_Verbose(
                     "PREGAME", -1,
@@ -1129,6 +1125,15 @@ static void ResetTrackingStateForNewRun() {
     s_phaseStartTime = GetTickCount();
 }
 
+// Injected into frontend_input_sync (M0 dependency inversion): win-screen
+// frame-input sends are allowed only while pregame is inactive or already in
+// gameplay handoff — the same predicate frontend_input_sync used to compute by
+// reaching up into PregameSync_GetPhase().
+static bool PregameWinScreenSendGate() {
+    const PregamePhase prePhase = PregameSync_GetPhase();
+    return prePhase == PregamePhase::Idle || prePhase == PregamePhase::GameplayHandoff;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -1162,6 +1167,7 @@ void PregameSync_Init() {
     s_phaseStartTime = 0;
 
     FrontendInputSync_Init();
+    FrontendInputSync_SetWinScreenSendGate(&PregameWinScreenSendGate);
     CharSelSync_Init();
     MatchBootstrap_Init();
 
@@ -1174,6 +1180,7 @@ void PregameSync_Shutdown() {
 
     MatchBootstrap_Shutdown();
     CharSelSync_Shutdown();
+    FrontendInputSync_SetWinScreenSendGate(nullptr);
     FrontendInputSync_Shutdown();
 
     s_phase = PregamePhase::Idle;

@@ -11,7 +11,6 @@
 
 #include "net/barrier_protocol.h"
 #include "net/pregame_sync.h"
-#include "net/match_bootstrap.h"
 #include "net/session_manager.h"
 #include "ui/log_window.h"
 

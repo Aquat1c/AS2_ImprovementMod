@@ -18,7 +18,9 @@ namespace Net {
 // Protocol Constants
 // ============================================================================
 
-constexpr uint16_t PROTOCOL_VERSION = 18;
+// v2 wire protocol (re0.7 M1). 18 = last 0.6/0.7 field build; 19 deliberately
+// skipped so interim re0.7 dev builds can never pair with field builds.
+constexpr uint16_t PROTOCOL_VERSION = 20;
 constexpr int      MAX_PACKET_SIZE  = 1200;     // Stay under typical MTU
 constexpr int      MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - 2;  // minus PacketType
 constexpr int      NETPLAY_PALETTE_BANK_COUNT = 12;
@@ -38,13 +40,19 @@ constexpr uint8_t NUM_CHANNELS      = 3;
 // Packet Types
 // ============================================================================
 
+// Retired at v20 (deleted outright — no send/receive site remained):
+//   SessionMeta (5), GameplayInput (20), WinScreenConfirm (41).
+// Retired-by-plan but still live in the old backend until the M3/M5 cutovers
+// (marked LEGACY below): Hello/HelloAck (superseded by the 5-step nonce
+// handshake), DelayChangeReq/Ack (INV-23: knobs become peer-local),
+// GekkoReady (superseded by TransitionBarrier GameplayStart),
+// SyncAnnounce/SyncConfirm delay-negotiation fields.
 enum class PacketType : uint16_t {
     // Session control (reliable, channel 0)
-    Hello           = 1,    // Initiator sends after ENet connect
-    HelloAck        = 2,    // Responder replies with own info
+    Hello           = 1,    // LEGACY handshake — retired at session2 (M3) cutover
+    HelloAck        = 2,    // LEGACY handshake — retired at session2 (M3) cutover
     Ready           = 3,    // Peer is ready for next phase
     Disconnect      = 4,    // Graceful disconnect with reason
-    SessionMeta     = 5,    // Arbitrary session metadata exchange
 
     // Initial session sync (reliable, channel 0)
     SyncAnnounce    = 6,    // Session metadata announce for pre-game agreement
@@ -72,7 +80,6 @@ enum class PacketType : uint16_t {
     CharSelFrameInput = 40, // Per-frame charsel input with redundancy
 
     // Win screen / pause
-    WinScreenConfirm    = 41,  // Legacy win screen one-shot confirm signal
     PauseQuit           = 42,  // Pause menu quit signal
     WinScreenFrameInput = 43,  // Mode 9 lockstep frame input with redundancy
 
@@ -81,16 +88,18 @@ enum class PacketType : uint16_t {
     PaletteData        = 51,
     PaletteAck         = 52,
 
-    // Gameplay (unreliable, channel 1)
-    GameplayInput   = 20,   // Legacy mod-owned rollback input sync (DEAD — no send site)
-    GekkoData       = 23,   // Raw GekkoNet internal protocol data
+    // Gameplay input stream (unreliable-sequenced, channel 1).
+    // v20: replaces GekkoData under the same id. Until the engine2 cutover
+    // (M5) the old backend still transports raw GekkoNet bytes under this id;
+    // the v2 InputStreamPayload below is the target schema (defined, unsent).
+    InputStream     = 23,
 
     // Startup gameplay-entry barrier (reliable, channel 0)
-    // Sent when first post-intro interactive boundary is reached while held;
-    // release requires mutual ready+ack.
+    // LEGACY — superseded by TransitionBarrier GameplayStart at the M5 cutover.
     GekkoReady      = 24,   // Startup barrier control (ready/ack)
 
     // Frontend shared-delay coordination
+    // LEGACY — retired with the delay-negotiation flow (INV-23) at cutover.
     DelayChangeReq  = 21,
     DelayChangeAck  = 22,
 
@@ -107,7 +116,22 @@ enum class PacketType : uint16_t {
     // proposal/ack round trip; stale seqs are re-acked idempotently.
     PhaseTransitionProposal = 60,
     PhaseTransitionAck      = 61,
-    ResyncRequest           = 62,  // "my frontend state diverged — re-sync instead of dying"
+    ResyncRequest           = 62,  // Frontend starvation interrogation (INV-11)
+    ResyncReply             = 63,  // Responder's identity tuple
+
+    // v2 session handshake (reliable, channel 0) — 5-step nonce exchange
+    // (master plan §4.2). Defined at M1; sent by session2 from M3.
+    SessionHello      = 70,  // step 1 (client, 200 ms resend)
+    SessionOffer      = 71,  // step 2 (host, echoes Hello verbatim — INV-13)
+    SessionAck        = 72,  // step 3 (client, echoes Offer verbatim)
+    SessionConfirm    = 73,  // step 4 (host, session_id)
+    SessionConfirmAck = 74,  // step 5 (client, session_id) → Connected
+
+    // v2 gameplay verification / timing (defined at M1; sent from M4+)
+    SyncHash        = 75,   // reliable ch0: periodic confirmed-frame state hash
+    SyncHashAck     = 76,   // reliable ch0: bounds sender's outstanding window
+    TimeProbe       = 77,   // unreliable ch1: 4 Hz µs RTT probe
+    TimeProbeAck    = 78,   // unreliable ch1: echo with responder dwell
 };
 
 enum class FrameTimingMode : uint8_t {
@@ -133,6 +157,32 @@ inline const char* FrameTimingModeDisplayName(FrameTimingMode mode) {
         case FrameTimingMode::Vanilla58_8: return "58.8 FPS";
         case FrameTimingMode::Proper60:    return "60.0 FPS";
         default:                           return "Unknown";
+    }
+}
+
+// ============================================================================
+// Frontend phase identity (v2, §3.4)
+// ============================================================================
+
+// Fixed enum, identical on both builds by construction — replaces the per-side
+// runtime `phase_serial` allocator as the acceptance key (INV-7). The continue
+// prompt rides WinScreen's stream under id 3 per the shipped continue_flow
+// design. The legacy phase_serial fields remain populated until the frontend
+// acceptance-rule cutover (M5) so the old backend keeps running unchanged.
+enum class FrontendPhaseId : uint8_t {
+    None      = 0,
+    CharSel   = 1,
+    StageSel  = 2,
+    WinScreen = 3,
+};
+
+inline const char* FrontendPhaseIdName(FrontendPhaseId id) {
+    switch (id) {
+        case FrontendPhaseId::None:      return "None";
+        case FrontendPhaseId::CharSel:   return "CharSel";
+        case FrontendPhaseId::StageSel:  return "StageSel";
+        case FrontendPhaseId::WinScreen: return "WinScreen";
+        default:                         return "Unknown";
     }
 }
 
@@ -216,6 +266,7 @@ enum class NetTransitionKind : uint8_t {
     RematchStart     = 3,  // begin pregame sync for the next match
     GameplayStart    = 4,  // enter the match handoff
     SessionCancel    = 5,  // graceful teardown with reason
+    EpochAlign       = 6,  // v2 (§4.5): adopt {epoch, first_phase, native_mode}
 };
 
 enum class PostMatchIntentWire : uint8_t {
@@ -231,6 +282,12 @@ struct PhaseTransitionPayload {
     uint8_t  intent;          // PostMatchIntentWire for PostMatchDecision, else 0
     uint16_t _pad;
     uint32_t session_id;      // pregame session id context (0 if none)
+    // v2 EpochAlign fields (§3.2/§4.5); zero for every other kind. Defined at
+    // M1 (compile-only); populated once match_setup mints epochs (M5).
+    uint32_t epoch;           // epoch being adopted (host-minted, u32, never 0)
+    uint8_t  first_phase;     // FrontendPhaseId of the epoch's first phase
+    uint8_t  native_mode;     // sender's native MODE_* at proposal time
+    uint16_t _pad2;
 };
 
 inline const char* NetTransitionKindName(NetTransitionKind kind) {
@@ -241,6 +298,7 @@ inline const char* NetTransitionKindName(NetTransitionKind kind) {
         case NetTransitionKind::RematchStart:      return "RematchStart";
         case NetTransitionKind::GameplayStart:     return "GameplayStart";
         case NetTransitionKind::SessionCancel:     return "SessionCancel";
+        case NetTransitionKind::EpochAlign:        return "EpochAlign";
     }
     return "?";
 }
@@ -357,7 +415,8 @@ struct FrontendPhaseBarrierPayload {
     uint16_t next_phase;         // Net::FrontendSyncPhase (next phase)
     uint32_t last_completed_frame; // Sender's final frame index for the completed phase
     uint8_t  reason_code;        // Barrier reason / transition category
-    uint8_t  _pad[3];
+    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  _pad[2];
 };
 
 struct FrontendBoundaryDigestPayload {
@@ -374,7 +433,8 @@ struct FrontendBoundaryDigestPayload {
     uint8_t  p2_palette;
     uint8_t  p1_palette_custom;
     uint8_t  p2_palette_custom;
-    uint8_t  _palette_pad[2];
+    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  _palette_pad;
     uint8_t  stage_cursor;
     uint8_t  stage_confirmed;
     uint8_t  stage_counter;
@@ -543,9 +603,10 @@ struct GekkoReadyPayload {
 
 struct CharSelFrameInputPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch (retired at M5)
     uint16_t phase;              // Net::FrontendSyncPhase (CharSel or StageSel)
-    uint16_t _phase_pad;
+    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
     uint16_t inputs[16];         // Redundant history: [frame, frame-1, ..., frame-15]
@@ -555,9 +616,10 @@ struct CharSelFrameInputPayload {
 
 struct WinScreenFrameInputPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
+    uint32_t phase_serial;       // Monotonic phase instance inside the epoch (retired at M5)
     uint16_t phase;              // Net::FrontendSyncPhase (WinScreen)
-    uint16_t _phase_pad;
+    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
     uint16_t inputs[16];         // Redundant history: [frame, frame-1, ..., frame-15]
@@ -621,6 +683,124 @@ struct DelayChangeAckPayload {
     uint8_t  _pad[2];
 };
 
+// ============================================================================
+// v2 wire payloads (master plan §3.2) — defined at M1, unsent until M3+.
+// ============================================================================
+
+// --- 5-step nonce handshake (§4.2) ---
+
+struct SessionHelloPayload {
+    uint16_t proto_ver;          // must equal PROTOCOL_VERSION (fail-closed)
+    uint32_t build_hash;         // exact build fingerprint (fail-closed)
+    uint16_t cadence_num;        // §2.8.2 cadence profile rational, numerator
+    uint16_t cadence_den;        // §2.8.2 cadence profile rational, denominator
+    uint64_t client_nonce;       // fresh nonzero per attempt (replay inertness)
+    char     nickname[16];       // null-terminated UTF-8
+};
+
+// Echo-verbatim (INV-13): confirm packets are built from the received BYTES,
+// never recomputed — the `shared=2` class of bug is structurally impossible.
+struct SessionOfferPayload {
+    SessionHelloPayload hello_echo;  // every Hello field, byte-exact
+    uint64_t host_nonce;             // fresh nonzero
+    uint32_t host_seed;
+    char     host_nickname[16];
+};
+
+struct SessionAckPayload {
+    SessionOfferPayload offer_echo;  // every Offer field, byte-exact
+};
+
+// session_id = fnv1a64(client_nonce || host_nonce || host_seed); equality of
+// the two directions is the final echo check.
+struct SessionConfirmPayload {
+    uint64_t session_id;
+};
+
+struct SessionConfirmAckPayload {
+    uint64_t session_id;
+};
+
+// --- Gameplay input stream (replaces GekkoData semantics at the M5 cutover) ---
+
+constexpr uint32_t INPUT_STREAM_MAX_INPUTS = 32;
+
+// Piggybacked peer-status block; advisory only. adv_delay/adv_rollback are
+// HUD/coverage-math inputs, never applied locally (INV-23); no pacing decision
+// may read produced_through as an error term (INV-1).
+struct PressureReport {
+    uint32_t produced_through;   // newest local input sealed (frontier)
+    uint32_t confirmed_frontier; // all inputs <= N are actual
+    uint8_t  prediction_depth;   // current speculative depth
+    uint8_t  run_state;          // Rollback::RunState
+    uint8_t  adv_delay;          // sender's D_local (advisory)
+    uint8_t  adv_rollback;       // sender's R_local (advisory)
+};
+
+// Redundant window anchored at peer_ack_through+1: oldest included frame =
+// max(newest_frame - (INPUT_STREAM_MAX_INPUTS-1), peer_ack_through+1).
+// inputs[0] = frame (newest_frame - count + 1) .. inputs[count-1] = newest.
+// Senders transmit the used prefix only; receivers merge idempotently.
+struct InputStreamPayload {
+    uint64_t session_id;
+    uint32_t epoch;
+    uint32_t newest_frame;
+    uint32_t ack_through;        // sender's contiguous remote-actual prefix
+    uint8_t  count;              // 1..INPUT_STREAM_MAX_INPUTS
+    uint8_t  _pad[3];
+    uint16_t inputs[INPUT_STREAM_MAX_INPUTS];
+    PressureReport pressure;
+};
+
+// --- Confirmed-frame verification (§2.7.7) ---
+
+struct SyncHashPayload {
+    uint64_t session_id;
+    uint32_t epoch;
+    uint32_t frame;              // canonical frame (confirmed on sender)
+    uint64_t gameplay_hash;      // authoritative sim-affecting-state digest
+    uint32_t rng_state;          // diagnostic
+    uint16_t hp0;                // diagnostic
+    uint16_t hp1;                // diagnostic
+};
+
+struct SyncHashAckPayload {
+    uint32_t epoch;
+    uint32_t frame;
+};
+
+// --- µs RTT probe (§2.9.3) ---
+
+struct TimeProbePayload {
+    uint32_t generation;         // estimator generation (stale replies inert)
+    uint64_t stamp_us;           // opaque QPC µs stamp, echoed verbatim
+};
+
+struct TimeProbeAckPayload {
+    uint32_t generation;
+    uint64_t stamp_us;           // echoed request stamp
+    uint32_t dwell_us;           // responder processing dwell to subtract
+};
+
+// --- Frontend starvation interrogation (INV-11) ---
+
+struct ResyncRequestPayload {
+    uint32_t epoch;
+    uint8_t  phase_id;           // FrontendPhaseId
+    uint8_t  native_mode;        // sender's native MODE_*
+    uint16_t _pad;
+    uint32_t local_frame;        // sender's current phase frame
+};
+
+// Same tuple, responder's view; mismatch triggers an EpochAlign re-run.
+struct ResyncReplyPayload {
+    uint32_t epoch;
+    uint8_t  phase_id;
+    uint8_t  native_mode;
+    uint16_t _pad;
+    uint32_t local_frame;
+};
+
 #pragma pack(pop)
 
 // GekkoReadyPayload flags
@@ -652,6 +832,48 @@ static_assert(sizeof(PacketType) + sizeof(SyncTracePayload) <= MAX_PACKET_SIZE,
     "SyncTracePayload must fit inside one transport packet");
 static_assert(sizeof(PacketType) + sizeof(ChurnPausePayload) <= MAX_PACKET_SIZE,
     "ChurnPausePayload must fit inside one transport packet");
+
+// v2 payload size pins (M1 facade/wire freeze — see docs/re0.7/API_FREEZE.md)
+static_assert(sizeof(SessionHelloPayload) == 34,
+    "SessionHelloPayload wire size must remain stable");
+static_assert(sizeof(SessionOfferPayload) == 62,
+    "SessionOfferPayload wire size must remain stable");
+static_assert(sizeof(SessionAckPayload) == 62,
+    "SessionAckPayload wire size must remain stable");
+static_assert(sizeof(SessionConfirmPayload) == 8 && sizeof(SessionConfirmAckPayload) == 8,
+    "Session confirm payload wire sizes must remain stable");
+static_assert(sizeof(PressureReport) == 12,
+    "PressureReport wire size must remain stable");
+static_assert(sizeof(InputStreamPayload) == 24 + 2 * INPUT_STREAM_MAX_INPUTS + 12,
+    "InputStreamPayload wire size must remain stable");
+static_assert(sizeof(SyncHashPayload) == 32,
+    "SyncHashPayload wire size must remain stable");
+static_assert(sizeof(SyncHashAckPayload) == 8,
+    "SyncHashAckPayload wire size must remain stable");
+static_assert(sizeof(TimeProbePayload) == 12 && sizeof(TimeProbeAckPayload) == 16,
+    "TimeProbe payload wire sizes must remain stable");
+static_assert(sizeof(ResyncRequestPayload) == 12 && sizeof(ResyncReplyPayload) == 12,
+    "Resync payload wire sizes must remain stable");
+static_assert(sizeof(PhaseTransitionPayload) == 20,
+    "PhaseTransitionPayload wire size must remain stable");
+static_assert(sizeof(PacketType) + sizeof(InputStreamPayload) <= MAX_PACKET_SIZE,
+    "InputStreamPayload must fit inside one transport packet");
+
+// M1 contract-freeze pins for byte-stable payloads carried over from v18.
+static_assert(sizeof(PaletteConfigPayload) == 20,
+    "PaletteConfigPayload wire size must remain stable");
+static_assert(sizeof(PaletteDataPayload) == 20 + NETPLAY_PALETTE_BANK_SIZE,
+    "PaletteDataPayload wire size must remain stable");
+static_assert(sizeof(PaletteAckPayload) == 16,
+    "PaletteAckPayload wire size must remain stable");
+static_assert(sizeof(CharSelFrameInputPayload) == 56,
+    "CharSelFrameInputPayload wire size must remain stable");
+static_assert(sizeof(WinScreenFrameInputPayload) == 56,
+    "WinScreenFrameInputPayload wire size must remain stable");
+static_assert(sizeof(FrontendPhaseBarrierPayload) == 20,
+    "FrontendPhaseBarrierPayload wire size must remain stable");
+static_assert(sizeof(FrontendBoundaryDigestPayload) == 36,
+    "FrontendBoundaryDigestPayload wire size must remain stable");
 
 // NatInfoPayload flags
 constexpr uint8_t NAT_INFO_FLAG_UPNP_ENABLED      = 1 << 0;
@@ -685,7 +907,6 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::HelloAck:       return "HelloAck";
         case PacketType::Ready:          return "Ready";
         case PacketType::Disconnect:     return "Disconnect";
-        case PacketType::SessionMeta:    return "SessionMeta";
         case PacketType::SyncAnnounce:   return "SyncAnnounce";
         case PacketType::SyncConfirm:    return "SyncConfirm";
         case PacketType::FrontendPhaseBarrier: return "FrontendPhaseBarrier";
@@ -703,12 +924,10 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::BaselineBreakdown: return "BaselineBreakdown";
         case PacketType::GameplayStart:  return "GameplayStart";
         case PacketType::GekkoReady:     return "GekkoReady";
-        case PacketType::GameplayInput:   return "GameplayInput";
         case PacketType::DelayChangeReq:  return "DelayChangeReq";
         case PacketType::DelayChangeAck:  return "DelayChangeAck";
-        case PacketType::GekkoData:       return "GekkoData";
+        case PacketType::InputStream:     return "InputStream";
         case PacketType::CharSelFrameInput:   return "CharSelFrameInput";
-        case PacketType::WinScreenConfirm:    return "WinScreenConfirm";
         case PacketType::PauseQuit:           return "PauseQuit";
         case PacketType::WinScreenFrameInput: return "WinScreenFrameInput";
         case PacketType::PaletteConfig:       return "PaletteConfig";
@@ -723,6 +942,16 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::PhaseTransitionProposal: return "PhaseTransitionProposal";
         case PacketType::PhaseTransitionAck:      return "PhaseTransitionAck";
         case PacketType::ResyncRequest:           return "ResyncRequest";
+        case PacketType::ResyncReply:             return "ResyncReply";
+        case PacketType::SessionHello:            return "SessionHello";
+        case PacketType::SessionOffer:            return "SessionOffer";
+        case PacketType::SessionAck:              return "SessionAck";
+        case PacketType::SessionConfirm:          return "SessionConfirm";
+        case PacketType::SessionConfirmAck:       return "SessionConfirmAck";
+        case PacketType::SyncHash:                return "SyncHash";
+        case PacketType::SyncHashAck:             return "SyncHashAck";
+        case PacketType::TimeProbe:               return "TimeProbe";
+        case PacketType::TimeProbeAck:            return "TimeProbeAck";
         default:                         return "Unknown";
     }
 }

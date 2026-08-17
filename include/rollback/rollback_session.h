@@ -30,6 +30,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "rollback/rollback_telemetry.h"
+
 namespace Rollback {
 
 // ============================================================================
@@ -109,8 +111,9 @@ void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2);
 // GekkoNet Packet Ingestion
 // ============================================================================
 
-/// Buffer a received GekkoData packet payload for GekkoNet to drain.
-/// Called by the packet callback when a GekkoData packet arrives.
+/// Buffer a received InputStream packet payload for GekkoNet to drain.
+/// Called by the packet router when an InputStream packet arrives.
+/// (Deleted at the engine2/M5 cutover.)
 void RollbackSession_BufferGekkoPacket(const void* data, size_t len);
 
 // ============================================================================
@@ -163,33 +166,8 @@ const char* RollbackSession_GetErrorReason();
 /// Returns true when a non-empty reason was captured.
 bool RollbackSession_TakeErrorReason(char* out, size_t outSize);
 
-struct RollbackTimesyncTelemetry {
-    int32_t  rb_frame_current;
-    int32_t  rb_frame_last_confirmed;
-    int32_t  rb_frame_last_remote_received;
-    int32_t  rb_frame_remote_contiguous;
-    int32_t  raw_remote_gap;
-    int32_t  effective_remote_delay;
-    int32_t  prediction_debt;
-    int32_t  rollback_budget;
-    int32_t  game_abs_frame_current;
-    int32_t  frame_origin_abs;
-    int32_t  rollback_count;
-    int32_t  last_rollback_replay_length;
-    int32_t  max_rollback_distance;
-    int32_t  predicted_frames_outstanding;
-    float    frames_ahead;
-    float    gekko_avg_ping;
-    float    gekko_jitter;
-    float    rtt_last_ms;
-    float    rtt_avg_ms;
-    float    rtt_p90_ms;
-    float    rtt_p95_ms;
-    float    jitter_avg_ms;
-    float    jitter_p95_ms;
-    float    packet_loss_ewma;
-    int32_t  loss_burst_max;
-};
+// RollbackTimesyncTelemetry now lives in rollback/rollback_telemetry.h (M0
+// extraction; gekko_avg_ping/gekko_jitter renamed link_avg_ping/link_jitter).
 
 /// Lightweight runtime telemetry for pacing/timesync logic.
 /// Unlike RollbackSession_GetSnapshot, this does NOT compute large-state CRCs.

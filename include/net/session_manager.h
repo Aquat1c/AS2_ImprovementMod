@@ -38,6 +38,16 @@ struct SessionSnapshot {
     char            error_text[128];
 };
 
+// M1 facade freeze (docs/re0.7/API_FREEZE.md): session2 must reproduce these
+// shapes byte-for-byte. If one of these fires, a preserved contract changed —
+// fix the change, not the assert. Values are MSVC Win32 default packing.
+static_assert(sizeof(PeerInfo) == 96,
+    "PeerInfo shape is frozen for the re0.7 rebuild (inventory §2.1)");
+static_assert(sizeof(ConnectionStats) == 40,
+    "ConnectionStats shape is frozen for the re0.7 rebuild (inventory §2.1)");
+static_assert(sizeof(SessionSnapshot) == 472,
+    "SessionSnapshot shape is frozen for the re0.7 rebuild (inventory §2.1)");
+
 // ============================================================================
 // Lifecycle
 // ============================================================================

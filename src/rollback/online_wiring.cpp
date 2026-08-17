@@ -3,7 +3,7 @@
  *
  * This is the integration glue that connects all subsystems:
  *   - Bootstrap → RollbackSession handoff
- *   - Packet routing for GameplayInput + StateDigest
+ *   - Engine-facing packet sinks (dispatch lives in net/gameplay_packet_router)
  *   - Lifecycle phase → rollback start/stop/pause
  *   - Disconnect → safe teardown
  *   - Post-match → clean handoff
@@ -22,6 +22,7 @@
 #include "rollback/determinism_verify.h"
 #include "patches/input_sync_hooks.h"
 #include "net/gameplay_bridge.h"
+#include "net/gameplay_packet_router.h"
 #include "net/match_lifecycle.h"
 #include "net/set_tracker.h"
 #include "net/pregame_sync.h"
@@ -243,320 +244,106 @@ static void LogGameplayPacketAnomaly(const char* reason,
 }
 
 // ============================================================================
-// Packet Dispatch for Gameplay Phase
+// Engine-facing packet sinks (dispatch itself moved to gameplay_packet_router)
 // ============================================================================
 
-/// Packet callback that handles both pregame AND gameplay packets.
-/// During gameplay, GameplayInput/StateDigest are dispatched here.
-/// All other packets are forwarded to the pregame handler.
-static void OnGameplayPacket(Net::PacketType type, const void* payload, size_t payloadLen) {
-    // Wire-acknowledged transition barriers must be reachable regardless of
-    // which callback owns the slot — winscreen-exit proposals arrive exactly
-    // while this handler is installed.
-    if (Net::TransitionBarrier_OnPacket(type, payload, payloadLen)) {
+void OnlineWiring_HandleEngineDataPacket(const void* payload, size_t payloadLen) {
+    // Engine internal protocol data (raw Gekko stream until the engine2
+    // cutover) — buffer for the rollback session to drain.
+    if (payloadLen == 0 || !payload) {
+        LogGameplayPacketAnomaly("Empty InputStream", Net::PacketType::InputStream, payloadLen, 1);
         return;
     }
-    switch (type) {
-        case Net::PacketType::GekkoData: {
-            // GekkoNet internal protocol data — buffer for GekkoNet to drain
-            if (payloadLen == 0 || !payload) {
-                LogGameplayPacketAnomaly("Empty GekkoData", type, payloadLen, 1);
-                break;
-            }
 
-            if (!s_rollbackActive) {
-                static uint32_t s_preLiveGekkoDrops = 0;
-                s_preLiveGekkoDrops++;
-                if (s_preLiveGekkoDrops <= 5 || (s_preLiveGekkoDrops % 120) == 0) {
-                    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
-                        "Dropping pre-live GekkoData while rollback session is not active: "
-                        "len=%zu phase=%s",
-                        payloadLen,
-                        Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
-                }
-                break;
-            }
-
-            RollbackSession_BufferGekkoPacket(payload, payloadLen);
-            s_packetsDispatched++;
-            s_remoteInputsReceived++;
-
-            NetplayLog_Verbose("GEKKO", RollbackSession_GetCurrentFrame(),
-                "Buffered GekkoData packet (%zu bytes)", payloadLen);
-            break;
-        }
-
-        case Net::PacketType::StateDigest: {
-            if (payloadLen < sizeof(Net::StateDigestPayload)) {
-                LogGameplayPacketAnomaly("Short StateDigest", type, payloadLen, sizeof(Net::StateDigestPayload));
-                break;
-            }
-            auto* p = static_cast<const Net::StateDigestPayload*>(payload);
-            RollbackDebug_OnRemoteDigest((int32_t)p->frame_number, p->crc32);
-
-            NetplayLog_Verbose("DIGEST", (int32_t)p->frame_number,
-                "Remote digest received: crc=0x%08X", p->crc32);
-            break;
-        }
-
-        case Net::PacketType::FrameSyncStatus: {
-            if (payloadLen < sizeof(Net::FrameSyncStatusPayload)) {
-                LogGameplayPacketAnomaly("Short FrameSyncStatus", type, payloadLen, sizeof(Net::FrameSyncStatusPayload));
-                break;
-            }
-            auto* p = static_cast<const Net::FrameSyncStatusPayload*>(payload);
-            RollbackDebug_OnRemoteFrameSyncStatus(
-                p->rb_frame_current,
-                p->game_abs_frame_current,
-                p->frame_origin_abs,
-                p->rb_frame_last_remote_received,
-                p->rb_frame_confirmed,
-                p->predicted_frames,
-                p->checksum);
-            break;
-        }
-
-        case Net::PacketType::SyncTrace: {
-            if (payloadLen < sizeof(Net::SyncTracePayload)) {
-                LogGameplayPacketAnomaly("Short SyncTrace", type, payloadLen, sizeof(Net::SyncTracePayload));
-                break;
-            }
-            Net::SyncTrace_OnRemoteTrace(static_cast<const Net::SyncTracePayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::ChurnPause: {
-            if (payloadLen < sizeof(Net::ChurnPausePayload)) {
-                LogGameplayPacketAnomaly("Short ChurnPause", type, payloadLen, sizeof(Net::ChurnPausePayload));
-                break;
-            }
-            Net::ChurnPause_OnRemotePacket(static_cast<const Net::ChurnPausePayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::GekkoReady: {
-            uint8_t flags = Net::GEKKO_READY_FLAG_READY;  // Legacy fallback: empty payload => READY
-            uint8_t phase = 0xFF;
-            int32_t remoteGameAbsFrame = -1;
-
-            if (payloadLen >= sizeof(Net::GekkoReadyPayload) && payload) {
-                const auto* p = static_cast<const Net::GekkoReadyPayload*>(payload);
-                flags = p->flags;
-                phase = p->phase;
-                remoteGameAbsFrame = p->game_abs_frame;
-            } else if (payloadLen >= 1 && payload) {
-                flags = *static_cast<const uint8_t*>(payload);
-            } else if (payloadLen != 0) {
-                LogGameplayPacketAnomaly("Short GekkoReady", type, payloadLen, sizeof(uint8_t));
-                break;
-            }
-
-            if ((flags & Net::GEKKO_READY_FLAG_READY) == 0 &&
-                (flags & Net::GEKKO_READY_FLAG_ACK) == 0) {
-                LogGameplayPacketAnomaly("Empty GekkoReady flags", type, payloadLen, sizeof(uint8_t));
-                break;
-            }
-            if ((flags & Net::GEKKO_READY_FLAG_ACK) != 0) {
-                flags |= Net::GEKKO_READY_FLAG_READY;
-            }
-
-            const bool legacyPhase = (phase == 0xFF);
-            const bool remoteAtInteractiveBoundary =
-                legacyPhase ||
-                (phase == (uint8_t)Net::MatchLifecyclePhase::PlayableGameplay);
-            if (!remoteAtInteractiveBoundary && !s_startupReleased) {
-                NetplayLog_Write("STARTUP", GetStartupLogFrame(),
-                    "Ignoring remote GekkoReady before interactive boundary: flags=0x%02X "
-                    "phase=%u remote_game_abs_frame=%d local_phase=%s",
-                    flags,
-                    (unsigned)phase,
-                    remoteGameAbsFrame,
-                    Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
-                break;
-            }
-
-            if ((flags & Net::GEKKO_READY_FLAG_READY) != 0) {
-                if (!s_remoteGekkoReady) {
-                    s_remoteGekkoReady = true;
-                    s_remoteReadyFrame = remoteGameAbsFrame;
-                    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
-                        "Remote startup READY observed: flags=0x%02X phase=%u remote_game_abs_frame=%d",
-                        flags, (unsigned)phase, remoteGameAbsFrame);
-                } else {
-                    NetplayLog_Verbose("STARTUP", GetStartupLogFrame(),
-                        "Duplicate remote READY ignored: flags=0x%02X phase=%u remote_game_abs_frame=%d",
-                        flags, (unsigned)phase, remoteGameAbsFrame);
-                }
-            }
-
-            if ((flags & Net::GEKKO_READY_FLAG_ACK) != 0) {
-                if (!s_remoteGekkoReadyAck) {
-                    s_remoteGekkoReadyAck = true;
-                    s_remoteAckFrame = remoteGameAbsFrame;
-                    NetplayLog_Write("STARTUP", GetStartupLogFrame(),
-                        "Remote startup ACK observed: flags=0x%02X phase=%u remote_game_abs_frame=%d",
-                        flags, (unsigned)phase, remoteGameAbsFrame);
-                } else {
-                    NetplayLog_Verbose("STARTUP", GetStartupLogFrame(),
-                        "Duplicate remote ACK ignored: flags=0x%02X phase=%u remote_game_abs_frame=%d",
-                        flags, (unsigned)phase, remoteGameAbsFrame);
-                }
-            }
-            break;
-        }
-
-        case Net::PacketType::CharSelFrameInput: {
-            if (payloadLen < sizeof(Net::CharSelFrameInputPayload)) {
-                LogGameplayPacketAnomaly("Short CharSelFrameInput", type, payloadLen,
-                                         sizeof(Net::CharSelFrameInputPayload));
-                break;
-            }
-            Net::CharSelSync_OnRemoteFrameInput(
-                static_cast<const Net::CharSelFrameInputPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::FrontendPhaseBarrier: {
-            if (payloadLen < sizeof(Net::FrontendPhaseBarrierPayload)) {
-                LogGameplayPacketAnomaly("Short FrontendPhaseBarrier", type, payloadLen,
-                                         sizeof(Net::FrontendPhaseBarrierPayload));
-                break;
-            }
-            Net::FrontendInputSync_OnRemotePhaseBarrier(
-                static_cast<const Net::FrontendPhaseBarrierPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::FrontendBoundaryDigest: {
-            if (payloadLen < sizeof(Net::FrontendBoundaryDigestPayload)) {
-                LogGameplayPacketAnomaly("Short FrontendBoundaryDigest", type, payloadLen,
-                                         sizeof(Net::FrontendBoundaryDigestPayload));
-                break;
-            }
-            Net::FrontendInputSync_OnRemoteBoundaryDigest(
-                static_cast<const Net::FrontendBoundaryDigestPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::DelayChangeReq: {
-            if (payloadLen < sizeof(Net::DelayChangeReqPayload)) {
-                LogGameplayPacketAnomaly("Short DelayChangeReq", type, payloadLen,
-                                         sizeof(Net::DelayChangeReqPayload));
-                break;
-            }
-            Net::FrontendInputSync_OnRemoteDelayChangeReq(
-                static_cast<const Net::DelayChangeReqPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::DelayChangeAck: {
-            if (payloadLen < sizeof(Net::DelayChangeAckPayload)) {
-                LogGameplayPacketAnomaly("Short DelayChangeAck", type, payloadLen,
-                                         sizeof(Net::DelayChangeAckPayload));
-                break;
-            }
-            Net::FrontendInputSync_OnRemoteDelayChangeAck(
-                static_cast<const Net::DelayChangeAckPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::CharSelLock: {
-            if (payloadLen < sizeof(Net::CharSelLockPayload)) {
-                LogGameplayPacketAnomaly("Short CharSelLock", type, payloadLen,
-                                         sizeof(Net::CharSelLockPayload));
-                break;
-            }
-            Net::CharSelSync_OnRemoteLock(
-                static_cast<const Net::CharSelLockPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::StageSync: {
-            if (payloadLen < sizeof(Net::StageSyncPayload)) {
-                LogGameplayPacketAnomaly("Short StageSync", type, payloadLen,
-                                         sizeof(Net::StageSyncPayload));
-                break;
-            }
-            Net::CharSelSync_OnRemoteStage(
-                static_cast<const Net::StageSyncPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::WinScreenFrameInput: {
-            if (payloadLen < sizeof(Net::WinScreenFrameInputPayload)) {
-                LogGameplayPacketAnomaly("Short WinScreenFrameInput", type, payloadLen,
-                                         sizeof(Net::WinScreenFrameInputPayload));
-                break;
-            }
-            Net::WinScreenSync_OnRemoteFrameInput(
-                static_cast<const Net::WinScreenFrameInputPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::PaletteConfig: {
-            if (payloadLen < sizeof(Net::PaletteConfigPayload)) {
-                LogGameplayPacketAnomaly("Short PaletteConfig", type, payloadLen,
-                                         sizeof(Net::PaletteConfigPayload));
-                break;
-            }
-            Net::NetplayPaletteRuntime_OnRemoteConfig(
-                static_cast<const Net::PaletteConfigPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::PaletteData: {
-            if (payloadLen < sizeof(Net::PaletteDataPayload)) {
-                LogGameplayPacketAnomaly("Short PaletteData", type, payloadLen,
-                                         sizeof(Net::PaletteDataPayload));
-                break;
-            }
-            Net::NetplayPaletteRuntime_OnRemoteData(
-                static_cast<const Net::PaletteDataPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::PaletteAck: {
-            if (payloadLen < sizeof(Net::PaletteAckPayload)) {
-                LogGameplayPacketAnomaly("Short PaletteAck", type, payloadLen,
-                                         sizeof(Net::PaletteAckPayload));
-                break;
-            }
-            Net::NetplayPaletteRuntime_OnRemoteAck(
-                static_cast<const Net::PaletteAckPayload*>(payload));
-            break;
-        }
-
-        case Net::PacketType::SyncAnnounce:
-        case Net::PacketType::SyncConfirm:
-            if (Net::PregameSync_HandleCrossPhaseSessionPacket(type, payload, payloadLen)) {
-                break;
-            }
-            NetplayLog_Write("HANDOFF", GetStartupLogFrame(),
-                "Ignored cross-phase session sync packet: type=%s pregame=%s lifecycle=%s",
-                Net::PacketTypeName(type),
-                Net::PregamePhaseName(Net::PregameSync_GetPhase()),
+    if (!s_rollbackActive) {
+        static uint32_t s_preLiveGekkoDrops = 0;
+        s_preLiveGekkoDrops++;
+        if (s_preLiveGekkoDrops <= 5 || (s_preLiveGekkoDrops % 120) == 0) {
+            NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                "Dropping pre-live InputStream while rollback session is not active: "
+                "len=%zu phase=%s",
+                payloadLen,
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
-            break;
+        }
+        return;
+    }
 
-        default:
-            // Check for win screen / pause packets
-            if (type == Net::PacketType::WinScreenConfirm) {
-                Net::WinScreenSync_OnRemoteConfirm();
-                break;
-            }
-            if (type == Net::PacketType::PauseQuit) {
-                Net::PauseHandler_OnRemotePauseQuit();
-                break;
-            }
-            // Not a gameplay packet; unhandled at this level.
-            // During gameplay, the pregame handler is not active,
-            // so non-gameplay packets are just logged.
-            NetplayLog_Verbose("PACKET", -1,
-                "Unhandled packet during gameplay: type=%s(%u) payload=%zu",
-                Net::PacketTypeName(type),
-                (unsigned)type,
-                payloadLen);
-            break;
+    RollbackSession_BufferGekkoPacket(payload, payloadLen);
+    s_packetsDispatched++;
+    s_remoteInputsReceived++;
+
+    NetplayLog_Verbose("GEKKO", RollbackSession_GetCurrentFrame(),
+        "Buffered InputStream packet (%zu bytes)", payloadLen);
+}
+
+void OnlineWiring_HandleStartupBarrierPacket(const void* payload, size_t payloadLen) {
+    const Net::PacketType type = Net::PacketType::GekkoReady;
+    uint8_t flags = Net::GEKKO_READY_FLAG_READY;  // Legacy fallback: empty payload => READY
+    uint8_t phase = 0xFF;
+    int32_t remoteGameAbsFrame = -1;
+
+    if (payloadLen >= sizeof(Net::GekkoReadyPayload) && payload) {
+        const auto* p = static_cast<const Net::GekkoReadyPayload*>(payload);
+        flags = p->flags;
+        phase = p->phase;
+        remoteGameAbsFrame = p->game_abs_frame;
+    } else if (payloadLen >= 1 && payload) {
+        flags = *static_cast<const uint8_t*>(payload);
+    } else if (payloadLen != 0) {
+        LogGameplayPacketAnomaly("Short GekkoReady", type, payloadLen, sizeof(uint8_t));
+        return;
+    }
+
+    if ((flags & Net::GEKKO_READY_FLAG_READY) == 0 &&
+        (flags & Net::GEKKO_READY_FLAG_ACK) == 0) {
+        LogGameplayPacketAnomaly("Empty GekkoReady flags", type, payloadLen, sizeof(uint8_t));
+        return;
+    }
+    if ((flags & Net::GEKKO_READY_FLAG_ACK) != 0) {
+        flags |= Net::GEKKO_READY_FLAG_READY;
+    }
+
+    const bool legacyPhase = (phase == 0xFF);
+    const bool remoteAtInteractiveBoundary =
+        legacyPhase ||
+        (phase == (uint8_t)Net::MatchLifecyclePhase::PlayableGameplay);
+    if (!remoteAtInteractiveBoundary && !s_startupReleased) {
+        NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+            "Ignoring remote GekkoReady before interactive boundary: flags=0x%02X "
+            "phase=%u remote_game_abs_frame=%d local_phase=%s",
+            flags,
+            (unsigned)phase,
+            remoteGameAbsFrame,
+            Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+        return;
+    }
+
+    if ((flags & Net::GEKKO_READY_FLAG_READY) != 0) {
+        if (!s_remoteGekkoReady) {
+            s_remoteGekkoReady = true;
+            s_remoteReadyFrame = remoteGameAbsFrame;
+            NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                "Remote startup READY observed: flags=0x%02X phase=%u remote_game_abs_frame=%d",
+                flags, (unsigned)phase, remoteGameAbsFrame);
+        } else {
+            NetplayLog_Verbose("STARTUP", GetStartupLogFrame(),
+                "Duplicate remote READY ignored: flags=0x%02X phase=%u remote_game_abs_frame=%d",
+                flags, (unsigned)phase, remoteGameAbsFrame);
+        }
+    }
+
+    if ((flags & Net::GEKKO_READY_FLAG_ACK) != 0) {
+        if (!s_remoteGekkoReadyAck) {
+            s_remoteGekkoReadyAck = true;
+            s_remoteAckFrame = remoteGameAbsFrame;
+            NetplayLog_Write("STARTUP", GetStartupLogFrame(),
+                "Remote startup ACK observed: flags=0x%02X phase=%u remote_game_abs_frame=%d",
+                flags, (unsigned)phase, remoteGameAbsFrame);
+        } else {
+            NetplayLog_Verbose("STARTUP", GetStartupLogFrame(),
+                "Duplicate remote ACK ignored: flags=0x%02X phase=%u remote_game_abs_frame=%d",
+                flags, (unsigned)phase, remoteGameAbsFrame);
+        }
     }
 }
 
@@ -629,7 +416,7 @@ static bool PrepareBaselineForInteractiveRelease() {
 
     // Switch to gameplay-phase packet callback now so startup READY/ACK can be
     // exchanged during intro/passive startup before rollback session begin.
-    Net::Session_SetPacketCallback(OnGameplayPacket);
+    Net::Session_SetPacketCallback(Net::GameplayPacketRouter_OnPacket);
     ResetStartupBarrierState("interactive release armed");
     s_liveReleaseArmed = true;
 
@@ -729,7 +516,7 @@ static bool TryStartRollbackSession() {
     // Register gameplay packet callback
     NetplayLog_Write("HANDOFF", interactiveFrame,
         "Registering gameplay packet callback");
-    Net::Session_SetPacketCallback(OnGameplayPacket);
+    Net::Session_SetPacketCallback(Net::GameplayPacketRouter_OnPacket);
 
     // Start rollback session through GameplayBridge
     bool ok = Net::GameplayBridge_StartSession(rbConfig);
@@ -973,7 +760,7 @@ static void CheckLifecyclePhase() {
                     // interactive startup barrier here so first-advance cannot race.
                     s_liveReleaseArmed = true;
                     ResetStartupBarrierState("lifecycle playable fallback");
-                    Net::Session_SetPacketCallback(OnGameplayPacket);
+                    Net::Session_SetPacketCallback(Net::GameplayPacketRouter_OnPacket);
                     NetplayLog_Write("STARTUP", GetStartupLogFrame(),
                         "Fallback: startup barrier armed at PlayableGameplay (handoff missing)");
                 }

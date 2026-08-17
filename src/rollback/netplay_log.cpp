@@ -216,4 +216,30 @@ void NetplayLog_Flush() {
     Diagnostics::AsyncLog_RequestFlush(false);
 }
 
+void NetplayLog_Stat(int32_t frame, const NetplayStatSample& sample) {
+    if (!s_logReady.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Frozen format — see netplay_log.h. Do not reorder or rename fields.
+    char line[512];
+    snprintf(line, sizeof(line),
+             "sim_fps=%.2f present_p50_us=%u present_p99_us=%u "
+             "hold_pred=%u hold_life=%u hold_input=%u hold_ext=%u "
+             "rollbacks=%u rb_max=%u slew_ppm=%d debt=%d silence_ms=%u",
+             sample.sim_fps,
+             sample.present_p50_us,
+             sample.present_p99_us,
+             sample.holds_prediction,
+             sample.holds_lifecycle,
+             sample.holds_local_input,
+             sample.holds_external,
+             sample.rollbacks,
+             sample.rollback_max_depth,
+             sample.slew_ppm,
+             sample.debt_frames,
+             sample.silence_ms);
+    Diagnostics::AsyncLog_EnqueueText("STAT", frame, line);
+}
+
 } // namespace Rollback
