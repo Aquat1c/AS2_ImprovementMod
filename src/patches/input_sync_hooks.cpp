@@ -12,6 +12,7 @@
  */
 
 #include "patches/input_sync_hooks.h"
+#include "patches/frame_scheduler.h"
 #include "patches/memory_utils.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -271,6 +272,9 @@ void InputSyncHooks_SetLoadBarrierFreeze(bool freeze) {
     s_load_barrier_freeze = freeze;
     if (freeze) {
         ResetVanillaTimeouts();
+        // Load stalls are external causes: they never leave hidden-frame
+        // repayment behind (§2.8.5 discardExternal).
+        FrameScheduler_DiscardExternalDebt("load_barrier_freeze");
         LOG_NETPLAY(LOG_INFO, "[InputSyncHooks] Load barrier freeze ENABLED — gameplay paused");
         Rollback::NetplayLog_Write("SYNC", -1,
             "Load barrier freeze ENABLED");

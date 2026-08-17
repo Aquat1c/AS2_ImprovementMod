@@ -1,4 +1,5 @@
 #include "patches/hook_installer.h"
+#include "patches/frame_scheduler.h"
 #include "patches/input_override.h"
 #include "patches/input_sync_hooks.h"
 #include "patches/tick_hooks.h"
@@ -377,11 +378,22 @@ bool InstallHooks() {
         LOG_WARN("Failed to install vanilla netplay suppression hooks (continuing anyway)");
     }
 
+    // --- Frame limiter detour (re0.7 M2, plan §2.8) ---
+    // Byte-signature scan of the 17 ms busy-spin cluster in Game_MainLoop and
+    // detour to the mod-owned FrameScheduler. On failure the legacy pinned
+    // Hook_GetTick virtual-clock limiter stays active (risk R-1 fallback) —
+    // loud, but not fatal.
+    if (!FrameScheduler_Install()) {
+        LOG_WARN("FrameScheduler limiter detour NOT installed — running on the "
+                 "legacy virtual-clock frame limiter (R-1 fallback)");
+    }
+
     return true;
 }
 
 void RemoveHooks() {
     LOG_INFO("Removing hooks...");
+    FrameScheduler_Shutdown();
     NetplayBackgroundRun::Shutdown();
     ShellHotkeyPatch_Remove();
     MH_DisableHook(MH_ALL_HOOKS);

@@ -12,7 +12,7 @@
 #include "patches/input_sync_hooks.h"
 #include "net/netplay_palette_runtime.h"
 #include "patches/memory_utils.h"
-#include "patches/tick_hooks.h"
+#include "patches/frame_scheduler.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
 
@@ -317,10 +317,11 @@ static bool OwnsLocalSimulation() {
 }
 
 static void ResetTickPacing() {
+    // The netplay tick-scale writers were deleted at M2 (INV-5: one speed
+    // authority). Spectator playback only ever wrote neutral values here;
+    // clearing the scheduler's period adjust keeps that contract.
     s_targetCatchupScale = 1.0f;
-    SetNetplayTickScale(1.0f, "spectator_playback_reset");
-    SetNetplayTickScaleTarget(1.0f, "spectator_playback_reset");
-    SetNetplayPacingActive(false, "spectator_playback_reset");
+    FrameScheduler_SetPeriodAdjustUs(0.0f, "spectator_playback_reset");
 }
 
 static void ClearPlaybackOverrides() {
@@ -537,9 +538,9 @@ static void ApplyCatchupScale(float targetScale, int32_t gap) {
         "spectator_catchup target=%.0fx gap=%d",
         targetScale,
         gap);
-    SetNetplayTickScale(1.0f, catchupReason);
-    SetNetplayTickScaleTarget(1.0f, catchupReason);
-    SetNetplayPacingActive(false, catchupReason);
+    // Catch-up is realized through batched dispatcher ticks, never through the
+    // clock; the scheduler period stays neutral (writers deleted at M2).
+    FrameScheduler_SetPeriodAdjustUs(0.0f, catchupReason);
 }
 
 static bool BootstrapReady(const SpectatorClientSnapshot& client,

@@ -1,4 +1,5 @@
 #include "patches/tick_hooks.h"
+#include "patches/frame_scheduler.h"
 #include "log_window.h"
 #include "rollback/netplay_log.h"
 
@@ -31,28 +32,17 @@ static bool g_tickSettingsPathResolved = false;
 static wchar_t g_tickSettingsPathW[MAX_PATH] = {};
 static char g_tickSettingsPathUtf8[MAX_PATH * 3] = {};
 
+// M2 thread confinement (DECOMP §5(c) mandatory fix #2): the accumulator math
+// runs only on the game main thread; other callers (the AVI streaming worker,
+// DECOMP §2.2) get the last published virtual value — race-free, monotonic,
+// and at most one main-loop pass stale.
+static volatile DWORD g_tickMainThreadId = 0;
+static volatile DWORD g_lastPublishedTick = 0;
+
 static float ClampTickScale(float scale) {
     if (scale < 0.1f) scale = 0.1f;
     if (scale > 32.0f) scale = 32.0f;
     return scale;
-}
-
-static float SlewScale(float current, float target) {
-    static constexpr float kMaxScaleStepPerFrame = 0.0035f;
-    const float delta = target - current;
-    if (delta > kMaxScaleStepPerFrame) {
-        return current + kMaxScaleStepPerFrame;
-    }
-    if (delta < -kMaxScaleStepPerFrame) {
-        return current - kMaxScaleStepPerFrame;
-    }
-    return target;
-}
-
-static float DesiredNetplayScale() {
-    return g_netplayTickState.pacing_active
-        ? ClampTickScale(g_netplayTickState.target_scale)
-        : 1.0f;
 }
 
 static bool EffectiveFrameLimiter60FpsEnabled() {
@@ -61,8 +51,16 @@ static bool EffectiveFrameLimiter60FpsEnabled() {
         : g_frameLimiter60FpsPreferenceEnabled;
 }
 
+// One speed authority (INV-5): with the FrameScheduler limiter detour
+// installed, the tick hook is pinned to 1.0 — manual speed and the cadence
+// correction are both realized in the scheduler's period instead. Only the
+// R-1 fallback (scheduler not installed) keeps the legacy virtual-clock
+// scaling alive.
 static float ComputeEffectiveScale() {
-    float scale = (float)(g_manualTickScale * g_netplayTickState.current_scale);
+    if (FrameScheduler_IsInstalled()) {
+        return 1.0f;
+    }
+    float scale = g_manualTickScale;
     if (EffectiveFrameLimiter60FpsEnabled()) {
         scale *= kFrameLimiter60FpsScale;
     }
@@ -84,24 +82,20 @@ static void MaybeWarnSlowEffectiveSpeed(float effectiveScale, DWORD realTickMs) 
         if (!g_slowSpeedWarned || repeatDue) {
             LOG_WARN(
                 "[TickHooks] Effective game speed below half: effective=%.3fx manual=%.3fx "
-                "netplay_current=%.3fx netplay_target=%.3fx pacing_active=%d limiter_60fps=%d reason=%s",
+                "scheduler_installed=%d limiter_60fps=%d reason=%s",
                 effectiveScale,
                 g_manualTickScale,
-                g_netplayTickState.current_scale,
-                g_netplayTickState.target_scale,
-                g_netplayTickState.pacing_active ? 1 : 0,
+                FrameScheduler_IsInstalled() ? 1 : 0,
                 EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
                 g_scaleReason);
             Rollback::NetplayLog_Write(
                 "SPEED",
                 -1,
-                "WARN effective speed below half: effective=%.3f manual=%.3f netplay_current=%.3f "
-                "netplay_target=%.3f pacing_active=%d limiter_60fps=%d reason=%s",
+                "WARN effective speed below half: effective=%.3f manual=%.3f "
+                "scheduler_installed=%d limiter_60fps=%d reason=%s",
                 effectiveScale,
                 g_manualTickScale,
-                g_netplayTickState.current_scale,
-                g_netplayTickState.target_scale,
-                g_netplayTickState.pacing_active ? 1 : 0,
+                FrameScheduler_IsInstalled() ? 1 : 0,
                 EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
                 g_scaleReason);
             g_slowSpeedWarned = true;
@@ -112,22 +106,16 @@ static void MaybeWarnSlowEffectiveSpeed(float effectiveScale, DWORD realTickMs) 
 
     if (g_slowSpeedWarned && effectiveScale >= kSlowSpeedRecoverThreshold) {
         LOG_INFO(
-            "[TickHooks] Effective game speed recovered: effective=%.3fx manual=%.3fx "
-            "netplay_current=%.3fx netplay_target=%.3fx reason=%s",
+            "[TickHooks] Effective game speed recovered: effective=%.3fx manual=%.3fx reason=%s",
             effectiveScale,
             g_manualTickScale,
-            g_netplayTickState.current_scale,
-            g_netplayTickState.target_scale,
             g_scaleReason);
         Rollback::NetplayLog_Write(
             "SPEED",
             -1,
-            "Recovered from slow speed: effective=%.3f manual=%.3f netplay_current=%.3f "
-            "netplay_target=%.3f reason=%s",
+            "Recovered from slow speed: effective=%.3f manual=%.3f reason=%s",
             effectiveScale,
             g_manualTickScale,
-            g_netplayTickState.current_scale,
-            g_netplayTickState.target_scale,
             g_scaleReason);
         g_slowSpeedWarned = false;
     }
@@ -192,18 +180,27 @@ DWORD __cdecl Hook_GetTick() {
     DWORD real = g_origGetTick ? g_origGetTick() : (GetTickCount() & 0x7FFFFFFF);
     real &= 0x7FFFFFFF;
 
+    // Thread confinement: the accumulator is single-owner. The first caller
+    // is the game main thread (DXLib init calls sub_635F80 long before the
+    // AVI worker exists, DECOMP §2.2).
+    const DWORD tid = GetCurrentThreadId();
+    DWORD mainTid = g_tickMainThreadId;
+    if (mainTid == 0) {
+        g_tickMainThreadId = tid;
+        mainTid = tid;
+    }
+    if (tid != mainTid) {
+        const DWORD last = g_lastPublishedTick;
+        return last != 0 ? last : real;
+    }
+
     if (!g_netplayTickState.initialized) {
         g_netplayTickState.initialized = true;
         g_netplayTickState.last_real_tick_ms = real;
         g_netplayTickState.virtual_tick_ms = (double)real;
-        g_netplayTickState.current_scale = ClampTickScale(g_netplayTickState.current_scale);
-        if (g_netplayTickState.current_scale <= 0.0f) {
-            g_netplayTickState.current_scale = 1.0f;
-        }
-        g_netplayTickState.target_scale = ClampTickScale(g_netplayTickState.target_scale);
-        if (g_netplayTickState.target_scale <= 0.0f) {
-            g_netplayTickState.target_scale = 1.0f;
-        }
+        g_netplayTickState.current_scale = 1.0f;
+        g_netplayTickState.target_scale = 1.0f;
+        g_netplayTickState.pacing_active = false;
     }
 
     uint32_t realDeltaMs = 0;
@@ -215,27 +212,23 @@ DWORD __cdecl Hook_GetTick() {
     }
     g_netplayTickState.last_real_tick_ms = real;
 
-    g_netplayTickState.current_scale = SlewScale(
-        ClampTickScale(g_netplayTickState.current_scale),
-        DesiredNetplayScale());
-
     const float effectiveScale = ComputeEffectiveScale();
     MaybeWarnSlowEffectiveSpeed(effectiveScale, real);
     if (fabsf(g_lastLoggedEffectiveScale - effectiveScale) > 0.005f) {
         if (kEnableEffectiveTickScaleLogs) {
             LOG_INFO(
-                "[TickHooks] Effective tick scale changed: %.3fx (manual=%.3fx target=%.3fx current=%.3fx active=%d)",
+                "[TickHooks] Effective tick scale changed: %.3fx (manual=%.3fx scheduler_installed=%d)",
                 effectiveScale,
                 g_manualTickScale,
-                g_netplayTickState.target_scale,
-                g_netplayTickState.current_scale,
-                g_netplayTickState.pacing_active ? 1 : 0);
+                FrameScheduler_IsInstalled() ? 1 : 0);
         }
         g_lastLoggedEffectiveScale = effectiveScale;
     }
 
     g_netplayTickState.virtual_tick_ms += (double)realDeltaMs * (double)effectiveScale;
-    return (DWORD)(((uint64_t)floor(g_netplayTickState.virtual_tick_ms)) & 0x7FFFFFFF);
+    const DWORD result = (DWORD)(((uint64_t)floor(g_netplayTickState.virtual_tick_ms)) & 0x7FFFFFFF);
+    g_lastPublishedTick = result;
+    return result;
 }
 
 void SetGlobalTickScale(float scale, const char* reason) {
@@ -266,7 +259,7 @@ void TickHooks_LoadSettings() {
     g_tickSettingsLoaded = true;
 
     LOG_INFO(
-        "[TickHooks] 60fps limiter correction preference: enabled=%d effective=%d scale=%.5f source=%s path=%s",
+        "[TickHooks] 60fps cadence preference: enabled=%d effective=%d fallback_scale=%.5f source=%s path=%s",
         g_frameLimiter60FpsPreferenceEnabled ? 1 : 0,
         EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
         kFrameLimiter60FpsScale,
@@ -288,7 +281,7 @@ void TickHooks_SaveSettings() {
         return;
     }
     LOG_INFO(
-        "[TickHooks] Saved 60fps limiter correction preference: enabled=%d effective=%d override=%d path=%s",
+        "[TickHooks] Saved 60fps cadence preference: enabled=%d effective=%d override=%d path=%s",
         g_frameLimiter60FpsPreferenceEnabled ? 1 : 0,
         EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
         g_frameLimiter60FpsSessionOverrideActive ? 1 : 0,
@@ -309,12 +302,11 @@ void TickHooks_SetFrameLimiter60FpsPreferenceEnabled(bool enabled) {
     }
     g_frameLimiter60FpsPreferenceEnabled = enabled;
     LOG_INFO(
-        "[TickHooks] 60fps limiter correction preference %s (effective=%d override=%d scale=%.5f effective_tick_scale=%.5f)",
+        "[TickHooks] 60fps cadence preference %s (effective=%d override=%d scheduler_installed=%d)",
         enabled ? "enabled" : "disabled",
         EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
         g_frameLimiter60FpsSessionOverrideActive ? 1 : 0,
-        kFrameLimiter60FpsScale,
-        ComputeEffectiveScale());
+        FrameScheduler_IsInstalled() ? 1 : 0);
 }
 
 bool TickHooks_GetFrameLimiter60FpsPreferenceEnabled() {
@@ -335,14 +327,13 @@ void TickHooks_SetFrameLimiter60FpsSessionOverride(bool enabled, const char* rea
     const bool effective = EffectiveFrameLimiter60FpsEnabled();
     if (!hadOverride || previousEffective != effective) {
         LOG_INFO(
-            "[TickHooks] Session FPS timing override: %s enabled=%d previous_effective=%d preference=%d manual_scale_forced=1.000 previous_manual=%.3f scale=%.5f effective_tick_scale=%.5f reason=%s",
+            "[TickHooks] Session FPS timing override: %s enabled=%d previous_effective=%d preference=%d manual_scale_forced=1.000 previous_manual=%.3f scheduler_installed=%d reason=%s",
             TickHooks_FrameLimiter60FpsLabel(enabled),
             enabled ? 1 : 0,
             previousEffective ? 1 : 0,
             g_frameLimiter60FpsPreferenceEnabled ? 1 : 0,
             g_preSessionManualTickScale,
-            kFrameLimiter60FpsScale,
-            ComputeEffectiveScale(),
+            FrameScheduler_IsInstalled() ? 1 : 0,
             reason ? reason : "?");
     }
 }
@@ -358,12 +349,11 @@ void TickHooks_ClearFrameLimiter60FpsSessionOverride(const char* reason) {
     g_manualTickScale = ClampTickScale(g_preSessionManualTickScale);
     SetScaleReason(reason ? reason : "session_fps_override_clear");
     LOG_INFO(
-        "[TickHooks] Cleared session FPS timing override: previous_effective=%d restored=%d preference=%d restored_manual=%.3f effective_tick_scale=%.5f reason=%s",
+        "[TickHooks] Cleared session FPS timing override: previous_effective=%d restored=%d preference=%d restored_manual=%.3f reason=%s",
         previousEffective ? 1 : 0,
         EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
         g_frameLimiter60FpsPreferenceEnabled ? 1 : 0,
         g_manualTickScale,
-        ComputeEffectiveScale(),
         reason ? reason : "?");
 }
 
@@ -379,39 +369,27 @@ float GetFrameLimiter60FpsCorrectionScale() {
     return kFrameLimiter60FpsScale;
 }
 
-void SetNetplayTickScale(float scale, const char* reason) {
-    const float clamped = ClampTickScale(scale);
-    g_netplayTickState.current_scale = clamped;
-    g_netplayTickState.target_scale = clamped;
-    g_netplayTickState.pacing_active = fabsf(clamped - 1.0f) > 0.001f;
-    SetScaleReason(reason ? reason : "netplay_scale_immediate");
-}
-
-void SetNetplayTickScaleTarget(float scale, const char* reason) {
-    g_netplayTickState.target_scale = ClampTickScale(scale);
-    if (reason && reason[0]) {
-        SetScaleReason(reason);
-    }
-}
-
-void SetNetplayPacingActive(bool active, const char* reason) {
-    g_netplayTickState.pacing_active = active;
-    if (!active) {
-        g_netplayTickState.target_scale = 1.0f;
-        SetScaleReason(reason ? reason : "pacing_inactive");
-    } else if (reason && reason[0]) {
-        SetScaleReason(reason);
-    }
-}
-
+// Rebase, never reset (INV-17; DECOMP §2.3 #1 — the backward-snap freeze
+// class). `virtual_tick_ms` continuity is preserved: game-side timestamps
+// (dword_816360, sound stamps, movie gate, joystick poll stamps) can never
+// end up ahead of the returned clock. Only the real-time anchor re-arms so a
+// long stall between sessions is not charged as one giant delta (the 100 ms
+// clamp already bounds that; this keeps the reason string honest).
 void ResetNetplayTickScaleState(const char* reason) {
-    memset(&g_netplayTickState, 0, sizeof(g_netplayTickState));
+    if (g_netplayTickState.initialized) {
+        const DWORD real = g_origGetTick
+            ? (g_origGetTick() & 0x7FFFFFFF)
+            : (GetTickCount() & 0x7FFFFFFF);
+        g_netplayTickState.last_real_tick_ms = real;
+        // virtual_tick_ms deliberately preserved.
+    }
     g_netplayTickState.current_scale = 1.0f;
     g_netplayTickState.target_scale = 1.0f;
+    g_netplayTickState.pacing_active = false;
     g_lastLoggedEffectiveScale = 1.0f;
     g_slowSpeedWarned = false;
     g_lastSlowSpeedLogMs = 0;
-    SetScaleReason(reason ? reason : "netplay_scale_reset");
+    SetScaleReason(reason ? reason : "netplay_scale_rebase");
 }
 
 void GetNetplayTickState(NetplayTickState* out) {
@@ -424,9 +402,13 @@ void GetNetplayTickState(NetplayTickState* out) {
 }
 
 float GetNetplayTickScale() {
-    return g_netplayTickState.current_scale;
+    // Netplay tick scaling was deleted at M2 (INV-5): the scheduler owns pace.
+    return 1.0f;
 }
 
 float GetEffectiveTickScale() {
+    if (FrameScheduler_IsInstalled()) {
+        return FrameScheduler_GetSpeedScale();
+    }
     return ComputeEffectiveScale();
 }

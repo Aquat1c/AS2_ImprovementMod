@@ -268,6 +268,8 @@ set(CORE_HEADERS
 )
 
 set(PATCH_HEADERS
+    include/patches/frame_scheduler.h
+    include/patches/frame_scheduler_core.h
     include/patches/memory_utils.h
     include/patches/unlock_patch.h
     include/patches/locale_patch.h
@@ -402,6 +404,7 @@ set(PATCH_SOURCES
     src/patches/render_guard.cpp
     src/patches/session_pump_hook.cpp
     src/patches/netplay_background_run.cpp
+    src/patches/frame_scheduler.cpp
     src/patches/tick_hooks.cpp
     src/patches/hook_installer.cpp
 )
@@ -561,6 +564,26 @@ set_target_properties(frame_arithmetic_tests PROPERTIES
 )
 
 add_test(NAME frame_arithmetic_tests COMMAND frame_arithmetic_tests)
+
+add_executable(frame_scheduler_tests
+    tests/frame_scheduler_tests.cpp
+)
+
+target_include_directories(frame_scheduler_tests PRIVATE
+    include
+)
+
+target_compile_definitions(frame_scheduler_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(frame_scheduler_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME frame_scheduler_tests COMMAND frame_scheduler_tests)
 
 add_executable(async_log_tests
     tests/async_log_tests.cpp

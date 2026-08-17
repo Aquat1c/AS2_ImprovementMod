@@ -219,3 +219,212 @@ milestone must know. Plan references are to `RE07_MASTER_REBUILD_PLAN.md`.
    SessionMeta/WinScreenConfirm` — swept clean (only comments and the dead
    `tests/test_packet_codec.cpp`, which belongs to the disabled legacy target
    and uses its own `PacketCodec::PacketType`).
+
+---
+
+## 2026-08-17 — M2 (FrameScheduler + clock pinning)
+
+### M2-1: `frame_scheduler` — deadline math, cadence profiles, semanticHold, rebase reporting, slew hook, STAT
+
+- **Files:** `include/patches/frame_scheduler_core.h` (new),
+  `include/patches/frame_scheduler.h` (new),
+  `src/patches/frame_scheduler.cpp` (new),
+  `tests/frame_scheduler_tests.cpp` (new), `CMakeLists.txt`.
+- **Done:**
+  - Pure core (`Sched` namespace, zero Win32/game includes, unit-tested):
+    `DeadlineClock` (§2.8.2 Bresenham carry — integer-exact, any `div`
+    consecutive steps sum to exactly `qpf*mul` ticks; sub-frame lateness
+    preserves the schedule; >2-period lateness rebases with frame count,
+    never compresses), `PaceSlew` (§2.8.4: deadband ≥2 enter / <1 release,
+    2500 ppm/frame target, 8000 ppm rise cap, 25000 ppm absolute cap,
+    instant release on stale), `CadenceDebtLedger` (§2.8.5: max 8,
+    CreateOne only for debt-declared PredictionLimit holds,
+    `ApplyRebasedFrames` typed-cause gate, `DiscardExternal`),
+    `IntervalStats` (per-second percentile window).
+  - Driver (`FrameScheduler_*`): cadence profiles `proper_60` {1,60} /
+    `compat_58` {17,1000} selected live from
+    `IsFrameLimiter60FpsPatchEnabled()` (the shipping `proper_60fps` /
+    session `frame_timing` override — §2.8.7 survival path); hybrid wait
+    (Sleep(1) until 2 ms, `_mm_pause` tail); QPC-regression rebase;
+    dead-clock latch (500 Sleep rounds with frozen QPC → loud
+    `PacingClockDead` log + rebase; the fail-closed *terminal* needs
+    session2 and lands at M3 — deviation, noted in the code); per-pass
+    accounting with first-cause-wins hold labeling; `run_state.h`
+    classification (its first runtime consumer, per the M0 note) +
+    `HoldEpisodeLedger` observation; manual speed (mod-menu slider /
+    replay fast-forward) realized by dividing the period — one speed
+    authority (INV-5).
+  - **STAT emission MOVED here from netplay_pacing** (M0 obligation): per
+    second via `NetplayLog_Stat` — sim_fps from pass accounting,
+    present_p50/p99 from wait-entry intervals, holds bucketed by typed
+    HoldCause, rollbacks/rb_max from rollback telemetry deltas, slew_ppm,
+    debt from the ledger, silence from the supervisor. Frozen format
+    untouched.
+  - Tests pin T-SCHED-1..4 (drift-zero over 600k/1M simulated frames both
+    profiles, rebase threshold + schedule preservation, semanticHold/debt
+    typed-cause gate, slew admission/rise/cap/hysteresis/stale-release)
+    plus percentile sanity. New CMake target `frame_scheduler_tests`.
+- **Deviations:**
+  1. STAT emits only while the scheduler is installed (the emission point
+     is the detour). In the R-1 fallback mode there is no STAT line — the
+     install failure is logged loudly instead.
+  2. Present intervals are measured wait-entry→wait-entry at the limiter
+     site (includes Present blocking — which is what T-SCHED measures);
+     the proxy is not instrumented.
+  3. sim_fps counts a pass with no dispatcher notifications (offline /
+     menus / frontend lockstep waits) as 1 sim — frontend lockstep waits
+     are not labeled holds (STAT is the gameplay acceptance instrument;
+     frontend holds would need a phase-aware producer that arrives at M5).
+
+### M2-2: Limiter detour (byte-signature, install-or-fail-loud)
+
+- **Files:** `src/patches/frame_scheduler.cpp` (scanner/patcher),
+  `src/patches/hook_installer.cpp`, `include/core/as2_constants.h`.
+- **Done:** signature scan over `[ADDR_GAME_MAINLOOP, +0x600)` for
+  `E8 <rel32→0x635F80> / 2B 05 60 63 81 00 / 83 F8 11 / jl-backward`
+  (short `7C` and near `0F 8C` forms accepted; call target verified by
+  computed rel32; jl displacement must be negative). Exactly-once match
+  required; the whole 16/20-byte cluster is replaced by
+  `call FrameScheduler_WaitForNextFrame` + NOPs (vanilla `jl`
+  structurally neutralized). The following re-stamp
+  (`call sub_635F80; mov dword_816360, eax`) is untouched → FPS
+  bookkeeping coherent. Original bytes restored in `RemoveHooks` →
+  `FrameScheduler_Shutdown`. New constants
+  `ADDR_FRAME_LIMITER_SCAN_BEGIN/SIZE`. Install called at the end of
+  `InstallHooks`; failure logs loud and leaves the legacy path running
+  (R-1). Config kill-switch `frame_scheduler=0` in
+  `as2_rollback_settings.ini` `[ModSettings]` (the R-1 "config flag for
+  one release"). `timeGetDevCaps` asserted at install (log-only).
+- **Register-safety note:** the detour replaces a `call sub_635F80`
+  (cdecl) at the same site, so caller-saved clobbers are identical by
+  construction; cdecl preserves ebx/esi/edi/ebp.
+
+### M2-3: `Hook_GetTick` pinned to 1.0; writers deleted; reset → rebase
+
+- **Files:** `src/patches/tick_hooks.cpp`, `include/patches/tick_hooks.h`,
+  `src/net/netplay_pacing.cpp`, `src/net/spectator_playback.cpp`.
+- **Done:**
+  - `SetNetplayTickScale`, `SetNetplayTickScaleTarget`,
+    `SetNetplayPacingActive` deleted (decl + def). Netplay slew/pacing
+    fields of `NetplayTickState` pinned to 1.0/false (struct kept for the
+    snapshot API); `GetNetplayTickScale()` returns 1.0.
+  - `Hook_GetTick` with scheduler installed = passthrough at scale 1.0
+    (100 ms delta clamp preserved); without it (R-1 fallback) the legacy
+    manual×1.02 virtual clock remains, now with BOTH DECOMP §5(c)
+    mandatory fixes: (1) `ResetNetplayTickScaleState` rebases —
+    `virtual_tick_ms` preserved, `last_real_tick_ms` re-anchored — the
+    backward-snap class (§2.3 #1) is closed even in the pinned shim;
+    (2) main-thread confinement — non-main callers (AVI worker) get the
+    last published tick, race-free.
+  - `netplay_pacing` sink swap (DECOMP §5 recommendation 3): the EMA
+    adjust now feeds `FrameScheduler_SetPeriodAdjustUs(adjust_ms*1000)`
+    (±1000 µs clamp in the scheduler); `DeactivatePacing`/Init/Reset
+    clear it; `NetplayPacing_ResetSession` additionally calls
+    `FrameScheduler_OnSessionReset` (adjust/slew/debt cleared, deadline
+    continuous). Snapshot `target_scale/current_scale` now report the
+    period-equivalent scale (`base/(base+adjust)`) so
+    online_wiring/rollback_debug consumers keep meaning. STAT rollup
+    block deleted (moved, M2-1); `connection_supervisor.h` include
+    dropped.
+  - `spectator_playback` only ever wrote neutral scales — calls replaced
+    with `FrameScheduler_SetPeriodAdjustUs(0)`; `tick_hooks.h` include
+    dropped.
+- **Deviation:** the M2 task table says "netplay_pacing.cpp callers"; the
+  writers also had call sites in `spectator_playback.cpp` (all neutral
+  no-ops) — swept with the same change. Manual speed
+  (`SetGlobalTickScale` — mod menu, replay fast-forward) survives and is
+  applied through the scheduler period, not the clock, keeping replay
+  speed control working under the pin.
+- **Fallback caveat (documented):** in R-1 fallback mode, netplay runs on
+  the fixed 1.02 correction with holds only — the continuous adjust
+  no-ops (scheduler absent). Degraded but functional; loud at install.
+
+### M2-4: d3d9 proxy `present_interval=immediate` config key
+
+- **Files:** `d3d9_proxy/d3d9_proxy.cpp`.
+- **Done:** the scaling swap chain's `PresentationInterval` (the single
+  present-interval owner, DECOMP §4.3) now reads
+  `[ModSettings] present_interval` from `as2_rollback_settings.ini`:
+  `default` (≙ vsync ONE, unchanged default) or `immediate` — the
+  documented escape for non-60 Hz-multiple displays / two-pacer beat
+  (§2.8.1). Logged once via ProxyLog.
+
+### M2-5: Dispatcher N∈{0,1,1+k} plumbing
+
+- **Files:** `src/patches/input_override.cpp`,
+  `src/patches/input_sync_hooks.cpp`.
+- **Done:**
+  - Hold passes (already −1 + AdvanceFrame-suppression pulse + vanilla
+    timeout clears — DECOMP §6.1, all three halves, unchanged) now report
+    their typed cause to the scheduler: legacy pacing holds →
+    `PredictionLimit` (or `ExternalSuspension` when
+    `ChurnPause_ShouldForceHold` is the trigger), startup/pre-live gates
+    and the pregame load-barrier freeze → `LifecycleBoundary`. All with
+    `create_debt=false` — **the M2 exit-gate semanticHold shim**: legacy
+    holds consume their slot at the normal deadline and owe nothing.
+  - Normal (non-rollback) Advance → `FrameScheduler_NotifySimFrame()`
+    (rollback-replay advances are re-runs and are not counted).
+  - Catch-up generalized to k at the Done boundary: when
+    `FrameScheduler_TryTakeCatchupFrame(R−depth−1)` grants (debt owed,
+    <2 extras this pass, headroom positive, <6000 µs wall budget), one
+    more BeginFrame cycle runs inside the same pass with a FRESH device
+    sample (DECOMP §6.2), crediting `NotifyCatchupFrame` per executed
+    hidden frame (partial batches keep their credit). This is the 0.6
+    double-tick machinery generalized — and **inert on the Gekko path**
+    by construction, because nothing creates debt until engine2's typed
+    PredictionLimit holds at M4 (protects the "0.6 Gekko netplay still
+    works" exit gate).
+  - `InputSyncHooks_SetLoadBarrierFreeze(true)` →
+    `FrameScheduler_DiscardExternalDebt` (§2.8.5 load-stall discard).
+- **Deviation:** §2.8.5 says "CreateOne on PredictionLimit holds"; at M2
+  the legacy shim deliberately does NOT create debt (see exit gate:
+  "netplay_pacing holds temporarily map to semanticHold"). The
+  `create_debt` parameter is the switch engine2 flips at M4.
+
+### Build-system summary (M2)
+
+- CMake: `src/patches/frame_scheduler.cpp` added to `PATCH_SOURCES`;
+  `frame_scheduler.h`/`frame_scheduler_core.h` added to `PATCH_HEADERS`;
+  new test target `frame_scheduler_tests` (+`add_test`). No files removed
+  from the build (netplay_pacing survives until M6; GekkoNet untouched).
+
+### Obligations for next milestones
+
+- **M3 (session2):** wire `PacingClockDead` and the 20 s progress
+  deadline into the `Session2_Terminate` funnel; supervisor re-feed does
+  not change the STAT `silence_ms` source name
+  (`ConnectionSupervisor_GetInboundSilenceMs` is re-implemented over
+  protocol silence per §2.2).
+- **M4 (engine2):** typed `nextAction` holds must call
+  `FrameScheduler_NotifyHold(cause, create_debt = cause==PredictionLimit)`
+  and feed `FrameScheduler_SubmitPeerDepthSample` from PressureReport
+  (the §2.8.4 input hook exists and is released-by-staleness until then);
+  `LocalInputMissing` currently has no producer (the legacy path cannot
+  detect it) — first emitter is engine2.
+- **M5 (frontend identity):** frontend lockstep waits are unlabeled at M2
+  (see M2-1 deviation 3); if frontend-phase STAT visibility is wanted,
+  add a phase-aware hold producer with the §3.4 migration.
+- **M6:** delete netplay_pacing controller + its shim sink call sites
+  (`FrameScheduler_SetPeriodAdjustUs` loses its last legacy caller), HUD
+  reads `FrameScheduler_GetSnapshot` (run_state/holds/slew/debt readouts
+  replace the NETCLASS/debt readouts).
+
+### Compile risks to check first (M2 build session)
+
+1. `frame_scheduler.cpp` is a new TU pulling `mmsystem.h` under
+   `WIN32_LEAN_AND_MEAN` (timeGetDevCaps/TIMECAPS) — winmm.lib is already
+   linked; if TIMECAPS is missing, include order vs lean-and-mean is the
+   suspect.
+2. `input_override.cpp` now includes `net/churn_pause.h` — check for
+   duplicate/ambiguous includes; `ChurnPause_ShouldForceHold` signature
+   is `(telemetry, phase, startup_released)`.
+3. `RollbackTimesyncTelemetry` field types are `int32_t`
+   (`rollback_count`, `prediction_debt`, `rollback_budget`) — the
+   catch-up headroom math in input_override and the STAT anchor math in
+   frame_scheduler assume that.
+4. `frame_scheduler_core.h` uses `<algorithm>` (std::sort) and includes
+   `rollback/run_state.h` — both header-only/pure; the new
+   `frame_scheduler_tests` target compiles it standalone.
+5. Any straggler caller of the deleted
+   `SetNetplayTickScale/Target/SetNetplayPacingActive` — grep-verified
+   zero remaining references at edit time.

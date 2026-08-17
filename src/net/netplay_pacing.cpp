@@ -1,8 +1,8 @@
 #include "net/netplay_pacing.h"
 
 #include "net/churn_pause.h"
-#include "net/connection_supervisor.h"
 #include "net/delay_policy.h"
+#include "patches/frame_scheduler.h"
 #include "patches/tick_hooks.h"
 #include "rollback/netplay_log.h"
 
@@ -85,14 +85,11 @@ static bool s_pacingHaywireWarned = false;
 static int32_t s_lastPacingSlowLogRb = -1000000;
 static int32_t s_lastPacingHaywireLogRb = -1000000;
 
-// §2.10 STAT rollup state (M0: fed from the legacy pacing telemetry; the M2
-// scheduler and M4 engine re-feed the same frozen line format from the typed
-// HoldCause plan — the format must not change).
-static DWORD    s_statWindowStartMs = 0;
-static int32_t  s_statWindowStartRb = -1;
-static int32_t  s_statWindowStartRollbacks = 0;
-static uint32_t s_statHoldsPrediction = 0;
-static int32_t  s_statMaxReplayLen = 0;
+// §2.10 STAT emission moved to the FrameScheduler at M2 (the M0 rollup that
+// lived here is gone per the M0 handoff note: "the STAT emission must MOVE to
+// FrameScheduler, not die with the module"). This controller now only feeds
+// the scheduler: continuous adjust via FrameScheduler_SetPeriodAdjustUs, and
+// its holds are reported by the dispatcher as typed semanticHolds.
 
 static constexpr float kPacingSlowThreshold = 0.98f;
 static constexpr float kPacingSlowRecoverThreshold = 0.985f;
@@ -100,59 +97,14 @@ static constexpr float kPacingHaywireThreshold = 0.5f;
 static constexpr int32_t kPacingSlowRepeatRb = 120;
 static constexpr int32_t kPacingHaywireRepeatRb = 60;
 
-static void ResetStatRollup() {
-    s_statWindowStartMs = 0;
-    s_statWindowStartRb = -1;
-    s_statWindowStartRollbacks = 0;
-    s_statHoldsPrediction = 0;
-    s_statMaxReplayLen = 0;
-}
-
-// Per-second §2.10 STAT emission, driven entirely by existing telemetry.
-// Present percentiles and slew report 0 until the M2 FrameScheduler owns the
-// clock; lifecycle/local-input/external hold buckets report 0 until the M4
-// engine plans holds with typed causes (legacy pacing cannot distinguish them
-// — all its freezes are network-attributed and land in hold_pred).
-static void UpdateStatRollup(const Rollback::RollbackTimesyncTelemetry& telemetry) {
-    const DWORD now = GetTickCount();
-    const bool needAnchor =
-        s_statWindowStartMs == 0 ||
-        s_statWindowStartRb < 0 ||
-        telemetry.rb_frame_current < s_statWindowStartRb;
-    if (needAnchor) {
-        s_statWindowStartMs = now;
-        s_statWindowStartRb = telemetry.rb_frame_current;
-        s_statWindowStartRollbacks = telemetry.rollback_count;
-        s_statHoldsPrediction = 0;
-        s_statMaxReplayLen = 0;
-        return;
+// Scale the controller's filtered adjust would produce (log/monitor and
+// snapshot vocabulary; the actual pacing lives in the scheduler period).
+static float PacingScaleFromAdjust(float adjustMs) {
+    float targetFrameMs = NetplayPacingController::kBaseFrameMs + adjustMs;
+    if (targetFrameMs < 1.0f) {
+        targetFrameMs = 1.0f;
     }
-
-    if (telemetry.last_rollback_replay_length > s_statMaxReplayLen) {
-        s_statMaxReplayLen = telemetry.last_rollback_replay_length;
-    }
-
-    const DWORD elapsed = now - s_statWindowStartMs;
-    if (elapsed < 1000) {
-        return;
-    }
-
-    Rollback::NetplayStatSample sample{};
-    sample.sim_fps =
-        (float)(telemetry.rb_frame_current - s_statWindowStartRb) * 1000.0f / (float)elapsed;
-    sample.holds_prediction = s_statHoldsPrediction;
-    const int32_t rollbacks = telemetry.rollback_count - s_statWindowStartRollbacks;
-    sample.rollbacks = rollbacks > 0 ? (uint32_t)rollbacks : 0u;
-    sample.rollback_max_depth = rollbacks > 0 ? (uint32_t)s_statMaxReplayLen : 0u;
-    sample.debt_frames = s_predictionDebt;
-    sample.silence_ms = Net::ConnectionSupervisor_GetInboundSilenceMs();
-    Rollback::NetplayLog_Stat(telemetry.rb_frame_current, sample);
-
-    s_statWindowStartMs = now;
-    s_statWindowStartRb = telemetry.rb_frame_current;
-    s_statWindowStartRollbacks = telemetry.rollback_count;
-    s_statHoldsPrediction = 0;
-    s_statMaxReplayLen = 0;
+    return NetplayPacingController::kBaseFrameMs / targetFrameMs;
 }
 
 static void ResetPacingScaleMonitorState() {
@@ -257,10 +209,12 @@ static bool IsInteractivePacingEnabled(Net::MatchRollbackPhase phase,
 }
 
 static void CopyTickState(Net::NetplayPacingSnapshot* out) {
-    NetplayTickState tickState{};
-    GetNetplayTickState(&tickState);
-    out->target_scale = tickState.target_scale;
-    out->current_scale = tickState.current_scale;
+    // The tick-scale writers were deleted at M2; the snapshot scale fields now
+    // report the period-equivalent scale the controller asks of the scheduler.
+    const float scale =
+        s_controller.active ? PacingScaleFromAdjust(s_controller.filtered_adjust_ms) : 1.0f;
+    out->target_scale = scale;
+    out->current_scale = scale;
 }
 
 static PacingProfile ProfileFor(Net::NetQuality quality) {
@@ -487,8 +441,7 @@ static void DeactivatePacing(Net::MatchRollbackPhase phase,
     const bool hadPacing = s_controller.active;
     const float priorAdjust = s_controller.filtered_adjust_ms;
 
-    SetNetplayPacingActive(false, reason);
-    SetNetplayTickScaleTarget(1.0f, reason);
+    FrameScheduler_SetPeriodAdjustUs(0.0f, reason);
 
     s_controller.filtered_adjust_ms = 0.0f;
     s_controller.last_frames_ahead = 0.0f;
@@ -506,14 +459,11 @@ static void DeactivatePacing(Net::MatchRollbackPhase phase,
     ResetDebtController();
 
     if (s_pacingSlowWarned || s_pacingHaywireWarned) {
-        NetplayTickState tickState{};
-        GetNetplayTickState(&tickState);
         Rollback::NetplayLog_Write(
             "PACE",
             -1,
-            "Pacing scale monitor reset: target=%.3f current=%.3f reason=%s",
-            tickState.target_scale,
-            tickState.current_scale,
+            "Pacing scale monitor reset: prior_adjust_ms=%.2f reason=%s",
+            priorAdjust,
             reason ? reason : "deactivate");
     }
     ResetPacingScaleMonitorState();
@@ -523,17 +473,14 @@ static void DeactivatePacing(Net::MatchRollbackPhase phase,
         return;
     }
 
-    NetplayTickState tickState{};
-    GetNetplayTickState(&tickState);
     Rollback::NetplayLog_Write(
         "PACE",
         -1,
-        "disable phase=%s reason=%s rollback_continues=%d target_scale=%.3f current_scale=%.3f",
+        "disable phase=%s reason=%s rollback_continues=%d prior_adjust_ms=%.2f",
         Net::MatchRollbackPhaseName(phase),
         reason ? reason : "unspecified",
         rollbackContinues ? 1 : 0,
-        tickState.target_scale,
-        tickState.current_scale);
+        priorAdjust);
 
     s_phase = phase;
 }
@@ -561,18 +508,15 @@ static void ApplyTickSlew(const Rollback::RollbackTimesyncTelemetry& telemetry,
         s_controller.filtered_adjust_ms = 0.0f;
     }
 
-    float targetFrameMs = NetplayPacingController::kBaseFrameMs + s_controller.filtered_adjust_ms;
-    if (targetFrameMs < 1.0f) {
-        targetFrameMs = 1.0f;
-    }
-
-    float targetScale = NetplayPacingController::kBaseFrameMs / targetFrameMs;
+    float targetScale = PacingScaleFromAdjust(s_controller.filtered_adjust_ms);
     targetScale = (std::clamp)(
         targetScale,
         NetplayPacingController::kScaleMin,
         clampSpeedup ? 1.0f : NetplayPacingController::kScaleMax);
 
-    SetNetplayPacingActive(true, "pacing_slew");
+    // M2 sink swap (DECOMP §5 recommendation): the continuous ±0.9 ms
+    // adjustment feeds the FrameScheduler period instead of the deleted
+    // virtual-clock scale target. Positive adjust = lengthen the period.
     char slewReason[128];
     _snprintf_s(
         slewReason,
@@ -583,14 +527,12 @@ static void ApplyTickSlew(const Rollback::RollbackTimesyncTelemetry& telemetry,
         s_controller.filtered_adjust_ms,
         targetScale,
         clampSpeedup ? 1 : 0);
-    SetNetplayTickScaleTarget(targetScale, slewReason);
+    FrameScheduler_SetPeriodAdjustUs(s_controller.filtered_adjust_ms * 1000.0f, slewReason);
 
-    NetplayTickState tickState{};
-    GetNetplayTickState(&tickState);
     MaybeWarnNetplayPacingScale(
         telemetry.rb_frame_current,
         targetScale,
-        tickState.current_scale,
+        targetScale,
         slewReason,
         context ? context : "pacing_slew");
 
@@ -599,19 +541,16 @@ static void ApplyTickSlew(const Rollback::RollbackTimesyncTelemetry& telemetry,
 }
 
 static void LogEnable(const Rollback::RollbackTimesyncTelemetry& telemetry) {
-    NetplayTickState tickState{};
-    GetNetplayTickState(&tickState);
     Rollback::NetplayLog_Write(
         "PACE",
         telemetry.rb_frame_current,
-        "enable phase=%s rb=%d frames_ahead=%.2f debt=%d adjust_ms=%.2f target_scale=%.3f current_scale=%.3f",
+        "enable phase=%s rb=%d frames_ahead=%.2f debt=%d adjust_ms=%.2f sched_speed=%.3f",
         Net::MatchRollbackPhaseName(s_phase),
         telemetry.rb_frame_current,
         telemetry.frames_ahead,
         s_predictionDebt,
         s_controller.filtered_adjust_ms,
-        tickState.target_scale,
-        tickState.current_scale);
+        FrameScheduler_GetSpeedScale());
 }
 
 static void LogUpdate(const Rollback::RollbackTimesyncTelemetry& telemetry) {
@@ -625,19 +564,16 @@ static void LogUpdate(const Rollback::RollbackTimesyncTelemetry& telemetry) {
         return;
     }
 
-    NetplayTickState tickState{};
-    GetNetplayTickState(&tickState);
     Rollback::NetplayLog_Write(
         "PACE",
         telemetry.rb_frame_current,
-        "update rb=%d frames_ahead=%.2f debt=%d pressure=%.2f adjust_ms=%.2f target_scale=%.3f current_scale=%.3f",
+        "update rb=%d frames_ahead=%.2f debt=%d pressure=%.2f adjust_ms=%.2f sched_speed=%.3f",
         telemetry.rb_frame_current,
         telemetry.frames_ahead,
         s_predictionDebt,
         s_pressure,
         s_controller.filtered_adjust_ms,
-        tickState.target_scale,
-        tickState.current_scale);
+        FrameScheduler_GetSpeedScale());
 }
 
 } // anonymous namespace
@@ -679,8 +615,7 @@ void NetplayPacing_Init() {
     s_quality = NetQuality::Unknown;
     s_profileSourceAvgOnly = true;
     ResetDebtController();
-    SetNetplayPacingActive(false, "pacing_init");
-    SetNetplayTickScaleTarget(1.0f, "pacing_init");
+    FrameScheduler_SetPeriodAdjustUs(0.0f, "pacing_init");
 }
 
 void NetplayPacing_Shutdown() {
@@ -700,14 +635,16 @@ void NetplayPacing_ResetSession(const char* reason) {
     DeactivatePacing(s_phase, reason ? reason : "session reset", false);
     s_prevHardHoldActive = false;
     ResetPacingScaleMonitorState();
+    // Rebase-only since M2 (INV-17): preserves virtual-clock continuity even
+    // in the pinned shim, closing the DECOMP §2.3 backward-snap class.
     ResetNetplayTickScaleState(reason ? reason : "session reset");
+    FrameScheduler_OnSessionReset(reason ? reason : "session reset");
     s_localModeLogged = false;
     s_quality = NetQuality::Unknown;
     s_lastNetClassLogRb = -1000000;
     s_lastDebtLogRb = -1000000;
     s_lastDecisionLogRb = -1000000;
     s_lastAsymDelayLogRb = -1000000;
-    ResetStatRollup();
 }
 
 void NetplayPacing_NotifyLocalMode() {
@@ -721,14 +658,11 @@ void NetplayPacing_NotifyLocalMode() {
 
     NetplayPacing_ResetSession("local mode");
 
-    NetplayTickState tickState{};
-    GetNetplayTickState(&tickState);
     Rollback::NetplayLog_Write(
         "PACE",
         -1,
-        "local_mode rollback_bypassed=1 target_scale=%.3f current_scale=%.3f",
-        tickState.target_scale,
-        tickState.current_scale);
+        "local_mode rollback_bypassed=1 sched_speed=%.3f",
+        FrameScheduler_GetSpeedScale());
     s_localModeLogged = true;
 }
 
@@ -940,7 +874,6 @@ void NetplayPacing_OnSessionSample(
         LogEnable(telemetry);
     }
     LogUpdate(telemetry);
-    UpdateStatRollup(telemetry);
 }
 
 void NetplayPacing_OnHoldSample(
@@ -959,24 +892,19 @@ void NetplayPacing_OnHoldSample(
 
     ApplyTickSlew(telemetry, true, NetplayPacingActionName(holdKind));
 
-    // Legacy pacing cannot label hold causes; every freeze it takes is
-    // network-attributed (hold_pred) until the typed-cause engine lands.
-    s_statHoldsPrediction++;
-    UpdateStatRollup(telemetry);
+    // Hold accounting: the dispatcher reports the typed cause to the
+    // FrameScheduler (semanticHold shim), which owns the STAT line since M2.
 
-    NetplayTickState tickState{};
-    GetNetplayTickState(&tickState);
     Rollback::NetplayLog_Write(
         "PACE",
         telemetry.rb_frame_current,
-        "hold_sample rb=%d action=%s debt=%d frames_ahead=%.2f pressure=%.2f target_scale=%.3f current_scale=%.3f",
+        "hold_sample rb=%d action=%s debt=%d frames_ahead=%.2f pressure=%.2f sched_speed=%.3f",
         telemetry.rb_frame_current,
         NetplayPacingActionName(holdKind),
         s_predictionDebt,
         telemetry.frames_ahead,
         s_pressure,
-        tickState.target_scale,
-        tickState.current_scale);
+        FrameScheduler_GetSpeedScale());
 }
 
 void NetplayPacing_GetSnapshot(NetplayPacingSnapshot* out) {

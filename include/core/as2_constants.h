@@ -318,6 +318,14 @@
 #define ADDR_GAME_MAINLOOP      0x5D2AC0
 #define DXLIB_PHANTOM_WINKEY_VK 0x07
 
+// Frame-limiter busy-spin cluster inside Game_MainLoop (decomp L266504–266510):
+//   call sub_635F80 / sub eax,[ADDR_LAST_FRAME_TIME] / cmp eax,17 / jl (spin)
+// The re0.7 FrameScheduler byte-signature-scans this window and detours the
+// cluster to FrameScheduler_WaitForNextFrame (src/patches/frame_scheduler.cpp);
+// the signature must match exactly once or the install fails loud (risk R-1).
+#define ADDR_FRAME_LIMITER_SCAN_BEGIN  ADDR_GAME_MAINLOOP
+#define ADDR_FRAME_LIMITER_SCAN_SIZE   0x600
+
 // Window_GetHandle (sub_6349F0) returns HWND global wParam @ 0x9DB648.
 // Do NOT use sub_620C70 — IDA mislabels it Sys_GetWindowHandle but it returns IDirectDraw* ppv.
 #define ADDR_WINDOW_GET_HANDLE   (GAME_BASE + 0x2349F0)

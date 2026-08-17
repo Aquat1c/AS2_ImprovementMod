@@ -539,6 +539,56 @@ static void LoadInputGuardSettings() {
         path);
 }
 
+// re0.7 M2 (master plan §2.8.1): presentation interval of the proxy-owned
+// scaling swap chain. DEFAULT (≙ONE, vsynced) stays the default — windowed
+// DWM present at 60 Hz + the mod's 16.667 ms scheduler is the lowest-jitter
+// combination. `present_interval=immediate` in as2_rollback_settings.ini
+// [ModSettings] is the documented escape for non-60 Hz-multiple displays or
+// two-pacer beat stutter (DECOMP §4.4); the scheduler's absolute deadlines
+// already treat Present blocking as frame cost, so no other change is needed.
+static bool g_scalingPresentIntervalLoaded = false;
+static UINT g_scalingPresentInterval = D3DPRESENT_INTERVAL_DEFAULT;
+
+static UINT GetConfiguredScalingPresentInterval() {
+    if (g_scalingPresentIntervalLoaded) {
+        return g_scalingPresentInterval;
+    }
+
+    wchar_t path[MAX_PATH] = {};
+    const DWORD len = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        wchar_t* slash = wcsrchr(path, L'\\');
+        wchar_t* fwdSlash = wcsrchr(path, L'/');
+        if (!slash || (fwdSlash && fwdSlash > slash)) {
+            slash = fwdSlash;
+        }
+        if (slash) {
+            slash[1] = L'\0';
+        } else {
+            path[0] = L'\0';
+        }
+        wcscat_s(path, L"as2_rollback_settings.ini");
+    } else {
+        wcscpy_s(path, L"as2_rollback_settings.ini");
+    }
+
+    wchar_t value[32] = {};
+    GetPrivateProfileStringW(L"ModSettings", L"present_interval", L"default",
+                             value, (DWORD)(sizeof(value) / sizeof(value[0])), path);
+    if (_wcsicmp(value, L"immediate") == 0) {
+        g_scalingPresentInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    } else {
+        g_scalingPresentInterval = D3DPRESENT_INTERVAL_DEFAULT;
+    }
+    g_scalingPresentIntervalLoaded = true;
+    ProxyLog("[SCALING] present_interval config: %ls -> %s (ini=%ls)",
+             value[0] ? value : L"default",
+             g_scalingPresentInterval == D3DPRESENT_INTERVAL_IMMEDIATE
+                 ? "IMMEDIATE" : "DEFAULT (vsync ONE)",
+             path);
+    return g_scalingPresentInterval;
+}
+
 static constexpr uintptr_t kAddrShellHotkeySuppressFlag = 0x009E5B74;
 // When 1, game wndproc returns before DefWindowProc (swallows Win/Alt+Shift). See as2_constants.h.
 static constexpr uintptr_t kAddrGameWndprocCustomHandler = 0x009DB660;
@@ -2304,7 +2354,7 @@ bool InitializeScalingSwapChain(IDirect3DDevice9* pDevice, HWND hWnd) {
     pp.EnableAutoDepthStencil = FALSE;
     pp.Flags = 0;
     pp.FullScreen_RefreshRateInHz = 0;
-    pp.PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
+    pp.PresentationInterval = GetConfiguredScalingPresentInterval();
     
     ProxyLog("[SCALING] Creating additional swap chain...");
     ProxyLog("[SCALING] CreateAdditionalSwapChain params:");

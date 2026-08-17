@@ -1,9 +1,11 @@
 #include "patches/input_override.h"
 #include "patches/input_sync_hooks.h"
+#include "patches/frame_scheduler.h"
 #include "input_system.h"
 #include "patches/memory_utils.h"
 #include "as2_constants.h"
 #include "log_window.h"
+#include "net/churn_pause.h"
 #include "net/netplay_menu_controller.h"
 #include "net/netplay_pacing.h"
 #include "net/netplay_phase_runtime.h"
@@ -1937,6 +1939,13 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             InputSyncHooks_SetLoadBarrierFreeze(false);
             InputSyncHooks_SetTimesyncFreeze(false);
         } else {
+            // Label the 0-sim pass for the scheduler/STAT (§2.10). The load
+            // barrier is a lifecycle window; other freeze owners (practice,
+            // replay, frontend lockstep) are not netplay holds and stay
+            // unlabeled. No debt: external/lifecycle waits owe nothing.
+            if (loadBarrierFreeze && pregameOwnsLoadBarrier) {
+                FrameScheduler_NotifyHold(Rollback::HoldCause::LifecycleBoundary, false);
+            }
             return -1;
         }
     }
@@ -2283,6 +2292,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             }
 
             InputSyncHooks_SetTimesyncFreeze(true);
+            FrameScheduler_NotifyHold(Rollback::HoldCause::LifecycleBoundary, false);
             Net::Session_Update();
             // Session death is the ConnectionSupervisor's call (Dead) or a
             // genuine session teardown; a mere interruption keeps the session
@@ -3028,6 +3038,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
             }
             InputSyncHooks_SetTimesyncFreeze(true);
+            FrameScheduler_NotifyHold(Rollback::HoldCause::LifecycleBoundary, false);
             Net::Session_Update();
             {
                 // Abort only on true session death: Gekko-side broken (20s
@@ -3059,6 +3070,18 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 startupReleased,
                 stallThreshold);
             if (pacingAction != Net::NetplayPacingAction::None) {
+                // M2 semanticHold shim (exit-gate contract): legacy pacing
+                // holds consume their pacing slot at the normal deadline and
+                // create NO CadenceDebt (the peer froze too; nothing to
+                // repay). Typed cause for the §2.10 STAT buckets: device
+                // churn is external, everything else the legacy controller
+                // decides is network-attributed (PredictionLimit).
+                const bool churnHold = Net::ChurnPause_ShouldForceHold(
+                    preTelemetry, rollbackPhase, startupReleased);
+                FrameScheduler_NotifyHold(
+                    churnHold ? Rollback::HoldCause::ExternalSuspension
+                              : Rollback::HoldCause::PredictionLimit,
+                    /*create_debt=*/false);
                 Net::NetplayPacing_OnHoldSample(
                     preTelemetry,
                     rollbackPhase,
@@ -3224,8 +3247,61 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     "First post-release NORMAL Advance observed");
             }
 
+            // Count canonical sim progress for the scheduler's STAT line.
+            // Rollback-replay advances re-run already-counted frames.
+            if (!hadRollback) {
+                FrameScheduler_NotifySimFrame();
+            }
+
             ResetVanillaTimeoutCounters();
             return 0;
+        }
+
+        // ── Hidden catch-up (§2.8.3, N = 1 + k) ─────────────────────────
+        // Generalization of the 0.6 double-tick machinery: while the
+        // CadenceDebt ledger owes hidden frames, run extra BeginFrame cycles
+        // inside this same pass (bounded by kMaxCatchupExtraPerPass, the
+        // depth headroom R − depth − 1, and the 6000 µs wall budget — all
+        // enforced in FrameScheduler_TryTakeCatchupFrame). The ledger has no
+        // debt producer on the Gekko path (legacy holds are semanticHolds),
+        // so k stays 0 until engine2 creates PredictionLimit debt at M4+.
+        {
+            Rollback::RollbackTimesyncTelemetry catchupTelemetry{};
+            Rollback::RollbackSession_GetTimesyncTelemetry(&catchupTelemetry);
+            const int32_t depthHeadroom =
+                catchupTelemetry.rollback_budget - catchupTelemetry.prediction_debt - 1;
+            if (FrameScheduler_TryTakeCatchupFrame(depthHeadroom)) {
+                // Hidden frames must consume a FRESH device sample (DECOMP
+                // §6.2: duplicating locally while the remote consumes real
+                // inputs is a desync).
+                InputSystem_Update();
+                const uint16_t catchupInput = Net::PlayerMapping_ReadLocalInput();
+
+                Rollback::NetplayLog_Write("TIMESYNC", Rollback::RollbackSession_GetCurrentFrame(),
+                    "Catch-up tick: extra BeginFrame local_input=0x%04X headroom=%d",
+                    catchupInput, depthHeadroom);
+
+                Rollback::RollbackSession_BeginFrame(catchupInput);
+                s_rollbackFrameStarted = true;
+
+                const Rollback::EventResult catchupResult =
+                    Rollback::RollbackSession_ProcessNextEvent();
+                if (catchupResult == Rollback::EventResult::Error) {
+                    s_rollbackFrameStarted = false;
+                    return AbortRollbackDispatcher("Rollback session failed during catch-up tick");
+                }
+                if (catchupResult == Rollback::EventResult::Advance) {
+                    uint16_t cp1 = 0;
+                    uint16_t cp2 = 0;
+                    Rollback::RollbackSession_GetAdvanceInputs(&cp1, &cp2);
+                    CommitRollbackAdvance(outputInputs, cp1, cp2);
+                    FrameScheduler_NotifyCatchupFrame();
+                    ResetVanillaTimeoutCounters();
+                    return 0;  // one more full game tick in this pass
+                }
+                // Immediate Done: no frame ran, nothing consumed.
+                s_rollbackFrameStarted = false;
+            }
         }
 
         s_rollbackFrameStarted = false;
