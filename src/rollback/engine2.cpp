@@ -341,6 +341,22 @@ bool RollbackEngine::ProduceLocalInputAhead(uint16_t fresh_sample) {
     if (lead >= bound) {
         return false;
     }
+
+    // INPUT LATENCY BOUND (INV-24 amendment, live run 23-25). Feeding the
+    // opponent through a stall is worth doing; fabricating the local player's
+    // future is not. SealLocal is permanent, so any frame sealed beyond the
+    // sim frontier freezes whatever the pad happened to read at that instant
+    // and silently discards everything pressed afterwards until the sim gets
+    // there. The peer bound above is a BANDWIDTH bound measured against the
+    // peer's ack, which on a 129 ms link sat ~20-30 frames past our own sim —
+    // half a second of dead input, permanent because produced_frontier never
+    // regresses. Frames the local player has not lived through yet are not
+    // ours to seal.
+    const int32_t sim_lead_signed = signedLead(produced_frontier_, sim_frontier_);
+    const uint32_t sim_lead = sim_lead_signed > 0 ? (uint32_t)sim_lead_signed : 0u;
+    if (sim_lead >= (uint32_t)delay_active_ + ENGINE_PRODUCER_SIM_LEAD_CAP) {
+        return false;
+    }
     if (!SealLocal(produced_frontier_, (uint16_t)(fresh_sample & ENGINE_INPUT_VALID_MASK))) {
         return false;
     }

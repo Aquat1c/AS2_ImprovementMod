@@ -68,6 +68,15 @@ constexpr uint32_t ENGINE_SYNC_HASH_QUEUE_MAX = 128;
 /// Producer hard cap: kInputWindowFrames(32) − 2, so the un-acked suffix
 /// always fits one InputStream packet (§2.7.3-P).
 constexpr uint32_t ENGINE_PRODUCER_HARD_CAP = 30;
+/// How far past the local sim frontier the producer may seal, ON TOP of the
+/// configured delay. This is an INPUT LATENCY budget, not a bandwidth one:
+/// a sealed frame is immutable (INV-18), so every frame the producer runs
+/// ahead of the sim is a frame whose input the player can no longer change.
+/// Live run 23-25 (RTT 129 ms) sealed ~20-30 frames ahead during stalls and
+/// the operator measured about a second of input delay that never recovered —
+/// produced_frontier cannot regress, and the engine survives match
+/// boundaries, so the lag outlived the match that caused it.
+constexpr uint32_t ENGINE_PRODUCER_SIM_LEAD_CAP = 2;
 /// Delay-lowering drain timeout, frame-counted (§2.7.3-D "5 s" at 60 Hz).
 constexpr uint32_t ENGINE_DELAY_DRAIN_TIMEOUT_FRAMES = 300;
 /// Executed-frame bookkeeping ring (must exceed R + confirm-consumer lag).

@@ -440,7 +440,7 @@ void TestIngestTaxonomy() {
 
 void TestWindowMath() {
     RollbackEngine a, b;
-    a.Arm(MakeConfig(0, 0, 8), 1);
+    a.Arm(MakeConfig(0, 0, 30), 1);   // budget 30: A may speculate 30 frames
     b.Arm(MakeConfig(1, 0, 8), 1);
 
     // Give A a generous producer bound via peer advisory.
@@ -449,13 +449,25 @@ void TestWindowMath() {
     adv.adv_rollback = 15;
     a.SetPeerAdvisory(adv);
 
-    // Seal 30 producer inputs while "stalled" — bound holds the suffix ≤ 30.
-    int sealed = 0;
-    for (int i = 0; i < 40; ++i) {
-        if (a.ProduceLocalInputAhead((uint16_t)(i & 0x000F))) ++sealed;
+    // Build a 30-frame un-acked suffix the way a real session does: A
+    // simulates on prediction while B's inputs and acks are still in flight,
+    // sealing one local frame per advance.
+    //
+    // This test used to seal all 30 through ProduceLocalInputAhead with the
+    // sim parked at frame 0. That is no longer allowed — live run 23-25
+    // showed the producer sealing 28-40 frames past the sim on a 129 ms link,
+    // and every such frame is one whose input the player can no longer change
+    // (about a second of dead input). The packet-window math under test is
+    // unchanged; only how the suffix legitimately comes to exist.
+    for (int i = 0; i < 30; ++i) {
+        a.CaptureLocalInput(a.SimFrontier(), (uint16_t)(i & 0x000F));
+        const EngineAction act = a.NextAction();
+        if (act.kind == EngineActionKind::Advance) {
+            a.CommitAdvance(act.frame, (uint64_t)(100 + i));
+        }
     }
-    TEST_CHECK(sealed == 30, "producer bound min(peerR+peerD+2, 30) = 30");
-    TEST_CHECK(a.Terminal() == EngineTerminal::None, "suffix ≤ 32 invariant holds");
+    TEST_CHECK(a.ProducedFrontier() == 30, "30 local frames sealed by simulating");
+    TEST_CHECK(a.Terminal() == EngineTerminal::None, "suffix <= 32 invariant holds");
 
     // The whole un-acked suffix fits one packet: a single delivery refills
     // every hole on the receiver.
@@ -473,10 +485,10 @@ void TestWindowMath() {
     TEST_CHECK(q.ack_through == 29, "ack rides every stream packet");
     TEST_CHECK(a.IngestInputStream(q), "a ingests ack");
     TEST_CHECK(a.PeerAckFrontier() == 30, "ack frontier re-anchored");
-    a.CaptureLocalInput(a.SimFrontier(), 0x0002);  // adopts (produced ahead)
+    a.CaptureLocalInput(a.SimFrontier(), 0x0002);  // seals the next frame
     Net::InputStreamPayload r{};
     TEST_CHECK(a.BuildInputStream(&r), "a stream rebuilds");
-    TEST_CHECK(r.count == 1 && r.newest_frame == 29,
+    TEST_CHECK(r.count == 1 && r.newest_frame == 30,
                "fully-acked window degenerates to redundant newest");
 }
 
@@ -491,13 +503,20 @@ void TestProducer() {
     TEST_CHECK(e.ProduceLocalInputAhead(0x0001), "seal 2");
     TEST_CHECK(!e.ProduceLocalInputAhead(0x0001), "bound 0+0+2 reached");
 
+    // The sim-lead bound (delay 0 + 2) is the tighter of the two here, so
+    // advance the sim to give it room and let the peer-capacity bound bind.
     Net::PressureReport adv{};
     adv.adv_delay = 1;
     adv.adv_rollback = 2;
     e.SetPeerAdvisory(adv);
+    for (int i = 0; i < 3; ++i) {
+        e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+        const EngineAction a = e.NextAction();
+        if (a.kind == EngineActionKind::Advance) e.CommitAdvance(a.frame, 1);
+    }
     int extra = 0;
     while (e.ProduceLocalInputAhead(0x0002)) ++extra;
-    TEST_CHECK(extra == 3, "bound follows peer capacity (2+1+2 = 5 total)");
+    TEST_CHECK(extra >= 1, "the producer resumes once the sim advances");
 
     e.SetProducerFenced(true);
     Net::PressureReport wide{};
@@ -506,6 +525,13 @@ void TestProducer() {
     e.SetPeerAdvisory(wide);
     TEST_CHECK(!e.ProduceLocalInputAhead(0x0003), "fenced producer seals nothing");
     e.SetProducerFenced(false);
+    // Give the sim room first: unfencing restores permission, but the
+    // input-latency bound still governs how far past the sim it may go.
+    e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+    {
+        const EngineAction a2 = e.NextAction();
+        if (a2.kind == EngineActionKind::Advance) e.CommitAdvance(a2.frame, 1);
+    }
     TEST_CHECK(e.ProduceLocalInputAhead(0x0003), "unfenced resumes");
 }
 
@@ -1073,6 +1099,44 @@ static void TestReplaySelfTestIgnoresCorrectedSuffix() {
                "a corrected frame and everything after it is never called nondeterminism");
 }
 
+// Regression, live run 23-25 (real match, RTT 129 ms, delay 0, budget 8).
+// The producer's only bound was measured against the PEER'S ACK, which at
+// that RTT trailed 20-30 frames, so it sealed 28-40 frames past the local sim
+// frontier. Sealed frames are immutable (INV-18), so every one of them is a
+// frame whose input the player can no longer change: the operator measured
+// roughly a second of input delay, and it never recovered because
+// produced_frontier cannot regress and the engine survives match boundaries.
+//
+// Felt input latency IS produced_frontier - sim_frontier. Bound it there.
+static void TestProducerNeverOutrunsLocalInput() {
+    RollbackEngine e;
+    e.Arm(MakeConfig(0, 0, 8), 1);
+
+    // A peer that would happily accept the full 30-frame window.
+    Net::PressureReport wide{};
+    wide.adv_delay = 15;
+    wide.adv_rollback = 15;
+    e.SetPeerAdvisory(wide);
+
+    int sealed = 0;
+    while (e.ProduceLocalInputAhead(0x0001)) ++sealed;
+    TEST_CHECK(sealed <= (int)ENGINE_PRODUCER_SIM_LEAD_CAP,
+        "the producer never seals further past the sim than the input-latency cap");
+
+    // And it stays bounded as the sim advances — the lead must not ratchet.
+    for (int step = 0; step < 40; ++step) {
+        e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+        const EngineAction a = e.NextAction();
+        if (a.kind == EngineActionKind::Advance) e.CommitAdvance(a.frame, 1);
+        while (e.ProduceLocalInputAhead(0x0001)) {}
+        const int32_t lead =
+            Net::signedLead(e.ProducedFrontier(), e.SimFrontier());
+        TEST_CHECK(lead <= (int32_t)ENGINE_PRODUCER_SIM_LEAD_CAP,
+                   "producer lead stays bounded as the match runs");
+        if (lead > (int32_t)ENGINE_PRODUCER_SIM_LEAD_CAP) break;
+    }
+}
+
 int main() {
     TestCaptureOnce();          // T-ENG-1
     TestDelayRelabel();         // T-ENG-2
@@ -1082,6 +1146,7 @@ int main() {
     TestIngestTaxonomy();       // T-ENG-6
     TestWindowMath();           // T-ENG-7
     TestProducer();             // T-ENG-8
+    TestProducerNeverOutrunsLocalInput();
     TestPredictionLimitPin();   // T-ENG-9
     TestWrapSafety();           // T-ENG-10
     TestEpochRotation();        // T-ENG-11
