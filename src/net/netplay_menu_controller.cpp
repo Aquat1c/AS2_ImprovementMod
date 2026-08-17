@@ -2715,20 +2715,26 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
     // Wire-driven signatures (M4): the local heuristics above have ~one-frame
     // lifetimes and can be destroyed by aborts; the peer's winscreen-exit
     // barrier and rematch intent arrive over the wire and cannot be missed.
+    const uint8_t remotePmdIntent =
+        Net::TransitionBarrier_RemoteProposed(Net::NetTransitionKind::PostMatchDecision)
+            ? Net::TransitionBarrier_GetRemoteIntent(Net::NetTransitionKind::PostMatchDecision)
+            : (uint8_t)Net::PostMatchIntentWire::None;
     const bool wireSuggestsRematch =
         Net::TransitionBarrier_IsCommitted(Net::NetTransitionKind::WinScreenExit) ||
-        (Net::TransitionBarrier_RemoteProposed(Net::NetTransitionKind::PostMatchDecision) &&
-         Net::TransitionBarrier_GetRemoteIntent(Net::NetTransitionKind::PostMatchDecision) ==
-             (uint8_t)Net::PostMatchIntentWire::Rematch);
+        remotePmdIntent == (uint8_t)Net::PostMatchIntentWire::Rematch ||
+        remotePmdIntent == (uint8_t)Net::PostMatchIntentWire::CharselRestart;
 
     if (!staleGameplayHandoff && !lifecycleSuggestsPostMatch && !wireSuggestsRematch) {
         return;
     }
 
-    // Announce our own rematch intent so the peer's restart doesn't depend on
-    // ITS local heuristics either.
+    // Announce our own restart intent so the peer's restart doesn't depend on
+    // ITS local heuristics either. M7 (F-7 unification): this path IS the
+    // lockstep-derived "any NO" charsel route, so it announces CharselRestart
+    // — the same value continue_flow's decline proposed — never Rematch
+    // (which now exclusively means the YES,YES fast path).
     Net::TransitionBarrier_Propose(Net::NetTransitionKind::PostMatchDecision,
-                                   (uint8_t)Net::PostMatchIntentWire::Rematch, 0);
+                                   (uint8_t)Net::PostMatchIntentWire::CharselRestart, 0);
 
     const DWORD now = GetTickCount();
     if ((now - s_autoRematchLastAttemptAt) < 250) {

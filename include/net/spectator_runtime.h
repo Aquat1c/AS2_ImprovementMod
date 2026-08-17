@@ -49,6 +49,17 @@ void SpectatorRuntime_OnGameplayFrame(int32_t rb_frame,
                                       uint16_t p2_input,
                                       bool rolling_back,
                                       int32_t confirmed_rb_frame);
+/// M7 (S-6): confirmed-only push from the engine2 confirm seam. Every frame
+/// is final by construction (rolling_back=false, confirmed==rb_frame), and
+/// carries the confirmed pre-state gameplay digest for S-4 record
+/// verification. `rb_frame` is match-relative (0-based per epoch) — the same
+/// numbering the per-match Gekko engine produced, so the sidecar protocol
+/// semantics are unchanged.
+void SpectatorRuntime_OnConfirmedFrame(int32_t rb_frame,
+                                       int32_t game_abs_frame,
+                                       uint16_t p1_input,
+                                       uint16_t p2_input,
+                                       uint64_t pre_state_hash);
 void SpectatorRuntime_OnMatchEnd(const char* reason);
 void SpectatorRuntime_OnDisconnect(const char* reason);
 

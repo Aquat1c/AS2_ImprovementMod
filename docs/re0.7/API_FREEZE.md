@@ -137,3 +137,15 @@ Changed at M4 (§3.2 terminal shape, INV-20): `DisconnectPayload` is now
 `{code u8, reason_id u32 (fnv1a32 of the typed reason name), human[96]}`
 (102 B pin); session2 fault terminals resend it at 100 ms across the bounded
 goodbye window. Wire break is legal (v20 is dev-only until M6).
+
+Changed at M7 (spectator/replay re-hookup): `PostMatchIntentWire` gains
+`CharselRestart` (4) — the lockstep-derived "any NO" route intent (F-7
+unification; `Rematch` now exclusively means the YES,YES fast path; the
+payload byte and size are unchanged). Spectator sidecar protocol stays v8:
+`FrameRecord` keeps its 16 B layout — the former pad bytes carry a 24-bit
+truncated confirmed pre-state digest under the new record flag
+`FRAME_FLAG_HAS_HASH` (S-4); `FRAME_FLAG_ROLLBACK_REWRITE` is retired on the
+engine2 path (never sent; still honored on receive). Replay file format:
+additive trailer chunk `AS2RCFM1` v1 (epoch-tagged confirmed input stream +
+30-frame-cadence digests) appended after the `AS2RPAL1` palette trailer;
+the loader is now a chunk scanner — 0.6-era files parse unchanged.

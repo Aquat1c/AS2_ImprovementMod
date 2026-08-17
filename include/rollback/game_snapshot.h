@@ -56,4 +56,12 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot);
 /// SyncHash exchange and the confirm pipeline.
 uint64_t GameSnapshot_HashGameplay(const GameSnapshot* snapshot);
 
+/// M7 (S-4/S-5): the same SIM-membership digest computed directly over the
+/// live game memory — no capture copy. Byte-for-byte identical to
+/// `GameSnapshot_HashGameplay(capture)` at the same instant, so spectator
+/// playback and replay verification can compare against the host/recorder
+/// confirmed pre-state hashes cheaply (one read pass, no memcpy). Returns
+/// false (and *outHash=0) if the regions fault.
+bool GameSnapshot_HashGameplayLive(uint64_t* outHash);
+
 } // namespace Rollback

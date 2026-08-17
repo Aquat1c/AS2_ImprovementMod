@@ -8,6 +8,7 @@
 #include "net/session_types.h"
 #include "net/set_tracker.h"
 #include "net/spectator_manager.h"
+#include "net/spectator_playback_policy.h"
 #include "net/spectator_protocol.h"
 #include "rollback/netplay_log.h"
 
@@ -856,6 +857,41 @@ void SpectatorRuntime_OnGameplayFrame(int32_t rb_frame,
 
     s_liveRbFrame = (std::max)(s_liveRbFrame, rb_frame);
     s_confirmedRbFrame = (std::max)(s_confirmedRbFrame, confirmed_rb_frame);
+}
+
+void SpectatorRuntime_OnConfirmedFrame(int32_t rb_frame,
+                                       int32_t game_abs_frame,
+                                       uint16_t p1_input,
+                                       uint16_t p2_input,
+                                       uint64_t pre_state_hash) {
+    // M7 (S-6): the engine2 confirm seam pushes each frame exactly once and
+    // only after it is final — rewrites are gone by construction, so the
+    // archive slot is written once and the confirmed watermark IS the frame.
+    if (!s_matchActive || !ShouldServeSpectators()) {
+        return;
+    }
+
+    ArchivedFrame* slot = EnsureFrameSlot(rb_frame);
+    if (!slot) {
+        return;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->valid = true;
+    slot->record.rb_frame = rb_frame;
+    slot->record.game_abs_frame = game_abs_frame;
+    slot->record.p1_input = p1_input;
+    slot->record.p2_input = p2_input;
+    slot->record.flags = Spectator::FRAME_FLAG_CONFIRMED |
+                         Spectator::FRAME_FLAG_HAS_HASH;
+    // S-4: 24-bit truncated confirmed pre-state digest in the former pad.
+    const uint32_t hash24 = Spectator::PlaybackHash24FromDigest(pre_state_hash);
+    slot->record.hash24[0] = (uint8_t)(hash24 & 0xFF);
+    slot->record.hash24[1] = (uint8_t)((hash24 >> 8) & 0xFF);
+    slot->record.hash24[2] = (uint8_t)((hash24 >> 16) & 0xFF);
+
+    s_liveRbFrame = (std::max)(s_liveRbFrame, rb_frame);
+    s_confirmedRbFrame = (std::max)(s_confirmedRbFrame, rb_frame);
 }
 
 void SpectatorRuntime_OnMatchEnd(const char* reason) {

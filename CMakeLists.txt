@@ -349,6 +349,7 @@ set(NET_HEADERS
     include/net/spectator_runtime.h
     include/net/spectator_client.h
     include/net/spectator_playback.h
+    include/net/spectator_playback_policy.h
     include/net/netplay_palette_runtime.h
     include/net/netplay_palette_storage.h
     include/net/time_probe.h

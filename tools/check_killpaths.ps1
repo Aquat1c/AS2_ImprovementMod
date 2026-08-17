@@ -42,6 +42,12 @@ $allow = @{
     # residual live session through Session2_Terminate(TransportFailed)
     # BEFORE the UI funnel); the single UI call site remains for surfacing.
     "src\patches\input_override.cpp"      = 1    # AbortRollbackDispatcher (typed-first, M6)
+    # match_director (M7): the F-7 lockstep-vs-barrier contradiction terminal
+    # — a remote PostMatchDecision proposal carrying the OTHER lockstep-
+    # derived intent can only mean divergent lockstep streams (protocol
+    # violation, INV-12 allowlisted cause; §4.6 row 4). Typed-first: routes
+    # through Session2_Terminate(ProtocolViolation) before the UI funnel.
+    "src\rollback\match_director.cpp"     = 1    # F-7 contradiction terminal (M7)
 }
 
 $pattern = "(NetMenu::)?(HandleDisconnection|OpenDisconnectError)\s*\("

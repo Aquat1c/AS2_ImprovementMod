@@ -12,6 +12,7 @@
 #include "patches/memory_utils.h"
 #include "patches/tick_hooks.h"
 #include "rollback/game_snapshot.h"
+#include "rollback/netplay_log.h"
 #include "rollback/resimulation.h"
 #include "ui/log_window.h"
 #include "ui/mod_menu.h"
@@ -124,6 +125,28 @@ constexpr uint32_t kReplayPaletteTrailerVersion = 1;
 constexpr uint32_t kReplayPaletteFlagP1 = 1u << 0;
 constexpr uint32_t kReplayPaletteFlagP2 = 1u << 1;
 
+// re0.7 M7 (S-5): confirmed-stream trailer chunk. Appended after the palette
+// trailer on netplay replay saves; carries the epoch-tagged confirmed input
+// stream plus a pre-state digest every 30 frames so playback can verify the
+// file is canonical (a predicted value can never enter it) and hash-clean.
+// The extension is additive: 0.6-era files (no chunk) load and play
+// unchanged; the chunk scanner ignores unknown trailing chunks.
+constexpr std::array<uint8_t, 8> kReplayConfirmedTrailerMagic = {
+    'A', 'S', '2', 'R', 'C', 'F', 'M', '1'
+};
+constexpr uint32_t kReplayConfirmedTrailerVersion = 1;
+// magic[8] + version + epoch + first_game_abs + record_count + hash_count +
+// payload_crc (all u32).
+constexpr size_t kReplayConfirmedTrailerHeaderSize = 8 + 6 * sizeof(uint32_t);
+constexpr size_t kReplayConfirmedInputRecordSize = 2 * sizeof(uint16_t);
+constexpr size_t kReplayConfirmedHashRecordSize = sizeof(uint32_t) + sizeof(uint64_t);
+constexpr uint32_t kReplayConfirmedHashCadence = 30;   // §2.7.7 SyncHash cadence
+// Hash-verify sync-acquire: the replay playback machine reaches gameplay via
+// the native loader, so the first records may not be bit-aligned with the
+// recorder's baseline. Arm strict verification on the first agreeing digest;
+// give up (fail-degrade, loud log) if none of the first N digests agree.
+constexpr uint32_t kReplayVerifyAcquireWindowHashes = 20;
+
 struct PendingPreparedInputs {
     bool valid = false;
     int32_t frame = -1;
@@ -220,6 +243,42 @@ static bool s_menuBackWasDown = false;
 static ReplaySave_t s_originalReplaySave = nullptr;
 static ReplaySelectDraw_t s_originalReplaySelectDraw = nullptr;
 static ReplayPaletteOverrideState s_loadedReplayPalette[2] = {};
+
+// ── M7 (S-5): confirmed-stream recorder (host side, fed from the engine2
+// confirm seam) ─────────────────────────────────────────────────────────────
+struct ConfirmedInputRecord {
+    uint16_t p1;
+    uint16_t p2;
+};
+static_assert(sizeof(ConfirmedInputRecord) == 4,
+    "ConfirmedInputRecord is memcpy'd to/from the trailer chunk — must stay 4 bytes");
+struct ConfirmedHashRecord {
+    uint32_t index;   // record index (game_abs − first_game_abs)
+    uint64_t hash;    // Block64 confirmed pre-tick gameplay digest
+};
+static uint32_t s_recEpoch = 0;
+static int32_t s_recFirstGameAbs = -1;
+static bool s_recContiguityBroken = false;
+static uint32_t s_recDropped = 0;
+static std::vector<ConfirmedInputRecord> s_recRecords;
+static std::vector<ConfirmedHashRecord> s_recHashes;
+
+// ── M7 (S-5): loaded confirmed stream + playback verification latches ──────
+struct LoadedConfirmedStream {
+    bool present = false;
+    uint32_t epoch = 0;
+    int32_t first_game_abs = -1;
+    std::vector<ConfirmedInputRecord> records;
+    std::map<int32_t, uint64_t> hashes;   // record index → digest
+};
+static LoadedConfirmedStream s_loadedConfirmed;
+static bool s_verifyDisabled = false;
+static bool s_verifyAcquired = false;
+static uint32_t s_verifyEntryMismatches = 0;
+static uint32_t s_verifyInputMismatches = 0;
+static uint32_t s_verifyHashMismatches = 0;
+static uint32_t s_verifyHashChecks = 0;
+
 static fs::path s_netplaySetFolder;
 static std::string s_netplaySetKey;
 static int s_netplaySetLastTotalMatches = 0;
@@ -330,8 +389,42 @@ static void ResetMenuHotkeyEdges() {
     InputSystem_ResetRepeatState(1);
 }
 
+static void ResetLoadedConfirmedStream() {
+    s_loadedConfirmed.present = false;
+    s_loadedConfirmed.epoch = 0;
+    s_loadedConfirmed.first_game_abs = -1;
+    s_loadedConfirmed.records.clear();
+    s_loadedConfirmed.hashes.clear();
+    s_verifyDisabled = false;
+    s_verifyAcquired = false;
+    s_verifyEntryMismatches = 0;
+    s_verifyInputMismatches = 0;
+    s_verifyHashMismatches = 0;
+    s_verifyHashChecks = 0;
+}
+
+static void ResetConfirmedRecorder(const char* reason) {
+    if (!s_recRecords.empty()) {
+        LOG_INFO("[Replay] Confirmed recorder reset (%s): epoch=%u records=%zu hashes=%zu dropped=%u",
+            reason ? reason : "?",
+            s_recEpoch,
+            s_recRecords.size(),
+            s_recHashes.size(),
+            s_recDropped);
+    }
+    s_recEpoch = 0;
+    s_recFirstGameAbs = -1;
+    s_recContiguityBroken = false;
+    s_recDropped = 0;
+    s_recRecords.clear();
+    s_recHashes.clear();
+}
+
 static void ResetLoadedReplayPaletteState() {
     memset(s_loadedReplayPalette, 0, sizeof(s_loadedReplayPalette));
+    // Loaded-file state travels together: a new load or unload also drops
+    // the confirmed-stream verification data (M7).
+    ResetLoadedConfirmedStream();
 }
 
 static void AppendU32(std::vector<uint8_t>* bytes, uint32_t value) {
@@ -500,6 +593,62 @@ static bool AppendReplayPaletteTrailer(const fs::path& path,
     return true;
 }
 
+// M7 (S-5): append the confirmed-stream chunk for the recorder's current
+// epoch (one match — the native save is one file per match, so the epoch
+// boundary IS the chapter boundary). Consumes the recorder.
+static bool AppendReplayConfirmedTrailer(const fs::path& path) {
+    if (s_recRecords.empty() || s_recFirstGameAbs < 0) {
+        return true;   // nothing recorded (offline match / Gekko fallback)
+    }
+
+    std::vector<uint8_t> payload;
+    payload.reserve(s_recRecords.size() * kReplayConfirmedInputRecordSize +
+                    s_recHashes.size() * kReplayConfirmedHashRecordSize);
+    const uint8_t* recordBytes = reinterpret_cast<const uint8_t*>(s_recRecords.data());
+    payload.insert(payload.end(), recordBytes,
+                   recordBytes + s_recRecords.size() * kReplayConfirmedInputRecordSize);
+    for (const ConfirmedHashRecord& hashRecord : s_recHashes) {
+        AppendU32(&payload, hashRecord.index);
+        const uint8_t* hashBytes = reinterpret_cast<const uint8_t*>(&hashRecord.hash);
+        payload.insert(payload.end(), hashBytes, hashBytes + sizeof(hashRecord.hash));
+    }
+
+    std::vector<uint8_t> chunk;
+    chunk.reserve(kReplayConfirmedTrailerHeaderSize + payload.size());
+    chunk.insert(chunk.end(), kReplayConfirmedTrailerMagic.begin(),
+                 kReplayConfirmedTrailerMagic.end());
+    AppendU32(&chunk, kReplayConfirmedTrailerVersion);
+    AppendU32(&chunk, s_recEpoch);
+    AppendU32(&chunk, (uint32_t)s_recFirstGameAbs);
+    AppendU32(&chunk, (uint32_t)s_recRecords.size());
+    AppendU32(&chunk, (uint32_t)s_recHashes.size());
+    AppendU32(&chunk, CalcCRC32(payload.data(), payload.size()));
+    chunk.insert(chunk.end(), payload.begin(), payload.end());
+
+    std::ofstream stream(path, std::ios::binary | std::ios::app);
+    if (!stream) {
+        LOG_ERROR("[Replay] Failed to append confirmed trailer: %s", WideToUtf8(path.wstring()).c_str());
+        return false;
+    }
+    stream.write(reinterpret_cast<const char*>(chunk.data()),
+                 static_cast<std::streamsize>(chunk.size()));
+    if (!stream) {
+        LOG_ERROR("[Replay] Confirmed trailer write failed: %s", WideToUtf8(path.wstring()).c_str());
+        return false;
+    }
+
+    LOG_INFO("[Replay] Appended confirmed trailer to %s (epoch=%u first_abs=%d records=%zu hashes=%zu dropped=%u contiguous=%d)",
+        WideToUtf8(path.wstring()).c_str(),
+        s_recEpoch,
+        s_recFirstGameAbs,
+        s_recRecords.size(),
+        s_recHashes.size(),
+        s_recDropped,
+        s_recContiguityBroken ? 0 : 1);
+    ResetConfirmedRecorder("consumed by replay save");
+    return true;
+}
+
 static uint8_t ReplayHeaderPaletteForSlot(const ReplayFileMetadata& metadata, uint8_t slot) {
     return slot == 0
         ? metadata.header[kReplayHeaderP1PaletteOffset]
@@ -520,53 +669,25 @@ static std::string ReplayHeaderNameForSlot(const ReplayFileMetadata& metadata, u
     return name;
 }
 
-static void ParseReplayPaletteTrailer(std::ifstream& stream,
-                                     const ReplayFileMetadata& metadata,
-                                     const char* replayPathForLog) {
-    ResetLoadedReplayPaletteState();
-
-    const std::streampos trailerStart = stream.tellg();
-    if (trailerStart < 0) {
-        return;
+// Parses one palette chunk starting at data[0]. Returns the chunk's byte
+// length (0 = malformed, caller stops scanning).
+static size_t ParsePaletteChunk(const uint8_t* data,
+                                size_t available,
+                                const ReplayFileMetadata& metadata,
+                                const char* replayPathForLog) {
+    if (available < kReplayPaletteTrailerHeaderSize) {
+        return 0;
     }
 
-    stream.seekg(0, std::ios::end);
-    const std::streampos fileEnd = stream.tellg();
-    if (fileEnd < trailerStart) {
-        stream.clear();
-        stream.seekg(trailerStart);
-        return;
-    }
-
-    const size_t trailerBytes = static_cast<size_t>(fileEnd - trailerStart);
-    stream.clear();
-    stream.seekg(trailerStart);
-    if (trailerBytes == 0) {
-        return;
-    }
-
-    std::vector<uint8_t> trailer(trailerBytes, 0);
-    stream.read(reinterpret_cast<char*>(trailer.data()), static_cast<std::streamsize>(trailer.size()));
-    if (!stream || stream.gcount() != static_cast<std::streamsize>(trailer.size())) {
-        LOG_WARN("[Replay] Failed to read trailer bytes for %s", replayPathForLog ? replayPathForLog : "(unknown)");
-        stream.clear();
-        return;
-    }
-
-    if (trailer.size() < kReplayPaletteTrailerHeaderSize ||
-        memcmp(trailer.data(), kReplayPaletteTrailerMagic.data(), kReplayPaletteTrailerMagic.size()) != 0) {
-        return;
-    }
-
-    const uint32_t version = ReadU32(trailer.data() + kReplayPaletteTrailerMagic.size());
-    const uint32_t flags = ReadU32(trailer.data() + kReplayPaletteTrailerMagic.size() + sizeof(uint32_t));
+    const uint32_t version = ReadU32(data + kReplayPaletteTrailerMagic.size());
+    const uint32_t flags = ReadU32(data + kReplayPaletteTrailerMagic.size() + sizeof(uint32_t));
     const uint32_t supportedFlags = kReplayPaletteFlagP1 | kReplayPaletteFlagP2;
     if (version != kReplayPaletteTrailerVersion || (flags & ~supportedFlags) != 0) {
         LOG_WARN("[Replay] Ignoring unsupported palette trailer in %s (version=%u flags=0x%08X)",
             replayPathForLog ? replayPathForLog : "(unknown)",
             version,
             flags);
-        return;
+        return 0;
     }
 
     size_t expectedSize = kReplayPaletteTrailerHeaderSize;
@@ -576,12 +697,12 @@ static void ParseReplayPaletteTrailer(std::ifstream& stream,
     if ((flags & kReplayPaletteFlagP2) != 0) {
         expectedSize += kReplayPaletteTrailerRecordSize;
     }
-    if (trailer.size() != expectedSize) {
-        LOG_WARN("[Replay] Ignoring malformed palette trailer in %s (bytes=%zu expected=%zu)",
+    if (available < expectedSize) {
+        LOG_WARN("[Replay] Ignoring truncated palette trailer in %s (bytes=%zu expected=%zu)",
             replayPathForLog ? replayPathForLog : "(unknown)",
-            trailer.size(),
+            available,
             expectedSize);
-        return;
+        return 0;
     }
 
     size_t offset = kReplayPaletteTrailerHeaderSize;
@@ -591,10 +712,10 @@ static void ParseReplayPaletteTrailer(std::ifstream& stream,
             continue;
         }
 
-        const uint8_t characterId = trailer[offset + 0];
-        const uint8_t basePalette = trailer[offset + 1];
-        const uint32_t storedCrc = ReadU32(trailer.data() + offset + 4);
-        const uint8_t* bankData = trailer.data() + offset + 8;
+        const uint8_t characterId = data[offset + 0];
+        const uint8_t basePalette = data[offset + 1];
+        const uint32_t storedCrc = ReadU32(data + offset + 4);
+        const uint8_t* bankData = data + offset + 8;
         const uint32_t computedCrc = CalcCRC32(bankData, Net::NETPLAY_PALETTE_BANK_SIZE);
         const uint32_t expectedCharacterId = ReplayHeaderCharacterForSlot(metadata, slot);
         const uint8_t expectedBasePalette = ReplayHeaderPaletteForSlot(metadata, slot);
@@ -635,6 +756,143 @@ static void ParseReplayPaletteTrailer(std::ifstream& stream,
         replayPathForLog ? replayPathForLog : "(unknown)",
         s_loadedReplayPalette[0].present ? 1 : 0,
         s_loadedReplayPalette[1].present ? 1 : 0);
+    return expectedSize;
+}
+
+// M7 (S-5): parses one confirmed-stream chunk. Returns the chunk's byte
+// length (0 = malformed).
+static size_t ParseConfirmedChunk(const uint8_t* data,
+                                  size_t available,
+                                  const char* replayPathForLog) {
+    if (available < kReplayConfirmedTrailerHeaderSize) {
+        return 0;
+    }
+
+    size_t off = kReplayConfirmedTrailerMagic.size();
+    const uint32_t version = ReadU32(data + off); off += 4;
+    const uint32_t epoch = ReadU32(data + off); off += 4;
+    const int32_t firstGameAbs = (int32_t)ReadU32(data + off); off += 4;
+    const uint32_t recordCount = ReadU32(data + off); off += 4;
+    const uint32_t hashCount = ReadU32(data + off); off += 4;
+    const uint32_t storedCrc = ReadU32(data + off); off += 4;
+
+    if (version != kReplayConfirmedTrailerVersion) {
+        LOG_WARN("[Replay] Ignoring unsupported confirmed trailer in %s (version=%u)",
+            replayPathForLog ? replayPathForLog : "(unknown)", version);
+        return 0;
+    }
+    if (recordCount > (uint32_t)INPUT_HISTORY_MAX ||
+        hashCount > recordCount / kReplayConfirmedHashCadence + 1) {
+        LOG_WARN("[Replay] Ignoring implausible confirmed trailer in %s (records=%u hashes=%u)",
+            replayPathForLog ? replayPathForLog : "(unknown)", recordCount, hashCount);
+        return 0;
+    }
+
+    const size_t payloadBytes =
+        (size_t)recordCount * kReplayConfirmedInputRecordSize +
+        (size_t)hashCount * kReplayConfirmedHashRecordSize;
+    const size_t chunkBytes = kReplayConfirmedTrailerHeaderSize + payloadBytes;
+    if (available < chunkBytes) {
+        LOG_WARN("[Replay] Ignoring truncated confirmed trailer in %s (bytes=%zu expected=%zu)",
+            replayPathForLog ? replayPathForLog : "(unknown)", available, chunkBytes);
+        return 0;
+    }
+
+    const uint8_t* payload = data + kReplayConfirmedTrailerHeaderSize;
+    const uint32_t computedCrc = CalcCRC32(payload, payloadBytes);
+    if (computedCrc != storedCrc) {
+        LOG_WARN("[Replay] Ignoring corrupt confirmed trailer in %s (stored=0x%08X actual=0x%08X)",
+            replayPathForLog ? replayPathForLog : "(unknown)", storedCrc, computedCrc);
+        return chunkBytes;   // well-formed length, bad payload — skip it
+    }
+
+    s_loadedConfirmed.present = true;
+    s_loadedConfirmed.epoch = epoch;
+    s_loadedConfirmed.first_game_abs = firstGameAbs;
+    s_loadedConfirmed.records.resize(recordCount);
+    if (recordCount > 0) {
+        memcpy(s_loadedConfirmed.records.data(), payload,
+               (size_t)recordCount * kReplayConfirmedInputRecordSize);
+    }
+    s_loadedConfirmed.hashes.clear();
+    const uint8_t* hashData = payload + (size_t)recordCount * kReplayConfirmedInputRecordSize;
+    for (uint32_t i = 0; i < hashCount; ++i) {
+        const uint8_t* rec = hashData + (size_t)i * kReplayConfirmedHashRecordSize;
+        const uint32_t index = ReadU32(rec);
+        uint64_t hash = 0;
+        memcpy(&hash, rec + 4, sizeof(hash));
+        s_loadedConfirmed.hashes[(int32_t)index] = hash;
+    }
+
+    LOG_INFO("[Replay] Loaded confirmed trailer from %s: epoch=%u first_abs=%d records=%u hashes=%u",
+        replayPathForLog ? replayPathForLog : "(unknown)",
+        epoch, firstGameAbs, recordCount, hashCount);
+    return chunkBytes;
+}
+
+static void ParseReplayPaletteTrailer(std::ifstream& stream,
+                                     const ReplayFileMetadata& metadata,
+                                     const char* replayPathForLog) {
+    ResetLoadedReplayPaletteState();
+
+    const std::streampos trailerStart = stream.tellg();
+    if (trailerStart < 0) {
+        return;
+    }
+
+    stream.seekg(0, std::ios::end);
+    const std::streampos fileEnd = stream.tellg();
+    if (fileEnd < trailerStart) {
+        stream.clear();
+        stream.seekg(trailerStart);
+        return;
+    }
+
+    const size_t trailerBytes = static_cast<size_t>(fileEnd - trailerStart);
+    stream.clear();
+    stream.seekg(trailerStart);
+    if (trailerBytes == 0) {
+        return;
+    }
+
+    std::vector<uint8_t> trailer(trailerBytes, 0);
+    stream.read(reinterpret_cast<char*>(trailer.data()), static_cast<std::streamsize>(trailer.size()));
+    if (!stream || stream.gcount() != static_cast<std::streamsize>(trailer.size())) {
+        LOG_WARN("[Replay] Failed to read trailer bytes for %s", replayPathForLog ? replayPathForLog : "(unknown)");
+        stream.clear();
+        return;
+    }
+
+    // M7: chunk scan — the trailing region holds zero or more self-
+    // identifying chunks (palette, confirmed stream) in any order. Old
+    // palette-only files parse exactly as before; unknown bytes stop the
+    // scan (forward compat, never fatal).
+    size_t offset = 0;
+    while (trailer.size() - offset >= kReplayPaletteTrailerMagic.size()) {
+        const uint8_t* chunk = trailer.data() + offset;
+        const size_t available = trailer.size() - offset;
+        size_t consumed = 0;
+        if (memcmp(chunk, kReplayPaletteTrailerMagic.data(),
+                   kReplayPaletteTrailerMagic.size()) == 0) {
+            consumed = ParsePaletteChunk(chunk, available, metadata, replayPathForLog);
+        } else if (memcmp(chunk, kReplayConfirmedTrailerMagic.data(),
+                          kReplayConfirmedTrailerMagic.size()) == 0) {
+            consumed = ParseConfirmedChunk(chunk, available, replayPathForLog);
+        } else {
+            if (offset == 0) {
+                // No known chunk at the trailer start — legacy file with
+                // unrelated trailing bytes; keep the old silent behavior.
+                return;
+            }
+            LOG_WARN("[Replay] Unknown trailer chunk in %s at offset %zu — stopping scan",
+                replayPathForLog ? replayPathForLog : "(unknown)", offset);
+            return;
+        }
+        if (consumed == 0) {
+            return;
+        }
+        offset += consumed;
+    }
 }
 
 static char __cdecl Hook_ReplaySave(int matchBase) {
@@ -645,13 +903,18 @@ static char __cdecl Hook_ReplaySave(int matchBase) {
     ReplayDirectorySnapshot before;
     const bool hasPaletteTrailer = BuildReplayPaletteSaveData(banks);
     const bool shouldRenameNetplayReplay = ShouldRenameNetplayReplaySave(session);
-    if (hasPaletteTrailer || shouldRenameNetplayReplay) {
+    // M7 (S-5): the confirmed chunk is netplay-context-gated exactly like the
+    // rename — a later LOCAL save must never inherit a stale netplay stream.
+    const bool hasConfirmedTrailer = shouldRenameNetplayReplay &&
+                                     !s_recRecords.empty() &&
+                                     s_recFirstGameAbs >= 0;
+    if (hasPaletteTrailer || shouldRenameNetplayReplay || hasConfirmedTrailer) {
         before = CaptureReplayDirectorySnapshot();
     }
 
     const char result = s_originalReplaySave ? s_originalReplaySave(matchBase) : 0;
 
-    if (!hasPaletteTrailer && !shouldRenameNetplayReplay) {
+    if (!hasPaletteTrailer && !shouldRenameNetplayReplay && !hasConfirmedTrailer) {
         return result;
     }
 
@@ -664,6 +927,10 @@ static char __cdecl Hook_ReplaySave(int matchBase) {
 
     if (hasPaletteTrailer) {
         AppendReplayPaletteTrailer(replayPath, banks);
+    }
+
+    if (hasConfirmedTrailer) {
+        AppendReplayConfirmedTrailer(replayPath);
     }
 
     if (shouldRenameNetplayReplay) {
@@ -2694,6 +2961,7 @@ bool ReplayRuntime_InstallHooks() {
 void ReplayRuntime_Init() {
     ResetMatchRuntimeState();
     ResetLoadedReplayPaletteState();
+    ResetConfirmedRecorder("runtime init");
     ResetNetplayReplaySetFolder("runtime init");
     ResetBrowserState();
     ResetMatchHotkeyEdges();
@@ -2709,6 +2977,7 @@ void ReplayRuntime_Shutdown() {
 
     DeactivateReplayMatch("shutdown");
     ResetLoadedReplayPaletteState();
+    ResetConfirmedRecorder("runtime shutdown");
     ResetNetplayReplaySetFolder("runtime shutdown");
     ResetBrowserState();
     s_initialized = false;
@@ -2787,6 +3056,88 @@ bool ReplayRuntime_CopyPaletteOverrideBank(uint8_t gameSlot, Net::NetplayPalette
     return true;
 }
 
+// M7 (S-5): pre-tick verification of the native tape against the loaded
+// confirmed stream. Input words are compared under the tape's 8-button mask
+// (the native tape stores one byte per player). Digests use the same
+// sync-acquire model as the spectator playback (the replay boots through the
+// native loader, so the first records may not be bit-aligned with the
+// recorder baseline); a replay is an offline artifact, so divergence
+// fail-DEGRADES with loud logs — nothing to tear down.
+static void VerifyConfirmedPlayback(int32_t dispatchedFrame,
+                                    const PendingPreparedInputs& prepared) {
+    if (!s_loadedConfirmed.present || s_verifyDisabled) {
+        return;
+    }
+    if (s_takeoverMode != TakeoverMode::None) {
+        // Takeover intentionally diverges from the recorded stream.
+        s_verifyDisabled = true;
+        LOG_INFO("[Replay] Confirmed-stream verification disabled (takeover armed)");
+        return;
+    }
+
+    const int32_t index = dispatchedFrame - s_loadedConfirmed.first_game_abs;
+    if (index < 0 || (size_t)index >= s_loadedConfirmed.records.size()) {
+        return;
+    }
+
+    const ConfirmedInputRecord& rec = s_loadedConfirmed.records[(size_t)index];
+    if (((rec.p1 ^ prepared.p1) & kReplayInputMask) != 0 ||
+        ((rec.p2 ^ prepared.p2) & kReplayInputMask) != 0) {
+        ++s_verifyInputMismatches;
+        if (s_verifyInputMismatches <= 5 || (s_verifyInputMismatches % 300) == 0) {
+            LOG_WARN("[Replay] Confirmed-stream INPUT mismatch at frame %d (idx=%d): "
+                     "tape P1=0x%02X P2=0x%02X confirmed P1=0x%04X P2=0x%04X count=%u",
+                dispatchedFrame, index,
+                prepared.p1 & kReplayInputMask, prepared.p2 & kReplayInputMask,
+                rec.p1, rec.p2, s_verifyInputMismatches);
+        }
+    }
+
+    const auto hashIt = s_loadedConfirmed.hashes.find(index);
+    if (hashIt == s_loadedConfirmed.hashes.end()) {
+        return;
+    }
+
+    uint64_t liveHash = 0;
+    if (!Rollback::GameSnapshot_HashGameplayLive(&liveHash)) {
+        return;
+    }
+    ++s_verifyHashChecks;
+
+    if (liveHash == hashIt->second) {
+        if (!s_verifyAcquired) {
+            s_verifyAcquired = true;
+            LOG_INFO("[Replay] Confirmed-stream hash sync ACQUIRED at frame %d (idx=%d, checks=%u)",
+                dispatchedFrame, index, s_verifyHashChecks);
+        }
+        return;
+    }
+
+    if (!s_verifyAcquired) {
+        ++s_verifyEntryMismatches;
+        if (s_verifyEntryMismatches >= kReplayVerifyAcquireWindowHashes) {
+            s_verifyDisabled = true;
+            LOG_WARN("[Replay] Confirmed-stream hash never acquired after %u cadence points — "
+                     "verification disabled for this playback (fail-degrade)",
+                s_verifyEntryMismatches);
+        }
+        return;
+    }
+
+    ++s_verifyHashMismatches;
+    LOG_WARN("[Replay] REPLAY DESYNC: confirmed pre-state hash mismatch at frame %d "
+             "(idx=%d recorded=0x%016llX live=0x%016llX mismatches=%u)",
+        dispatchedFrame, index,
+        (unsigned long long)hashIt->second,
+        (unsigned long long)liveHash,
+        s_verifyHashMismatches);
+    Rollback::NetplayLog_Write("REPLAY", dispatchedFrame,
+        "REPLAY DESYNC at idx=%d recorded=0x%016llX live=0x%016llX",
+        index,
+        (unsigned long long)hashIt->second,
+        (unsigned long long)liveHash);
+}
+
 void ReplayRuntime_OnDispatcherAdvance(int16_t* outputInputs) {
     if (!s_replayMatchActive || !outputInputs) {
         return;
@@ -2799,6 +3150,8 @@ void ReplayRuntime_OnDispatcherAdvance(int16_t* outputInputs) {
         return;
     }
 
+    VerifyConfirmedPlayback(dispatchedFrame, prepared);
+
     outputInputs[0] = static_cast<int16_t>(prepared.p1);
     outputInputs[1] = static_cast<int16_t>(prepared.p2);
 
@@ -2806,6 +3159,56 @@ void ReplayRuntime_OnDispatcherAdvance(int16_t* outputInputs) {
     InputSystem_SetNetplayInput(0, prepared.p1);
     InputSystem_SetNetplayInput(1, prepared.p2);
     s_pendingPreparedInputs = prepared;
+}
+
+void ReplayRuntime_OnConfirmedFrame(uint32_t epoch,
+                                    int32_t game_abs_frame,
+                                    uint16_t p1_input,
+                                    uint16_t p2_input,
+                                    uint64_t pre_state_hash) {
+    if (!s_initialized || game_abs_frame < 0) {
+        return;
+    }
+
+    // Epoch boundary = chapter boundary (S-5): the recorder holds exactly
+    // one match's confirmed stream; the native one-file-per-match save
+    // consumes it, and a new epoch discards whatever was not saved.
+    if (epoch != s_recEpoch) {
+        ResetConfirmedRecorder("epoch rotation");
+        s_recEpoch = epoch;
+    }
+    if (s_recFirstGameAbs < 0) {
+        s_recFirstGameAbs = game_abs_frame;
+    }
+
+    const int64_t expectedIndex = (int64_t)s_recRecords.size();
+    const int64_t index = (int64_t)game_abs_frame - s_recFirstGameAbs;
+    if (index != expectedIndex) {
+        // The confirm seam pops in order, so this is defensive only.
+        ++s_recDropped;
+        if (!s_recContiguityBroken) {
+            s_recContiguityBroken = true;
+            LOG_WARN("[Replay] Confirmed recorder contiguity break: expected idx=%lld got %lld (abs=%d)",
+                (long long)expectedIndex, (long long)index, game_abs_frame);
+        }
+        return;
+    }
+    if (s_recRecords.size() >= (size_t)INPUT_HISTORY_MAX) {
+        ++s_recDropped;
+        return;
+    }
+
+    ConfirmedInputRecord rec{};
+    rec.p1 = p1_input;
+    rec.p2 = p2_input;
+    s_recRecords.push_back(rec);
+
+    if ((s_recRecords.size() - 1) % kReplayConfirmedHashCadence == 0) {
+        ConfirmedHashRecord hashRecord{};
+        hashRecord.index = (uint32_t)(s_recRecords.size() - 1);
+        hashRecord.hash = pre_state_hash;
+        s_recHashes.push_back(hashRecord);
+    }
 }
 
 } // namespace Replay

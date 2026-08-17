@@ -198,4 +198,49 @@ uint64_t GameSnapshot_HashGameplay(const GameSnapshot* snapshot) {
     return h;
 }
 
+bool GameSnapshot_HashGameplayLive(uint64_t* outHash) {
+    if (!outHash) {
+        return false;
+    }
+    *outHash = 0;
+
+    // MUST mirror GameSnapshot_HashGameplay exactly: same SimHeader field
+    // order, same region order, same Block64 chaining — a captured snapshot
+    // of this instant hashes to the identical value (M7 verification seam).
+    struct SimHeader {
+        uint32_t rng_seed;
+        uint32_t sim_frame;
+        uint32_t game_mode;
+        uint32_t substate;
+        uint32_t substate_timer;
+        uint32_t game_type;
+        uint32_t match_phase_timer;
+        uint32_t input_read_idx;
+        uint32_t input_write_idx;
+        uint32_t effect_index;
+    } header{};
+
+    uint64_t h = BLOCK64_SEED;
+    __try {
+        header.rng_seed = DetVer_GetRngSeed();
+        header.sim_frame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+        header.game_mode = ReadMemory<uint32_t>(ADDR_GAME_MODE);
+        header.substate = ReadMemory<uint32_t>(ADDR_SUB_STATE);
+        header.substate_timer = ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER);
+        header.game_type = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
+        header.match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
+        header.input_read_idx = ReadMemory<uint32_t>(ADDR_INPUT_READ_IDX);
+        header.input_write_idx = ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX);
+        header.effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
+        h = Block64_Update(h, &header, sizeof(header));
+        h = Block64_Update(h, (const void*)kMainStart, kMainSize);
+        h = Block64_Update(h, (const void*)kInputP1Start, kInputSize);
+        h = Block64_Update(h, (const void*)kInputP2Start, kInputSize);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    *outHash = h;
+    return true;
+}
+
 } // namespace Rollback

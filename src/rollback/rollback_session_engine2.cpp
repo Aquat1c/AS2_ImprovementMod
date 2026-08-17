@@ -32,7 +32,9 @@
 #include "net/protocol.h"
 #include "net/session_manager.h"
 #include "net/session2.h"
+#include "net/spectator_runtime.h"
 #include "net/time_probe.h"
+#include "replay/replay_runtime.h"
 #include "patches/frame_scheduler.h"
 #include "rollback/determinism_verify.h"
 #include "patches/memory_utils.h"
@@ -221,11 +223,30 @@ void SendPendingSyncHashes() {
 }
 
 void DrainConfirmSeam() {
-    // M4: the confirm seam is drained to bound the ring; the spectator/replay
-    // consumers rewire onto it at M7 (S-5/S-6).
+    // The single immutable confirm seam (§2.7.3-F): feeds (a) the SyncHash
+    // exchange, (b) the spectator sidecar push, (c) the replay recorder.
+    // M7 (S-5/S-6): every popped frame is final by construction — a predicted
+    // value can never reach the sidecar archive or a replay file, and rewrite
+    // flags are gone (FRAME_FLAG_ROLLBACK_REWRITE retired on this path).
     ConfirmedFrame cf{};
     while (s_engine.PopConfirmedFrame(&cf)) {
-        DesyncDump_StoreChecksum(RbFrame(cf.frame), (uint32_t)cf.pre_state_hash);
+        const int32_t rb = RbFrame(cf.frame);
+        DesyncDump_StoreChecksum(rb, (uint32_t)cf.pre_state_hash);
+
+        // Match-relative numbering (0-based per epoch): the sidecar protocol
+        // and the replay tape keep the per-match frame identity the Gekko
+        // per-match engine produced; the canonical counter spans the session
+        // (INV-15) and stays internal. A record from before the current epoch
+        // origin (rotation raced the drain) is skipped — its match is over
+        // and its archive was sealed at OnMatchEnd.
+        const int32_t matchRel = rb - RbEpochOrigin();
+        if (matchRel >= 0) {
+            const int32_t gameAbs = s_frameOriginAbs + matchRel;
+            Net::SpectatorRuntime_OnConfirmedFrame(matchRel, gameAbs,
+                cf.inputs[0], cf.inputs[1], cf.pre_state_hash);
+            Replay::ReplayRuntime_OnConfirmedFrame(cf.epoch, gameAbs,
+                cf.inputs[0], cf.inputs[1], cf.pre_state_hash);
+        }
     }
     SendPendingSyncHashes();
     const HashVerify v = s_engine.PumpSyncHashVerify();
@@ -429,6 +450,11 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
 
 void RollbackSession_End() {
     if (!s_active && !s_suspended) return;
+    if (s_active) {
+        // M7 (S-5/S-6): flush any confirmed tail into the spectator archive
+        // and the replay recorder before the engine identity disappears.
+        DrainConfirmSeam();
+    }
     const int32_t frame = RbFrame(s_engine.SimFrontier());
     s_active = false;
     s_suspended = false;
@@ -454,6 +480,11 @@ void RollbackSession_SuspendBetweenMatches(const char* reason) {
         RollbackSession_End();
         return;
     }
+    // M7 (S-5/S-6): final seam flush at the match boundary — the director
+    // fires SpectatorRuntime_OnMatchEnd right after this returns, and the
+    // epoch rotates before the next drain would run (a stale-origin record
+    // would otherwise be dropped by the seam's matchRel guard).
+    DrainConfirmSeam();
     s_active = false;
     s_suspended = true;
     s_matchExitPending = false;

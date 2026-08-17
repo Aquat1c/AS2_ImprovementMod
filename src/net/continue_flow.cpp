@@ -179,8 +179,15 @@ static void ResolveDecline(const char* why) {
     SetState(FlowState::DeclineCooldown, why);
 
     // Telemetry/wire-signature only — fired AFTER resolution, decides nothing.
+    // M7 (F-7): the "any NO" route is the lockstep-derived charsel restart —
+    // the SAME intent the auto-rematch path announces, so both sides of a
+    // healthy session always propose the identical value. The director is
+    // told what the shared lockstep stream resolved to; a remote proposal
+    // contradicting it can only mean divergent streams (fail-closed).
+    Rollback::OnlineWiring_SetExpectedPostMatchIntent(
+        (uint8_t)PostMatchIntentWire::CharselRestart);
     TransitionBarrier_Propose(NetTransitionKind::PostMatchDecision,
-                              (uint8_t)PostMatchIntentWire::ReturnToSession, 0);
+                              (uint8_t)PostMatchIntentWire::CharselRestart, 0);
 }
 
 static void ResolveRematch() {
@@ -241,6 +248,9 @@ static void ResolveRematch() {
     }
 
     // Telemetry/wire-signature only — fired AFTER resolution, decides nothing.
+    // M7 (F-7): register the lockstep-derived answer with the director.
+    Rollback::OnlineWiring_SetExpectedPostMatchIntent(
+        (uint8_t)PostMatchIntentWire::Rematch);
     TransitionBarrier_Propose(NetTransitionKind::PostMatchDecision,
                               (uint8_t)PostMatchIntentWire::Rematch, 0);
 }

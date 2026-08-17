@@ -2500,6 +2500,35 @@ bool SpectatorClient_GetFrameInputs(int32_t rb_frame, uint16_t* outP1, uint16_t*
     return true;
 }
 
+bool SpectatorClient_GetFrameHash(int32_t rb_frame, uint32_t* outHash24, bool* outHasHash) {
+    if (outHash24) {
+        *outHash24 = 0;
+    }
+    if (outHasHash) {
+        *outHasHash = false;
+    }
+    if (rb_frame < s_bufferBaseRbFrame) {
+        return false;
+    }
+
+    const BufferedFrame* slot = GetBufferSlot(rb_frame);
+    if (!slot || !slot->valid) {
+        return false;
+    }
+
+    if ((slot->record.flags & Spectator::FRAME_FLAG_HAS_HASH) != 0) {
+        if (outHasHash) {
+            *outHasHash = true;
+        }
+        if (outHash24) {
+            *outHash24 = (uint32_t)slot->record.hash24[0] |
+                         ((uint32_t)slot->record.hash24[1] << 8) |
+                         ((uint32_t)slot->record.hash24[2] << 16);
+        }
+    }
+    return true;
+}
+
 bool SpectatorClient_GetBufferedPaletteSlot(uint8_t gameSlot, SpectatorBufferedPaletteSlot* out) {
     if (!out) {
         return false;

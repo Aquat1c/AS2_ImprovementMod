@@ -102,6 +102,17 @@ bool OnlineWiring_MatchEndLadderAllows(Net::NetTransitionKind kind);
 /// boundary).
 void OnlineWiring_MatchEndLadderNotifyConsumed(Net::NetTransitionKind kind);
 
+/// M7 (F-7): continue_flow registers the LOCKSTEP-DERIVED post-match intent
+/// (PostMatchIntentWire: Rematch for YES,YES, CharselRestart for any NO) at
+/// resolution. Both peers compute the resolution from the same consumed
+/// lockstep stream, so a remote PostMatchDecision proposal carrying the
+/// OTHER lockstep-derived value can only mean divergent streams — the
+/// director fails closed (ProtocolViolation terminal). User-action intents
+/// (ReturnToSession / Disconnect from the post-match menu) are exempt: they
+/// are choices, not derivations. The expectation is cleared when the ladder
+/// disarms.
+void OnlineWiring_SetExpectedPostMatchIntent(uint8_t intentWire);
+
 // ============================================================================
 // Diagnostics
 // ============================================================================

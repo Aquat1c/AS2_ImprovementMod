@@ -8,13 +8,17 @@
 #include "net/mode_ownership.h"
 #include "net/netplay_menu_controller.h"
 #include "net/spectator_client.h"
+#include "net/spectator_playback_policy.h"
 #include "patches/charsel_palette_select.h"
 #include "patches/input_sync_hooks.h"
 #include "net/netplay_palette_runtime.h"
 #include "patches/memory_utils.h"
 #include "patches/frame_scheduler.h"
 #include "rollback/determinism_verify.h"
+#include "rollback/game_snapshot.h"
 #include "rollback/netplay_log.h"
+
+#include <windows.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -40,8 +44,6 @@ constexpr int32_t kBootstrapStartBufferFrames = 10;
 // while still giving the game state machine time to settle between retries.
 constexpr uint32_t kBootstrapRetryFrames = 30;
 constexpr uint32_t kBootstrapStateLogFrames = 120;
-constexpr int32_t kCatchupBudgetStepGap = 30;
-constexpr int32_t kCatchupBudgetMax = 9;
 constexpr float kManualCatchupScaleSteps[] = {
     0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f
 };
@@ -73,6 +75,23 @@ static bool s_matchSettingsApplied = false;
 static uint32_t s_lastBootstrapMode = 0xFFFFFFFFu;
 static uint32_t s_lastBootstrapSub = 0xFFFFFFFFu;
 static uint32_t s_bootstrapSubFrames = 0;
+
+// ── M7 §2.8.8 elastic pacing latches ────────────────────────────────────────
+static bool s_playbackPrimed = false;       // startup prime reached once
+static bool s_rebuffering = false;          // underrun → resume at 120, not 240
+static bool s_catchingUp = false;           // catch-up hysteresis latch
+static uint32_t s_elasticCredit = 0;        // Bresenham cadence credit
+static uint32_t s_elasticHoldCount = 0;
+static int64_t s_sliceStartQpc = 0;         // 12 ms catch-up wall slice anchor
+static int64_t s_qpcFrequency = 0;
+
+// ── M7 S-4 record hash verification latches ─────────────────────────────────
+static bool s_hvDisabled = false;
+static bool s_hvAcquired = false;
+static uint32_t s_hvEntryMismatches = 0;
+static uint32_t s_hvChecks = 0;
+static bool s_hvFailLatch = false;          // consumed by FrameUpdate → leave
+static char s_hvFailReason[128] = "";
 
 static void CopyText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) {
@@ -371,6 +390,18 @@ static void ResetLocalSimulationState() {
     s_localPlaybackRbFrame = -1;
     ResetDispatchState();
     ResetBootstrapDriveState();
+    // M7 pacing + verification latches restart with the local simulation.
+    s_playbackPrimed = false;
+    s_rebuffering = false;
+    s_catchingUp = false;
+    s_elasticCredit = 0;
+    s_elasticHoldCount = 0;
+    s_hvDisabled = false;
+    s_hvAcquired = false;
+    s_hvEntryMismatches = 0;
+    s_hvChecks = 0;
+    s_hvFailLatch = false;
+    s_hvFailReason[0] = '\0';
 }
 
 static void ClearTrackedIdentity() {
@@ -499,22 +530,15 @@ static void UpdateSpectatorPaletteHints(const SpectatorClientSnapshot& client) {
     }
 }
 
-static float ComputeAutoCatchupScale(int32_t gap) {
-    if (gap <= 0) {
-        return 1.0f;
+static int64_t NowQpcMicros() {
+    if (s_qpcFrequency == 0) {
+        LARGE_INTEGER freq{};
+        QueryPerformanceFrequency(&freq);
+        s_qpcFrequency = freq.QuadPart != 0 ? freq.QuadPart : 1;
     }
-
-    int32_t budget = 1 + (gap / kCatchupBudgetStepGap);
-    if (budget > kCatchupBudgetMax) {
-        budget = kCatchupBudgetMax;
-    }
-    if (budget > gap) {
-        budget = gap;
-    }
-    if (budget < 1) {
-        budget = 1;
-    }
-    return (float)budget;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return (int64_t)((now.QuadPart * 1000000LL) / s_qpcFrequency);
 }
 
 static void ApplyCatchupScale(float targetScale, int32_t gap) {
@@ -750,24 +774,38 @@ static void UpdateLivePlayback(const SpectatorClientSnapshot& client) {
     SyncStreamEdges(client);
     SyncObservedDispatchFrame();
 
-    const int32_t nextRbFrame = s_nextDispatchRbFrame >= 0 ? s_nextDispatchRbFrame : 0;
-    const int32_t availableFrames = client.confirmed_contiguous_rb_frame - nextRbFrame + 1;
-
-    if (availableFrames <= 0) {
+    // S-4 fail latch: a verified divergence stops consumption immediately;
+    // FrameUpdate performs the actual leave (never inside the dispatcher).
+    if (s_hvFailLatch) {
         s_dispatchFrameBudget = 0;
         s_dispatchFramesProducedThisLoop = 0;
         SpectatorClient_SetFastForwardEnabled(false);
         SpectatorClient_SetHardSyncEnabled(false);
         InputSyncHooks_SetTimesyncFreeze(true);
-        ApplyCatchupScale(1.0f, 0);
-        TransitionState(SpectatorPlaybackState::Buffering,
-            "Buffering confirmed match data.");
         return;
     }
+
+    const int32_t nextRbFrame = s_nextDispatchRbFrame >= 0 ? s_nextDispatchRbFrame : 0;
+    const int32_t availableFrames = client.confirmed_contiguous_rb_frame - nextRbFrame + 1;
+    const size_t buffered = availableFrames > 0 ? (size_t)availableFrames : 0u;
+
+    // A sealed stream will never grow again — priming/rebuffer thresholds
+    // must not deadlock a finite tail (policy PlaybackPrimed, S-2).
+    const bool streamSealed = !client.match_active ||
+        client.state == SpectatorClientState::Failed;
 
     uint16_t p1Input = 0;
     uint16_t p2Input = 0;
-    if (!SpectatorClient_GetFrameInputs(nextRbFrame, &p1Input, &p2Input)) {
+    const bool nextFrameReady = buffered > 0 &&
+        SpectatorClient_GetFrameInputs(nextRbFrame, &p1Input, &p2Input);
+
+    if (!nextFrameReady) {
+        // True underrun (or archive hole): freeze; the elastic cadence above
+        // this point exists precisely to make this rare. Resume at the
+        // rebuffer mark (120), not the full startup prime (240).
+        if (s_playbackPrimed) {
+            s_rebuffering = true;
+        }
         s_dispatchFrameBudget = 0;
         s_dispatchFramesProducedThisLoop = 0;
         SpectatorClient_SetFastForwardEnabled(false);
@@ -775,19 +813,64 @@ static void UpdateLivePlayback(const SpectatorClientSnapshot& client) {
         InputSyncHooks_SetTimesyncFreeze(true);
         ApplyCatchupScale(1.0f, 0);
         TransitionState(SpectatorPlaybackState::Buffering,
-            "Waiting for the next confirmed frame.");
+            buffered > 0 ? "Waiting for the next confirmed frame."
+                         : "Buffering confirmed match data.");
         return;
     }
 
-    InputSyncHooks_SetTimesyncFreeze(false);
+    // §2.8.8 startup prime / rebuffer gate: build the ~4 s live cushion
+    // before consuming (2 s after an underrun); a sealed tail plays out.
+    if (!Spectator::PlaybackPrimed(buffered, streamSealed, s_rebuffering)) {
+        s_dispatchFrameBudget = 0;
+        s_dispatchFramesProducedThisLoop = 0;
+        SpectatorClient_SetFastForwardEnabled(false);
+        SpectatorClient_SetHardSyncEnabled(false);
+        InputSyncHooks_SetTimesyncFreeze(true);
+        ApplyCatchupScale(1.0f, 0);
+        TransitionState(SpectatorPlaybackState::Buffering,
+            "%s the playback cushion (%u/%u).",
+            s_rebuffering ? "Rebuilding" : "Priming",
+            (unsigned)buffered,
+            (unsigned)(s_rebuffering ? Spectator::kPlaybackRebufferRecords
+                                     : Spectator::kPlaybackStartupBufferRecords));
+        return;
+    }
+    s_playbackPrimed = true;
+    s_rebuffering = false;
 
-    const int32_t gap = client.confirmed_contiguous_rb_frame - nextRbFrame;
-    float targetScale = ComputeAutoCatchupScale(gap);
-    if (gap > 0 && HasManualCatchupOverride()) {
-        targetScale = GetManualCatchupScale();
+    // Catch-up plan with hysteresis (enter >300, release at ≤240 target).
+    const Spectator::PlaybackCatchupPlan catchPlan =
+        Spectator::PlaybackCatchupPlan_Next(buffered, s_catchingUp);
+    s_catchingUp = catchPlan.catchingUp;
+    int32_t dispatchBudget = (int32_t)catchPlan.tickBudget;
+
+    if (!s_catchingUp) {
+        // Elastic slow-motion under low water (S-2): Bresenham-distributed
+        // single-slot holds — smooth slight slow motion instead of
+        // freeze-then-sprint. Never invents or skips a canonical record.
+        const Spectator::PlaybackElasticPlan elastic =
+            Spectator::PlaybackElasticPlan_Next(buffered, s_elasticCredit);
+        s_elasticCredit = elastic.nextCredit;
+        if (!elastic.advance) {
+            ++s_elasticHoldCount;
+            s_dispatchFrameBudget = 0;
+            s_dispatchFramesProducedThisLoop = 0;
+            SpectatorClient_SetFastForwardEnabled(false);
+            SpectatorClient_SetHardSyncEnabled(false);
+            InputSyncHooks_SetTimesyncFreeze(true);
+            ApplyCatchupScale(1.0f, (int32_t)buffered - 1);
+            TransitionState(SpectatorPlaybackState::Live,
+                "Playing live (elastic %u permille, %u buffered).",
+                elastic.speedPermille,
+                (unsigned)buffered);
+            return;
+        }
     }
 
-    int32_t dispatchBudget = (int32_t)targetScale;
+    // Manual override caps the automatic budget while active (hotkeys).
+    if (HasManualCatchupOverride() && buffered > 1) {
+        dispatchBudget = (int32_t)GetManualCatchupScale();
+    }
     if (dispatchBudget < 1) {
         dispatchBudget = 1;
     }
@@ -795,15 +878,17 @@ static void UpdateLivePlayback(const SpectatorClientSnapshot& client) {
         dispatchBudget = availableFrames;
     }
 
+    InputSyncHooks_SetTimesyncFreeze(false);
     s_dispatchFrameBudget = dispatchBudget;
     s_dispatchFramesProducedThisLoop = 0;
     SpectatorClient_SetFastForwardEnabled(dispatchBudget > 1);
     SpectatorClient_SetHardSyncEnabled(false);
-    ApplyCatchupScale((float)dispatchBudget, gap);
+    ApplyCatchupScale((float)dispatchBudget, (int32_t)buffered - 1);
 
     if (dispatchBudget > 1) {
         TransitionState(SpectatorPlaybackState::CatchingUp,
-            "Catching up to the live match.");
+            "Catching up toward the live cushion (%u buffered).",
+            (unsigned)buffered);
     } else {
         TransitionState(SpectatorPlaybackState::Live,
             "Playing live.");
@@ -1046,6 +1131,27 @@ void SpectatorPlayback_FrameUpdate() {
             EnterSafeMenuIfNeeded();
             ResetPlayback("Watch playback idle.");
         }
+        return;
+    }
+
+    // S-4 fail-closed consumption: a verified divergence leaves the session
+    // (the player link is unaffected). Copy the reason first — the reset
+    // below clears the latch state.
+    if (s_hvFailLatch) {
+        char reason[sizeof(s_hvFailReason)] = {};
+        strncpy_s(reason, sizeof(reason),
+            s_hvFailReason[0] ? s_hvFailReason
+                              : "Watch playback diverged from the match.",
+            _TRUNCATE);
+        SPLAY_LOG(s_localPlaybackRbFrame,
+            "Consuming S-4 divergence latch — disconnecting spectator session: %s",
+            reason);
+        EnterSafeMenuIfNeeded();
+        SpectatorClient_Disconnect(reason);
+        ResetLocalSimulationState();
+        ClearTrackedIdentity();
+        ClearSpectatorPaletteHints();
+        TransitionState(SpectatorPlaybackState::PlaybackError, "%s", reason);
         return;
     }
 
@@ -1344,6 +1450,18 @@ SpectatorDispatchAction SpectatorPlayback_GetDispatcherFrame(uint16_t* outP1,
         return SpectatorDispatchAction::BreakLoop;
     }
 
+    // §2.8.8 wall slice: hidden catch-up ticks stop when the 12 ms budget
+    // elapses — the tick ladder is an upper bound, the slice is the truth.
+    // The batch keeps the ticks it already executed; a slow machine degrades
+    // convergence speed, never visible cadence.
+    if (s_dispatchFramesProducedThisLoop == 0) {
+        s_sliceStartQpc = NowQpcMicros();
+    } else if ((uint64_t)(NowQpcMicros() - s_sliceStartQpc) >=
+               Spectator::kPlaybackCatchupSliceMicros) {
+        s_dispatchFramesProducedThisLoop = 0;
+        return SpectatorDispatchAction::BreakLoop;
+    }
+
     const int32_t rbFrame = s_nextDispatchRbFrame;
     uint16_t p1 = 0;
     uint16_t p2 = 0;
@@ -1353,6 +1471,62 @@ SpectatorDispatchAction SpectatorPlayback_GetDispatcherFrame(uint16_t* outP1,
         SpectatorClient_SetFastForwardEnabled(false);
         SpectatorClient_SetHardSyncEnabled(false);
         return SpectatorDispatchAction::BreakLoop;
+    }
+
+    // S-4: verify the record's confirmed pre-state digest against our own
+    // live state BEFORE ticking it (which also checks the post-state of the
+    // previous tick). Strict mode arms on the first agreeing record; a
+    // stream that never agrees within the window degrades to unverified
+    // playback (loud log) — the viewer entered through the native loader,
+    // not the players' baseline rendezvous. After acquisition a mismatch is
+    // a genuine divergence: fail closed, leave the session (player link
+    // unaffected — publication is observational).
+    {
+        uint32_t recordHash24 = 0;
+        bool recordHasHash = false;
+        SpectatorClient_GetFrameHash(rbFrame, &recordHash24, &recordHasHash);
+        if (recordHasHash && !s_hvDisabled) {
+            uint64_t liveDigest = 0;
+            if (Rollback::GameSnapshot_HashGameplayLive(&liveDigest)) {
+                ++s_hvChecks;
+                const uint32_t localHash24 =
+                    Spectator::PlaybackHash24FromDigest(liveDigest);
+                switch (Spectator::PlaybackVerifyRecordHash(
+                            recordHasHash, s_hvDisabled, s_hvAcquired,
+                            s_hvEntryMismatches, recordHash24, localHash24)) {
+                    case Spectator::PlaybackHashVerdict::Acquired:
+                        s_hvAcquired = true;
+                        SPLAY_LOG(rbFrame,
+                            "Record hash sync ACQUIRED (checks=%u entry_misses=%u)",
+                            s_hvChecks, s_hvEntryMismatches);
+                        break;
+                    case Spectator::PlaybackHashVerdict::EntryMismatch:
+                        ++s_hvEntryMismatches;
+                        break;
+                    case Spectator::PlaybackHashVerdict::GiveUp:
+                        s_hvDisabled = true;
+                        SPLAY_LOG(rbFrame,
+                            "Record hash verification GAVE UP after %u entry misses — "
+                            "continuing unverified (fail-degrade)",
+                            s_hvEntryMismatches + 1);
+                        break;
+                    case Spectator::PlaybackHashVerdict::Diverged:
+                        s_hvFailLatch = true;
+                        _snprintf_s(s_hvFailReason, sizeof(s_hvFailReason), _TRUNCATE,
+                            "Watch playback diverged from the match at frame %d.",
+                            rbFrame);
+                        SPLAY_LOG(rbFrame,
+                            "SPECTATOR DESYNC: record hash 0x%06X != local 0x%06X "
+                            "(checks=%u) — leaving the session (S-4 fail-closed)",
+                            recordHash24, localHash24, s_hvChecks);
+                        s_dispatchFrameBudget = 0;
+                        s_dispatchFramesProducedThisLoop = 0;
+                        return SpectatorDispatchAction::BreakLoop;
+                    default:
+                        break;
+                }
+            }
+        }
     }
 
     *outP1 = p1;

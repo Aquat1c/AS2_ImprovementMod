@@ -35,6 +35,8 @@
 #include "patches/frame_scheduler.h"
 #include "net/packet_router.h"
 #include "net/match_lifecycle.h"
+#include "net/netplay_menu_controller.h"
+#include "net/session2.h"
 #include "net/set_tracker.h"
 #include "net/pregame_sync.h"
 #include "net/frontend_input_sync.h"
@@ -119,6 +121,21 @@ static uint32_t s_ladderHeldTicks    = 0;
 static uint32_t s_ladderHeldLogCount = 0;
 constexpr uint32_t kLadderFailOpenTicks = 600;   // ≈10 s at 60 Hz
 
+// ── M7 (F-7): lockstep-derived post-match intent expectation ────────────────
+// Registered by continue_flow at resolution (Rematch | CharselRestart);
+// compared against the remote PostMatchDecision proposal while the boundary
+// is live. Divergence between the two LOCKSTEP-DERIVED values = divergent
+// lockstep streams = fail-closed terminal (worse than a desync — playing a
+// rematch on divergent streams is a guaranteed desync). User-action intents
+// are exempt (§ online_wiring.h note).
+static uint8_t  s_expectedPmdIntent  = 0;   // PostMatchIntentWire, 0 = none
+static bool     s_pmdContradictionFired = false;
+
+static void ClearExpectedPostMatchIntent() {
+    s_expectedPmdIntent = 0;
+    s_pmdContradictionFired = false;
+}
+
 static void ArmMatchEndLadder(const char* reason) {
     if (s_ladderArmed) return;
     s_ladderArmed = true;
@@ -126,6 +143,7 @@ static void ArmMatchEndLadder(const char* reason) {
     s_ladderPmdConsumed = false;
     s_ladderHeldTicks = 0;
     s_ladderHeldLogCount = 0;
+    ClearExpectedPostMatchIntent();
     NetplayLog_Write("LADDER", -1,
         "Match-end ladder ARMED (%s): WinScreenExit -> PostMatchDecision -> EpochAlign",
         reason ? reason : "?");
@@ -135,6 +153,7 @@ static void DisarmMatchEndLadder(const char* reason) {
     if (!s_ladderArmed) return;
     s_ladderArmed = false;
     s_ladderHeldTicks = 0;
+    ClearExpectedPostMatchIntent();
     NetplayLog_Write("LADDER", -1,
         "Match-end ladder disarmed (%s): wse=%d pmd=%d",
         reason ? reason : "?",
@@ -880,11 +899,10 @@ void OnlineWiring_MatchEndLadderNotifyConsumed(Net::NetTransitionKind kind) {
             break;
         case Net::NetTransitionKind::EpochAlign: {
             // Ladder complete: retire this boundary's earlier-step slots so
-            // stale commits can never satisfy the NEXT boundary. (F-7 note:
-            // a PostMatchDecision intent contradicting the lockstep-derived
-            // answer is logged at the consume sites; the protocol-violation
-            // terminal is deferred until the wire intents are unified —
-            // see IMPLEMENTATION_LOG M6.)
+            // stale commits can never satisfy the NEXT boundary. (F-7: the
+            // intent-contradiction terminal is live since M7 — see
+            // UpdatePostMatchIntentGuard; the wire intents were unified so
+            // both lockstep-derived routes propose distinct values.)
             Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::WinScreenExit);
             Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::PostMatchDecision);
             Net::TransitionBarrier_Clear(Net::NetTransitionKind::WinScreenExit,
@@ -897,6 +915,64 @@ void OnlineWiring_MatchEndLadderNotifyConsumed(Net::NetTransitionKind kind) {
         default:
             break;
     }
+}
+
+void OnlineWiring_SetExpectedPostMatchIntent(uint8_t intentWire) {
+    s_expectedPmdIntent = intentWire;
+    s_pmdContradictionFired = false;
+    NetplayLog_Write("LADDER", -1,
+        "Lockstep-derived post-match intent registered: %s",
+        Net::PostMatchIntentWireName((Net::PostMatchIntentWire)intentWire));
+}
+
+// M7 (F-7): fail-closed compare of the remote PostMatchDecision proposal
+// against the lockstep-derived local answer. Only the two lockstep-derived
+// values (Rematch / CharselRestart) participate: both peers compute the
+// resolution from the SAME consumed lockstep stream (F-5), so a
+// contradiction between them can only mean the streams diverged — playing
+// on would guarantee a desynced rematch. User-action intents
+// (ReturnToSession / Disconnect) come from the post-match menu, not from a
+// derivation, and are exempt (a strict compare there would kill healthy
+// sessions on legitimate asymmetric choices).
+static bool IsLockstepDerivedIntent(uint8_t intent) {
+    return intent == (uint8_t)Net::PostMatchIntentWire::Rematch ||
+           intent == (uint8_t)Net::PostMatchIntentWire::CharselRestart;
+}
+
+static void UpdatePostMatchIntentGuard() {
+    if (s_pmdContradictionFired ||
+        s_expectedPmdIntent == 0 ||
+        !IsLockstepDerivedIntent(s_expectedPmdIntent)) {
+        return;
+    }
+    if (!Net::TransitionBarrier_RemoteProposed(Net::NetTransitionKind::PostMatchDecision)) {
+        return;
+    }
+    const uint8_t remote =
+        Net::TransitionBarrier_GetRemoteIntent(Net::NetTransitionKind::PostMatchDecision);
+    if (!IsLockstepDerivedIntent(remote) || remote == s_expectedPmdIntent) {
+        return;
+    }
+
+    s_pmdContradictionFired = true;
+    char reason[160];
+    snprintf(reason, sizeof(reason),
+        "Post-match decision contradiction: local lockstep resolved %s, peer proposed %s "
+        "(divergent lockstep streams)",
+        Net::PostMatchIntentWireName((Net::PostMatchIntentWire)s_expectedPmdIntent),
+        Net::PostMatchIntentWireName((Net::PostMatchIntentWire)remote));
+    NetplayLog_Write("LADDER", -1, "F-7 TERMINAL: %s", reason);
+    NetplayLog_Flush();
+    LOG_ERROR("[MatchDirector] %s", reason);
+
+    // Fail closed (INV-20): typed terminal first (reasoned Disconnect on the
+    // wire), then the match unwind and the single UI funnel — the same order
+    // the supervisor terminals use.
+    Net::Session2_Terminate(Net::Session2TerminalReason::ProtocolViolation, reason);
+    if (Net::MatchLifecycle_GetPhase() != Net::MatchLifecyclePhase::DisconnectRecovery) {
+        Net::MatchLifecycle_OnDisconnect(reason);
+    }
+    NetMenu::HandleDisconnection(reason);
 }
 
 // Fail-open watchdog: a wedged ladder degrades into the §4.6 recovery ladder
@@ -948,6 +1024,7 @@ void OnlineWiring_Init() {
     s_ladderArmed = false;
     s_ladderWseConsumed = false;
     s_ladderPmdConsumed = false;
+    ClearExpectedPostMatchIntent();
     ResetStartupBarrierState("init");
 
     Net::ChurnPause_Init();
@@ -995,6 +1072,9 @@ void OnlineWiring_FrameUpdate() {
 
     // INV-9 ladder fail-open watchdog.
     UpdateLadderWatchdog();
+
+    // F-7 lockstep-vs-barrier contradiction guard (M7).
+    UpdatePostMatchIntentGuard();
 
     // Mid-session delay hotkeys (M5; peer-local, INV-23).
     UpdateDelayHotkeys();

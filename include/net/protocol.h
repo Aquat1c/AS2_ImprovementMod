@@ -266,10 +266,28 @@ enum class NetTransitionKind : uint8_t {
 
 enum class PostMatchIntentWire : uint8_t {
     None             = 0,
-    Rematch          = 1,
-    ReturnToSession  = 2,
-    Disconnect       = 3,
+    Rematch          = 1,  // lockstep-derived: YES,YES continue fast path
+    ReturnToSession  = 2,  // user action: post-match menu "return"
+    Disconnect       = 3,  // user action: post-match menu "disconnect"
+    // M7 (F-7 intent unification): lockstep-derived "any NO" route — both
+    // sides return to charsel for a new match under a fresh epoch. Distinct
+    // from Rematch (fast path) and from the user-action intents so the
+    // director can compare the two lockstep-derived intents fail-closed:
+    // Rematch vs CharselRestart across the wire can only mean divergent
+    // lockstep streams (F-7 protocol-violation terminal).
+    CharselRestart   = 4,
 };
+
+inline const char* PostMatchIntentWireName(PostMatchIntentWire intent) {
+    switch (intent) {
+        case PostMatchIntentWire::None:            return "None";
+        case PostMatchIntentWire::Rematch:         return "Rematch";
+        case PostMatchIntentWire::ReturnToSession: return "ReturnToSession";
+        case PostMatchIntentWire::Disconnect:      return "Disconnect";
+        case PostMatchIntentWire::CharselRestart:  return "CharselRestart";
+    }
+    return "?";
+}
 
 struct PhaseTransitionPayload {
     uint32_t transition_seq;  // monotonic per session, minted by the proposer

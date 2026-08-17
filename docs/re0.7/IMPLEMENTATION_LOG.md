@@ -1538,3 +1538,242 @@ session) would destroy the §8.3 partial-fallback option.
 9. `s_engine.SetPeerAdvisory` remains caller-less (IngestInputStream applies
    the advisory internally) — MSVC may warn on the unused decl only, no
    action needed.
+
+---
+
+## 2026-08-17 — M7 (spectator/replay re-hookup onto the confirm seam)
+
+### M7-1: S-6 — engine2 → SpectatorRuntime confirmed-only push
+
+- **Files:** `src/rollback/rollback_session_engine2.cpp`,
+  `include/net/spectator_runtime.h`, `src/net/spectator_runtime.cpp`,
+  `include/net/spectator_protocol.h`.
+- **Done:**
+  - `DrainConfirmSeam` (the §2.7.3-F single immutable seam) now pushes every
+    popped `ConfirmedFrame` to the sidecar via a new additive
+    `SpectatorRuntime_OnConfirmedFrame(rb, game_abs, p1, p2, pre_state_hash)`
+    — confirmed-only by construction: no rewrite flags, watermark == frame,
+    each archive slot written exactly once. The PRESERVED
+    `SpectatorRuntime_OnGameplayFrame` signature is untouched (the Gekko
+    fallback adapter still calls it).
+  - **Frame numbering:** the seam pushes MATCH-RELATIVE rb frames
+    (`RbFrame − RbEpochOrigin`, 0-based per epoch) + the matching
+    `game_abs` — identical semantics to the per-match Gekko engine, so the
+    sidecar protocol/clients see no change across the cutover (inventory §6
+    match_id formula + payloads untouched). Records from a pre-rotation
+    epoch that race the drain are dropped by a `matchRel >= 0` guard.
+  - **Boundary flush:** `RollbackSession_SuspendBetweenMatches` and `_End`
+    drain the seam BEFORE deactivating (the director fires
+    `SpectatorRuntime_OnMatchEnd` right after Suspend returns, and rotation
+    re-bases the epoch origin — un-flushed frames would be unmappable).
+  - `FRAME_FLAG_ROLLBACK_REWRITE` retired on the engine2 path (comment marks
+    it legacy; still set by rollback_session.cpp in the ON config, still
+    honored by clients — wire-compatible both directions).
+
+### M7-2: S-4 — record hash verification (host stamp + client verify)
+
+- **Files:** `include/net/spectator_protocol.h`, `src/net/spectator_runtime.cpp`,
+  `include/net/spectator_client.h`, `src/net/spectator_client.cpp`,
+  `include/rollback/game_snapshot.h`, `src/rollback/game_snapshot.cpp`,
+  `src/net/spectator_playback.cpp`, `include/net/spectator_playback_policy.h`.
+- **Done:**
+  - `FrameRecord`'s 3 pad bytes now carry a 24-bit fold of the confirmed
+    pre-state Block64 digest under new flag `FRAME_FLAG_HAS_HASH` — wire
+    size pinned at 16 B (static_assert added), sidecar protocol stays v8,
+    old/new hosts and clients interoperate (absent flag = no verification).
+  - New `GameSnapshot_HashGameplayLive()`: the SIM-membership digest
+    computed directly over live game memory, mirror-exact to
+    `GameSnapshot_HashGameplay` (same SimHeader order, same region order,
+    same Block64 chaining) — one read pass, no capture memcpy, __try
+    guarded. This is the client-side comparison source.
+  - Playback verifies each record's hash BEFORE ticking it (which also
+    checks the previous tick's post-state). **Sync-acquire model:** strict
+    mode arms on the first agreeing record; a stream that never agrees
+    within 600 records logs loudly and degrades to unverified (the viewer
+    enters via the native charsel/loader path, not the players' baseline
+    rendezvous — a systematic entry offset must not kill every session).
+    After acquisition a mismatch is a genuine divergence: fail-closed
+    latch → consumed by `SpectatorPlayback_FrameUpdate` →
+    `SpectatorClient_Disconnect` + PlaybackError (leave the session; the
+    player link is untouched — publication is observational, per S-4).
+  - New additive `SpectatorClient_GetFrameHash(rb, *hash24, *has)`.
+
+### M7-3: §2.8.8 — elastic spectator pacing (policy port)
+
+- **Files:** `include/net/spectator_playback_policy.h` (new, pure header),
+  `src/net/spectator_playback.cpp`, `CMakeLists.txt`.
+- **Done:**
+  - Policy ported from qoh99_netplay `game/SpectatorPlaybackPolicy.h` with
+    the plan's watermarks: live target/startup prime 240 (~4 s), rebuffer
+    resume 120, catch-up enter >300 with hysteresis release at ≤240,
+    elastic slow-motion 950/850/700 permille at 180/120/60 records
+    (Bresenham credit — distributed single-slot holds, never invents or
+    skips a record), deep-backlog tick ladder 2/4/8/16/24 by rung, 12 ms
+    wall slice, sealed-stream override (a finite tail never waits for a
+    threshold it cannot reach). All pure/constexpr, unit-testable.
+  - `UpdateLivePlayback` rebuilt on the policy: startup prime & rebuffer
+    gates (freeze until cushion), elastic holds under low water (freeze
+    pulse for exactly the held slot), catch-up budget from the ladder
+    (replaces the old `1 + gap/30, cap 9` heuristic), manual hotkey
+    override retained (caps the budget while set), sealed-tail drain for
+    match-end/transport-failure playback preserved.
+  - `SpectatorPlayback_GetDispatcherFrame` enforces the 12 ms wall slice
+    across hidden catch-up ticks (QPC-anchored at the first tick of each
+    presentation slot; executed ticks keep their credit — INV-21 analog);
+    yields at phase boundaries exactly as before (mode gate + budget).
+- **Deviation (deliberate):** the viewer now intentionally runs ~4 s behind
+  the confirmed edge (QOH99 model, S-2 spec). The old code chased gap→0 and
+  froze on every jitter bubble. The prime largely overlaps the pre-match
+  intro, but a mid-intro join will visibly hold up to ~4 s once before
+  playback starts — that is the design (latency-biased observational view).
+
+### M7-4: S-5 — replay recorder onto the confirmed pipeline; epoch chapters; additive format
+
+- **Files:** `include/replay/replay_runtime.h`, `src/replay/replay_runtime.cpp`,
+  `src/rollback/rollback_session_engine2.cpp`.
+- **Done:**
+  - New `ReplayRuntime_OnConfirmedFrame(epoch, game_abs, p1, p2, pre_hash)`
+    fed from `DrainConfirmSeam`: the recorder buffers exactly one epoch's
+    confirmed input stream (u16 canonical words) + a pre-state digest every
+    30 frames (§2.7.7 cadence). **Epoch boundary = chapter boundary**: an
+    epoch change resets the buffer; the native one-file-per-match
+    `ReplaySave` consumes it — chapters and files are 1:1 by construction.
+    Contiguity is asserted (seam pops in order; breaks are counted and
+    logged, defensive only). Recorder is netplay-context-gated at save
+    (same gate as the netplay rename) so a later local save can never
+    inherit a stale netplay stream.
+  - `Hook_ReplaySave` appends a new self-identifying trailer chunk
+    `AS2RCFM1` v1: `{version, epoch, first_game_abs, record_count,
+    hash_count, payload_crc}` + records + hash points. Appended after the
+    palette trailer; CRC-protected.
+  - **Trailer loader reworked into a chunk scanner** (`AS2RPAL1` /
+    `AS2RCFM1`, any order, unknown chunk stops the scan non-fatally). The
+    palette chunk's parse semantics are byte-identical for old files —
+    playback of 0.6 files unaffected (the S-5 requirement); the "v-bump" is
+    realized as the new chunk's own magic+version rather than mutating the
+    native 0x48 header (which the game itself parses).
+  - **Playback verification:** during replay playback the dispatcher-fed
+    inputs are compared per frame against the confirmed stream (under the
+    native tape's 8-button mask — the tape stores bytes) and the live
+    digest (`GameSnapshot_HashGameplayLive`) against the recorded cadence
+    hashes, with the same sync-acquire model as the spectator (20 cadence
+    points). Replays are offline artifacts, so divergence fail-DEGRADES
+    with loud `REPLAY DESYNC` logs + counters (nothing to tear down);
+    takeover mode disables verification (it diverges by design). This is
+    the instrument for the M8 "plays back hash-clean" exit-gate run.
+- **Note:** the mapping anchor is `first_game_abs` — the game-abs domain ==
+  the native tape index domain (both are the game's per-match input
+  write-index timeline; verified against `ReadObservedFrame`/
+  `WriteReplayHistoryFrame`).
+
+### M7-5: F-7 — PostMatchDecision intent unification + contradiction terminal (M6 obligation closed)
+
+- **Files:** `include/net/protocol.h`, `src/net/continue_flow.cpp`,
+  `src/net/netplay_menu_controller.cpp`, `include/rollback/online_wiring.h`,
+  `src/rollback/match_director.cpp`, `tools/check_killpaths.ps1`.
+- **Done:**
+  - **Unification:** `PostMatchIntentWire::CharselRestart` (4, additive —
+    payload byte/size unchanged). The lockstep-derived intents are now
+    disjoint from the user-action intents: `Rematch` = YES,YES fast path
+    only; `CharselRestart` = any-NO charsel route (continue_flow decline
+    AND the menu controller's auto-rematch announce — previously
+    `ReturnToSession` vs `Rematch` for the same route, which is why M6
+    could not enable the compare). `wireSuggestsRematch` accepts either
+    Rematch or CharselRestart from the peer.
+  - **Terminal:** continue_flow registers the lockstep-derived answer via
+    new `OnlineWiring_SetExpectedPostMatchIntent()` at resolution; the
+    director compares it against the remote PostMatchDecision proposal
+    every FrameUpdate while the boundary is live. A contradiction between
+    the two LOCKSTEP-DERIVED values (Rematch vs CharselRestart) = divergent
+    lockstep streams → `Session2_Terminate(ProtocolViolation)` →
+    `MatchLifecycle_OnDisconnect` → `NetMenu::HandleDisconnection` (typed-
+    first, same order as the supervisor terminals). User-action intents
+    (ReturnToSession/Disconnect from the post-match menu) are EXEMPT —
+    they are choices, not derivations; a strict compare there would kill
+    healthy sessions. Expectation clears on ladder arm/disarm.
+  - Kill-path gate: `match_director.cpp = 1` allowlisted with the INV-12
+    justification (protocol violation is an allowlisted teardown cause,
+    §4.6 row 4).
+
+### M7-6: Deferred-obligation decisions (logged per the plan rule)
+
+- **PeerIdentity round/timing folding (M3/M6 note): REVIEWED, RETAINED.**
+  The spectator re-hookup confirmed the packet is load-bearing as-is (the
+  sidecar's name/round data flows from SessionSnapshot, which PeerIdentity
+  fills); folding round/timing into config exchange would churn three
+  frozen wire pins for zero functional gain. Obligation closed as
+  "reviewed at M7, keep".
+- **Load/GO → TransitionBarrier consolidation (M5-1 dev. 1): STILL DEFERRED.**
+  Plan condition ("only if a director-driven reload lands") not met — no
+  reload machinery was built at M7.
+- **Baseline retry with real asset reload (M5-1 dev. 2): DEFERRED to M8+.**
+  Needs mode-rewinding director machinery; the shipped recapture retry
+  satisfies §2.5's one-retry semantics for transient divergences, and a
+  deterministic divergence still terminates one retry later as specified.
+- **Frontend per-phase STAT rollup (M2/M6 note): DEFERRED (low priority).**
+  The STAT line is the frozen §7 acceptance instrument (M0: "do not
+  change"); frontend waits are already labeled LifecycleBoundary since M6,
+  and the hold-episode ledger logs give per-phase visibility. A separate
+  PSTAT line remains an option if M8 field analysis wants it.
+
+### Build-system summary (M7)
+
+- CMake: `include/net/spectator_playback_policy.h` added to `NET_HEADERS`.
+  No sources added/deleted; no test-target changes.
+- **Both configs chased:** ON (Gekko fallback) compiles everything M7 touched
+  — spectator_runtime/client/playback, replay_runtime, protocol.h,
+  continue_flow, menu controller, match_director, game_snapshot are all
+  config-independent TUs; the ON config simply has no
+  `OnConfirmedFrame` producers (Gekko adapter untouched, still pushes
+  `OnGameplayFrame` with rewrite flags; recorder stays empty; records carry
+  no hashes → clients skip verification). `lib/GekkoNet` untouched.
+- API_FREEZE §6 updated (M7 wire-state paragraph).
+
+### Obligations for M8
+
+- **Exit-gate runs (need builds):** spectate a full 3-match rematch session
+  incl. late join (deep-backlog ladder) + starve test (elastic holds, no
+  freeze-then-sprint) — watch `SPLAY` logs for prime/rebuffer/elastic
+  transitions and the S-4 ACQUIRED line; replay the same session and check
+  zero `REPLAY DESYNC` lines (hash-clean gate).
+- **S-4 acquire tuning:** if field spectates show the 600-record acquire
+  window never arming (systematic baseline offset between the charsel-boot
+  path and the players' baseline), the hash membership of the spectator
+  comparison needs the M4-6 audit treatment before strict mode can be
+  meaningful; the fail-degrade path keeps sessions alive meanwhile.
+- **Elastic prime UX:** if the ~4 s prime reads as a hang to users, surface
+  the existing Buffering status ("Priming the playback cushion (n/240)")
+  in the spectator HUD prominently (it is already in the status string).
+- **F-7 in the rematch soak:** extend `rematch_soak` assertions to include
+  zero `F-7 TERMINAL` lines across 100 healthy cycles (the guard must
+  never fire on a healthy session — both YES,YES and any-NO cycles).
+- **Gekko full removal** (flag, adapter TU, vendored lib) remains gated on
+  the §7 suite + LE-1 passing on real builds (M6 note stands).
+
+### Compile risks to check first (M7 build session)
+
+1. **Both configs:** `-DAS2_WITH_GEKKO=OFF` (default) and `ON` (fallback).
+   The OFF config's `rollback_session_engine2.cpp` now includes
+   `net/spectator_runtime.h` + `replay/replay_runtime.h` — first place an
+   include-order slip surfaces (replay_runtime.h forward-declares
+   `Net::NetplayPaletteBank`; no heavy includes).
+2. `spectator_playback.cpp` gained an explicit `#include <windows.h>` (QPC)
+   after the project headers — if a winsock/winsock2 clash appears in that
+   TU, the fix is WIN32_LEAN_AND_MEAN ordering, not removing the include
+   (the TU previously reached windows.h transitively).
+3. `GameSnapshot_HashGameplayLive` uses `__try` with POD-only locals —
+   MSVC C2712 fires if anyone adds an unwindable local later (same
+   discipline as the adapter's existing SEH blocks).
+4. `replay_runtime.cpp`: new `Rollback::NetplayLog_Write` calls needed
+   `rollback/netplay_log.h` (added). `ConfirmedInputRecord` is memcpy'd —
+   4-byte static_assert added; if MSVC pads it the assert is the truth.
+5. `spectator_protocol.h` `FrameRecord` static_assert (16 B) — the struct
+   is pack(1); if it fires something else changed.
+6. `frontend_sync_tests` does NOT link continue_flow.cpp — the new
+   `OnlineWiring_SetExpectedPostMatchIntent` call sites need no stub;
+   verified against the target source list.
+7. Policy header constexpr functions with multiple statements/static_asserts
+   — C++20 targets only (all test targets already set CXX_STANDARD 20).
+8. `kCatchupBudgetStepGap`/`kCatchupBudgetMax`/`ComputeAutoCatchupScale`
+   deleted from spectator_playback.cpp — grep-verified zero remaining
+   references at edit time.

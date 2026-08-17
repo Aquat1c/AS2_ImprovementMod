@@ -53,7 +53,15 @@ enum MatchStateKind : uint8_t {
 constexpr uint8_t HELLO_FLAG_ACCEPT_REDIRECT = 1 << 0;
 
 constexpr uint8_t FRAME_FLAG_CONFIRMED = 1 << 0;
+// Retired at re0.7 M7 (S-6): the engine2 confirm seam pushes confirmed-only
+// frames, so the host never sets this anymore. Kept for the legacy
+// AS2_WITH_GEKKO source (which still overwrites archive slots in place) and
+// for wire compatibility — clients continue to honor it when present.
 constexpr uint8_t FRAME_FLAG_ROLLBACK_REWRITE = 1 << 1;
+// M7 (S-4): the record's `hash24` bytes carry a 24-bit truncation of the
+// host's confirmed pre-state gameplay digest (Block64). Absent (old hosts,
+// Gekko fallback) => bytes are zero and the flag is unset.
+constexpr uint8_t FRAME_FLAG_HAS_HASH = 1 << 2;
 
 constexpr uint8_t CLIENT_STATUS_FLAG_FAST_FORWARD = 1 << 0;
 constexpr uint8_t CLIENT_STATUS_FLAG_HARD_SYNC = 1 << 1;
@@ -123,8 +131,14 @@ struct FrameRecord {
     uint16_t p1_input;
     uint16_t p2_input;
     uint8_t flags;
-    uint8_t _pad[3];
+    // M7 (S-4): low/mid/high bytes of the truncated confirmed pre-state
+    // digest when FRAME_FLAG_HAS_HASH is set; zero otherwise. Occupies the
+    // former pad bytes — the wire size (16 B) is unchanged, so protocol
+    // version 8 clients/hosts interoperate in both directions.
+    uint8_t hash24[3];
 };
+static_assert(sizeof(FrameRecord) == 16,
+    "FrameRecord wire size must stay 16 bytes (hash24 lives in the former pad)");
 
 struct FrameBatchPayload {
     uint32_t match_id;

@@ -120,6 +120,10 @@ SpectatorClientState SpectatorClient_GetState();
 void SpectatorClient_GetSnapshot(SpectatorClientSnapshot* out);
 void SpectatorClient_GetDiscoverySnapshot(SpectatorDiscoverySnapshot* out);
 bool SpectatorClient_GetFrameInputs(int32_t rb_frame, uint16_t* outP1, uint16_t* outP2);
+/// M7 (S-4): true when the buffered record exists; *outHasHash reports
+/// whether the host stamped a truncated confirmed pre-state digest on it
+/// (FRAME_FLAG_HAS_HASH), and *outHash24 receives the 24-bit value.
+bool SpectatorClient_GetFrameHash(int32_t rb_frame, uint32_t* outHash24, bool* outHasHash);
 bool SpectatorClient_GetBufferedPaletteSlot(uint8_t game_slot, SpectatorBufferedPaletteSlot* out);
 bool SpectatorClient_CopyBufferedPaletteBank(uint8_t game_slot, NetplayPaletteBank* out);
 
