@@ -364,7 +364,6 @@ set(NET_HEADERS
     include/net/charsel_sync.h
     include/net/stagesel_sync.h
     include/net/stage_watchdog_tracker.h
-    include/net/match_bootstrap.h
     include/net/match_lifecycle.h
     include/net/sync_policy.h
     include/net/delay_policy.h
@@ -497,11 +496,10 @@ set(NET_SOURCES
     src/net/netplay_menu_controller.cpp
     src/net/netplay_menu_ui.cpp
     src/net/locked_match_config.cpp
-    src/net/pregame_sync.cpp
+    src/net/match_setup.cpp
     src/net/charsel_sync.cpp
     src/net/stagesel_sync.cpp
     src/net/stage_watchdog_tracker.cpp
-    src/net/match_bootstrap.cpp
     src/net/match_lifecycle.cpp
     src/net/winscreen_sync.cpp
     src/net/pause_handler.cpp

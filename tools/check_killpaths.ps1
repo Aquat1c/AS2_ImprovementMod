@@ -30,10 +30,15 @@ $allow = @{
     # User actions (INV-1b):
     "src\net\pause_handler.cpp"           = 1    # remote quit from pause menu
     "src\net\mode_ownership.cpp"          = 2    # user left charsel / game left netplay context
-    # Legacy heuristic callers being burned down by M4/M5 — DO NOT ADD, only remove:
-    "src\net\pregame_sync.cpp"            = 2    # SetPhase(Error) + session-lost guard (M5 target)
-    "src\net\match_lifecycle.cpp"         = 1    # session-lost guard (M5 target)
-    "src\patches\input_override.cpp"      = 1    # AbortRollbackDispatcher (M4 target)
+    # match_setup (M5, replaces pregame_sync): SetPhase(Error) is reserved
+    # for genuine fail-closed terminals only (config validation failure,
+    # second baseline mismatch → ConfirmedDesync via Session2_Terminate);
+    # every recoverable path routes through RestartPregame on the live
+    # connection (INV-12). Second site = session-already-lost UI guard.
+    "src\net\match_setup.cpp"             = 2
+    # Legacy heuristic callers being burned down by M6 — DO NOT ADD, only remove:
+    "src\net\match_lifecycle.cpp"         = 1    # session-lost guard (M6 target)
+    "src\patches\input_override.cpp"      = 1    # AbortRollbackDispatcher (M6 target)
 }
 
 $pattern = "(NetMenu::)?(HandleDisconnection|OpenDisconnectError)\s*\("

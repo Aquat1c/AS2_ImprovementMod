@@ -644,8 +644,8 @@ void RollbackDebug_RenderImGui(bool* p_open) {
         ImGui::Text("Remote Delay:     %d", delaySnap.remote_announced_delay);
         ImGui::Text("Protection Win:   %d", delaySnap.protection_window);
         ImGui::Text("Stall Threshold:  %d", wiringSnap.stall_threshold);
-        ImGui::Text("Avg Ping:         %.1f ms", snap.gekko_avg_ping);
-        ImGui::Text("Jitter:           %.1f ms", snap.gekko_jitter);
+        ImGui::Text("Avg Ping:         %.1f ms", snap.link_avg_ping);
+        ImGui::Text("Jitter:           %.1f ms", snap.link_jitter);
         ImGui::Text("Rec Delay:        %d", delaySnap.recommended_delay);
         ImGui::Text("Rec Max RB:       %d", delaySnap.recommended_max_rollback);
 

@@ -1548,10 +1548,10 @@ void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2) {
 }
 
 // ============================================================================
-// GekkoNet Packet Ingestion
+// Wire packet ingestion (routed by net/packet_router)
 // ============================================================================
 
-void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
+void RollbackSession_OnInputStreamPacket(const void* data, size_t len) {
     if (!data || len == 0) return;
 
     if (s_recvCount >= MAX_PENDING_RECV) {
@@ -1573,6 +1573,15 @@ void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
     s_recvBuffer[s_recvCount].len = len;
     s_recvCount++;
     s_remoteInputsRecv++;
+}
+
+void RollbackSession_OnSyncHashPacket(const void* data, size_t len) {
+    // v2 SyncHash verification belongs to the engine2 backend (§2.7.7); the
+    // Gekko adapter's desync detection rides StateDigest. Ignore quietly —
+    // a v2 peer never pairs with a Gekko build (handshake cadence/build
+    // checks fail closed first).
+    (void)data;
+    (void)len;
 }
 
 // ============================================================================
@@ -1786,8 +1795,8 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->remote_inputs_received = s_remoteInputsRecv;
 
     // GekkoNet network stats
-    out->gekko_avg_ping = s_cachedAvgPing;
-    out->gekko_jitter = s_cachedJitter;
+    out->link_avg_ping = s_cachedAvgPing;
+    out->link_jitter = s_cachedJitter;
 }
 
 uint32_t RollbackSession_ComputeLiveStateChecksum() {

@@ -27,10 +27,25 @@ void TransitionBarrier_FrameUpdate();
 // Clear all in-flight barriers (session boundary / disconnect).
 void TransitionBarrier_Reset(const char* reason);
 
+// Clear one kind's slot (e.g. arming a fresh startup barrier for the next
+// match without disturbing unrelated in-flight barriers).
+void TransitionBarrier_Clear(NetTransitionKind kind, const char* reason);
+
 // Propose a transition (idempotent — safe to call every frame while the local
 // side wants the transition). `intent` carries PostMatchIntentWire for
 // PostMatchDecision barriers, else 0.
 void TransitionBarrier_Propose(NetTransitionKind kind, uint8_t intent, uint32_t sessionId);
+
+// Propose an EpochAlign barrier (§4.5): payload carries {epoch, first_phase,
+// native_mode}. Commit additionally requires both sides to have proposed the
+// SAME {epoch, first_phase} (INV-10); native_mode is informational (each side
+// completes its native exit before consuming the commit).
+void TransitionBarrier_ProposeEpochAlign(uint32_t epoch, uint8_t firstPhase,
+                                         uint8_t nativeMode, uint32_t sessionId);
+
+// Remote EpochAlign proposal fields (valid while RemoteProposed(EpochAlign)).
+bool TransitionBarrier_GetRemoteEpochAlign(uint32_t* epoch, uint8_t* firstPhase,
+                                           uint8_t* nativeMode);
 
 // True once BOTH sides proposed the kind and the local proposal was acked.
 bool TransitionBarrier_IsCommitted(NetTransitionKind kind);

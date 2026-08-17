@@ -26,6 +26,13 @@ struct BarrierSlot {
     uint32_t localSeq       = 0;
     uint32_t remoteSeq      = 0;
     DWORD    lastSendTick   = 0;
+    // EpochAlign payload (§4.5); zero for every other kind.
+    uint32_t localEpoch     = 0;
+    uint8_t  localFirstPhase = 0;
+    uint8_t  localNativeMode = 0;
+    uint32_t remoteEpoch    = 0;
+    uint8_t  remoteFirstPhase = 0;
+    uint8_t  remoteNativeMode = 0;
 };
 
 bool        s_initialized = false;
@@ -44,17 +51,25 @@ void SendProposal(NetTransitionKind kind, BarrierSlot& slot) {
     p.kind = (uint8_t)kind;
     p.intent = slot.localIntent;
     p.session_id = slot.sessionId;
+    p.epoch = slot.localEpoch;
+    p.first_phase = slot.localFirstPhase;
+    p.native_mode = slot.localNativeMode;
     Session_SendPacket(CHANNEL_CONTROL, PacketType::PhaseTransitionProposal,
                        &p, sizeof(p), true);
     slot.lastSendTick = GetTickCount();
 }
 
-void SendAck(NetTransitionKind kind, uint32_t seq, uint8_t intent, uint32_t sessionId) {
+void SendAck(NetTransitionKind kind, uint32_t seq, uint8_t intent,
+             const PhaseTransitionPayload& echo) {
     PhaseTransitionPayload p{};
     p.transition_seq = seq;
     p.kind = (uint8_t)kind;
     p.intent = intent;
-    p.session_id = sessionId;
+    p.session_id = echo.session_id;
+    // Echo the align fields verbatim (INV-13 discipline for the new fields).
+    p.epoch = echo.epoch;
+    p.first_phase = echo.first_phase;
+    p.native_mode = echo.native_mode;
     Session_SendPacket(CHANNEL_CONTROL, PacketType::PhaseTransitionAck,
                        &p, sizeof(p), true);
 }
@@ -62,6 +77,24 @@ void SendAck(NetTransitionKind kind, uint32_t seq, uint8_t intent, uint32_t sess
 void MaybeCommit(NetTransitionKind kind, BarrierSlot& slot) {
     if (slot.committed) return;
     if (slot.localProposed && slot.localAcked && slot.remoteProposed) {
+        // EpochAlign (§4.5, INV-10): commit only when both sides proposed the
+        // SAME {epoch, first_phase}. A mismatch is surfaced (never silently
+        // corrected) and the higher epoch wins by re-proposal on the adopter
+        // side (match_setup drives that).
+        if (kind == NetTransitionKind::EpochAlign &&
+            (slot.localEpoch != slot.remoteEpoch ||
+             slot.localFirstPhase != slot.remoteFirstPhase)) {
+            static DWORD s_lastMismatchLogTick = 0;
+            const DWORD now = GetTickCount();
+            if (s_lastMismatchLogTick == 0 || (now - s_lastMismatchLogTick) >= 1000) {
+                s_lastMismatchLogTick = now;
+                Rollback::NetplayLog_Write("TRANSIT", -1,
+                    "EpochAlign proposal mismatch (commit refused): local={%u,%u} remote={%u,%u}",
+                    slot.localEpoch, slot.localFirstPhase,
+                    slot.remoteEpoch, slot.remoteFirstPhase);
+            }
+            return;
+        }
         slot.committed = true;
         slot.commitConsumed = false;
         LOG_NETPLAY(LOG_INFO,
@@ -97,6 +130,17 @@ void TransitionBarrier_Reset(const char* reason) {
     }
 }
 
+void TransitionBarrier_Clear(NetTransitionKind kind, const char* reason) {
+    BarrierSlot* slot = SlotFor(kind);
+    if (!slot) return;
+    const bool hadState = slot->localProposed || slot->remoteProposed;
+    *slot = BarrierSlot{};
+    if (s_initialized && hadState) {
+        Rollback::NetplayLog_Write("TRANSIT", -1, "Clear %s: %s",
+            NetTransitionKindName(kind), reason ? reason : "?");
+    }
+}
+
 void TransitionBarrier_FrameUpdate() {
     if (!s_initialized) return;
     const DWORD now = GetTickCount();
@@ -128,6 +172,46 @@ void TransitionBarrier_Propose(NetTransitionKind kind, uint8_t intent, uint32_t 
         NetTransitionKindName(kind), slot->localSeq, intent);
     SendProposal(kind, *slot);
     MaybeCommit(kind, *slot);
+}
+
+void TransitionBarrier_ProposeEpochAlign(uint32_t epoch, uint8_t firstPhase,
+                                         uint8_t nativeMode, uint32_t sessionId) {
+    if (!s_initialized) return;
+    BarrierSlot* slot = SlotFor(NetTransitionKind::EpochAlign);
+    if (!slot) return;
+    if (slot->localProposed) {
+        // Same payload already in flight/committed: idempotent no-op.
+        if (slot->localEpoch == epoch && slot->localFirstPhase == firstPhase) {
+            return;
+        }
+        // Payload change before/after commit re-proposes with a fresh seq
+        // (adoption of a higher epoch, §4.5).
+        slot->localAcked = false;
+        slot->committed = false;
+        slot->commitConsumed = false;
+    }
+    slot->localProposed = true;
+    slot->localIntent = 0;
+    slot->sessionId = sessionId;
+    slot->localEpoch = epoch;
+    slot->localFirstPhase = firstPhase;
+    slot->localNativeMode = nativeMode;
+    slot->localSeq = s_nextSeq++;
+    LOG_NETPLAY(LOG_INFO,
+        "[Transition] Propose EpochAlign seq=%u epoch=%u first_phase=%u native_mode=%u",
+        slot->localSeq, epoch, firstPhase, nativeMode);
+    SendProposal(NetTransitionKind::EpochAlign, *slot);
+    MaybeCommit(NetTransitionKind::EpochAlign, *slot);
+}
+
+bool TransitionBarrier_GetRemoteEpochAlign(uint32_t* epoch, uint8_t* firstPhase,
+                                           uint8_t* nativeMode) {
+    const BarrierSlot* slot = SlotFor(NetTransitionKind::EpochAlign);
+    if (!slot || !slot->remoteProposed) return false;
+    if (epoch) *epoch = slot->remoteEpoch;
+    if (firstPhase) *firstPhase = slot->remoteFirstPhase;
+    if (nativeMode) *nativeMode = slot->remoteNativeMode;
+    return true;
 }
 
 bool TransitionBarrier_IsCommitted(NetTransitionKind kind) {
@@ -183,10 +267,13 @@ bool TransitionBarrier_OnPacket(PacketType type, const void* payload, size_t pay
         slot->remoteProposed = true;
         slot->remoteSeq = p->transition_seq;
         slot->remoteIntent = p->intent;
-        SendAck(kind, p->transition_seq, p->intent, p->session_id);
+        slot->remoteEpoch = p->epoch;
+        slot->remoteFirstPhase = p->first_phase;
+        slot->remoteNativeMode = p->native_mode;
+        SendAck(kind, p->transition_seq, p->intent, *p);
         if (!duplicate) {
-            LOG_NETPLAY(LOG_INFO, "[Transition] Remote proposed %s seq=%u intent=%u",
-                NetTransitionKindName(kind), p->transition_seq, p->intent);
+            LOG_NETPLAY(LOG_INFO, "[Transition] Remote proposed %s seq=%u intent=%u epoch=%u",
+                NetTransitionKindName(kind), p->transition_seq, p->intent, p->epoch);
         }
         MaybeCommit(kind, *slot);
         return true;

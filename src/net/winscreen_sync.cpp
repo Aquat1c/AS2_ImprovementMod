@@ -128,9 +128,9 @@ static void StorePendingRemoteFrame(const WinScreenFrameInputPayload* p) {
     if (s_pendingRemoteFrameCount <= 4 || (s_pendingRemoteFrameCount % 16) == 0) {
         Rollback::NetplayLog_Write(
             "WINLOCK", -1,
-            "Buffered early win-screen frame input: epoch=%u serial=%u frame=%u count=%u buffered=%d dropped=%u",
+            "Buffered early win-screen frame input: epoch=%u phase_id=%u frame=%u count=%u buffered=%d dropped=%u",
             p->epoch_id,
-            p->phase_serial,
+            p->phase_id,
             p->frame,
             p->input_count,
             s_pendingRemoteFrameCount,
@@ -143,14 +143,15 @@ static void DrainPendingRemoteFrames() {
         return;
     }
 
+    // §3.4 acceptance: buffered frames replay iff they carry the current
+    // (epoch, phase_id) identity — no per-side serials exist (INV-7).
     int replayed = 0;
     int discarded = 0;
     const uint32_t epoch = FrontendInputSync_GetEpochId();
-    const uint32_t serial = FrontendInputSync_GetPhaseSerial();
     for (int i = 0; i < s_pendingRemoteFrameCount; ++i) {
         const WinScreenFrameInputPayload& p = s_pendingRemoteFrames[i];
         if (p.epoch_id == epoch &&
-            p.phase_serial == serial &&
+            p.phase_id == (uint8_t)FrontendPhaseId::WinScreen &&
             p.phase == (uint16_t)FrontendSyncPhase::WinScreen) {
             FrontendInputSync_OnRemoteWinScreenFrameInput(&p);
             replayed++;
@@ -161,12 +162,11 @@ static void DrainPendingRemoteFrames() {
 
     Rollback::NetplayLog_Write(
         "WINLOCK", -1,
-        "Drained early win-screen frame inputs: replayed=%d discarded=%d dropped=%u epoch=%u serial=%u",
+        "Drained early win-screen frame inputs: replayed=%d discarded=%d dropped=%u epoch=%u",
         replayed,
         discarded,
         s_pendingRemoteFrameDropped,
-        epoch,
-        serial);
+        epoch);
     ClearPendingRemoteFrames();
 }
 
@@ -197,19 +197,20 @@ void WinScreenSync_Begin() {
     if (s_active) {
         return;
     }
-    if (!FrontendInputSync_IsDelayNegotiated()) {
+    if (!FrontendInputSync_IsEpochActive()) {
         // Transient window during cross-phase rematch adoption: the adopt
-        // reset clears the negotiated delay one tick before SyncConfirm
+        // reset tears the epoch down one tick before the EpochAlign commit
         // re-establishes it. Latching a recovery request here killed healthy
         // rematches (observed 4x on 2026-08-16); instead defer — callers
         // retry Begin() every frame while the winscreen route is active, and
-        // it succeeds as soon as negotiation lands.
+        // it succeeds as soon as the epoch lands. (M5: the delay-negotiation
+        // gate is gone — the frontend delay is derived locally, INV-23.)
         static DWORD s_lastDeferLogTick = 0;
         const DWORD now = GetTickCount();
         if (s_lastDeferLogTick == 0 || (now - s_lastDeferLogTick) >= 1000) {
             s_lastDeferLogTick = now;
             LOG_NETPLAY(LOG_WARNING,
-                "[WinScreenSync] Begin deferred: frontend delay not negotiated yet");
+                "[WinScreenSync] Begin deferred: no active frontend epoch yet");
         }
         return;
     }
@@ -229,12 +230,12 @@ void WinScreenSync_Begin() {
 
     Rollback::NetplayLog_Write(
         "WINLOCK", -1,
-        "=== WINSCREEN BEGIN: epoch=%u shared_delay=%u role=%s ===",
+        "=== WINSCREEN BEGIN: epoch=%u frontend_delay=%u role=%s ===",
         FrontendInputSync_GetEpochId(),
-        FrontendInputSync_GetSharedDelay(),
+        FrontendInputSync_GetFrontendDelay(),
         s_isHost ? "Host" : "Join");
-    LOG_NETPLAY(LOG_INFO, "[WinScreenSync] Begin (shared frontend delay=%u)",
-        FrontendInputSync_GetSharedDelay());
+    LOG_NETPLAY(LOG_INFO, "[WinScreenSync] Begin (frontend delay=%u)",
+        FrontendInputSync_GetFrontendDelay());
 }
 
 void WinScreenSync_Abort() {

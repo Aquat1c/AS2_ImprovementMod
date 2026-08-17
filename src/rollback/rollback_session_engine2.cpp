@@ -27,6 +27,8 @@
 #include "core/as2_constants.h"
 #include "net/connection_supervisor.h"
 #include "net/delay_policy.h"
+#include "net/frontend_input_sync.h"
+#include "net/pregame_sync.h"
 #include "net/protocol.h"
 #include "net/session_manager.h"
 #include "net/session2.h"
@@ -63,7 +65,9 @@ int      s_localPlayer = 0;
 int      s_remotePlayer = 1;
 uint32_t s_baselineChecksum = 0;
 int32_t  s_frameOriginAbs = 0;
-uint32_t s_epoch = 1;           // rotated by the director from M5/M6 on
+uint32_t s_epoch = 1;           // adopted from match_setup at Begin (M5);
+                                // cross-match RotateEpoch lands with the M6
+                                // director (engine survives the match end)
 char     s_sessionError[160] = "";
 bool     s_terminalReported = false;
 
@@ -272,7 +276,14 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     ec.max_remote_future = 120;
     ec.history_capacity = 4096;
 
-    s_epoch = 1;                 // M5's match_setup takes epoch authority
+    // Epoch authority (M5, §2.5): match_setup mints/adopts the session's
+    // epoch; the adapter arms the engine and tags savestates under it. A
+    // zero epoch means the harness drives the adapter without a pregame —
+    // fall back to 1 so offline bring-up keeps working.
+    s_epoch = Net::PregameSync_GetCurrentEpoch();
+    if (s_epoch == 0) {
+        s_epoch = 1;
+    }
     if (!s_engine.Arm(ec, s_epoch)) {
         LOG_ERROR("[RollbackSession/engine2] Arm failed: %s", s_engine.TerminalDetail());
         return false;
@@ -344,6 +355,14 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
 
 bool RollbackSession_PollSession() {
     if (!s_active) return false;
+    // Producer fence (§2.7.3-P, M5 obligation closed): the stalled-producer
+    // must not feed the gameplay stream while a frontend lockstep phase owns
+    // the input exchange or the pregame machine is mid-barrier — those
+    // regimes own their own streams. NOT fenced during the continue prompt's
+    // gameplay tail: mode 9 rides the winscreen lockstep stream, which is an
+    // input phase and therefore fences here by construction.
+    s_engine.SetProducerFenced(
+        Net::FrontendInputSync_IsInputPhaseActive() || Net::PregameSync_IsActive());
     // Producer while stalled (INV-24): one seal per frame period; the
     // scheduler paces the caller, so one call per pass is the cadence.
     if (s_engine.ProduceLocalInputAhead(s_lastLocalSample)) {
@@ -483,10 +502,8 @@ void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2) {
 // Packet ingestion
 // ============================================================================
 
-void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
-    // v2 ingest: the router still funnels PacketType::InputStream (23)
-    // through this facade entry until the M5 routing-table cutover renames
-    // it. Payload is the §3.2 InputStreamPayload.
+void RollbackSession_OnInputStreamPacket(const void* data, size_t len) {
+    // v2 ingest (§3.2 InputStreamPayload) — the M5 routing-table entry point.
     if (!s_active || !data) return;
     if (len < sizeof(Net::InputStreamPayload)) {
         NetplayLog_Verbose("ROLLBACK", RbFrame(s_engine.SimFrontier()),
@@ -512,6 +529,28 @@ void RollbackSession_BufferGekkoPacket(const void* data, size_t len) {
     // M2 obligation: feed the §2.8.4 pace-slew input from PressureReport.
     FrameScheduler_SubmitPeerDepthSample((int32_t)p.pressure.prediction_depth,
                                          localDepth);
+}
+
+void RollbackSession_OnSyncHashPacket(const void* data, size_t len) {
+    // §2.7.7 confirmed-frame verification ingest (routed by packet_router,
+    // session_id gated there for this v2-only type).
+    if (!s_active || !data) return;
+    if (len < sizeof(Net::SyncHashPayload)) {
+        NetplayLog_Verbose("ROLLBACK", RbFrame(s_engine.SimFrontier()),
+            "engine2 ingest: short SyncHash payload (%zu < %zu), dropped",
+            len, sizeof(Net::SyncHashPayload));
+        return;
+    }
+    Net::SyncHashPayload p{};
+    memcpy(&p, data, sizeof(p));
+
+    const uint64_t sid = Net::Session2_GetSessionId();
+    if (sid != 0 && p.session_id != 0 && p.session_id != sid) {
+        return;  // §3.1: wrong session_id is structurally inert
+    }
+
+    (void)s_engine.ReceiveSyncHash(p);
+    ReportEngineTerminal();
 }
 
 // ============================================================================
@@ -667,10 +706,9 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->local_inputs_sent = (int32_t)s_localInputsSent;
     out->remote_inputs_received = (int32_t)s_remoteInputsRecv;
 
-    // Snapshot keeps the legacy field names until the M5 facade rename
-    // (inventory §11); link stats arrive with time_probe (M6).
-    out->gekko_avg_ping = 0.0f;
-    out->gekko_jitter = 0.0f;
+    // Link stats arrive with time_probe (M6); zeros until then.
+    out->link_avg_ping = 0.0f;
+    out->link_jitter = 0.0f;
 }
 
 uint32_t RollbackSession_ComputeLiveStateChecksum() {

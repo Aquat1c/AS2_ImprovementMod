@@ -4,7 +4,7 @@
  * Standalone module that defines and documents the barrier/sync
  * semantics used during pre-game, gameplay, and post-match phases.
  *
- * This module does NOT replace pregame_sync or match_bootstrap.
+ * This module does NOT replace match_setup (the PregameSync_* provider).
  * It provides:
  *   1. Explicit documentation of each barrier type and its semantics
  *   2. Helpers for barrier state queries that other modules can use
@@ -12,13 +12,13 @@
  *
  * Barrier types in the lifecycle:
  *
- *   SYNC BARRIERS (pregame_sync.cpp):
+ *   SYNC BARRIERS (match_setup.cpp):
  *     - SyncAnnounce/SyncConfirm: session identity agreement
  *     - CharSelInput/CharSelLock: character selection lockstep
  *     - StageSync: stage selection lockstep
  *     → All reliable, CHANNEL_CONTROL
  *
- *   BOOTSTRAP BARRIERS (match_bootstrap.cpp):
+ *   BOOTSTRAP BARRIERS (match_setup.cpp):
  *     - ConfigExchange/ConfigAck: match config agreement
  *     - LoadBarrier: both peers finished asset loading
  *     - BaselineReady/BaselineDigest: normalized bootstrap agreement
@@ -78,8 +78,6 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         case PacketType::CharSelInput:
         case PacketType::CharSelLock:
         case PacketType::StageSync:
-        case PacketType::DelayChangeReq:
-        case PacketType::DelayChangeAck:
         case PacketType::ConfigExchange:
         case PacketType::ConfigAck:
         case PacketType::LoadBarrier:
@@ -88,8 +86,9 @@ inline bool BarrierProtocol_IsReliable(PacketType type) {
         case PacketType::BaselineBreakdown:
         case PacketType::GameplayStart:
 
-        // Startup gameplay-entry barrier — reliable
-        case PacketType::GekkoReady:
+        // Frontend starvation interrogation (INV-11) — reliable
+        case PacketType::ResyncRequest:
+        case PacketType::ResyncReply:
             return true;
 
         // Gameplay stream — unreliable (redundancy handles loss)
@@ -130,8 +129,6 @@ inline uint8_t BarrierProtocol_GetChannel(PacketType type) {
         case PacketType::ChurnPause:
             return CHANNEL_DEBUG;
 
-        // Startup gameplay-entry barrier — control channel, same as GameplayStart
-        case PacketType::GekkoReady:
         case PacketType::NatTraversalSignal:
             return CHANNEL_CONTROL;
 

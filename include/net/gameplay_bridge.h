@@ -45,8 +45,8 @@ struct GameplayBridgeSnapshot {
     int      rollback_budget;
     int32_t  rb_frame_current;
     float    frames_ahead;
-    float    gekko_avg_ping;
-    float    gekko_jitter;
+    float    link_avg_ping;
+    float    link_jitter;
     char     status[128];
 };
 

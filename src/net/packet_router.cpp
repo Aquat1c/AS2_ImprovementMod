@@ -18,6 +18,7 @@
 #include "net/netplay_palette_runtime.h"
 #include "net/pause_handler.h"
 #include "net/pregame_sync.h"
+#include "net/session2.h"
 #include "net/sync_trace.h"
 #include "net/transition_barrier.h"
 #include "net/winscreen_sync.h"
@@ -54,6 +55,28 @@ void LogRouterPacketAnomaly(const char* reason,
 }
 
 uint32_t s_unknownPacketCount = 0;
+uint32_t s_sessionIdDropCount = 0;
+
+// §3.1: gameplay-phase packets carry the 64-bit handshake session_id; a
+// wrong id is dropped BEFORE any state mutation (stale, replayed, and
+// port-reuse datagrams are structurally inert). A zero id (peer not yet
+// confirmed / legacy Gekko bytes) passes through — the sinks self-guard.
+bool SessionIdGateDrops(uint64_t packetSessionId, PacketType type) {
+    const uint64_t sid = Net::Session2_GetSessionId();
+    if (sid == 0 || packetSessionId == 0 || packetSessionId == sid) {
+        return false;
+    }
+    s_sessionIdDropCount++;
+    if (s_sessionIdDropCount <= 5 || (s_sessionIdDropCount % 300) == 0) {
+        Rollback::NetplayLog_Write("PACKET", RouterLogFrame(),
+            "Dropped %s with foreign session_id: packet=%016llX local=%016llX total_dropped=%u",
+            PacketTypeName(type),
+            (unsigned long long)packetSessionId,
+            (unsigned long long)sid,
+            s_sessionIdDropCount);
+    }
+    return true;
+}
 
 } // anonymous namespace
 
@@ -65,8 +88,8 @@ void PacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadL
         return;
     }
     switch (type) {
-        // --- Pregame-machine-owned set (state lives in pregame_sync /
-        // match_bootstrap; CharSelLock/StageSync also set pregame latches) ---
+        // --- Pregame-machine-owned set (state lives in match_setup;
+        // CharSelLock/StageSync also set pregame latches) ---
         case PacketType::SyncAnnounce:
         case PacketType::SyncConfirm:
         case PacketType::CharSelInput:
@@ -82,15 +105,50 @@ void PacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadL
             PregameSync_OnSessionPacket(type, payload, payloadLen);
             break;
 
-        // --- Engine sinks (Gekko-era, until the engine2/match_setup cutover;
-        // both handlers self-guard against pre-live arrival) ---
+        // --- Engine sinks (both handlers self-guard against pre-live
+        // arrival). NOTE on the §3.1 session_id gate: under AS2_WITH_GEKKO=ON
+        // the InputStream payload is still raw GekkoNet bytes, so the id can
+        // only be validated at the engine2 adapter's typed ingest — the
+        // adapter drops foreign session_ids before any state mutation. The
+        // v2-only SyncHash packets are gated here. ---
         case PacketType::InputStream: {
             Rollback::OnlineWiring_HandleEngineDataPacket(payload, payloadLen);
             break;
         }
 
-        case PacketType::GekkoReady: {
-            Rollback::OnlineWiring_HandleStartupBarrierPacket(payload, payloadLen);
+        case PacketType::SyncHash: {
+            if (payloadLen < sizeof(SyncHashPayload)) {
+                LogRouterPacketAnomaly("Short SyncHash", type, payloadLen, sizeof(SyncHashPayload));
+                break;
+            }
+            auto* p = static_cast<const SyncHashPayload*>(payload);
+            if (SessionIdGateDrops(p->session_id, type)) {
+                break;
+            }
+            Rollback::RollbackSession_OnSyncHashPacket(payload, payloadLen);
+            break;
+        }
+
+        // --- Frontend starvation interrogation (INV-11) ---
+        case PacketType::ResyncRequest: {
+            if (payloadLen < sizeof(ResyncRequestPayload)) {
+                LogRouterPacketAnomaly("Short ResyncRequest", type, payloadLen,
+                                       sizeof(ResyncRequestPayload));
+                break;
+            }
+            FrontendInputSync_OnRemoteResyncRequest(
+                static_cast<const ResyncRequestPayload*>(payload));
+            break;
+        }
+
+        case PacketType::ResyncReply: {
+            if (payloadLen < sizeof(ResyncReplyPayload)) {
+                LogRouterPacketAnomaly("Short ResyncReply", type, payloadLen,
+                                       sizeof(ResyncReplyPayload));
+                break;
+            }
+            FrontendInputSync_OnRemoteResyncReply(
+                static_cast<const ResyncReplyPayload*>(payload));
             break;
         }
 
@@ -185,28 +243,6 @@ void PacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadL
             }
             FrontendInputSync_OnRemoteBoundaryDigest(
                 static_cast<const FrontendBoundaryDigestPayload*>(payload));
-            break;
-        }
-
-        case PacketType::DelayChangeReq: {
-            if (payloadLen < sizeof(DelayChangeReqPayload)) {
-                LogRouterPacketAnomaly("Short DelayChangeReq", type, payloadLen,
-                                       sizeof(DelayChangeReqPayload));
-                break;
-            }
-            FrontendInputSync_OnRemoteDelayChangeReq(
-                static_cast<const DelayChangeReqPayload*>(payload));
-            break;
-        }
-
-        case PacketType::DelayChangeAck: {
-            if (payloadLen < sizeof(DelayChangeAckPayload)) {
-                LogRouterPacketAnomaly("Short DelayChangeAck", type, payloadLen,
-                                       sizeof(DelayChangeAckPayload));
-                break;
-            }
-            FrontendInputSync_OnRemoteDelayChangeAck(
-                static_cast<const DelayChangeAckPayload*>(payload));
             break;
         }
 

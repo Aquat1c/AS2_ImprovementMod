@@ -37,6 +37,13 @@ constexpr uint8_t FRONTEND_JITTER_PRESSURE_SAMPLE_THRESHOLD = 3;
 constexpr uint8_t FRONTEND_STARVATION_PRESSURE_SAMPLE_THRESHOLD = 2;
 constexpr uint32_t FRONTEND_LEAD_EXTRA_DEFAULT = 2;
 
+// INV-11 interrogation thresholds (§4.6): 120 lockstep ticks (~2 s) of zero
+// accepted remote frames, or 60 coherent-but-unexpected phase_id packets,
+// whichever first. Three failed cycles escalate to a pregame restart.
+constexpr uint32_t FRONTEND_STARVATION_INTERROGATE_FRAMES = 120;
+constexpr uint32_t FRONTEND_PHASE_ID_MISMATCH_THRESHOLD = 60;
+constexpr uint8_t  FRONTEND_RESYNC_MAX_CYCLES = 3;
+
 static_assert((FRONTEND_RING_SIZE & (FRONTEND_RING_SIZE - 1)) == 0,
     "Frontend input ring size must be a power of two");
 static_assert(FRONTEND_INPUT_REDUNDANCY > 0,
@@ -46,14 +53,15 @@ static bool              s_initialized = false;
 static bool              s_epochActive = false;
 static SessionRole       s_role = SessionRole::Host;
 static uint32_t          s_epochId = 0;
-static uint32_t          s_nextPhaseSerial = 1;
-static uint32_t          s_phaseSerial = 0;
 static FrontendSyncPhase s_phase = FrontendSyncPhase::None;
 static PacketType        s_packetType = PacketType::CharSelFrameInput;
 static bool              s_inputPhaseActive = false;
 // Injected winscreen send gate (M0 dependency inversion — replaces the upward
 // PregameSync_GetPhase() include). Null = sends allowed.
 static FrontendWinScreenSendGate s_winScreenSendGate = nullptr;
+// Injected transport-health gate (INV-11: interrogate only while the
+// supervisor reports the transport alive). Null = healthy.
+static FrontendTransportHealthyGate s_transportHealthyGate = nullptr;
 
 static uint32_t          s_consumeFrame = 0;
 static uint32_t          s_localInputFrame = 0;
@@ -68,12 +76,10 @@ static bool              s_hasRemoteInput[FRONTEND_RING_SIZE] = {};
 static uint16_t          s_lastPhysicalInput = 0;
 static uint16_t          s_latchedPressedInput = 0;
 
-static uint16_t          s_localDelayProposal = FRONTEND_DELAY_MIN;
-static uint16_t          s_remoteDelayProposal = 0;
-static bool              s_remoteDelayProposalSeen = false;
-static uint16_t          s_sharedDelay = FRONTEND_DELAY_MIN;
-static bool              s_delayNegotiated = false;
-static bool              s_remoteSharedDelaySeen = false;
+// Frontend delay: locally derived per epoch (peer-local, INV-23). Live bumps
+// are increase-only local decisions applied at a scheduled consume frame so
+// the input pipeline never rewinds; no wire negotiation exists.
+static uint16_t          s_frontendDelay = FRONTEND_DELAY_MIN;
 
 static DWORD             s_lastRemoteInputTime = 0;
 static DWORD             s_lastResendTime = 0;
@@ -81,7 +87,7 @@ static DWORD             s_lastTargetedResendTime = 0;
 static DWORD             s_lastRingWindowPressureLogTime = 0;
 static DWORD             s_lastRemoteFrameTraceLogTime = 0;
 static bool              s_remoteFrameTraceLogTimeValid = false;
-static DWORD             s_lastDelayBumpRequestTime = 0;
+static DWORD             s_lastDelayBumpTime = 0;
 static DWORD             s_waitingForCurrentFrameSince = 0;
 static DWORD             s_lastPressureSampleTime = 0;
 static uint8_t           s_jitterPressureSamples = 0;
@@ -93,11 +99,6 @@ static bool              s_pendingDelayBump = false;
 static uint16_t          s_pendingDelay = 0;
 static uint32_t          s_pendingApplyFrom = 0;
 static FrontendDelayBumpReason s_pendingDelayReason = FrontendDelayBumpReason::None;
-
-static bool              s_waitingForDelayAck = false;
-static uint16_t          s_requestedDelay = 0;
-static uint32_t          s_requestedApplyFrom = 0;
-static FrontendDelayBumpReason s_requestedDelayReason = FrontendDelayBumpReason::None;
 
 static bool              s_localPhaseBarrierSent = false;
 static bool              s_remotePhaseBarrierSeen = false;
@@ -115,6 +116,13 @@ static uint32_t          s_remoteDigest = 0;
 
 static bool              s_localAdvanceObserved = false;
 static bool              s_remoteAdvanceObserved = false;
+
+// INV-11 interrogation state (per input phase).
+static uint32_t          s_starvedFrames = 0;
+static uint32_t          s_phaseIdMismatchCount = 0;
+static uint8_t           s_resyncCycles = 0;
+static bool              s_resyncAwaitingReply = false;
+static FrontendResyncEscalation s_resyncEscalation = FrontendResyncEscalation::None;
 
 static char              s_recoveryReason[128] = {};
 
@@ -193,19 +201,6 @@ static FrontendDelayProposalDetails ComputeDelayProposalDetails() {
     return details;
 }
 
-static FrontendDelayBumpReason SanitizeDelayReason(uint8_t reasonCode) {
-    switch ((FrontendDelayBumpReason)reasonCode) {
-        case FrontendDelayBumpReason::None:
-        case FrontendDelayBumpReason::Starvation:
-        case FrontendDelayBumpReason::RemoteRequest:
-        case FrontendDelayBumpReason::HostAdjust:
-        case FrontendDelayBumpReason::JitterPressure:
-            return (FrontendDelayBumpReason)reasonCode;
-        default:
-            return FrontendDelayBumpReason::None;
-    }
-}
-
 static void ResetDelayPressureTracking() {
     s_waitingForCurrentFrameSince = 0;
     s_lastPressureSampleTime = 0;
@@ -220,12 +215,9 @@ static uint16_t ClampFrontendDelay(uint16_t delay) {
 }
 
 static uint16_t GetEffectiveDelayFloor() {
-    uint16_t floor = s_sharedDelay;
+    uint16_t floor = s_frontendDelay;
     if (s_pendingDelayBump && s_pendingDelay > floor) {
         floor = s_pendingDelay;
-    }
-    if (s_waitingForDelayAck && s_requestedDelay > floor) {
-        floor = s_requestedDelay;
     }
     return floor;
 }
@@ -294,6 +286,20 @@ static uint16_t ConsumeLatchedFrontendInput(uint16_t current) {
     return out;
 }
 
+static uint8_t CurrentPhaseIdByte() {
+    return (uint8_t)FrontendSyncPhaseToPhaseId(s_phase);
+}
+
+// Native MODE_* byte for the resync identity tuple. The standalone test
+// build has no game memory to read (GetGameMode dereferences 0x81638C).
+static uint8_t CurrentNativeModeByte() {
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+    return 0;
+#else
+    return (uint8_t)GetGameMode();
+#endif
+}
+
 static void LogFrontendQueueState(const char* reason, DWORD now, bool force) {
     if (!force &&
         s_lastRingWindowPressureLogTime != 0 &&
@@ -311,11 +317,11 @@ static void LogFrontendQueueState(const char* reason, DWORD now, bool force) {
         : 0;
     Rollback::NetplayLog_Write(
         "FRONTQ", -1,
-        "Queue state: reason=%s epoch=%u phase=%s serial=%u consume=%u local_head=%u local_lead=%u max_lead=%u capture_limit=%u remote_contig=%u remote_latest=%u remote_ack=%u missing_current=%u hole_span=%u wait_ms=%lu shared_delay=%u pending_delay=%u",
+        "Queue state: reason=%s epoch=%u phase=%s phase_id=%u consume=%u local_head=%u local_lead=%u max_lead=%u capture_limit=%u remote_contig=%u remote_latest=%u remote_ack=%u missing_current=%u hole_span=%u wait_ms=%lu delay=%u pending_delay=%u starved=%u",
         reason ? reason : "?",
         s_epochId,
         FrontendSyncPhaseName(s_phase),
-        s_phaseSerial,
+        CurrentPhaseIdByte(),
         s_consumeFrame,
         s_localInputFrame,
         GetLocalLeadFrames(),
@@ -327,8 +333,9 @@ static void LogFrontendQueueState(const char* reason, DWORD now, bool force) {
         HasRemoteInputFrame(s_consumeFrame) ? 0u : 1u,
         remoteHoleSpan,
         (unsigned long)waitMs,
-        s_sharedDelay,
-        GetEffectiveDelayFloor());
+        s_frontendDelay,
+        GetEffectiveDelayFloor(),
+        s_starvedFrames);
 }
 
 static void ClearPhaseInputState() {
@@ -343,7 +350,7 @@ static void ClearPhaseInputState() {
     s_lastRingWindowPressureLogTime = 0;
     s_lastRemoteFrameTraceLogTime = 0;
     s_remoteFrameTraceLogTimeValid = false;
-    s_lastDelayBumpRequestTime = 0;
+    s_lastDelayBumpTime = 0;
     s_timedOut = false;
     memset(s_localInputs, 0, sizeof(s_localInputs));
     memset(s_remoteInputs, 0, sizeof(s_remoteInputs));
@@ -357,10 +364,6 @@ static void ClearPhaseInputState() {
     s_pendingDelay = 0;
     s_pendingApplyFrom = 0;
     s_pendingDelayReason = FrontendDelayBumpReason::None;
-    s_waitingForDelayAck = false;
-    s_requestedDelay = 0;
-    s_requestedApplyFrom = 0;
-    s_requestedDelayReason = FrontendDelayBumpReason::None;
     s_localPhaseBarrierSent = false;
     s_remotePhaseBarrierSeen = false;
     s_barrierNextPhase = FrontendSyncPhase::None;
@@ -375,6 +378,11 @@ static void ClearPhaseInputState() {
     s_remoteDigest = 0;
     s_localAdvanceObserved = false;
     s_remoteAdvanceObserved = false;
+    s_starvedFrames = 0;
+    s_phaseIdMismatchCount = 0;
+    s_resyncCycles = 0;
+    s_resyncAwaitingReply = false;
+    s_resyncEscalation = FrontendResyncEscalation::None;
     ResetDelayPressureTracking();
 }
 
@@ -382,47 +390,12 @@ static void ClearEpochState() {
     s_epochActive = false;
     s_role = SessionRole::Host;
     s_epochId = 0;
-    s_nextPhaseSerial = 1;
-    s_phaseSerial = 0;
     s_phase = FrontendSyncPhase::None;
     s_packetType = PacketType::CharSelFrameInput;
     s_inputPhaseActive = false;
-    s_localDelayProposal = FRONTEND_DELAY_MIN;
-    s_remoteDelayProposal = 0;
-    s_remoteDelayProposalSeen = false;
-    s_sharedDelay = FRONTEND_DELAY_MIN;
-    s_delayNegotiated = false;
-    s_remoteSharedDelaySeen = false;
+    s_frontendDelay = FRONTEND_DELAY_MIN;
     s_recoveryReason[0] = '\0';
     ClearPhaseInputState();
-}
-
-static void LogFrontendCore(const char* message) {
-    Rollback::NetplayLog_Write(
-        "FRONTEND", -1,
-        "%s: epoch=%u phase=%s serial=%u input_active=%d consume=%u local=%u remote=%u remote_contig=%u shared_delay=%u recovery=%s",
-        message ? message : "state",
-        s_epochId,
-        FrontendSyncPhaseName(s_phase),
-        s_phaseSerial,
-        s_inputPhaseActive ? 1 : 0,
-        s_consumeFrame,
-        s_localInputFrame,
-        s_remoteLatestFrame,
-        GetRemoteContiguousFrameExclusive(),
-        s_sharedDelay,
-        s_recoveryReason[0] ? s_recoveryReason : "none");
-}
-
-static uint32_t AllocatePhaseSerial() {
-    if (s_nextPhaseSerial == 0) {
-        s_nextPhaseSerial = 1;
-    }
-    const uint32_t serial = s_nextPhaseSerial++;
-    if (s_nextPhaseSerial == 0) {
-        s_nextPhaseSerial = 1;
-    }
-    return serial;
 }
 
 static bool SendInputPacket(uint32_t frame, const char* reason) {
@@ -434,7 +407,7 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
         if (s_phase != FrontendSyncPhase::WinScreen || !WinScreenSync_IsActive()) {
             return false;
         }
-        // Injected predicate (M0 dependency inversion): pregame_sync registers
+        // Injected predicate (M0 dependency inversion): match_setup registers
         // its phase-based gate; a null gate allows sends (test harness default).
         if (s_winScreenSendGate && !s_winScreenSendGate()) {
             return false;
@@ -444,8 +417,8 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
     if (s_packetType == PacketType::CharSelFrameInput) {
         CharSelFrameInputPayload payload{};
         payload.epoch_id = s_epochId;
-        payload.phase_serial = s_phaseSerial;
         payload.phase = (uint16_t)s_phase;
+        payload.phase_id = CurrentPhaseIdByte();
         payload.frame = frame;
         payload.ack_frame = s_consumeFrame;
 
@@ -467,8 +440,8 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
         if (!sent) {
             Rollback::NetplayLog_Write(
                 "FRONTEND", -1,
-                "Send CharSelFrameInput failed: serial=%u frame=%u ack=%u count=%u reason=%s",
-                payload.phase_serial,
+                "Send CharSelFrameInput failed: phase_id=%u frame=%u ack=%u count=%u reason=%s",
+                payload.phase_id,
                 payload.frame,
                 payload.ack_frame,
                 payload.input_count,
@@ -479,8 +452,8 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
 
     WinScreenFrameInputPayload payload{};
     payload.epoch_id = s_epochId;
-    payload.phase_serial = s_phaseSerial;
     payload.phase = (uint16_t)s_phase;
+    payload.phase_id = CurrentPhaseIdByte();
     payload.frame = frame;
     payload.ack_frame = s_consumeFrame;
 
@@ -502,8 +475,8 @@ static bool SendInputPacket(uint32_t frame, const char* reason) {
     if (!sent) {
         Rollback::NetplayLog_Write(
             "FRONTEND", -1,
-            "Send WinScreenFrameInput failed: serial=%u frame=%u ack=%u count=%u reason=%s",
-            payload.phase_serial,
+            "Send WinScreenFrameInput failed: phase_id=%u frame=%u ack=%u count=%u reason=%s",
+            payload.phase_id,
             payload.frame,
             payload.ack_frame,
             payload.input_count,
@@ -517,7 +490,7 @@ static void EnsureLocalLead(const char* reason) {
         return;
     }
 
-    const uint32_t targetLead = (uint32_t)(s_sharedDelay > 0 ? s_sharedDelay : FRONTEND_DELAY_MIN);
+    const uint32_t targetLead = (uint32_t)(s_frontendDelay > 0 ? s_frontendDelay : FRONTEND_DELAY_MIN);
     const uint32_t captureLimit = GetLocalCaptureHeadLimitExclusive();
     while (GetLocalLeadFrames() < targetLead && s_localInputFrame < captureLimit) {
         StoreLocalInputFrame(s_localInputFrame, 0);
@@ -534,49 +507,32 @@ static void MaybeApplyPendingDelay() {
         return;
     }
 
-    const uint16_t oldDelay = s_sharedDelay;
+    const uint16_t oldDelay = s_frontendDelay;
     const FrontendDelayBumpReason appliedReason = s_pendingDelayReason;
-    s_sharedDelay = ClampFrontendDelay(s_pendingDelay);
+    s_frontendDelay = ClampFrontendDelay(s_pendingDelay);
     s_pendingDelayBump = false;
     s_pendingDelay = 0;
     s_pendingApplyFrom = 0;
     s_pendingDelayReason = FrontendDelayBumpReason::None;
-    s_waitingForDelayAck = false;
-    s_requestedDelay = 0;
-    s_requestedApplyFrom = 0;
-    s_requestedDelayReason = FrontendDelayBumpReason::None;
     ResetDelayPressureTracking();
 
     Rollback::NetplayLog_Write(
         "FRONTDELAY", -1,
-        "Applied shared frontend delay bump: old=%u new=%u phase=%s serial=%u frame=%u reason=%s",
+        "Applied local frontend delay bump: old=%u new=%u phase=%s frame=%u reason=%s",
         oldDelay,
-        s_sharedDelay,
+        s_frontendDelay,
         FrontendSyncPhaseName(s_phase),
-        s_phaseSerial,
         s_consumeFrame,
         FrontendDelayBumpReasonName(appliedReason));
 }
 
-static void SendDelayChangeAck(uint16_t ackedDelay,
-                               uint32_t applyFromFrame,
-                               bool accepted,
-                               FrontendDelayBumpReason reason) {
-    DelayChangeAckPayload ack{};
-    ack.epoch_id = s_epochId;
-    ack.phase_serial = s_phaseSerial;
-    ack.phase = (uint16_t)s_phase;
-    ack.acked_delay = ackedDelay;
-    ack.apply_from_frame = applyFromFrame;
-    ack.accepted = accepted ? 1 : 0;
-    ack.reason_code = (uint8_t)reason;
-    BarrierProtocol_SendPacket(PacketType::DelayChangeAck, &ack, sizeof(ack));
-}
-
-static void RequestDelayIncrease(uint16_t requestedDelay,
-                                 FrontendDelayBumpReason reason,
-                                 const char* context) {
-    if (!s_epochActive || !s_inputPhaseActive || s_waitingForDelayAck) {
+// Increase-only local frontend delay bump (INV-23: peer-local knob, no wire
+// message — the peer simply sees our capture lead grow). Applied at a
+// scheduled consume frame so the pipeline never rewinds.
+static void ScheduleLocalDelayIncrease(uint16_t requestedDelay,
+                                       FrontendDelayBumpReason reason,
+                                       const char* context) {
+    if (!s_epochActive || !s_inputPhaseActive) {
         return;
     }
 
@@ -585,32 +541,19 @@ static void RequestDelayIncrease(uint16_t requestedDelay,
         return;
     }
 
-    DelayChangeReqPayload req{};
-    req.epoch_id = s_epochId;
-    req.phase_serial = s_phaseSerial;
-    req.phase = (uint16_t)s_phase;
-    req.new_delay = requestedDelay;
-    req.apply_from_frame = s_consumeFrame + requestedDelay + 2;
-    req.reason_code = (uint8_t)reason;
-
-    if (!BarrierProtocol_SendPacket(PacketType::DelayChangeReq, &req, sizeof(req))) {
-        return;
-    }
-
-    s_waitingForDelayAck = true;
-    s_requestedDelay = requestedDelay;
-    s_requestedApplyFrom = req.apply_from_frame;
-    s_requestedDelayReason = reason;
-    s_lastDelayBumpRequestTime = NowMs();
+    s_pendingDelayBump = true;
+    s_pendingDelay = requestedDelay;
+    s_pendingApplyFrom = s_consumeFrame + requestedDelay + 2;
+    s_pendingDelayReason = reason;
+    s_lastDelayBumpTime = NowMs();
 
     Rollback::NetplayLog_Write(
         "FRONTDELAY", -1,
-        "Requested frontend delay bump: phase=%s serial=%u current=%u requested=%u apply_from=%u reason=%s context=%s",
+        "Scheduled local frontend delay bump: phase=%s current=%u requested=%u apply_from=%u reason=%s context=%s",
         FrontendSyncPhaseName(s_phase),
-        s_phaseSerial,
-        s_sharedDelay,
+        s_frontendDelay,
         requestedDelay,
-        req.apply_from_frame,
+        s_pendingApplyFrom,
         FrontendDelayBumpReasonName(reason),
         context ? context : "?");
 }
@@ -618,14 +561,13 @@ static void RequestDelayIncrease(uint16_t requestedDelay,
 static void MaybeRequestLiveDelayIncrease(DWORD now) {
     if (!s_epochActive ||
         !s_inputPhaseActive ||
-        s_waitingForDelayAck ||
         s_pendingDelayBump ||
-        s_sharedDelay >= FRONTEND_DELAY_MAX) {
+        s_frontendDelay >= FRONTEND_DELAY_MAX) {
         return;
     }
 
-    if (s_lastDelayBumpRequestTime != 0 &&
-        (now - s_lastDelayBumpRequestTime) < FRONTEND_DELAY_BUMP_INTERVAL_MS) {
+    if (s_lastDelayBumpTime != 0 &&
+        (now - s_lastDelayBumpTime) < FRONTEND_DELAY_BUMP_INTERVAL_MS) {
         return;
     }
 
@@ -667,10 +609,9 @@ static void MaybeRequestLiveDelayIncrease(DWORD now) {
     if (jitterPressure || starvationPressure) {
         Rollback::NetplayLog_Verbose(
             "FRONTDELAY", -1,
-            "Delay pressure sample: phase=%s serial=%u shared=%u floor=%u rec=%u base=%u jitter_frames=%u avg_ping=%.1f variance=%.1f silence_ms=%lu wait_ms=%lu remote_contig=%u remote_latest=%u hole_span=%u missing_current=%u jitter_samples=%u starvation_samples=%u",
+            "Delay pressure sample: phase=%s delay=%u floor=%u rec=%u base=%u jitter_frames=%u avg_ping=%.1f variance=%.1f silence_ms=%lu wait_ms=%lu remote_contig=%u remote_latest=%u hole_span=%u missing_current=%u jitter_samples=%u starvation_samples=%u",
             FrontendSyncPhaseName(s_phase),
-            s_phaseSerial,
-            s_sharedDelay,
+            s_frontendDelay,
             delayFloor,
             details.recommended_delay,
             details.base_delay,
@@ -695,30 +636,138 @@ static void MaybeRequestLiveDelayIncrease(DWORD now) {
         const uint16_t targetDelay = details.recommended_delay > delayFloor
             ? details.recommended_delay
             : ClampFrontendDelay((uint16_t)(delayFloor + 1));
-        RequestDelayIncrease(targetDelay,
+        ScheduleLocalDelayIncrease(targetDelay,
             FrontendDelayBumpReason::Starvation,
             "sustained starvation pressure");
         return;
     }
 
     if (s_jitterPressureSamples >= FRONTEND_JITTER_PRESSURE_SAMPLE_THRESHOLD) {
-        RequestDelayIncrease(details.recommended_delay,
+        ScheduleLocalDelayIncrease(details.recommended_delay,
             FrontendDelayBumpReason::JitterPressure,
             "sustained jitter pressure");
     }
 }
 
+// ============================================================================
+// INV-11 interrogation (§4.6 ladder step 2)
+// ============================================================================
+
+static bool TransportHealthyForInterrogation() {
+    return s_transportHealthyGate == nullptr || s_transportHealthyGate();
+}
+
+static void SendResyncRequest(const char* reason) {
+    ResyncRequestPayload req{};
+    req.epoch = s_epochId;
+    req.phase_id = CurrentPhaseIdByte();
+    req.native_mode = CurrentNativeModeByte();
+    req.local_frame = s_consumeFrame;
+    if (!BarrierProtocol_SendPacket(PacketType::ResyncRequest, &req, sizeof(req))) {
+        return;
+    }
+    s_resyncAwaitingReply = true;
+    s_resyncCycles = (uint8_t)(s_resyncCycles < 0xFF ? s_resyncCycles + 1 : 0xFF);
+    Rollback::NetplayLog_Write(
+        "FRONTRESYNC", -1,
+        "Sent ResyncRequest: epoch=%u phase_id=%u mode=%u frame=%u cycle=%u reason=%s",
+        req.epoch, req.phase_id, req.native_mode, req.local_frame,
+        s_resyncCycles, reason ? reason : "?");
+    if (s_resyncCycles >= FRONTEND_RESYNC_MAX_CYCLES &&
+        s_resyncEscalation == FrontendResyncEscalation::None) {
+        // Three failed cycles (~6 s) → pregame restart under a fresh epoch
+        // (§4.6 step 3). NEVER a teardown (INV-12).
+        s_resyncEscalation = FrontendResyncEscalation::Restart;
+        Rollback::NetplayLog_Write(
+            "FRONTRESYNC", -1,
+            "Interrogation exhausted (%u cycles) — requesting pregame restart",
+            s_resyncCycles);
+    }
+}
+
+// Starvation clock: counted in lockstep ticks (FrameUpdate cadence), never
+// wall time (INV-16 discipline for sync decisions; wall clocks pace resends
+// only).
+static void UpdateStarvationInterrogation() {
+    if (!s_epochActive || !s_inputPhaseActive) {
+        return;
+    }
+    if (HasRemoteInputFrame(s_consumeFrame)) {
+        s_starvedFrames = 0;
+        s_resyncAwaitingReply = false;
+        return;
+    }
+    s_starvedFrames++;
+    if (s_starvedFrames < FRONTEND_STARVATION_INTERROGATE_FRAMES) {
+        return;
+    }
+    if (!TransportHealthyForInterrogation()) {
+        // Transport itself is in trouble — the supervisor's silence ladder
+        // owns this case (INV-14); do not interrogate over a dead link.
+        return;
+    }
+    s_starvedFrames = 0;
+    SendResyncRequest("starvation threshold");
+}
+
+static void NotePhaseIdMismatch(uint32_t epochId, uint8_t packetPhaseId, PacketType type) {
+    s_phaseIdMismatchCount++;
+    if ((s_phaseIdMismatchCount % 20u) == 1u) {
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Coherent-but-unexpected phase_id packet: type=%s epoch=%u packet_phase_id=%u local_phase_id=%u count=%u",
+            PacketTypeName(type),
+            epochId,
+            packetPhaseId,
+            CurrentPhaseIdByte(),
+            s_phaseIdMismatchCount);
+    }
+    // §3.4: at threshold this triggers the INV-11 interrogation instead of
+    // silent dropping forever.
+    if (s_phaseIdMismatchCount >= FRONTEND_PHASE_ID_MISMATCH_THRESHOLD &&
+        TransportHealthyForInterrogation()) {
+        s_phaseIdMismatchCount = 0;
+        SendResyncRequest("phase_id mismatch threshold");
+    }
+}
+
+// §3.4 frame acceptance: (epoch, phase_id) with the mismatch counter.
+static bool AcceptFramePacketIdentity(uint32_t epochId,
+                                      uint8_t packetPhaseId,
+                                      PacketType type) {
+    if (!s_epochActive) {
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Ignored frame input with no active epoch: type=%s epoch=%u phase_id=%u",
+            PacketTypeName(type), epochId, packetPhaseId);
+        return false;
+    }
+    if (epochId != s_epochId) {
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "Ignored stale-epoch frame input: type=%s packet_epoch=%u local_epoch=%u",
+            PacketTypeName(type), epochId, s_epochId);
+        return false;
+    }
+    if (packetPhaseId != CurrentPhaseIdByte()) {
+        NotePhaseIdMismatch(epochId, packetPhaseId, type);
+        return false;
+    }
+    return true;
+}
+
 static void HandleRemoteFrameInput(uint32_t epochId,
-                                   uint32_t phaseSerial,
+                                   uint8_t packetPhaseId,
                                    uint16_t phase,
                                    uint32_t frame,
                                    uint32_t ackFrame,
                                    const uint16_t* inputs,
                                    uint16_t inputCount,
                                    PacketType type) {
-    if (!FrontendInputSync_IsCurrentEpochPhaseSerial(epochId, phase, phaseSerial, type, "frame input")) {
+    if (!AcceptFramePacketIdentity(epochId, packetPhaseId, type)) {
         return;
     }
+    (void)phase;  // diagnostic only; acceptance is keyed on (epoch, phase_id)
     if (type != s_packetType) {
         // In-flight packet from the previous screen crossing a phase edge
         // (e.g. a CharSel frame arriving after StageSel began). Pure ordering
@@ -796,6 +845,11 @@ static void HandleRemoteFrameInput(uint32_t epochId,
             s_waitingForCurrentFrameSince = 0;
         }
         s_starvationPressureSamples = 0;
+        // Accepted remote traffic ends the current interrogation cycle
+        // (recovered — INV-11 ladder resets).
+        s_starvedFrames = 0;
+        s_resyncCycles = 0;
+        s_resyncAwaitingReply = false;
     }
 
     if (ackFrame < s_localInputFrame &&
@@ -813,11 +867,10 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         } else if (futureFramesIgnored > 0) {
             Rollback::NetplayLog_Write(
                 "FRONTNET", -1,
-                "Unable to satisfy targeted frontend resend: type=%s epoch=%u phase=%s serial=%u requested=%u local=%u consume=%u remote_ack=%u remote_frame=%u ignored_future=%d remote_contig=%u",
+                "Unable to satisfy targeted frontend resend: type=%s epoch=%u phase=%s requested=%u local=%u consume=%u remote_ack=%u remote_frame=%u ignored_future=%d remote_contig=%u",
                 PacketTypeName(type),
                 epochId,
                 FrontendSyncPhaseName(s_phase),
-                s_phaseSerial,
                 resendFrame,
                 s_localInputFrame,
                 s_consumeFrame,
@@ -834,11 +887,10 @@ static void HandleRemoteFrameInput(uint32_t epochId,
         s_lastRingWindowPressureLogTime = now;
         Rollback::NetplayLog_Write(
             "FRONTNET", -1,
-            "Remote frontend input ahead of retain window: type=%s epoch=%u phase=%s serial=%u frame=%u consume=%u ahead=%u ack=%u count=%u ignored_future=%d accepted_history=%d remote_contig=%u remote_latest=%u",
+            "Remote frontend input ahead of retain window: type=%s epoch=%u phase=%s frame=%u consume=%u ahead=%u ack=%u count=%u ignored_future=%d accepted_history=%d remote_contig=%u remote_latest=%u",
             PacketTypeName(type),
             epochId,
             FrontendSyncPhaseName(s_phase),
-            s_phaseSerial,
             frame,
             s_consumeFrame,
             frame >= s_consumeFrame ? (frame - s_consumeFrame) : 0,
@@ -851,7 +903,7 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     }
 
     if (futureFramesIgnored > 0) {
-        RequestDelayIncrease(
+        ScheduleLocalDelayIncrease(
             ClampFrontendDelay((uint16_t)(GetEffectiveDelayFloor() + 1)),
             FrontendDelayBumpReason::Starvation,
             "remote frontend input beyond retain window");
@@ -861,11 +913,10 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     if (!acceptedAny && frame <= previousRemoteLatest && sampleFrameTrace) {
         Rollback::NetplayLog_Verbose(
             "FRONTNET", -1,
-            "Ignored duplicate/out-of-order remote frame input: type=%s epoch=%u phase=%s serial=%u frame=%u ack=%u consume=%u remote_contig=%u remote_latest=%u",
+            "Ignored duplicate/out-of-order remote frame input: type=%s epoch=%u phase=%s frame=%u ack=%u consume=%u remote_contig=%u remote_latest=%u",
             PacketTypeName(type),
             epochId,
             FrontendSyncPhaseName(s_phase),
-            s_phaseSerial,
             frame,
             ackFrame,
             s_consumeFrame,
@@ -874,11 +925,10 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     } else if (acceptedAny && frame < previousRemoteLatest && sampleFrameTrace) {
         Rollback::NetplayLog_Verbose(
             "FRONTNET", -1,
-            "Accepted out-of-order remote frame history fill: type=%s epoch=%u phase=%s serial=%u frame=%u ack=%u new=%d consume=%u remote_contig=%u remote_latest=%u",
+            "Accepted out-of-order remote frame history fill: type=%s epoch=%u phase=%s frame=%u ack=%u new=%d consume=%u remote_contig=%u remote_latest=%u",
             PacketTypeName(type),
             epochId,
             FrontendSyncPhaseName(s_phase),
-            s_phaseSerial,
             frame,
             ackFrame,
             newFramesApplied,
@@ -890,11 +940,10 @@ static void HandleRemoteFrameInput(uint32_t epochId,
     if (sampleFrameTrace && (acceptedAny || futureFramesIgnored > 0)) {
         Rollback::NetplayLog_Verbose(
             "FRONTNET", -1,
-            "Remote frame input sample: type=%s epoch=%u phase=%s serial=%u frame=%u ack=%u count=%u new=%d consume=%u remote_contig=%u remote_latest=%u ignored_future=%d",
+            "Remote frame input sample: type=%s epoch=%u phase=%s frame=%u ack=%u count=%u new=%d consume=%u remote_contig=%u remote_latest=%u ignored_future=%d",
             PacketTypeName(type),
             epochId,
             FrontendSyncPhaseName(s_phase),
-            s_phaseSerial,
             frame,
             ackFrame,
             inputCount,
@@ -930,12 +979,16 @@ void FrontendInputSync_SetWinScreenSendGate(FrontendWinScreenSendGate gate) {
     s_winScreenSendGate = gate;
 }
 
+void FrontendInputSync_SetTransportHealthyGate(FrontendTransportHealthyGate gate) {
+    s_transportHealthyGate = gate;
+}
+
 int FrontendInputSync_ComputeDelayProposal() {
     const FrontendDelayProposalDetails details = ComputeDelayProposalDetails();
 
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Local frontend delay proposal: configured_delay=%u configured_floor=%u base=%u jitter_bump=%u final=%u avg_ping=%.1f variance=%.1f one_way=%.2f jitter_frames=%.2f valid=%d",
+        "Local frontend delay: configured_delay=%u configured_floor=%u base=%u jitter_bump=%u final=%u avg_ping=%.1f variance=%.1f one_way=%.2f jitter_frames=%.2f valid=%d",
         details.configured_delay,
         details.configured_floor,
         details.base_delay,
@@ -952,19 +1005,21 @@ int FrontendInputSync_ComputeDelayProposal() {
 
 void FrontendInputSync_BeginEpoch(SessionRole role,
                                   uint32_t epochId,
-                                  uint16_t localDelayProposal,
+                                  uint16_t frontendDelay,
                                   const char* reason) {
+    // INV-8: one frontend sync machine per epoch — beginning an epoch cancels
+    // every deferred/pending machine of any prior epoch by construction.
     ClearEpochState();
     s_epochActive = true;
     s_role = role;
     s_epochId = epochId;
-    s_localDelayProposal = ClampFrontendDelay(localDelayProposal);
+    s_frontendDelay = ClampFrontendDelay(frontendDelay);
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Begin epoch: epoch=%u role=%s local_delay_proposal=%u reason=%s",
+        "Begin epoch: epoch=%u role=%s frontend_delay=%u reason=%s",
         s_epochId,
         SessionRoleName(role),
-        s_localDelayProposal,
+        s_frontendDelay,
         reason ? reason : "?");
 }
 
@@ -994,6 +1049,10 @@ void FrontendInputSync_AbortEpoch(const char* reason) {
     ClearEpochState();
 }
 
+bool FrontendInputSync_IsEpochActive() {
+    return s_epochActive;
+}
+
 void FrontendInputSync_StopWinScreenInputPhase(const char* reason) {
     if (s_phase == FrontendSyncPhase::WinScreen && s_inputPhaseActive) {
         Rollback::NetplayLog_Write(
@@ -1008,86 +1067,8 @@ void FrontendInputSync_StopWinScreenInputPhase(const char* reason) {
     }
 }
 
-void FrontendInputSync_OnRemoteSyncAnnounce(uint16_t remoteDelayProposal, const char* reason) {
-    if (!s_epochActive) {
-        return;
-    }
-    s_remoteDelayProposal = ClampFrontendDelay(remoteDelayProposal);
-    s_remoteDelayProposalSeen = true;
-    Rollback::NetplayLog_Write(
-        "FRONTEND", -1,
-        "Remote SyncAnnounce delay proposal: epoch=%u remote=%u reason=%s",
-        s_epochId,
-        s_remoteDelayProposal,
-        reason ? reason : "?");
-}
-
-void FrontendInputSync_OnRemoteSyncConfirm(uint16_t remoteDelayProposal,
-                                           uint16_t remoteSharedDelay,
-                                           const char* reason) {
-    if (!s_epochActive) {
-        return;
-    }
-    s_remoteDelayProposal = ClampFrontendDelay(remoteDelayProposal);
-    s_remoteDelayProposalSeen = true;
-    s_sharedDelay = ClampFrontendDelay(remoteSharedDelay);
-    s_remoteSharedDelaySeen = true;
-    Rollback::NetplayLog_Write(
-        "FRONTEND", -1,
-        "Remote SyncConfirm delay: epoch=%u remote_proposal=%u shared=%u reason=%s",
-        s_epochId,
-        s_remoteDelayProposal,
-        s_sharedDelay,
-        reason ? reason : "?");
-}
-
-bool FrontendInputSync_FinalizeDelayNegotiation(const char* reason) {
-    if (!s_epochActive || !s_remoteDelayProposalSeen) {
-        return false;
-    }
-
-    const uint16_t computed = ClampFrontendDelay(
-        s_localDelayProposal > s_remoteDelayProposal ? s_localDelayProposal : s_remoteDelayProposal);
-
-    if (s_role == SessionRole::Host) {
-        s_sharedDelay = computed;
-        s_delayNegotiated = true;
-    } else {
-        if (!s_remoteSharedDelaySeen) {
-            return false;
-        }
-        if (s_sharedDelay < computed) {
-            FrontendInputSync_RequestRecovery("remote shared frontend delay was below local requirements");
-            return false;
-        }
-        s_delayNegotiated = true;
-    }
-
-    Rollback::NetplayLog_Write(
-        "FRONTEND", -1,
-        "Frontend delay negotiated: epoch=%u local=%u remote=%u shared=%u reason=%s",
-        s_epochId,
-        s_localDelayProposal,
-        s_remoteDelayProposal,
-        s_sharedDelay,
-        reason ? reason : "?");
-    return true;
-}
-
-bool FrontendInputSync_IsDelayNegotiated() {
-    return s_delayNegotiated;
-}
-
-uint16_t FrontendInputSync_GetSharedDelay() {
-    return s_sharedDelay;
-}
-
-uint16_t FrontendInputSync_GetLocalDelayProposal() {
-    return s_localDelayProposal;
-}
-
-uint16_t FrontendInputSync_GetRemoteDelayProposal() {
-    return s_remoteDelayProposal;
+uint16_t FrontendInputSync_GetFrontendDelay() {
+    return s_frontendDelay;
 }
 
 uint32_t FrontendInputSync_GetEpochId() {
@@ -1098,21 +1079,35 @@ void FrontendInputSync_BeginInputPhase(FrontendSyncPhase phase,
                                        PacketType packetType,
                                        const char* reason) {
     if (!s_epochActive) {
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "ERROR: BeginInputPhase without active epoch: phase=%s reason=%s",
+            FrontendSyncPhaseName(phase),
+            reason ? reason : "?");
         return;
+    }
+    if (s_inputPhaseActive) {
+        // INV-8 fail-log: a second Begin while a machine is active means a
+        // caller missed an EndPhase. The old machine is torn down (never two
+        // machines for one epoch), loudly.
+        Rollback::NetplayLog_Write(
+            "FRONTEND", -1,
+            "ERROR: BeginInputPhase while phase %s active (epoch=%u) — replacing (INV-8)",
+            FrontendSyncPhaseName(s_phase),
+            s_epochId);
     }
     ClearPhaseInputState();
     s_phase = phase;
-    s_phaseSerial = AllocatePhaseSerial();
     s_packetType = packetType;
     s_inputPhaseActive = true;
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Begin input phase: epoch=%u phase=%s serial=%u packet=%s shared_delay=%u max_local_lead=%u reason=%s",
+        "Begin input phase: epoch=%u phase=%s phase_id=%u packet=%s frontend_delay=%u max_local_lead=%u reason=%s",
         s_epochId,
         FrontendSyncPhaseName(phase),
-        s_phaseSerial,
+        CurrentPhaseIdByte(),
         PacketTypeName(packetType),
-        s_sharedDelay,
+        s_frontendDelay,
         GetFrontendMaxLocalLead(),
         reason ? reason : "?");
 }
@@ -1123,14 +1118,12 @@ void FrontendInputSync_BeginPassivePhase(FrontendSyncPhase phase, const char* re
     }
     ClearPhaseInputState();
     s_phase = phase;
-    s_phaseSerial = AllocatePhaseSerial();
     s_inputPhaseActive = false;
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Begin passive phase: epoch=%u phase=%s serial=%u reason=%s",
+        "Begin passive phase: epoch=%u phase=%s reason=%s",
         s_epochId,
         FrontendSyncPhaseName(phase),
-        s_phaseSerial,
         reason ? reason : "?");
 }
 
@@ -1143,12 +1136,15 @@ void FrontendInputSync_EndPhase(const char* reason) {
         reason ? reason : "?");
     ClearPhaseInputState();
     s_phase = FrontendSyncPhase::None;
-    s_phaseSerial = 0;
     s_inputPhaseActive = false;
 }
 
 FrontendSyncPhase FrontendInputSync_GetPhase() {
     return s_phase;
+}
+
+FrontendPhaseId FrontendInputSync_GetPhaseId() {
+    return FrontendSyncPhaseToPhaseId(s_phase);
 }
 
 bool FrontendInputSync_IsInputPhaseActive() {
@@ -1175,10 +1171,6 @@ uint32_t FrontendInputSync_GetRemoteContiguousFrameExclusive() {
     return GetRemoteContiguousFrameExclusive();
 }
 
-uint32_t FrontendInputSync_GetPhaseSerial() {
-    return s_phaseSerial;
-}
-
 void FrontendInputSync_FrameUpdate() {
     if (!s_epochActive) {
         return;
@@ -1187,6 +1179,8 @@ void FrontendInputSync_FrameUpdate() {
     if (!s_inputPhaseActive) {
         return;
     }
+
+    UpdateStarvationInterrogation();
 
     const DWORD now = NowMs();
     if (s_localInputFrame > 0 && (now - s_lastResendTime) >= FRONTEND_RESEND_INTERVAL_MS) {
@@ -1299,7 +1293,7 @@ void FrontendInputSync_OnRemoteCharSelFrameInput(const CharSelFrameInputPayload*
         return;
     }
     HandleRemoteFrameInput(p->epoch_id,
-                           p->phase_serial,
+                           p->phase_id,
                            p->phase,
                            p->frame,
                            p->ack_frame,
@@ -1313,7 +1307,7 @@ void FrontendInputSync_OnRemoteWinScreenFrameInput(const WinScreenFrameInputPayl
         return;
     }
     HandleRemoteFrameInput(p->epoch_id,
-                           p->phase_serial,
+                           p->phase_id,
                            p->phase,
                            p->frame,
                            p->ack_frame,
@@ -1359,29 +1353,6 @@ bool FrontendInputSync_IsCurrentEpochPhase(uint32_t epochId,
     return true;
 }
 
-bool FrontendInputSync_IsCurrentEpochPhaseSerial(uint32_t epochId,
-                                                 uint16_t phase,
-                                                 uint32_t phaseSerial,
-                                                 PacketType type,
-                                                 const char* context) {
-    if (!FrontendInputSync_IsCurrentEpochPhase(epochId, phase, type, context)) {
-        return false;
-    }
-    if (phaseSerial != s_phaseSerial) {
-        Rollback::NetplayLog_Write(
-            "FRONTEND", -1,
-            "Ignored stale phase-serial packet: type=%s packet_serial=%u local_serial=%u epoch=%u phase=%s context=%s",
-            PacketTypeName(type),
-            phaseSerial,
-            s_phaseSerial,
-            epochId,
-            FrontendSyncPhaseName(s_phase),
-            context ? context : "?");
-        return false;
-    }
-    return true;
-}
-
 void FrontendInputSync_SendPhaseBarrier(FrontendSyncPhase nextPhase,
                                         uint8_t reasonCode,
                                         const char* reason) {
@@ -1390,8 +1361,8 @@ void FrontendInputSync_SendPhaseBarrier(FrontendSyncPhase nextPhase,
     }
     FrontendPhaseBarrierPayload payload{};
     payload.epoch_id = s_epochId;
-    payload.phase_serial = s_phaseSerial;
     payload.phase = (uint16_t)s_phase;
+    payload.phase_id = CurrentPhaseIdByte();
     payload.next_phase = (uint16_t)nextPhase;
     payload.last_completed_frame = s_consumeFrame > 0 ? (s_consumeFrame - 1) : 0;
     payload.reason_code = reasonCode;
@@ -1402,10 +1373,9 @@ void FrontendInputSync_SendPhaseBarrier(FrontendSyncPhase nextPhase,
     }
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Sent phase barrier: epoch=%u phase=%s serial=%u next=%s last_frame=%u reason_code=%u reason=%s",
+        "Sent phase barrier: epoch=%u phase=%s next=%s last_frame=%u reason_code=%u reason=%s",
         s_epochId,
         FrontendSyncPhaseName(s_phase),
-        s_phaseSerial,
         FrontendSyncPhaseName(nextPhase),
         payload.last_completed_frame,
         reasonCode,
@@ -1416,28 +1386,25 @@ void FrontendInputSync_OnRemotePhaseBarrier(const FrontendPhaseBarrierPayload* p
     if (!p) {
         return;
     }
-    if (!FrontendInputSync_IsCurrentEpochPhaseSerial(p->epoch_id,
-                                                     p->phase,
-                                                     p->phase_serial,
-                                                     PacketType::FrontendPhaseBarrier,
-                                                     "phase barrier")) {
+    if (!FrontendInputSync_IsCurrentEpochPhase(p->epoch_id,
+                                               p->phase,
+                                               PacketType::FrontendPhaseBarrier,
+                                               "phase barrier")) {
         return;
     }
     if (s_localPhaseBarrierSent &&
         s_barrierNextPhase != (FrontendSyncPhase)p->next_phase &&
         s_barrierNextPhase != FrontendSyncPhase::None) {
         // An in-flight barrier crossing a phase edge disagrees with ours.
-        // Drop it and keep waiting — the frontend starvation timeout still
-        // backstops a genuine divergence. (M4 replaces this with an explicit
-        // resync handshake.) Latching recovery here killed live sessions on
-        // pure packet ordering.
+        // Drop it and keep waiting — the interrogation ladder (INV-11)
+        // backstops a genuine divergence. Latching recovery here killed live
+        // sessions on pure packet ordering.
         Rollback::NetplayLog_Write(
             "FRONTEND", -1,
-            "Ignored phase barrier with mismatched next-phase: local=%s remote=%s epoch=%u serial=%u",
+            "Ignored phase barrier with mismatched next-phase: local=%s remote=%s epoch=%u",
             FrontendSyncPhaseName(s_barrierNextPhase),
             FrontendSyncPhaseName((FrontendSyncPhase)p->next_phase),
-            s_epochId,
-            s_phaseSerial);
+            s_epochId);
         return;
     }
     s_remotePhaseBarrierSeen = true;
@@ -1445,10 +1412,9 @@ void FrontendInputSync_OnRemotePhaseBarrier(const FrontendPhaseBarrierPayload* p
     s_barrierNextPhase = (FrontendSyncPhase)p->next_phase;
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Remote phase barrier: epoch=%u phase=%s serial=%u next=%s last_frame=%u reason_code=%u",
+        "Remote phase barrier: epoch=%u phase=%s next=%s last_frame=%u reason_code=%u",
         s_epochId,
         FrontendSyncPhaseName(s_phase),
-        s_phaseSerial,
         FrontendSyncPhaseName((FrontendSyncPhase)p->next_phase),
         p->last_completed_frame,
         p->reason_code);
@@ -1474,7 +1440,8 @@ void FrontendInputSync_SendBoundaryDigest(const FrontendBoundaryDigestPayload* p
         return;
     }
     FrontendBoundaryDigestPayload sendPayload = *payload;
-    sendPayload.phase_serial = s_phaseSerial;
+    sendPayload._retired_serial = 0;
+    sendPayload.phase_id = CurrentPhaseIdByte();
     if (!BarrierProtocol_SendPacket(PacketType::FrontendBoundaryDigest, &sendPayload, sizeof(sendPayload))) {
         return;
     }
@@ -1501,10 +1468,9 @@ void FrontendInputSync_SendBoundaryDigest(const FrontendBoundaryDigestPayload* p
     if (s_digestMismatch) {
         Rollback::NetplayLog_Write(
             "FRONTDESYNC", -1,
-            "Boundary digest mismatch after local send: epoch=%u phase=%s serial=%u kind=%s frame=%u local=0x%08X remote=0x%08X action=recovery",
+            "Boundary digest mismatch after local send: epoch=%u phase=%s kind=%s frame=%u local=0x%08X remote=0x%08X action=recovery",
             sendPayload.epoch_id,
             FrontendSyncPhaseName((FrontendSyncPhase)sendPayload.phase),
-            sendPayload.phase_serial,
             FrontendDigestKindName((FrontendDigestKind)sendPayload.digest_kind),
             sendPayload.frame,
             s_localDigest,
@@ -1513,10 +1479,9 @@ void FrontendInputSync_SendBoundaryDigest(const FrontendBoundaryDigestPayload* p
     }
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Sent boundary digest: epoch=%u phase=%s serial=%u kind=%s frame=%u digest=0x%08X reason=%s",
+        "Sent boundary digest: epoch=%u phase=%s kind=%s frame=%u digest=0x%08X reason=%s",
         sendPayload.epoch_id,
         FrontendSyncPhaseName((FrontendSyncPhase)sendPayload.phase),
-        sendPayload.phase_serial,
         FrontendDigestKindName((FrontendDigestKind)sendPayload.digest_kind),
         sendPayload.frame,
         sendPayload.digest,
@@ -1527,11 +1492,10 @@ void FrontendInputSync_OnRemoteBoundaryDigest(const FrontendBoundaryDigestPayloa
     if (!p) {
         return;
     }
-    if (!FrontendInputSync_IsCurrentEpochPhaseSerial(p->epoch_id,
-                                                     p->phase,
-                                                     p->phase_serial,
-                                                     PacketType::FrontendBoundaryDigest,
-                                                     "boundary digest")) {
+    if (!FrontendInputSync_IsCurrentEpochPhase(p->epoch_id,
+                                               p->phase,
+                                               PacketType::FrontendBoundaryDigest,
+                                               "boundary digest")) {
         return;
     }
     if (s_localDigestSent && s_digestKind != (FrontendDigestKind)p->digest_kind) {
@@ -1552,10 +1516,9 @@ void FrontendInputSync_OnRemoteBoundaryDigest(const FrontendBoundaryDigestPayloa
     if (s_digestMismatch) {
         Rollback::NetplayLog_Write(
             "FRONTDESYNC", -1,
-            "Boundary digest mismatch after remote digest: epoch=%u phase=%s serial=%u kind=%s frame=%u local=0x%08X remote=0x%08X action=recovery",
+            "Boundary digest mismatch after remote digest: epoch=%u phase=%s kind=%s frame=%u local=0x%08X remote=0x%08X action=recovery",
             p->epoch_id,
             FrontendSyncPhaseName((FrontendSyncPhase)p->phase),
-            p->phase_serial,
             FrontendDigestKindName((FrontendDigestKind)p->digest_kind),
             p->frame,
             s_localDigest,
@@ -1564,10 +1527,9 @@ void FrontendInputSync_OnRemoteBoundaryDigest(const FrontendBoundaryDigestPayloa
     }
     Rollback::NetplayLog_Write(
         "FRONTEND", -1,
-        "Remote boundary digest: epoch=%u phase=%s serial=%u kind=%s frame=%u digest=0x%08X match=%d",
+        "Remote boundary digest: epoch=%u phase=%s kind=%s frame=%u digest=0x%08X match=%d",
         p->epoch_id,
         FrontendSyncPhaseName((FrontendSyncPhase)p->phase),
-        p->phase_serial,
         FrontendDigestKindName((FrontendDigestKind)p->digest_kind),
         p->frame,
         p->digest,
@@ -1582,135 +1544,52 @@ bool FrontendInputSync_HasDigestMismatch() {
     return s_digestMismatch;
 }
 
-void FrontendInputSync_OnRemoteDelayChangeReq(const DelayChangeReqPayload* p) {
+void FrontendInputSync_OnRemoteResyncRequest(const ResyncRequestPayload* p) {
     if (!p) {
         return;
     }
-    if (!FrontendInputSync_IsCurrentEpochPhaseSerial(p->epoch_id,
-                                                     p->phase,
-                                                     p->phase_serial,
-                                                     PacketType::DelayChangeReq,
-                                                     "delay change req")) {
-        return;
-    }
-
-    const uint16_t requested = ClampFrontendDelay(p->new_delay);
-    const FrontendDelayBumpReason requestedReason = SanitizeDelayReason(p->reason_code);
-    const uint32_t requestedApplyFrom = p->apply_from_frame > (s_consumeFrame + 1)
-        ? p->apply_from_frame
-        : (s_consumeFrame + 1);
-    const uint16_t delayFloor = GetEffectiveDelayFloor();
-    if (requested < delayFloor) {
-        SendDelayChangeAck(delayFloor,
-                           s_consumeFrame + 1,
-                           false,
-                           requestedReason);
-        return;
-    }
-
-    if (s_pendingDelayBump &&
-        s_pendingDelay == requested &&
-        s_pendingApplyFrom == requestedApplyFrom) {
-        SendDelayChangeAck(requested,
-                           requestedApplyFrom,
-                           true,
-                           requestedReason);
-        Rollback::NetplayLog_Verbose(
-            "FRONTDELAY", -1,
-            "Ignored duplicate remote delay bump request: phase=%s serial=%u requested=%u apply_from=%u reason=%s",
-            FrontendSyncPhaseName(s_phase),
-            s_phaseSerial,
-            requested,
-            requestedApplyFrom,
-            FrontendDelayBumpReasonName(requestedReason));
-        return;
-    }
-
-    s_pendingDelayBump = true;
-    s_pendingDelay = requested;
-    s_pendingApplyFrom = requestedApplyFrom;
-    s_pendingDelayReason = requestedReason;
-    SendDelayChangeAck(requested,
-                       s_pendingApplyFrom,
-                       true,
-                       requestedReason);
-
+    // Always answer with our identity tuple (INV-11: interrogation is an
+    // identity exchange, never a drop). Replying is legal in any state — a
+    // mismatched reply is exactly what triggers the peer's EpochAlign re-run.
+    ResyncReplyPayload reply{};
+    reply.epoch = s_epochId;
+    reply.phase_id = CurrentPhaseIdByte();
+    reply.native_mode = CurrentNativeModeByte();
+    reply.local_frame = s_consumeFrame;
+    BarrierProtocol_SendPacket(PacketType::ResyncReply, &reply, sizeof(reply));
     Rollback::NetplayLog_Write(
-        "FRONTDELAY", -1,
-        "Accepted remote delay bump: phase=%s serial=%u current=%u requested=%u apply_from=%u floor=%u reason=%s",
-        FrontendSyncPhaseName(s_phase),
-        s_phaseSerial,
-        s_sharedDelay,
-        requested,
-        s_pendingApplyFrom,
-        delayFloor,
-        FrontendDelayBumpReasonName(requestedReason));
+        "FRONTRESYNC", -1,
+        "Answered ResyncRequest: peer={epoch=%u phase_id=%u mode=%u frame=%u} local={epoch=%u phase_id=%u frame=%u}",
+        p->epoch, p->phase_id, p->native_mode, p->local_frame,
+        reply.epoch, reply.phase_id, reply.local_frame);
 }
 
-void FrontendInputSync_OnRemoteDelayChangeAck(const DelayChangeAckPayload* p) {
+void FrontendInputSync_OnRemoteResyncReply(const ResyncReplyPayload* p) {
     if (!p) {
         return;
     }
-    if (!FrontendInputSync_IsCurrentEpochPhaseSerial(p->epoch_id,
-                                                     p->phase,
-                                                     p->phase_serial,
-                                                     PacketType::DelayChangeAck,
-                                                     "delay change ack")) {
-        return;
-    }
-    if (!s_waitingForDelayAck) {
-        if (s_pendingDelayBump &&
-            p->accepted &&
-            p->acked_delay == s_pendingDelay &&
-            p->apply_from_frame == s_pendingApplyFrom) {
-            Rollback::NetplayLog_Verbose(
-                "FRONTDELAY", -1,
-                "Ignored duplicate frontend delay bump ack: serial=%u acked=%u apply_from=%u reason=%s",
-                s_phaseSerial,
-                p->acked_delay,
-                p->apply_from_frame,
-                FrontendDelayBumpReasonName(SanitizeDelayReason(p->reason_code)));
-        }
-        return;
-    }
-
-    s_waitingForDelayAck = false;
-    if (!p->accepted) {
-        Rollback::NetplayLog_Write(
-            "FRONTDELAY", -1,
-            "Remote rejected frontend delay bump: serial=%u requested=%u current=%u",
-            s_phaseSerial,
-            s_requestedDelay,
-            s_sharedDelay);
-        return;
-    }
-    if (p->acked_delay < s_requestedDelay) {
-        FrontendInputSync_RequestRecovery("frontend delay bump acked a smaller delay than requested");
-        return;
-    }
-
-    const uint16_t ackedDelay = s_pendingDelayBump && s_pendingDelay > p->acked_delay
-        ? s_pendingDelay
-        : p->acked_delay;
-    const uint32_t applyFrom = s_pendingDelayBump && s_pendingApplyFrom > p->apply_from_frame
-        ? s_pendingApplyFrom
-        : p->apply_from_frame;
-
-    s_pendingDelayBump = true;
-    s_pendingDelay = ackedDelay;
-    s_pendingApplyFrom = applyFrom > s_requestedApplyFrom
-        ? applyFrom
-        : s_requestedApplyFrom;
-    s_pendingDelayReason = s_requestedDelayReason;
+    s_resyncAwaitingReply = false;
+    const bool identityMatch =
+        p->epoch == s_epochId && p->phase_id == CurrentPhaseIdByte();
     Rollback::NetplayLog_Write(
-        "FRONTDELAY", -1,
-        "Remote acked frontend delay bump: serial=%u requested=%u acked=%u effective=%u apply_from=%u reason=%s",
-        s_phaseSerial,
-        s_requestedDelay,
-        p->acked_delay,
-        s_pendingDelay,
-        s_pendingApplyFrom,
-        FrontendDelayBumpReasonName(s_pendingDelayReason));
+        "FRONTRESYNC", -1,
+        "ResyncReply: peer={epoch=%u phase_id=%u mode=%u frame=%u} local={epoch=%u phase_id=%u frame=%u} match=%d cycles=%u",
+        p->epoch, p->phase_id, p->native_mode, p->local_frame,
+        s_epochId, CurrentPhaseIdByte(), s_consumeFrame,
+        identityMatch ? 1 : 0, s_resyncCycles);
+    if (!identityMatch && s_resyncEscalation == FrontendResyncEscalation::None) {
+        // Confirmed identity mismatch on a live link → EpochAlign re-run
+        // (§4.6 step 2). match_setup consumes and acts.
+        s_resyncEscalation = s_resyncCycles >= FRONTEND_RESYNC_MAX_CYCLES
+            ? FrontendResyncEscalation::Restart
+            : FrontendResyncEscalation::Realign;
+    }
+}
+
+FrontendResyncEscalation FrontendInputSync_ConsumeResyncEscalation() {
+    const FrontendResyncEscalation out = s_resyncEscalation;
+    s_resyncEscalation = FrontendResyncEscalation::None;
+    return out;
 }
 
 void FrontendInputSync_ReportLocalAdvanceIntent(uint16_t packedInput) {
@@ -1788,7 +1667,7 @@ void FrontendInputSync_GetSnapshot(FrontendInputSyncSnapshot* out) {
     out->input_phase_active = s_inputPhaseActive;
     out->role = s_role;
     out->phase = s_phase;
-    out->phase_serial = s_phaseSerial;
+    out->phase_id = CurrentPhaseIdByte();
     out->consume_id.epoch_id = s_epochId;
     out->consume_id.phase = (uint16_t)s_phase;
     out->consume_id.frame = (uint16_t)s_consumeFrame;
@@ -1796,10 +1675,7 @@ void FrontendInputSync_GetSnapshot(FrontendInputSyncSnapshot* out) {
     out->remote_latest_frame = s_remoteLatestFrame;
     out->remote_contiguous_frame_exclusive = GetRemoteContiguousFrameExclusive();
     out->max_local_lead = GetFrontendMaxLocalLead();
-    out->local_delay_proposal = s_localDelayProposal;
-    out->remote_delay_proposal = s_remoteDelayProposal;
-    out->shared_delay = s_sharedDelay;
-    out->delay_negotiated = s_delayNegotiated;
+    out->frontend_delay = s_frontendDelay;
     out->local_phase_barrier_sent = s_localPhaseBarrierSent;
     out->remote_phase_barrier_seen = s_remotePhaseBarrierSeen;
     out->phase_barrier_satisfied = s_localPhaseBarrierSent && s_remotePhaseBarrierSeen;
@@ -1811,12 +1687,14 @@ void FrontendInputSync_GetSnapshot(FrontendInputSyncSnapshot* out) {
     out->digest_kind = s_digestKind;
     out->local_digest = s_localDigest;
     out->remote_digest = s_remoteDigest;
-    out->pending_delay_bump = s_pendingDelayBump || s_waitingForDelayAck;
-    out->pending_delay = s_pendingDelayBump ? s_pendingDelay : s_requestedDelay;
-    out->pending_apply_from = s_pendingDelayBump ? s_pendingApplyFrom : s_requestedApplyFrom;
+    out->pending_delay_bump = s_pendingDelayBump;
+    out->pending_delay = s_pendingDelay;
+    out->pending_apply_from = s_pendingApplyFrom;
     out->local_advance_observed = s_localAdvanceObserved;
     out->remote_advance_observed = s_remoteAdvanceObserved;
     out->timed_out = s_timedOut;
+    out->starved_frames = s_starvedFrames;
+    out->resync_cycles = s_resyncCycles;
     _snprintf_s(out->recovery_reason,
                 sizeof(out->recovery_reason),
                 _TRUNCATE,

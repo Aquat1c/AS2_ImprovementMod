@@ -56,12 +56,13 @@ static const SentPacket* FindLastPacket(Net::PacketType type) {
     return nullptr;
 }
 
-static const Net::DelayChangeReqPayload* FindLastDelayReq() {
-    const SentPacket* packet = FindLastPacket(Net::PacketType::DelayChangeReq);
-    if (!packet || packet->payload.size() < sizeof(Net::DelayChangeReqPayload)) {
-        return nullptr;
+static bool HasPendingLocalDelayBump(uint16_t* outDelay = nullptr) {
+    Net::FrontendInputSyncSnapshot snap{};
+    Net::FrontendInputSync_GetSnapshot(&snap);
+    if (outDelay) {
+        *outDelay = snap.pending_delay;
     }
-    return reinterpret_cast<const Net::DelayChangeReqPayload*>(packet->payload.data());
+    return snap.pending_delay_bump;
 }
 
 static Net::CharSelFrameInputPayload MakeFrameInput(uint32_t epochId,
@@ -70,8 +71,8 @@ static Net::CharSelFrameInputPayload MakeFrameInput(uint32_t epochId,
                                                     uint16_t input) {
     Net::CharSelFrameInputPayload payload{};
     payload.epoch_id = epochId;
-    payload.phase_serial = Net::FrontendInputSync_GetPhaseSerial();
     payload.phase = (uint16_t)phase;
+    payload.phase_id = (uint8_t)Net::FrontendSyncPhaseToPhaseId(phase);
     payload.frame = frame;
     payload.ack_frame = 0;
     payload.input_count = 1;
@@ -84,8 +85,8 @@ static Net::WinScreenFrameInputPayload MakeWinScreenFrameInput(uint32_t epochId,
                                                                uint16_t input) {
     Net::WinScreenFrameInputPayload payload{};
     payload.epoch_id = epochId;
-    payload.phase_serial = Net::FrontendInputSync_GetPhaseSerial();
     payload.phase = (uint16_t)Net::FrontendSyncPhase::WinScreen;
+    payload.phase_id = (uint8_t)Net::FrontendPhaseId::WinScreen;
     payload.frame = frame;
     payload.ack_frame = 0;
     payload.input_count = 1;
@@ -111,27 +112,22 @@ static void ResetSubsystems(uint32_t nowMs = 100) {
     Net::StageSelSync_Init();
 }
 
-static void BeginNegotiatedPhase(uint16_t sharedDelay,
-                                 Net::FrontendSyncPhase phase,
-                                 Net::PacketType packetType = Net::PacketType::CharSelFrameInput) {
-    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x12345678u, sharedDelay, "test epoch");
-    Net::FrontendInputSync_OnRemoteSyncAnnounce(sharedDelay, "test remote announce");
-    TEST_CHECK(Net::FrontendInputSync_FinalizeDelayNegotiation("test finalize"),
-        "frontend delay negotiation should succeed");
+// M5: the frontend delay is a locally derived, peer-local value (INV-23) —
+// no negotiation exists; the epoch begins with the local delay directly.
+static void BeginLocalPhase(uint16_t frontendDelay,
+                            Net::FrontendSyncPhase phase,
+                            Net::PacketType packetType = Net::PacketType::CharSelFrameInput) {
+    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x12345678u, frontendDelay, "test epoch");
     Net::FrontendInputSync_BeginInputPhase(phase, packetType, "test phase");
 }
 
-static void BeginNegotiatedWinScreen(uint16_t sharedDelay) {
-    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Join, 0x87654321u, sharedDelay, "test winscreen epoch");
-    Net::FrontendInputSync_OnRemoteSyncAnnounce(sharedDelay, "test winscreen remote announce");
-    Net::FrontendInputSync_OnRemoteSyncConfirm(sharedDelay, sharedDelay, "test winscreen remote confirm");
-    TEST_CHECK(Net::FrontendInputSync_FinalizeDelayNegotiation("test winscreen finalize"),
-        "winscreen frontend delay negotiation should succeed");
+static void BeginLocalWinScreen(uint16_t frontendDelay) {
+    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Join, 0x87654321u, frontendDelay, "test winscreen epoch");
     g_sessionRole = Net::SessionRole::Join;
     Net::WinScreenSync_Begin();
 }
 
-static void TestJitterAwareProposalAndSharedNegotiation() {
+static void TestJitterAwareLocalDelayDerivation() {
     ResetSubsystems();
 
     Net::DelayPolicy_UpdateMeasurement(18.0f, 0.0f);
@@ -141,15 +137,14 @@ static void TestJitterAwareProposalAndSharedNegotiation() {
     const int jitteryProposal = Net::FrontendInputSync_ComputeDelayProposal();
 
     TEST_CHECK(jitteryProposal > stableProposal,
-        "high RTT variance should raise the local frontend delay proposal");
+        "high RTT variance should raise the local frontend delay");
 
+    // M5 (INV-23): the epoch adopts the locally derived value directly —
+    // there is no negotiation and no remote input to the number.
     Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x100u,
-        (uint16_t)stableProposal, "asymmetric proposal test");
-    Net::FrontendInputSync_OnRemoteSyncAnnounce((uint16_t)jitteryProposal, "remote proposal");
-    TEST_CHECK(Net::FrontendInputSync_FinalizeDelayNegotiation("negotiate asymmetric"),
-        "asymmetric frontend proposals should negotiate successfully");
-    TEST_CHECK(Net::FrontendInputSync_GetSharedDelay() == (uint16_t)std::max(stableProposal, jitteryProposal),
-        "shared frontend delay should be the max of local and remote recommendations");
+        (uint16_t)jitteryProposal, "local delay adoption test");
+    TEST_CHECK(Net::FrontendInputSync_GetFrontendDelay() == (uint16_t)jitteryProposal,
+        "the frontend delay should be exactly the locally derived value");
 }
 
 static void TestJitterPressureTriggersIncreaseOnlyDelayBump() {
@@ -157,7 +152,7 @@ static void TestJitterPressureTriggersIncreaseOnlyDelayBump() {
 
     Net::DelayPolicy_UpdateMeasurement(18.0f, 0.0f);
     const uint16_t initialDelay = (uint16_t)Net::FrontendInputSync_ComputeDelayProposal();
-    BeginNegotiatedPhase(initialDelay, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(initialDelay, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0);
     ClearSentPackets();
 
@@ -169,21 +164,19 @@ static void TestJitterPressureTriggersIncreaseOnlyDelayBump() {
     Net::FrontendInputSync_Test_SetClockMs(850);
     Net::FrontendInputSync_HasInputsForCurrentFrame();
 
-    const Net::DelayChangeReqPayload* req = FindLastDelayReq();
-    TEST_CHECK(req != nullptr, "sustained jitter pressure should emit a delay bump request");
-    if (req) {
-        TEST_CHECK(req->new_delay > initialDelay,
-            "jitter-triggered delay bump should only increase the shared delay");
-        TEST_CHECK(req->reason_code == (uint8_t)Net::FrontendDelayBumpReason::JitterPressure,
-            "jitter-triggered delay bump should carry the jitter pressure reason");
-    }
+    // M5: the bump is a LOCAL scheduled increase (no wire message, INV-23).
+    uint16_t pendingDelay = 0;
+    TEST_CHECK(HasPendingLocalDelayBump(&pendingDelay),
+        "sustained jitter pressure should schedule a local delay bump");
+    TEST_CHECK(pendingDelay > initialDelay,
+        "jitter-triggered delay bump should only increase the frontend delay");
 }
 
 static void TestStarvationDelayBumpRequiresRemoteFrame() {
     ResetSubsystems(100);
 
     Net::DelayPolicy_UpdateMeasurement(18.0f, 0.0f);
-    BeginNegotiatedPhase(3, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(3, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0);
     ClearSentPackets();
 
@@ -194,7 +187,7 @@ static void TestStarvationDelayBumpRequiresRemoteFrame() {
     Net::FrontendInputSync_Test_SetClockMs(1600);
     Net::FrontendInputSync_HasInputsForCurrentFrame();
 
-    TEST_CHECK(FindLastDelayReq() == nullptr,
+    TEST_CHECK(!HasPendingLocalDelayBump(),
         "phase-entry starvation before any remote frame should not increase frontend delay");
 
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
@@ -213,18 +206,13 @@ static void TestStarvationDelayBumpRequiresRemoteFrame() {
     Net::FrontendInputSync_Test_SetClockMs(2850);
     Net::FrontendInputSync_HasInputsForCurrentFrame();
 
-    const Net::DelayChangeReqPayload* req = FindLastDelayReq();
-    TEST_CHECK(req != nullptr,
-        "starvation after remote traffic has started should still request a delay bump");
-    if (req) {
-        TEST_CHECK(req->reason_code == (uint8_t)Net::FrontendDelayBumpReason::Starvation,
-            "post-traffic starvation bump should carry the starvation reason");
-    }
+    TEST_CHECK(HasPendingLocalDelayBump(),
+        "starvation after remote traffic has started should still schedule a local delay bump");
 }
 
 static void TestOutOfOrderFrontendInputWaitsForMissingCurrentFrame() {
     ResetSubsystems();
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0x0010);
 
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
@@ -254,7 +242,7 @@ static void TestOutOfOrderFrontendInputWaitsForMissingCurrentFrame() {
 
 static void TestCharSelInputUsesNegotiatedFrontendDelay() {
     ResetSubsystems();
-    BeginNegotiatedPhase(4, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(4, Net::FrontendSyncPhase::CharSel);
 
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
     Net::FrontendInputSync_CaptureLocalInput(0x0040);
@@ -281,7 +269,7 @@ static void TestCharSelInputUsesNegotiatedFrontendDelay() {
 
 static void TestFrontendInputBeyondRingDoesNotAliasOrRecover() {
     ResetSubsystems();
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0x0010);
 
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
@@ -297,7 +285,7 @@ static void TestFrontendInputBeyondRingDoesNotAliasOrRecover() {
 
 static void TestConsumedLocalFrontendInputRemainsResendableUntilAcked() {
     ResetSubsystems(100);
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0x0010);
 
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
@@ -329,7 +317,7 @@ static void TestConsumedLocalFrontendInputRemainsResendableUntilAcked() {
 
 static void TestFrontendSendAheadCannotOverwritePeerAckWindow() {
     ResetSubsystems(100);
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
 
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
     for (uint32_t i = 0; i < 296; i++) {
@@ -388,7 +376,7 @@ static void TestStageMergeOpposingDirectionsAndConfirm() {
 
 static void TestWinScreenAdvanceReleasesFromEitherPeer() {
     ResetSubsystems();
-    BeginNegotiatedWinScreen(2);
+    BeginLocalWinScreen(2);
 
     Net::WinScreenSync_CaptureLocalInput(0);
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
@@ -420,15 +408,15 @@ static void TestWinScreenAdvanceReleasesFromEitherPeer() {
         "winscreen should record the actual peer that requested the skip");
 }
 
-static void TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters() {
+static void TestPhaseTransitionPreservesDelayAndResetsPhaseCounters() {
     ResetSubsystems();
-    BeginNegotiatedPhase(4, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(4, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0x0010);
 
     Net::FrontendInputSyncSnapshot before{};
     Net::FrontendInputSync_GetSnapshot(&before);
-    TEST_CHECK(before.shared_delay == 4,
-        "charsel phase should start with the negotiated shared delay");
+    TEST_CHECK(before.frontend_delay == 4,
+        "charsel phase should start with the locally derived frontend delay");
     TEST_CHECK(before.local_input_frame > 0,
         "charsel phase should advance local input lead once capture begins");
 
@@ -440,8 +428,8 @@ static void TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters() {
     Net::FrontendInputSync_GetSnapshot(&after);
     TEST_CHECK(after.phase == Net::FrontendSyncPhase::StageSel,
         "phase transition should advance to stage select explicitly");
-    TEST_CHECK(after.shared_delay == before.shared_delay,
-        "stage select should preserve the negotiated shared frontend delay");
+    TEST_CHECK(after.frontend_delay == before.frontend_delay,
+        "stage select should preserve the frontend delay across the phase edge");
     TEST_CHECK(after.consume_id.frame == 0,
         "phase transition should reset the per-phase consume frame");
     TEST_CHECK(after.local_input_frame == 0,
@@ -450,26 +438,28 @@ static void TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters() {
         "phase transition should reset only the per-phase remote frame tracking");
 }
 
-static void TestStalePhaseSerialFrontendInputIsIgnored() {
+static void TestStaleEpochAndForeignPhaseIdInputIsIgnored() {
     ResetSubsystems();
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
-    const uint32_t oldSerial = Net::FrontendInputSync_GetPhaseSerial();
-
-    Net::FrontendInputSync_BeginInputPhase(Net::FrontendSyncPhase::CharSel,
-        Net::PacketType::CharSelFrameInput,
-        "same phase serial rollover test");
-    TEST_CHECK(Net::FrontendInputSync_GetPhaseSerial() != oldSerial,
-        "starting a new frontend phase instance should allocate a new phase serial");
-
     Net::FrontendInputSync_CaptureLocalInput(0);
 
-    Net::CharSelFrameInputPayload stale =
-        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0x0040);
-    stale.phase_serial = oldSerial;
-    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&stale);
+    // Section 3.4: acceptance is keyed on (epoch, phase_id) - a stale epoch
+    // is dropped outright (no serials exist to diverge, INV-7).
+    Net::CharSelFrameInputPayload staleEpoch =
+        MakeFrameInput(epochId - 1u, Net::FrontendSyncPhase::CharSel, 0, 0x0040);
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&staleEpoch);
     TEST_CHECK(!Net::FrontendInputSync_HasInputsForCurrentFrame(),
-        "same-epoch same-phase input with an old phase serial should be ignored");
+        "stale-epoch frame input must be ignored");
+
+    // A coherent-but-unexpected phase_id is counted (interrogation source),
+    // never applied.
+    Net::CharSelFrameInputPayload wrongPhase =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0x0055);
+    wrongPhase.phase_id = (uint8_t)Net::FrontendPhaseId::WinScreen;
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&wrongPhase);
+    TEST_CHECK(!Net::FrontendInputSync_HasInputsForCurrentFrame(),
+        "frame input with a mismatched phase_id must not be applied");
 
     Net::CharSelFrameInputPayload current =
         MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0x0080);
@@ -478,14 +468,69 @@ static void TestStalePhaseSerialFrontendInputIsIgnored() {
     uint16_t local = 0;
     uint16_t remote = 0;
     TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&local, &remote, nullptr),
-        "current phase-serial input should unblock the frontend frame");
+        "matching (epoch, phase_id) input should unblock the frontend frame");
     TEST_CHECK(remote == 0x0080,
-        "stale phase-serial input must not overwrite current remote input");
+        "mismatched-identity input must not overwrite current remote input");
+}
+
+static void TestStarvationInterrogationAndEscalationLadder() {
+    ResetSubsystems();
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
+    Net::FrontendInputSync_CaptureLocalInput(0);
+    ClearSentPackets();
+
+    // 120 lockstep ticks of zero accepted remote frames -> ResyncRequest
+    // (INV-11: interrogate on a live transport, never time out silently).
+    for (int i = 0; i < 120; ++i) {
+        Net::FrontendInputSync_FrameUpdate();
+    }
+    const SentPacket* req = FindLastPacket(Net::PacketType::ResyncRequest);
+    TEST_CHECK(req != nullptr,
+        "120 starved lockstep ticks should emit a ResyncRequest");
+    if (req && req->payload.size() >= sizeof(Net::ResyncRequestPayload)) {
+        const auto* rp = reinterpret_cast<const Net::ResyncRequestPayload*>(req->payload.data());
+        TEST_CHECK(rp->epoch == Net::FrontendInputSync_GetEpochId(),
+            "ResyncRequest should carry the current epoch");
+        TEST_CHECK(rp->phase_id == (uint8_t)Net::FrontendPhaseId::CharSel,
+            "ResyncRequest should carry the current phase_id");
+    }
+
+    // A mismatched reply confirms a divergent identity -> Realign escalation.
+    Net::ResyncReplyPayload reply{};
+    reply.epoch = Net::FrontendInputSync_GetEpochId() + 5u;
+    reply.phase_id = (uint8_t)Net::FrontendPhaseId::WinScreen;
+    reply.local_frame = 0;
+    Net::FrontendInputSync_OnRemoteResyncReply(&reply);
+    TEST_CHECK(Net::FrontendInputSync_ConsumeResyncEscalation() ==
+                   Net::FrontendResyncEscalation::Realign,
+        "an identity-mismatch reply should escalate to an EpochAlign re-run");
+    TEST_CHECK(Net::FrontendInputSync_ConsumeResyncEscalation() ==
+                   Net::FrontendResyncEscalation::None,
+        "the escalation latch should consume exactly once");
+
+    // Three failed interrogation cycles -> pregame restart escalation.
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        for (int i = 0; i < 120; ++i) {
+            Net::FrontendInputSync_FrameUpdate();
+        }
+    }
+    TEST_CHECK(Net::FrontendInputSync_ConsumeResyncEscalation() ==
+                   Net::FrontendResyncEscalation::Restart,
+        "three failed interrogation cycles should escalate to a pregame restart");
+
+    // A request from the peer is always answered with our identity tuple.
+    ClearSentPackets();
+    Net::ResyncRequestPayload peerReq{};
+    peerReq.epoch = 999;
+    peerReq.phase_id = (uint8_t)Net::FrontendPhaseId::StageSel;
+    Net::FrontendInputSync_OnRemoteResyncRequest(&peerReq);
+    TEST_CHECK(FindLastPacket(Net::PacketType::ResyncReply) != nullptr,
+        "a ResyncRequest must always be answered with a ResyncReply");
 }
 
 static void TestDuplicateFrontendInputAndStageSyncAreIdempotent() {
     ResetSubsystems();
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0);
 
     const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
@@ -507,7 +552,6 @@ static void TestDuplicateFrontendInputAndStageSyncAreIdempotent() {
 
     Net::StageSyncPayload initial{};
     initial.epoch_id = epochId;
-    initial.phase_serial = Net::FrontendInputSync_GetPhaseSerial();
     initial.phase = (uint16_t)Net::FrontendSyncPhase::StageSel;
     initial.frame = 5;
     initial.stage_id = 3;
@@ -539,7 +583,7 @@ static void TestDuplicateFrontendInputAndStageSyncAreIdempotent() {
 
 static void TestNoLiveDelayDecreaseDuringActivePhase() {
     ResetSubsystems(100);
-    BeginNegotiatedPhase(4, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(4, Net::FrontendSyncPhase::CharSel);
     Net::FrontendInputSync_CaptureLocalInput(0);
     ClearSentPackets();
 
@@ -551,7 +595,7 @@ static void TestNoLiveDelayDecreaseDuringActivePhase() {
     Net::FrontendInputSync_Test_SetClockMs(750);
     Net::FrontendInputSync_HasInputsForCurrentFrame();
 
-    TEST_CHECK(FindLastDelayReq() == nullptr,
+    TEST_CHECK(!HasPendingLocalDelayBump(),
         "frontend delay must not auto-decrease during an active phase");
 }
 
@@ -591,7 +635,7 @@ static void TestGameplayDelaySharedSafeAndExpertModes() {
 
 static void TestLocalInputLatchPreservesTapWhileLeadCapped() {
     ResetSubsystems(100);
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
 
     Net::FrontendInputSync_CaptureLocalInput(0);
     Net::FrontendInputSync_CaptureLocalInput(0);
@@ -636,7 +680,7 @@ static void TestLocalInputLatchPreservesTapWhileLeadCapped() {
 
 static void TestFrontendInputPacketsCarrySixteenFramesOfHistory() {
     ResetSubsystems(100);
-    BeginNegotiatedPhase(2, Net::FrontendSyncPhase::CharSel);
+    BeginLocalPhase(2, Net::FrontendSyncPhase::CharSel);
     ClearSentPackets();
 
     for (uint16_t i = 0; i < 20; i++) {
@@ -780,7 +824,7 @@ void LogWindow_RenderContent(void) {}
 int main() {
     std::printf("Running frontend sync tests...\n");
 
-    TestJitterAwareProposalAndSharedNegotiation();
+    TestJitterAwareLocalDelayDerivation();
     TestJitterPressureTriggersIncreaseOnlyDelayBump();
     TestStarvationDelayBumpRequiresRemoteFrame();
     TestOutOfOrderFrontendInputWaitsForMissingCurrentFrame();
@@ -790,8 +834,9 @@ int main() {
     TestFrontendSendAheadCannotOverwritePeerAckWindow();
     TestStageMergeOpposingDirectionsAndConfirm();
     TestWinScreenAdvanceReleasesFromEitherPeer();
-    TestPhaseTransitionPreservesSharedDelayAndResetsPhaseCounters();
-    TestStalePhaseSerialFrontendInputIsIgnored();
+    TestPhaseTransitionPreservesDelayAndResetsPhaseCounters();
+    TestStaleEpochAndForeignPhaseIdInputIsIgnored();
+    TestStarvationInterrogationAndEscalationLadder();
     TestDuplicateFrontendInputAndStageSyncAreIdempotent();
     TestNoLiveDelayDecreaseDuringActivePhase();
     TestGameplayDelaySharedSafeAndExpertModes();

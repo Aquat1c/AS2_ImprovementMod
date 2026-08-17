@@ -78,9 +78,10 @@ packet_router→engine ingest — additions are allowed, removals are not):
       `gekko_avg_ping`/`gekko_jitter` → `link_avg_ping`/`link_jitter`)
 - [ ] `RollbackSession_ComputeLiveStateChecksum` / `InjectLocalInput`
 
-Deleted at the M5 cutover (already planned, not part of the freeze):
-`RollbackSession_BufferGekkoPacket`. `RollbackSessionSnapshot.gekko_*` field
-names are renamed `link_*` at M5 together with the engine cutover.
+Done at M5: `RollbackSession_BufferGekkoPacket` renamed
+`RollbackSession_OnInputStreamPacket` (both adapters);
+`RollbackSession_OnSyncHashPacket` added (engine2 ingest; Gekko no-op);
+`RollbackSessionSnapshot.gekko_*` field names renamed `link_*`.
 
 ## 5. Policy/lifecycle contracts consumed by the frontend — preserved
 
@@ -102,15 +103,21 @@ until M5, then the v2 `InputStreamPayload` schema).
 Deleted at M3 (session2 cutover): `Hello` (1), `HelloAck` (2) — superseded by
 the live 5-step nonce handshake; their side data (nickname/round/timing/HUD
 style) moved to `PeerIdentity` (79, new at M3, sent post-handshake).
-Marked LEGACY, still live until the M5 cutover: `DelayChangeReq/Ack`,
-`GekkoReady`, `SyncAnnounce`/`SyncConfirm` delay-negotiation fields.
+Deleted at M5: `DelayChangeReq` (21) / `DelayChangeAck` (22) + payloads
+(INV-23 — the frontend delay is locally derived, no negotiation flow);
+`GekkoReady` (24) + payload + flags (the startup gameplay-entry barrier rides
+`TransitionBarrier` kind `GameplayStart`); the `SyncAnnounce`/`SyncConfirm`
+delay fields (byte positions kept as `_retired*` pads, sizes 8/12 stable).
+Changed at M5 (§3.4 acceptance cutover): the frontend `phase_serial` fields
+became `_retired_serial` pads (sent 0, never read); acceptance is keyed on
+`(epoch, phase_id)`; `ResyncRequest` (62) / `ResyncReply` (63) are live
+(INV-11 interrogation); `NetTransitionKind::EpochAlign` payload fields are
+live (host-minted epoch authority, match_setup).
 Live from M3: `SessionHello/Offer/Ack/Confirm/ConfirmAck` (the handshake),
 `PeerIdentity`; `DisconnectReason::Busy` (5) as ENet disconnect data.
-Defined, still unsent (M4+): `InputStreamPayload` + `PressureReport`,
-`SyncHash/SyncHashAck`, `TimeProbe/TimeProbeAck`, `ResyncReply`
-(+ `ResyncRequest` payload), `FrontendPhaseId`,
-`NetTransitionKind::EpochAlign` + payload fields, `phase_id` in the four
-frontend payloads.
+Live from M5 on the engine2 configuration: `SyncHash` (75) with the router
+session_id gate. Defined, still unsent: `SyncHashAck`,
+`TimeProbe/TimeProbeAck` (time_probe lands at M6).
 Changed at M4 (§3.2 terminal shape, INV-20): `DisconnectPayload` is now
 `{code u8, reason_id u32 (fnv1a32 of the typed reason name), human[96]}`
 (102 B pin); session2 fault terminals resend it at 100 ms across the bounded

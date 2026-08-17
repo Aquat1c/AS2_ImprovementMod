@@ -108,13 +108,20 @@ bool RollbackSession_DrainPendingNonAdvanceEvents();
 void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2);
 
 // ============================================================================
-// GekkoNet Packet Ingestion
+// Wire packet ingestion (routed by net/packet_router)
 // ============================================================================
 
-/// Buffer a received InputStream packet payload for GekkoNet to drain.
-/// Called by the packet router when an InputStream packet arrives.
-/// (Deleted at the engine2/M5 cutover.)
-void RollbackSession_BufferGekkoPacket(const void* data, size_t len);
+/// Ingest a received InputStream (23) payload. Under AS2_WITH_GEKKO=ON the
+/// payload is raw GekkoNet bytes buffered for the Gekko session to drain;
+/// under the engine2 adapter it is the v2 InputStreamPayload (§3.2), with
+/// the session_id gate applied before any state mutation (§3.1).
+/// (M5: renamed from RollbackSession_BufferGekkoPacket — inventory §11.)
+void RollbackSession_OnInputStreamPacket(const void* data, size_t len);
+
+/// Ingest a received SyncHash (75) payload (§2.7.7 confirmed-frame
+/// verification). No-op on the Gekko adapter (its desync detection rides
+/// StateDigest); the engine2 adapter feeds the engine's hash queue.
+void RollbackSession_OnSyncHashPacket(const void* data, size_t len);
 
 // ============================================================================
 // Queries
@@ -226,9 +233,10 @@ struct RollbackSessionSnapshot {
     int32_t  local_inputs_sent;
     int32_t  remote_inputs_received;
 
-    // GekkoNet network stats
-    float    gekko_avg_ping;
-    float    gekko_jitter;
+    // Link stats (M5 rename per inventory §11: gekko_* → link_*; fed by the
+    // backend's own RTT estimate — time_probe from M6 on the engine2 path)
+    float    link_avg_ping;
+    float    link_jitter;
 };
 
 void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out);

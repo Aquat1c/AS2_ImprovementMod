@@ -966,3 +966,319 @@ milestone must know. Plan references are to `RE07_MASTER_REBUILD_PLAN.md`.
 7. `engine2_tests` runs a 100k-frame soak + a memcpy-heavy microbench —
    expect a few seconds of runtime; if CTest timeouts are tight, the soak
    constant is `kFrames` in `SoakRun`.
+
+---
+
+## 2026-08-17 — M5 (match_setup + frontend phase-identity cutover; ships with M6)
+
+### M5-1: `net/match_setup` — PregameSync_* facade re-implementation; pregame_sync/match_bootstrap internals deleted
+
+- **Files:** `src/net/match_setup.cpp` (new, ~1660 lines),
+  `include/net/pregame_sync.h` (facade preserved; additive
+  `PregameSync_GetCurrentEpoch()` + `PregameBootstrapInfo`/
+  `PregameSync_GetBootstrapInfo()`), `src/net/pregame_sync.cpp` (DELETED),
+  `src/net/match_bootstrap.cpp` (DELETED), `include/net/match_bootstrap.h`
+  (DELETED), `CMakeLists.txt`.
+- **Done:**
+  - One phase machine behind the verbatim 12-function `PregameSync_*` facade
+    (`PregamePhase` kept as the reporting vocabulary). The former
+    match_bootstrap internals (config exchange, load barrier, baseline
+    rendezvous, GameplayStart GO) are absorbed as statics in the same TU;
+    `MatchBootstrap_*` is retired tree-wide (online_wiring's two snapshot
+    reads now use the additive `PregameSync_GetBootstrapInfo`).
+  - **Epoch authority (§2.5):** host-minted u32 generations, strictly
+    increasing, session-scoped (counter resets when `Session2_GetSessionId()`
+    changes; `NextEpoch()` also absorbs the deterministic charsel-cancel
+    frontend rebinds so mints can never collide). Join adopts via EpochAlign.
+  - **EpochAlign barrier (INV-8/10):** rides the SyncConfirmed reporting
+    phase. Host mints + proposes `{epoch, first_phase(CharSel|None),
+    native_mode}`; join waits, adopts the host payload verbatim, echoes its
+    proposal; commit requires identical `{epoch, first_phase}` (enforced in
+    transition_barrier). Commit consumption is gated on completing any native
+    mode-9 exit (§4.5 step 2); the commit cancels every prior frontend
+    machine (`FrontendInputSync_AbortEpoch` + fresh `BeginEpoch(epoch)`)
+    and routes to CharSel or (fast path) straight to ConfigExchange.
+  - **Rematch fast path preserved:** `BeginRematch` contract unchanged;
+    implemented as rotate → EpochAlign(first_phase=None) → ConfigExchange →
+    Load → Baseline → GO; freeze-coverage extension carried over.
+  - **Recovery ladder (§4.6, INV-11/12):** ALL recoverable failures now route
+    through `RestartPregame(reason)` — abort machines, fresh epoch, live
+    connection, both roles (a mid-run foreign SyncAnnounce is recognized as
+    the peer's restart signal and converges both sides). This covers: sync/
+    align/config timeouts (with the M1 45 s liveness-cap semantics kept),
+    load timeout (F-11), baseline timeout, baseline capture failure, and all
+    frontend recovery requests (which previously went `Error` →
+    `HandleDisconnection`). `SetPhase(Error)` is now reserved for genuine
+    fail-closed terminals: config validation/hash rejection (C-3 class) and
+    the second baseline mismatch, which fires
+    `Session2_Terminate(ConfirmedDesync)` first (`BaselineMismatch`, F-12).
+  - **Interrogation escalations consumed here:** `FrontendInputSync_
+    ConsumeResyncEscalation()` polled every FrameUpdate (including
+    Idle/GameplayHandoff so the winscreen stream is covered): `Realign` in a
+    charsel-family phase → EpochAlign re-run under the SAME epoch (barrier
+    slot cleared, re-proposed, frontend phase restarted at re-commit);
+    anything else → pregame restart under a fresh epoch. Never a teardown.
+  - **INV-11 transport gate injected:** `FrontendInputSync_
+    SetTransportHealthyGate` registered with supervisor
+    `!Interrupted && !Dead` (interrogate only on a live link; the silence
+    ladder owns the rest — INV-14).
+  - Baseline mismatch retry (§2.5 "retry load once"): first mismatch dumps
+    both breakdowns and re-runs the Baseline phase (recapture + re-exchange)
+    once under the same epoch; second mismatch is the terminal.
+  - Callback rewiring per inventory §4/§6 all preserved at their new homes:
+    `NetplayPaletteRuntime_OnLockedMatchConfig` at config agreement,
+    `SpectatorRuntime_OnSelectionCommitted` at ConfigAgreed,
+    `MatchLifecycle_OnMatchEnter` + `OnlineWiring_OnGameplayStart` at
+    handoff, palette `OnDisconnect` at begin/abort/restart resets.
+- **Deviations (logged per the plan rule):**
+  1. **Config/load/baseline stay on their shipping packet flows** (14-19/25)
+     rather than TransitionBarrier kinds. The §2.5 wording makes load/GO
+     "TransitionBarrier commits"; the shipping LoadBarrier/BaselineReady/
+     GameplayStart packets already implement the same reliable both-or-neither
+     rendezvous AND carry payloads (mode/substate/sim-frame diagnostics,
+     bootstrap frame facts) a bare intent barrier cannot. EpochAlign and the
+     startup gameplay-entry release (M5-4) are TransitionBarrier kinds as
+     specified. M6 may consolidate if the director wants one primitive.
+  2. **Baseline "retry load once" is a recapture-and-re-exchange**, not a
+     full asset reload (the game is frozen at the sub-3 boundary; a real
+     reload needs mode rewinding the director doesn't own until M6). A
+     deterministic content divergence therefore terminates one retry later,
+     as specified; a transient capture divergence is genuinely healed.
+  3. **Winscreen-context Realign escalates to Restart** (fresh epoch,
+     charsel) instead of re-running EpochAlign for the winscreen epoch — the
+     native mode-9 exit routing needed for a same-epoch winscreen re-align
+     belongs to the M6 director. Ladder level 3 instead of level 2; still
+     never a teardown.
+  4. `PregameSnapshot.session_id` keeps reporting the 32-bit pregame run id
+     (seed scope), not the epoch — UI meaning unchanged; the epoch has its
+     own query.
+
+### M5-2: Frontend phase-identity migration (§3.4) — serial allocator deleted; delay negotiation retired (INV-23)
+
+- **Files:** `include/net/frontend_input_sync.h` (rewritten),
+  `src/net/frontend_input_sync.cpp` (rewritten), `include/net/protocol.h`,
+  `src/net/charsel_sync.cpp`, `src/net/winscreen_sync.cpp`,
+  `src/patches/input_override.cpp` (1 rename),
+  `include/net/barrier_protocol.h`.
+- **Done:**
+  - **Acceptance rule cutover:** frame-input packets accept iff
+    `(epoch, phase_id)` matches (§3.4); `phase_id` is filled from the fixed
+    `FrontendPhaseId` mapping (`FrontendSyncPhaseToPhaseId`, new inline in
+    the header). A coherent-but-unexpected `phase_id` increments a counter;
+    at 60 packets it triggers the INV-11 interrogation instead of silent
+    dropping. Control-plane packets (CharSelLock/StageSync/phase barrier/
+    boundary digest) accept on `(epoch, phase)` — both halves fixed enums,
+    nothing allocated at runtime (INV-7).
+  - **Serial allocator deleted:** `AllocatePhaseSerial`, `s_phaseSerial`,
+    `GetPhaseSerial`, `IsCurrentEpochPhaseSerial` gone; every wire
+    `phase_serial` field renamed `_retired_serial` (sent 0, never read;
+    wire sizes/pins unchanged: 56/56/20/36/16/24). winscreen_sync's
+    early-frame buffer drains on `(epoch, phase_id)`.
+  - **Delay negotiation retired (INV-23, INV-13):** the frontend delay is a
+    locally derived per-epoch value (`GetFrontendDelay`, renamed from
+    GetSharedDelay). Deleted: `OnRemoteSyncAnnounce/OnRemoteSyncConfirm`
+    (delay carriers), `FinalizeDelayNegotiation`, `IsDelayNegotiated`,
+    `GetLocal/RemoteDelayProposal`, the whole DelayChangeReq/Ack wire flow
+    (packets 21/22 + payloads + routes + classification). Live bumps are
+    increase-only LOCAL scheduled applies at `consume+delay+2` (the pressure
+    sampling machinery is kept as the trigger); the `SyncAnnounce`/
+    `SyncConfirm` delay fields (incl. the `shared=` field that shipped
+    wrong) became `_retired*` pads, sizes 8/12 stable.
+  - `WinScreenSync_Begin`'s defer gate is now "no active epoch"
+    (`FrontendInputSync_IsEpochActive`, new) instead of "delay not
+    negotiated"; INV-8 fail-log added to `BeginInputPhase` (a second Begin
+    while a machine is active replaces it loudly).
+  - Snapshot struct reshaped (only consumer was the test suite):
+    `frontend_delay`, `phase_id`, `starved_frames`, `resync_cycles` added;
+    serial/negotiation fields gone.
+- **Deviation:** §3.2 says the serial field is "removed"; the BYTES stay as
+  `_retired_serial` padding because the M1 wire-size pins
+  (`static_assert` 56 B etc.) are load-bearing across the tree. Semantics
+  (allocator, acceptance key, all reads) are fully removed.
+
+### M5-3: ResyncRequest/Reply interrogation (INV-11) + session_id gate
+
+- **Files:** `src/net/frontend_input_sync.cpp` (+header),
+  `src/net/packet_router.cpp`, `include/net/packet_router.h`.
+- **Done:**
+  - Starvation clock counted in lockstep ticks (FrameUpdate cadence, never
+    wall time): 120 ticks with zero accepted remote frames while the
+    injected transport gate reports Healthy/Degraded → send
+    `ResyncRequest{epoch, phase_id, native_mode, local_frame}`; every
+    request is a cycle; accepted remote traffic resets counter+cycles.
+    Requests are ALWAYS answered with the responder's identity tuple.
+  - Reply identity mismatch → `FrontendResyncEscalation::Realign`; three
+    cycles (~6 s) → `Restart`. The latch is consumed by match_setup (M5-1)
+    — this module never tears anything down (INV-12).
+  - Router routes `ResyncRequest`/`ResyncReply` (reliable ch0 via the
+    barrier classification) and gates the v2-only `SyncHash` on
+    `Session2_GetSessionId()` (§3.1, drop-before-mutation). InputStream
+    CANNOT be gated at the router while AS2_WITH_GEKKO=ON ships raw Gekko
+    bytes under id 23 — the gate lives at the engine2 adapter's typed
+    ingest (documented in the router).
+  - `GetGameMode()` reads are fenced behind `AS2_FRONTEND_SYNC_TESTING`
+    (the standalone test binary has no game memory).
+
+### M5-4: GekkoReady retired — startup release rides TransitionBarrier GameplayStart
+
+- **Files:** `src/rollback/online_wiring.cpp`,
+  `include/rollback/online_wiring.h`, `include/net/protocol.h`,
+  `include/net/barrier_protocol.h`, `src/net/packet_router.cpp`,
+  `include/net/transition_barrier.h`, `src/net/transition_barrier.cpp`.
+- **Done:**
+  - The READY/ACK flag exchange (~180 lines: SendGekkoReadyPacket,
+    OnlineWiring_HandleStartupBarrierPacket, 4 latches + frames) is replaced
+    by one `TransitionBarrier_Propose(GameplayStart)` at the interactive
+    boundary; commit = mutual release (the barrier owns 250 ms resends and
+    idempotent re-acks — it was modeled on this exact exchange).
+    `PacketType::GekkoReady` (24), its payload and flags are deleted from
+    the wire vocabulary.
+  - New `TransitionBarrier_Clear(kind)` clears one slot;
+    `ResetStartupBarrierState` clears the GameplayStart slot so a stale
+    proposal from a previous match can never satisfy the next match's
+    release (the structural replacement for the old "ignore remote READY
+    before interactive boundary" guard). Ordering closes the race: the
+    arm-time clear happens at the pregame handoff, seconds before either
+    peer's post-intro proposal can exist.
+  - transition_barrier gains the EpochAlign payload plumbing (M5-1):
+    per-slot `{epoch, first_phase, native_mode}` for both sides, echoed
+    verbatim in acks (INV-13 discipline), commit refused on
+    `{epoch, first_phase}` mismatch with a rate-limited surface log
+    (INV-6/INV-10), `ProposeEpochAlign`/`GetRemoteEpochAlign` API.
+- **Deviation:** the pregame `GameplayStart` packet (19) is NOT folded into
+  the barrier (see M5-1 deviation 1) — the plan's single-name "GameplayStart
+  barrier" is realized as: pregame GO = packet 19 (host-authoritative,
+  carries frame facts), startup release = TransitionBarrier kind 4.
+
+### M5-5: Engine adapter obligations closed (epoch authority, producer fence, facade renames, SyncHash ingest, delay hotkeys)
+
+- **Files:** `src/rollback/rollback_session_engine2.cpp`,
+  `src/rollback/rollback_session.cpp`, `include/rollback/rollback_session.h`,
+  `src/rollback/online_wiring.cpp`, `src/net/gameplay_bridge.cpp`,
+  `include/net/gameplay_bridge.h`, `src/rollback/rollback_debug.cpp`.
+- **Done:**
+  - **Epoch authority into the adapter (M4 obligation):** engine2 Begin arms
+    with `PregameSync_GetCurrentEpoch()` (falls back to 1 only when no
+    pregame ran — harness use); StateHistory tag context follows. The M4
+    "pins epoch 1" stub is gone.
+  - **Producer fencing (M4 obligation):** `SetProducerFenced(frontend input
+    phase active || pregame active)` refreshed every `PollSession` — the
+    stalled-producer never feeds the gameplay stream while a frontend
+    lockstep phase owns the exchange (§2.7.3-P). The continue prompt is
+    covered by construction (mode 9 rides the winscreen input phase).
+  - **Facade renames (inventory §11):** `RollbackSession_BufferGekkoPacket`
+    → `RollbackSession_OnInputStreamPacket` (both adapters + the
+    online_wiring caller); new `RollbackSession_OnSyncHashPacket` (engine2:
+    session-gated `ReceiveSyncHash` + terminal pump; Gekko: documented
+    no-op); `RollbackSessionSnapshot.gekko_avg_ping/gekko_jitter` →
+    `link_avg_ping/link_jitter` (fill sites in both adapters; readers in
+    online_wiring STATS, rollback_debug ImGui, gameplay_bridge — whose own
+    doomed snapshot fields were renamed too).
+  - **Delay hotkeys `-`/`=` (plan §9 Q3 SHIP):** edge-detected
+    `VK_OEM_MINUS/PLUS` in `OnlineWiring_FrameUpdate` while gameplay is
+    active → `RollbackSession_SetLocalDelay(active±1)` +
+    `DelayPolicy_OnRollbackApplied` — peer-local, zero wire traffic (B-7);
+    works on both adapters (`SetLocalDelay` exists on the Gekko path too).
+- **Deviations/notes:** hotkeys use `GetAsyncKeyState` (global, not
+  focus-gated) — matches the mod's existing hotkey idiom; refine with the M6
+  HUD pass if focus-gating is wanted. Cross-match `RotateEpoch` (engine
+  surviving the match end) remains the M6 director's job — at M5 the engine
+  still re-arms per match, now under the true epoch.
+
+### M5-6: Tests + gates + docs
+
+- **Files:** `tests/frontend_sync_tests.cpp`, `tools/check_killpaths.ps1`,
+  `docs/re0.7/API_FREEZE.md`, `CMakeLists.txt`.
+- **Done:**
+  - frontend_sync_tests reworked to the M5 API: local-delay derivation test
+    (replaces shared-negotiation), local scheduled-bump tests (replace the
+    DelayChangeReq wire assertions), `(epoch, phase_id)` acceptance test
+    (stale epoch + foreign phase_id, replaces the phase-serial test), and a
+    new interrogation-ladder test (120-tick starvation → ResyncRequest with
+    the right identity tuple; mismatch reply → Realign, consumed-once; 3
+    cycles → Restart; requests always answered). Frame builders fill
+    phase_id; snapshot field renames followed.
+  - Kill-path gate: `pregame_sync.cpp` entry replaced by
+    `match_setup.cpp = 2` (terminal Error funnel + session-lost guard) with
+    the INV-12 justification; match_lifecycle/input_override entries
+    retagged M6. Counts otherwise unchanged.
+  - API_FREEZE §4/§6 updated: facade renames done; M5 wire deletions
+    (DelayChangeReq/Ack, GekkoReady, announce/confirm delay fields),
+    §3.4 cutover state, live ResyncRequest/Reply + EpochAlign payloads +
+    SyncHash-with-gate documented.
+- **Deviation:** the M5 exit gate's "EpochAlign" unit coverage is not in
+  frontend_sync_tests — transition_barrier isn't linked there (the suite
+  stubs `TransitionBarrier_Propose`), and linking it would collide with the
+  stubs. The commit rule is exercised by the in-game frontend-only soak
+  (the gate's second half); a dedicated barrier unit target is an M6
+  obligation.
+
+### Build-system summary (M5)
+
+- CMake `NET_SOURCES`: -`pregame_sync.cpp`, -`match_bootstrap.cpp`;
+  +`match_setup.cpp`. `NET_HEADERS`: -`match_bootstrap.h`
+  (`pregame_sync.h` stays — preserved facade).
+- Deleted files: `src/net/pregame_sync.cpp`, `src/net/match_bootstrap.cpp`,
+  `include/net/match_bootstrap.h`.
+- Both `AS2_WITH_GEKKO` configurations chase the same edits: the Gekko
+  adapter implements the renamed ingest + no-op SyncHash entry; GekkoNet
+  lib/ untouched; no test-target source lists changed.
+
+### Obligations for next milestones
+
+- **M6 (director/cutover):** cross-match `RotateEpoch` +
+  `StateHistory_SetTagContext` at the rematch GameplayStart commit (engine
+  stays armed across matches — the M5 adapter still re-arms per match);
+  strict INV-9 match-end ladder gating (WinScreenExit → PostMatchDecision →
+  EpochAlign held-and-re-acked in order) — at M5 the three barriers exist
+  and fire in order by construction but no director refuses out-of-order
+  commits; winscreen-epoch same-epoch Realign (M5 escalates to Restart);
+  consider folding PeerIdentity round/timing into config exchange (M3 note,
+  still open); time_probe + frontend-delay latch (§2.9.3) replaces the
+  ms-RTT `ComputeDelayProposal` source; frontend-phase STAT hold producer
+  (M2 note, still open); consolidate load/GO onto TransitionBarrier if the
+  director wants one primitive; delete `DelayPolicy_GetStallThreshold` with
+  the input_override rewrite; dedicated transition_barrier unit target
+  (EpochAlign commit rule, Clear semantics).
+- **M6 kill-path burn-down:** match_lifecycle session-lost guard +
+  input_override abort site; match_setup's Error funnel shrinks further
+  once engine terminals own BaselineMismatch surfacing.
+- **M8:** LE-1/§7.3 cells exercise the interrogation ladder under loss
+  (ResyncRequest must NOT fire on plain packet loss — the 120-tick window
+  plus redundant-window refill makes that structurally unlikely; verify).
+
+### Compile risks to check first (M5 build session)
+
+1. `match_setup.cpp` is a new ~1660-line TU aggregating the pregame +
+   bootstrap include sets plus session2/supervisor/transition_barrier —
+   first place an include-order or namespace slip surfaces. It defines
+   `PregameSync_*` in `namespace Net` with statics in an anonymous
+   namespace; `PregameSync_Begin` is called from inside the anonymous
+   namespace (`RestartPregame`) via the header declaration.
+2. `frontend_input_sync.cpp` was rewritten wholesale — the
+   frontend_sync_tests target compiles it standalone under
+   `AS2_FRONTEND_SYNC_TESTING`; the new `CurrentNativeModeByte()` fence is
+   what keeps `GetGameMode()` out of that binary. If the tests crash at
+   runtime, look for any other raw-memory read that slipped in.
+3. `PhaseTransitionPayload` echo in `SendAck` now passes the whole payload
+   struct by const ref — signature changed inside transition_barrier.cpp
+   only; no external callers.
+4. Renamed/deleted symbol stragglers — grep-verified zero references at edit
+   time for: `MatchBootstrap_*`, `PacketType::GekkoReady`,
+   `PacketType::DelayChangeReq/Ack`, `GekkoReadyPayload`,
+   `GEKKO_READY_FLAG_*`, `DelayChangeReq/AckPayload`,
+   `FrontendInputSync_GetPhaseSerial`, `IsCurrentEpochPhaseSerial`,
+   `GetSharedDelay`, `IsDelayNegotiated`, `FinalizeDelayNegotiation`,
+   `OnRemoteSyncAnnounce/Confirm`, `OnRemoteDelayChange*`,
+   `RollbackSession_BufferGekkoPacket`, `.gekko_avg_ping/.gekko_jitter`,
+   live `phase_serial` fields, `frontend_delay_proposal/shared`.
+5. `RollbackSession_OnSyncHashPacket` must exist in BOTH adapter TUs —
+   Gekko no-op is in rollback_session.cpp; the AS2_WITH_GEKKO=OFF config
+   uses the engine2 implementation. The router calls it unconditionally.
+6. `frontend_sync_tests` exercises the new interrogation path — the
+   `FrontendInputSync_FrameUpdate` loop tests assume one starvation tick
+   per call while the current remote frame is missing; if the counter
+   semantics change, the 120/360 constants in the test are the mirror.
+7. MSVC unused-variable warnings possible in match_setup
+   (`s_loadBarrierSent`, `s_remoteCapabilities` are write-mostly — same as
+   the deleted TUs).

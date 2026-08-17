@@ -3593,7 +3593,7 @@ int __cdecl Hook_InputProcess(int gameState) {
                     &gatedMerged,
                     &pressedMerged,
                     Net::FrontendInputSync_GetRemoteAckFrame(),
-                    Net::FrontendInputSync_GetSharedDelay(),
+                    Net::FrontendInputSync_GetFrontendDelay(),
                     stageCursor);
             }
 

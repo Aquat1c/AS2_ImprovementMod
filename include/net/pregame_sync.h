@@ -17,6 +17,15 @@
  * Since re0.7 M3 the state machine no longer owns the Session packet
  * callback: net/packet_router is the single registered dispatch owner and
  * routes the pregame packet set into PregameSync_OnSessionPacket.
+ *
+ * Since re0.7 M5 the implementation is net/match_setup.cpp (master plan
+ * §2.5): one phase machine replacing pregame_sync + match_bootstrap behind
+ * this preserved 12-function facade. It owns epoch authority (host-minted
+ * u32 generations, strictly increasing, EpochAlign TransitionBarrier commit
+ * before any frontend input exchange), the config/load/baseline/handoff
+ * barriers, the rematch fast path, and the §4.6 recovery ladder (frontend
+ * timeouts recover by pregame restart under a fresh epoch — never teardown,
+ * INV-12).
  */
 
 #pragma once
@@ -174,6 +183,25 @@ const LockedMatchConfig* PregameSync_GetLockedConfig();
 
 /// Has the pre-game sync completed successfully?
 bool PregameSync_IsComplete();
+
+/// The current epoch (host-minted u32 generation, §2.5). Strictly increasing
+/// for the life of the session; 0 = no epoch minted/adopted yet. Consumed by
+/// the engine adapter (savestate tag context / engine arm) and diagnostics.
+uint32_t PregameSync_GetCurrentEpoch();
+
+/// Bootstrap handoff facts consumed by the match director side
+/// (online_wiring until M6): baseline CRCs and barrier frame diagnostics.
+struct PregameBootstrapInfo {
+    uint32_t local_baseline_crc;
+    uint32_t remote_baseline_crc;
+    int32_t  local_load_sim_frame;
+    int32_t  remote_load_sim_frame;
+    int32_t  local_baseline_sim_frame;
+    int32_t  remote_baseline_sim_frame;
+    uint32_t bootstrap_frame_abs;
+    int32_t  gameplay_start_host_game_abs_frame;
+};
+void PregameSync_GetBootstrapInfo(PregameBootstrapInfo* out);
 
 /// Handle SyncAnnounce/SyncConfirm while the gameplay packet callback is still
 /// active (rematch race). Returns true when the packet was consumed.

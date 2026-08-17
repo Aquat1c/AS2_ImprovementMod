@@ -13,9 +13,12 @@
  *   - TransitionBarrier packets are offered first (reachable in every regime)
  *   - pregame-machine-owned types -> PregameSync_OnSessionPacket
  *   - frontend lockstep / palette / debug types -> owning module handlers
- *   - engine sinks (InputStream, GekkoReady) -> OnlineWiring_Handle* (the
- *     handlers self-guard: pre-live InputStream drops with logging, startup
- *     barrier ignores pre-boundary READYs) until the engine2 cutover
+ *   - engine sinks: InputStream -> OnlineWiring_HandleEngineDataPacket
+ *     (self-guarding: pre-live drops with logging; §3.1 session_id enforced
+ *     at the typed engine2 ingest), SyncHash -> RollbackSession (session_id
+ *     gated here). The startup barrier rides TransitionBarrier GameplayStart
+ *     since M5 (GekkoReady retired).
+ *   - ResyncRequest/Reply (INV-11) -> frontend interrogation handlers
  *   - unknown types: log + count, never terminal (forward compat within a
  *     protocol version)
  *

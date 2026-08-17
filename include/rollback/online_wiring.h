@@ -5,7 +5,7 @@
  * This is the integration glue — NOT a new architecture — just wiring:
  *
  *   1. Bootstrap completion → RollbackSession_Begin
- *   2. InputStream packets → RollbackSession_BufferGekkoPacket
+ *   2. InputStream packets → RollbackSession_OnInputStreamPacket
  *   3. Lifecycle transitions → RollbackSession_End / state safety
  *   4. Disconnect/failure → safe teardown 
  *   5. Post-match/rematch → clean handoff
@@ -75,12 +75,11 @@ void OnlineWiring_OnReturnToSession();
 // Packet sinks (called by Net::PacketRouter_OnPacket — M0 extraction, M3 promotion)
 // ============================================================================
 
-/// Engine input stream packet (InputStream, id 23 — raw Gekko data until the
-/// engine2 cutover). Buffers into the rollback session when active.
+/// Engine input stream packet (InputStream, id 23 — raw Gekko data under
+/// AS2_WITH_GEKKO=ON, v2 InputStreamPayload under engine2). Feeds the
+/// rollback session when active. (The startup gameplay-entry barrier rides
+/// TransitionBarrier kind GameplayStart since M5 — GekkoReady is retired.)
 void OnlineWiring_HandleEngineDataPacket(const void* payload, size_t payloadLen);
-
-/// Startup gameplay-entry barrier packet (GekkoReady READY/ACK flags).
-void OnlineWiring_HandleStartupBarrierPacket(const void* payload, size_t payloadLen);
 
 // ============================================================================
 // Diagnostics

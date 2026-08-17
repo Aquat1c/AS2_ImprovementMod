@@ -429,7 +429,6 @@ static void SendCharSelLock() {
 
     CharSelLockPayload payload{};
     payload.epoch_id = FrontendInputSync_GetEpochId();
-    payload.phase_serial = FrontendInputSync_GetPhaseSerial();
     payload.phase = (uint16_t)FrontendSyncPhase::CharSel;
     payload.character_id = s_localChar;
     payload.palette = s_localPalette;
@@ -439,9 +438,8 @@ static void SendCharSelLock() {
 
     Rollback::NetplayLog_Write(
         "CHARSEL", -1,
-        "Sent CharSelLock: epoch=%u serial=%u char=%u palette=%u custom=%u",
+        "Sent CharSelLock: epoch=%u char=%u palette=%u custom=%u",
         payload.epoch_id,
-        payload.phase_serial,
         payload.character_id,
         payload.palette,
         s_localPaletteCustom ? 1 : 0);
@@ -550,7 +548,6 @@ static void MirrorHostStageStateOnClient(const StageWatchdogState& state, const 
 static void SendStageWatchdog(const StageWatchdogState& state, bool confirmed, const char* reason) {
     StageSyncPayload payload{};
     payload.epoch_id = FrontendInputSync_GetEpochId();
-    payload.phase_serial = FrontendInputSync_GetPhaseSerial();
     payload.phase = (uint16_t)FrontendSyncPhase::StageSel;
     payload.frame = (uint16_t)FrontendInputSync_GetConsumeFrame();
     payload.stage_id = state.stage_id;
@@ -568,9 +565,8 @@ static void SendStageWatchdog(const StageWatchdogState& state, bool confirmed, c
 
     Rollback::NetplayLog_Verbose(
         "STAGESEL", -1,
-        "Sent StageSync watchdog: epoch=%u serial=%u frame=%u stage=%u confirmed=%u cursor=%u counter=%u sub=%u rounds_raw=%u rounds_to_win=%d reason=%s",
+        "Sent StageSync watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u counter=%u sub=%u rounds_raw=%u rounds_to_win=%d reason=%s",
         payload.epoch_id,
-        payload.phase_serial,
         payload.frame,
         payload.stage_id,
         payload.confirmed,
@@ -829,12 +825,12 @@ void CharSelSync_Begin() {
     CharSelPaletteSelect_OnCharSelBegin(true, s_isHost ? 0 : 1);
     Rollback::NetplayLog_Write(
         "CHARSEL", -1,
-        "=== CHARSEL BEGIN: epoch=%u shared_delay=%u role=%s ===",
+        "=== CHARSEL BEGIN: epoch=%u frontend_delay=%u role=%s ===",
         FrontendInputSync_GetEpochId(),
-        FrontendInputSync_GetSharedDelay(),
+        FrontendInputSync_GetFrontendDelay(),
         s_isHost ? "Host" : "Join");
-    LOG_NETPLAY(LOG_INFO, "[CharSelSync] Begin (shared frontend delay=%u)",
-        FrontendInputSync_GetSharedDelay());
+    LOG_NETPLAY(LOG_INFO, "[CharSelSync] Begin (frontend delay=%u)",
+        FrontendInputSync_GetFrontendDelay());
 }
 
 void CharSelSync_BeginStagePhase() {
@@ -875,9 +871,9 @@ void CharSelSync_BeginStagePhase() {
     const uint8_t initialRoundOption = CurrentAuthoritativeRoundOption();
     Rollback::NetplayLog_Write(
         "STAGESEL", -1,
-        "=== STAGE SELECT BEGIN: epoch=%u shared_delay=%u rounds_raw=%u rounds_to_win=%d role=%s ===",
+        "=== STAGE SELECT BEGIN: epoch=%u frontend_delay=%u rounds_raw=%u rounds_to_win=%d role=%s ===",
         FrontendInputSync_GetEpochId(),
-        FrontendInputSync_GetSharedDelay(),
+        FrontendInputSync_GetFrontendDelay(),
         initialRoundOption,
         GameSettingsSync_RoundsToWin(initialRoundOption),
         s_isHost ? "Host" : "Join");
@@ -1065,11 +1061,10 @@ void CharSelSync_OnRemoteLock(const CharSelLockPayload* p) {
     if (!s_active || !p) {
         return;
     }
-    if (!FrontendInputSync_IsCurrentEpochPhaseSerial(p->epoch_id,
-                                                     p->phase,
-                                                     p->phase_serial,
-                                                     PacketType::CharSelLock,
-                                                     "char lock")) {
+    if (!FrontendInputSync_IsCurrentEpochPhase(p->epoch_id,
+                                               p->phase,
+                                               PacketType::CharSelLock,
+                                               "char lock")) {
         return;
     }
 
@@ -1092,9 +1087,8 @@ void CharSelSync_OnRemoteLock(const CharSelLockPayload* p) {
 
     Rollback::NetplayLog_Write(
         "CHARSEL", -1,
-        "Remote character locked: epoch=%u serial=%u char=%u palette=%u custom=%u forced=%u",
+        "Remote character locked: epoch=%u char=%u palette=%u custom=%u forced=%u",
         p->epoch_id,
-        p->phase_serial,
         p->character_id,
         p->palette,
         s_remotePaletteCustom ? 1 : 0,
@@ -1109,11 +1103,10 @@ void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
     if (!s_active || !p) {
         return;
     }
-    if (!FrontendInputSync_IsCurrentEpochPhaseSerial(p->epoch_id,
-                                                     p->phase,
-                                                     p->phase_serial,
-                                                     PacketType::StageSync,
-                                                     "stage watchdog")) {
+    if (!FrontendInputSync_IsCurrentEpochPhase(p->epoch_id,
+                                               p->phase,
+                                               PacketType::StageSync,
+                                               "stage watchdog")) {
         return;
     }
 
@@ -1123,9 +1116,8 @@ void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
         applyResult == StageWatchdogApplyResult::IgnoredRegression) {
         Rollback::NetplayLog_Verbose(
             "STAGESEL", -1,
-            "Ignored StageSync watchdog: epoch=%u serial=%u frame=%u stage=%u confirmed=%u rounds_raw=%u result=%s",
+            "Ignored StageSync watchdog: epoch=%u frame=%u stage=%u confirmed=%u rounds_raw=%u result=%s",
             p->epoch_id,
-            p->phase_serial,
             p->frame,
             p->stage_id,
             p->confirmed,
@@ -1158,9 +1150,8 @@ void CharSelSync_OnRemoteStage(const StageSyncPayload* p) {
 
     Rollback::NetplayLog_Verbose(
         "STAGESEL", -1,
-        "Remote stage watchdog: epoch=%u serial=%u frame=%u stage=%u confirmed=%u cursor=%u sub=%u rounds_raw=%u rounds_to_win=%d result=%s",
+        "Remote stage watchdog: epoch=%u frame=%u stage=%u confirmed=%u cursor=%u sub=%u rounds_raw=%u rounds_to_win=%d result=%s",
         accepted.epoch_id,
-        accepted.phase_serial,
         accepted.frame,
         accepted.stage_id,
         accepted.confirmed,
@@ -1209,7 +1200,7 @@ void CharSelSync_GetSnapshot(CharSelSyncSnapshot* out) {
 
     out->lockstep_frame = FrontendInputSync_GetConsumeFrame();
     out->local_input_frame = FrontendInputSync_GetLocalInputFrame();
-    out->input_delay = (int)FrontendInputSync_GetSharedDelay();
+    out->input_delay = (int)FrontendInputSync_GetFrontendDelay();
 }
 
 } // namespace Net

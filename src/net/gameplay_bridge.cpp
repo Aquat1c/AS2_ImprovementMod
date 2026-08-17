@@ -83,11 +83,11 @@ void GameplayBridge_GetSnapshot(GameplayBridgeSnapshot* out) {
     out->rb_frame_current = Rollback::RollbackSession_GetCurrentFrame();
     out->frames_ahead = Rollback::RollbackSession_FramesAhead();
 
-    // GekkoNet network stats from rollback session
+    // Link stats from rollback session
     Rollback::RollbackSessionSnapshot rbSnap{};
     Rollback::RollbackSession_GetSnapshot(&rbSnap);
-    out->gekko_avg_ping = rbSnap.gekko_avg_ping;
-    out->gekko_jitter = rbSnap.gekko_jitter;
+    out->link_avg_ping = rbSnap.link_avg_ping;
+    out->link_jitter = rbSnap.link_jitter;
 
     strncpy_s(out->status, sizeof(out->status), s_status, _TRUNCATE);
 }

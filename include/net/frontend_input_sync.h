@@ -5,11 +5,14 @@
  * character select, stage select, and win screen.
  *
  * The core provides:
- *   - one epoch-scoped frontend timeline
- *   - one shared negotiated frontend delay per epoch
+ *   - one epoch-scoped frontend timeline (epoch minted by match_setup, §2.5)
+ *   - a locally derived frontend delay per epoch (peer-local, INV-23 —
+ *     the delay-negotiation wire flow is retired at M5)
  *   - phase-scoped input rings and resend/timeout handling
+ *   - (epoch, phase_id) frame acceptance (§3.4 — the per-side phase_serial
+ *     allocator is deleted, INV-7)
  *   - explicit phase barriers and boundary digests
- *   - increase-only live delay bump coordination
+ *   - the ResyncRequest/Reply starvation interrogation (INV-11)
  */
 
 #pragma once
@@ -43,6 +46,17 @@ inline const char* FrontendSyncPhaseName(FrontendSyncPhase phase) {
     }
 }
 
+/// Fixed §3.4 wire identity of a frontend phase (identical on both builds by
+/// construction — nothing is allocated at runtime, INV-7).
+inline FrontendPhaseId FrontendSyncPhaseToPhaseId(FrontendSyncPhase phase) {
+    switch (phase) {
+        case FrontendSyncPhase::CharSel:   return FrontendPhaseId::CharSel;
+        case FrontendSyncPhase::StageSel:  return FrontendPhaseId::StageSel;
+        case FrontendSyncPhase::WinScreen: return FrontendPhaseId::WinScreen;
+        default:                           return FrontendPhaseId::None;
+    }
+}
+
 enum class FrontendDigestKind : uint8_t {
     None        = 0,
     CharSelLock = 1,
@@ -65,21 +79,25 @@ inline const char* FrontendDigestKindName(FrontendDigestKind kind) {
 enum class FrontendDelayBumpReason : uint8_t {
     None         = 0,
     Starvation   = 1,
-    RemoteRequest = 2,
-    HostAdjust   = 3,
-    JitterPressure = 4,
+    JitterPressure = 2,
 };
 
 inline const char* FrontendDelayBumpReasonName(FrontendDelayBumpReason reason) {
     switch (reason) {
         case FrontendDelayBumpReason::None:          return "None";
         case FrontendDelayBumpReason::Starvation:    return "Starvation";
-        case FrontendDelayBumpReason::RemoteRequest: return "RemoteRequest";
-        case FrontendDelayBumpReason::HostAdjust:    return "HostAdjust";
         case FrontendDelayBumpReason::JitterPressure:return "JitterPressure";
         default:                                     return "Unknown";
     }
 }
+
+/// Escalation requested by the INV-11 interrogation ladder (§4.6). Consumed
+/// (and acted on) by match_setup; this module never tears anything down.
+enum class FrontendResyncEscalation : uint8_t {
+    None    = 0,
+    Realign = 1,   // identity mismatch confirmed → EpochAlign re-run
+    Restart = 2,   // 3 failed interrogation cycles → pregame restart, fresh epoch
+};
 
 struct FrontendFrameId {
     uint32_t epoch_id;
@@ -92,16 +110,13 @@ struct FrontendInputSyncSnapshot {
     bool              input_phase_active;
     SessionRole       role;
     FrontendSyncPhase phase;
-    uint32_t          phase_serial;
+    uint8_t           phase_id;          // FrontendPhaseId of the active phase
     FrontendFrameId   consume_id;
     uint32_t          local_input_frame;
     uint32_t          remote_latest_frame;
     uint32_t          remote_contiguous_frame_exclusive;
     uint32_t          max_local_lead;
-    uint16_t          local_delay_proposal;
-    uint16_t          remote_delay_proposal;
-    uint16_t          shared_delay;
-    bool              delay_negotiated;
+    uint16_t          frontend_delay;    // locally derived (INV-23)
     bool              local_phase_barrier_sent;
     bool              remote_phase_barrier_seen;
     bool              phase_barrier_satisfied;
@@ -119,6 +134,8 @@ struct FrontendInputSyncSnapshot {
     bool              local_advance_observed;
     bool              remote_advance_observed;
     bool              timed_out;
+    uint32_t          starved_frames;    // frames since last accepted remote input
+    uint8_t           resync_cycles;     // interrogation cycles this phase
     char              recovery_reason[128];
 };
 
@@ -131,21 +148,23 @@ void FrontendInputSync_Shutdown();
 typedef bool (*FrontendWinScreenSendGate)();
 void FrontendInputSync_SetWinScreenSendGate(FrontendWinScreenSendGate gate);
 
+/// Predicate reporting a healthy/degraded transport (true = healthy enough to
+/// interrogate — INV-11: starvation with a live transport is a protocol
+/// fault). Injected by match_setup (supervisor verdict); null = healthy.
+typedef bool (*FrontendTransportHealthyGate)();
+void FrontendInputSync_SetTransportHealthyGate(FrontendTransportHealthyGate gate);
+
 int  FrontendInputSync_ComputeDelayProposal();
-void FrontendInputSync_BeginEpoch(SessionRole role, uint32_t epochId, uint16_t localDelayProposal, const char* reason);
+void FrontendInputSync_BeginEpoch(SessionRole role, uint32_t epochId, uint16_t frontendDelay, const char* reason);
 void FrontendInputSync_RebindEpoch(uint32_t epochId, const char* reason);
 void FrontendInputSync_AbortEpoch(const char* reason);
+bool FrontendInputSync_IsEpochActive();
 
 /// Stop win-screen input emission immediately (rematch / cross-phase handoff).
 void FrontendInputSync_StopWinScreenInputPhase(const char* reason);
-void FrontendInputSync_OnRemoteSyncAnnounce(uint16_t remoteDelayProposal, const char* reason);
-void FrontendInputSync_OnRemoteSyncConfirm(uint16_t remoteDelayProposal, uint16_t remoteSharedDelay, const char* reason);
-bool FrontendInputSync_FinalizeDelayNegotiation(const char* reason);
 
-bool FrontendInputSync_IsDelayNegotiated();
-uint16_t FrontendInputSync_GetSharedDelay();
-uint16_t FrontendInputSync_GetLocalDelayProposal();
-uint16_t FrontendInputSync_GetRemoteDelayProposal();
+/// The locally derived frontend delay for this epoch (peer-local, INV-23).
+uint16_t FrontendInputSync_GetFrontendDelay();
 uint32_t FrontendInputSync_GetEpochId();
 
 void FrontendInputSync_BeginInputPhase(FrontendSyncPhase phase, PacketType packetType, const char* reason);
@@ -153,13 +172,13 @@ void FrontendInputSync_BeginPassivePhase(FrontendSyncPhase phase, const char* re
 void FrontendInputSync_EndPhase(const char* reason);
 
 FrontendSyncPhase FrontendInputSync_GetPhase();
+FrontendPhaseId FrontendInputSync_GetPhaseId();
 bool FrontendInputSync_IsInputPhaseActive();
 uint32_t FrontendInputSync_GetConsumeFrame();
 uint32_t FrontendInputSync_GetLocalInputFrame();
 uint32_t FrontendInputSync_GetRemoteLatestFrame();
 uint32_t FrontendInputSync_GetRemoteAckFrame();
 uint32_t FrontendInputSync_GetRemoteContiguousFrameExclusive();
-uint32_t FrontendInputSync_GetPhaseSerial();
 
 void FrontendInputSync_FrameUpdate();
 void FrontendInputSync_CaptureLocalInput(uint16_t packedInput);
@@ -169,8 +188,10 @@ bool FrontendInputSync_ConsumeCurrentFrame(uint16_t* outLocal, uint16_t* outRemo
 void FrontendInputSync_OnRemoteCharSelFrameInput(const CharSelFrameInputPayload* p);
 void FrontendInputSync_OnRemoteWinScreenFrameInput(const WinScreenFrameInputPayload* p);
 
+/// (epoch, phase) acceptance for control-plane frontend packets (CharSelLock,
+/// StageSync, phase barrier, boundary digest). Frame-input packets use the
+/// §3.4 (epoch, phase_id) rule internally.
 bool FrontendInputSync_IsCurrentEpochPhase(uint32_t epochId, uint16_t phase, PacketType type, const char* context);
-bool FrontendInputSync_IsCurrentEpochPhaseSerial(uint32_t epochId, uint16_t phase, uint32_t phaseSerial, PacketType type, const char* context);
 void FrontendInputSync_SendPhaseBarrier(FrontendSyncPhase nextPhase, uint8_t reasonCode, const char* reason);
 void FrontendInputSync_OnRemotePhaseBarrier(const FrontendPhaseBarrierPayload* p);
 bool FrontendInputSync_IsPhaseBarrierSatisfied(FrontendSyncPhase nextPhase);
@@ -181,8 +202,11 @@ void FrontendInputSync_OnRemoteBoundaryDigest(const FrontendBoundaryDigestPayloa
 bool FrontendInputSync_IsDigestMatched(FrontendDigestKind kind);
 bool FrontendInputSync_HasDigestMismatch();
 
-void FrontendInputSync_OnRemoteDelayChangeReq(const DelayChangeReqPayload* p);
-void FrontendInputSync_OnRemoteDelayChangeAck(const DelayChangeAckPayload* p);
+// INV-11 interrogation (§4.6 ladder step 2; routed by packet_router).
+void FrontendInputSync_OnRemoteResyncRequest(const ResyncRequestPayload* p);
+void FrontendInputSync_OnRemoteResyncReply(const ResyncReplyPayload* p);
+/// Consume the pending escalation verdict (returns None when nothing pending).
+FrontendResyncEscalation FrontendInputSync_ConsumeResyncEscalation();
 
 void FrontendInputSync_ReportLocalAdvanceIntent(uint16_t packedInput);
 void FrontendInputSync_ReportRemoteAdvanceIntent(uint16_t packedInput);

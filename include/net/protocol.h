@@ -46,10 +46,12 @@ constexpr uint8_t NUM_CHANNELS      = 3;
 // legacy handshake is superseded by the 5-step nonce exchange (70–74); the
 // side data they carried (nickname/round/timing/HUD style) now rides
 // PeerIdentity (79) after the handshake completes.
-// Retired-by-plan but still live in the old backend until the M5 cutover
-// (marked LEGACY below): DelayChangeReq/Ack (INV-23: knobs become
-// peer-local), GekkoReady (superseded by TransitionBarrier GameplayStart),
-// SyncAnnounce/SyncConfirm delay-negotiation fields.
+// Retired at M5 (deleted outright): DelayChangeReq (21) / DelayChangeAck (22)
+// — INV-23: delay is a peer-local knob, the frontend delay is derived
+// locally, no negotiation wire flow exists; GekkoReady (24) — the startup
+// gameplay-entry barrier now rides TransitionBarrier kind GameplayStart;
+// the SyncAnnounce/SyncConfirm delay-negotiation fields (INV-13/INV-23) —
+// announce/confirm survive as pregame wake-up/identity packets only.
 enum class PacketType : uint16_t {
     // Session control (reliable, channel 0)
     Ready           = 3,    // Peer is ready for next phase
@@ -90,19 +92,10 @@ enum class PacketType : uint16_t {
     PaletteAck         = 52,
 
     // Gameplay input stream (unreliable-sequenced, channel 1).
-    // v20: replaces GekkoData under the same id. Until the engine2 cutover
-    // (M5) the old backend still transports raw GekkoNet bytes under this id;
-    // the v2 InputStreamPayload below is the target schema (defined, unsent).
+    // v20: replaces GekkoData under the same id. In the AS2_WITH_GEKKO=ON
+    // configuration the Gekko backend still transports raw GekkoNet bytes
+    // under this id; the engine2 backend sends the v2 InputStreamPayload.
     InputStream     = 23,
-
-    // Startup gameplay-entry barrier (reliable, channel 0)
-    // LEGACY — superseded by TransitionBarrier GameplayStart at the M5 cutover.
-    GekkoReady      = 24,   // Startup barrier control (ready/ack)
-
-    // Frontend shared-delay coordination
-    // LEGACY — retired with the delay-negotiation flow (INV-23) at cutover.
-    DelayChangeReq  = 21,
-    DelayChangeAck  = 22,
 
     // Debug / diagnostics (unreliable, channel 2)
     Ping            = 30,   // Application-level ping (supplements ENet RTT)
@@ -174,10 +167,11 @@ inline const char* FrameTimingModeDisplayName(FrameTimingMode mode) {
 // ============================================================================
 
 // Fixed enum, identical on both builds by construction — replaces the per-side
-// runtime `phase_serial` allocator as the acceptance key (INV-7). The continue
-// prompt rides WinScreen's stream under id 3 per the shipped continue_flow
-// design. The legacy phase_serial fields remain populated until the frontend
-// acceptance-rule cutover (M5) so the old backend keeps running unchanged.
+// runtime `phase_serial` allocator as the acceptance key (INV-7, §3.4). The
+// continue prompt rides WinScreen's stream under id 3 per the shipped
+// continue_flow design. The serial allocator is deleted at M5; the retired
+// wire bytes stay as `_retired_serial` padding so the pinned payload sizes
+// hold (always sent as 0, never read).
 enum class FrontendPhaseId : uint8_t {
     None      = 0,
     CharSel   = 1,
@@ -283,8 +277,8 @@ struct PhaseTransitionPayload {
     uint8_t  intent;          // PostMatchIntentWire for PostMatchDecision, else 0
     uint16_t _pad;
     uint32_t session_id;      // pregame session id context (0 if none)
-    // v2 EpochAlign fields (§3.2/§4.5); zero for every other kind. Defined at
-    // M1 (compile-only); populated once match_setup mints epochs (M5).
+    // v2 EpochAlign fields (§3.2/§4.5); zero for every other kind. Populated
+    // by match_setup (M5): host-minted epoch, first phase, sender native mode.
     uint32_t epoch;           // epoch being adopted (host-minted, u32, never 0)
     uint8_t  first_phase;     // FrontendPhaseId of the epoch's first phase
     uint8_t  native_mode;     // sender's native MODE_* at proposal time
@@ -391,10 +385,14 @@ struct SyncTracePayload {
 
 // Initial session sync payloads
 
+// M5 (INV-23): the frontend delay is derived locally on each peer; the
+// delay-negotiation fields (including the `shared=` field that shipped wrong,
+// INV-13) are retired. Byte positions stay as `_retired*` padding so the
+// pinned wire sizes hold (sent as 0, never read).
 struct SyncAnnouncePayload {
     uint32_t session_id;         // Random session identifier for this match
     uint8_t  capability_flags;   // Bit 0: savestate baseline, Bit 1: desync diagnostics
-    uint8_t  frontend_delay_proposal; // Local frontend delay recommendation for this epoch
+    uint8_t  _retired_delay;     // was frontend_delay_proposal (retired M5)
     uint8_t  round_count;        // Host-owned vanilla option 0..2 when sent by host
     uint8_t  _pad;
 };
@@ -403,26 +401,26 @@ struct SyncConfirmPayload {
     uint32_t session_id;         // Agreed session ID (host's ID is authoritative)
     uint8_t  confirmed;          // 1 = all checks passed
     uint8_t  assigned_side;      // Host decides: 0 = host is P1, 1 = host is P2
-    uint8_t  frontend_delay_proposal; // Echo of sender's local recommendation
-    uint8_t  frontend_shared_delay;   // Shared frontend delay agreed for this epoch
+    uint8_t  _retired_delay;     // was frontend_delay_proposal (retired M5)
+    uint8_t  _retired_shared;    // was frontend_shared_delay (retired M5)
     uint8_t  round_count;        // Host-owned vanilla option 0..2 when sent by host
     uint8_t  _pad[3];
 };
 
 struct FrontendPhaseBarrierPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
+    uint32_t _retired_serial;    // was phase_serial (retired M5, always 0)
     uint16_t phase;              // Net::FrontendSyncPhase (current phase)
     uint16_t next_phase;         // Net::FrontendSyncPhase (next phase)
     uint32_t last_completed_frame; // Sender's final frame index for the completed phase
     uint8_t  reason_code;        // Barrier reason / transition category
-    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  phase_id;           // FrontendPhaseId (§3.4 acceptance key)
     uint8_t  _pad[2];
 };
 
 struct FrontendBoundaryDigestPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
+    uint32_t _retired_serial;    // was phase_serial (retired M5, always 0)
     uint16_t phase;              // Net::FrontendSyncPhase
     uint8_t  digest_kind;        // Net::FrontendDigestKind
     uint8_t  substate;           // Native substate for diagnostics
@@ -434,7 +432,7 @@ struct FrontendBoundaryDigestPayload {
     uint8_t  p2_palette;
     uint8_t  p1_palette_custom;
     uint8_t  p2_palette_custom;
-    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  phase_id;           // FrontendPhaseId (§3.4 acceptance key)
     uint8_t  _palette_pad;
     uint8_t  stage_cursor;
     uint8_t  stage_confirmed;
@@ -473,7 +471,7 @@ struct CharSelInputPayload {
 
 struct CharSelLockPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
+    uint32_t _retired_serial;    // was phase_serial (retired M5, always 0)
     uint16_t phase;              // Net::FrontendSyncPhase (must be CharSel)
     uint8_t  character_id;       // Resolved character ID from grid table
     uint8_t  palette;            // Final palette
@@ -483,7 +481,7 @@ struct CharSelLockPayload {
 
 struct StageSyncPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
+    uint32_t _retired_serial;    // was phase_serial (retired M5, always 0)
     uint16_t phase;              // Net::FrontendSyncPhase (must be StageSel)
     uint16_t frame;              // Sender's current phase frame
     uint8_t  stage_id;           // Sender's currently resolved stage ID
@@ -595,18 +593,11 @@ struct GameplayStartPayload {
     uint32_t host_game_abs_frame;   // Host absolute engine frame when GameplayStart was sent
 };
 
-struct GekkoReadyPayload {
-    uint8_t  flags;              // GEKKO_READY_FLAG_*
-    uint8_t  phase;              // Sender MatchLifecyclePhase at send time
-    uint16_t _pad;
-    int32_t  game_abs_frame;     // Sender absolute engine frame at startup barrier send time
-};
-
 struct CharSelFrameInputPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch (retired at M5)
+    uint32_t _retired_serial;    // was phase_serial (retired M5, always 0)
     uint16_t phase;              // Net::FrontendSyncPhase (CharSel or StageSel)
-    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  phase_id;           // FrontendPhaseId (§3.4 acceptance key)
     uint8_t  _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
@@ -617,9 +608,9 @@ struct CharSelFrameInputPayload {
 
 struct WinScreenFrameInputPayload {
     uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch (retired at M5)
+    uint32_t _retired_serial;    // was phase_serial (retired M5, always 0)
     uint16_t phase;              // Net::FrontendSyncPhase (WinScreen)
-    uint8_t  phase_id;           // v2: FrontendPhaseId (0 until M5 cutover)
+    uint8_t  phase_id;           // FrontendPhaseId (§3.4 acceptance key)
     uint8_t  _phase_pad;
     uint32_t frame;              // Lockstep frame number
     uint32_t ack_frame;          // Sender's consumeFrame (frame they need from us)
@@ -661,27 +652,6 @@ struct PaletteAckPayload {
     uint8_t  received_data;
     uint8_t  _pad;
     uint32_t payload_crc;
-};
-
-struct DelayChangeReqPayload {
-    uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
-    uint16_t phase;              // Net::FrontendSyncPhase
-    uint16_t new_delay;          // Requested shared frontend delay
-    uint32_t apply_from_frame;   // Apply point inside the phase timeline
-    uint8_t  reason_code;        // Net::FrontendDelayBumpReason
-    uint8_t  _pad[3];
-};
-
-struct DelayChangeAckPayload {
-    uint32_t epoch_id;           // Frontend epoch/session scope
-    uint32_t phase_serial;       // Monotonic phase instance inside the epoch
-    uint16_t phase;              // Net::FrontendSyncPhase
-    uint16_t acked_delay;        // Accepted shared frontend delay
-    uint32_t apply_from_frame;   // Apply point inside the phase timeline
-    uint8_t  accepted;           // 1 = accepted, 0 = rejected
-    uint8_t  reason_code;        // Net::FrontendDelayBumpReason
-    uint8_t  _pad[2];
 };
 
 // ============================================================================
@@ -804,10 +774,6 @@ struct ResyncReplyPayload {
 
 #pragma pack(pop)
 
-// GekkoReadyPayload flags
-constexpr uint8_t GEKKO_READY_FLAG_READY = 1 << 0;  // Local reached post-intro interactive boundary
-constexpr uint8_t GEKKO_READY_FLAG_ACK   = 1 << 1;  // Local has observed peer READY
-
 constexpr uint8_t CHARSEL_LOCK_FLAG_CUSTOM_PALETTE = 1 << 0;
 
 constexpr uint8_t NETPLAY_PALETTE_FLAG_TRANSPORT_ENABLED = 1 << 0;
@@ -922,9 +888,6 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::BaselineDigest: return "BaselineDigest";
         case PacketType::BaselineBreakdown: return "BaselineBreakdown";
         case PacketType::GameplayStart:  return "GameplayStart";
-        case PacketType::GekkoReady:     return "GekkoReady";
-        case PacketType::DelayChangeReq:  return "DelayChangeReq";
-        case PacketType::DelayChangeAck:  return "DelayChangeAck";
         case PacketType::InputStream:     return "InputStream";
         case PacketType::CharSelFrameInput:   return "CharSelFrameInput";
         case PacketType::PauseQuit:           return "PauseQuit";
