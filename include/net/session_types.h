@@ -18,7 +18,7 @@ namespace Net {
 enum class SessionState : uint8_t {
     Idle,             // No session active
     Connecting,       // ENet connect in progress
-    Handshaking,      // ENet connected, exchanging Hello/HelloAck
+    Handshaking,      // ENet connected, running the 5-step nonce handshake
     Connected,        // Handshake complete, session established
     Ready,            // Both peers signaled ready
     Disconnecting,    // Graceful disconnect in progress
@@ -86,6 +86,7 @@ enum class DisconnectReason : uint16_t {
     VersionMismatch = 2,
     Error           = 3,
     UserCancel      = 4,
+    Busy            = 5,   // v2 (edge C-5/C-6): host already paired with a peer
 };
 
 // ============================================================================

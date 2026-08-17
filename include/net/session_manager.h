@@ -1,15 +1,17 @@
 /**
- * Alice Senki 2 - Session Manager
+ * Alice Senki 2 - Session facade (implemented by net/session2 since re0.7 M3)
  *
  * Owns the session state machine and handshake logic on top of the
- * ENet transport layer. Manages a single peer connection.
+ * transport2 ENet worker. Manages a single peer connection. The handshake is
+ * the v2 5-step nonce exchange (master plan §4.2); teardown funnels through
+ * Session2_Terminate (net/session2.h).
  *
- * State machine:
+ * State machine (reporting vocabulary, preserved):
  *   Idle -> Connecting -> Handshaking -> Connected -> Ready
  *                                                  -> Disconnecting -> Idle
  *                                    -> Failed
  *
- * The session manager does NOT own gameplay or rollback state.
+ * The session layer does NOT own gameplay or rollback state.
  * Higher layers query session state and send/receive through it.
  */
 
@@ -110,9 +112,12 @@ bool Session_SendPacket(uint8_t channel, PacketType type,
 typedef void (*PacketCallback)(PacketType type, const void* payload, size_t payloadLen);
 
 /// Register a callback for packets not handled by the session layer.
-/// Only one callback can be active at a time.
+/// Only one callback can be active at a time. Since re0.7 M3 the default
+/// sink is net/packet_router (registered at Session_Init, never handed off);
+/// a non-null callback overrides it and passing nullptr restores the router.
 /// Reliable control packets received before a callback is installed are
-/// deferred and flushed in order when a callback becomes available.
+/// deferred (bounded 256 packets / 256 KB) and flushed in order when a
+/// callback becomes available.
 void Session_SetPacketCallback(PacketCallback cb);
 
 // ============================================================================

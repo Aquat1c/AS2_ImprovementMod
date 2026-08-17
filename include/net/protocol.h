@@ -42,15 +42,16 @@ constexpr uint8_t NUM_CHANNELS      = 3;
 
 // Retired at v20 (deleted outright — no send/receive site remained):
 //   SessionMeta (5), GameplayInput (20), WinScreenConfirm (41).
-// Retired-by-plan but still live in the old backend until the M3/M5 cutovers
-// (marked LEGACY below): Hello/HelloAck (superseded by the 5-step nonce
-// handshake), DelayChangeReq/Ack (INV-23: knobs become peer-local),
-// GekkoReady (superseded by TransitionBarrier GameplayStart),
+// Retired at M3 with the session2 cutover: Hello (1) / HelloAck (2) — the
+// legacy handshake is superseded by the 5-step nonce exchange (70–74); the
+// side data they carried (nickname/round/timing/HUD style) now rides
+// PeerIdentity (79) after the handshake completes.
+// Retired-by-plan but still live in the old backend until the M5 cutover
+// (marked LEGACY below): DelayChangeReq/Ack (INV-23: knobs become
+// peer-local), GekkoReady (superseded by TransitionBarrier GameplayStart),
 // SyncAnnounce/SyncConfirm delay-negotiation fields.
 enum class PacketType : uint16_t {
     // Session control (reliable, channel 0)
-    Hello           = 1,    // LEGACY handshake — retired at session2 (M3) cutover
-    HelloAck        = 2,    // LEGACY handshake — retired at session2 (M3) cutover
     Ready           = 3,    // Peer is ready for next phase
     Disconnect      = 4,    // Graceful disconnect with reason
 
@@ -132,6 +133,14 @@ enum class PacketType : uint16_t {
     SyncHashAck     = 76,   // reliable ch0: bounds sender's outstanding window
     TimeProbe       = 77,   // unreliable ch1: 4 Hz µs RTT probe
     TimeProbeAck    = 78,   // unreliable ch1: echo with responder dwell
+
+    // v2 post-handshake identity exchange (reliable, channel 0) — M3.
+    // The v2 handshake payloads (70–74) are wire-frozen and carry only the
+    // fail-closed identity (version/build/cadence/nonces/short nickname);
+    // the preserved PeerInfo contract (full nickname, round option, frame
+    // timing, HUD style — inventory §2.1) is filled by this one-shot packet
+    // sent by both sides on entering Connected.
+    PeerIdentity    = 79,
 };
 
 enum class FrameTimingMode : uint8_t {
@@ -192,13 +201,17 @@ inline const char* FrontendPhaseIdName(FrontendPhaseId id) {
 
 #pragma pack(push, 1)
 
-struct HelloPayload {
-    uint16_t protocol_version;   // Must match PROTOCOL_VERSION
-    uint32_t build_hash;         // Exact local mod build fingerprint
-    char     nickname[64];       // Null-terminated UTF-8 nickname
+// One-shot identity exchange sent by both sides after the v2 handshake
+// reaches Connected (PeerIdentity, 79). Carries the side data the legacy
+// Hello/HelloAck used to piggyback so the preserved PeerInfo/HUD-style/round
+// contracts keep working; the fail-closed fields (version/build/cadence)
+// were already verified by the handshake and are NOT repeated here.
+struct PeerIdentityPayload {
+    char     nickname[64];       // Null-terminated UTF-8 nickname (full length)
     uint16_t listen_port;        // Port this peer is listening on
     uint8_t  round_count;        // Sender's current vanilla round option 0..2
-    uint8_t  frame_timing_mode;  // Net::FrameTimingMode
+    uint8_t  frame_timing_mode;  // Net::FrameTimingMode (handshake-verified equal)
+    uint8_t  hud_style_valid;    // 1 = HUD style fields are meaningful
     uint8_t  hud_trail_r;
     uint8_t  hud_trail_g;
     uint8_t  hud_trail_b;
@@ -211,27 +224,7 @@ struct HelloPayload {
     uint8_t  hud_score_b;
     uint8_t  hud_font_size;      // NetplayHudStyle::HudFontSize
     uint8_t  hud_vertical_position; // NetplayHudStyle::HudVerticalPosition
-};
-
-struct HelloAckPayload {
-    uint16_t protocol_version;
-    uint32_t build_hash;         // Exact local mod build fingerprint
-    char     nickname[64];
-    uint16_t listen_port;
-    uint8_t  round_count;        // Sender's current vanilla round option 0..2
-    uint8_t  frame_timing_mode;  // Host-authoritative Net::FrameTimingMode
-    uint8_t  hud_trail_r;
-    uint8_t  hud_trail_g;
-    uint8_t  hud_trail_b;
-    uint8_t  hud_text_r;
-    uint8_t  hud_text_g;
-    uint8_t  hud_text_b;
-    uint8_t  hud_trail_length;
-    uint8_t  hud_score_r;
-    uint8_t  hud_score_g;
-    uint8_t  hud_score_b;
-    uint8_t  hud_font_size;
-    uint8_t  hud_vertical_position;
+    uint8_t  _pad[3];
 };
 
 struct DisconnectPayload {
@@ -818,10 +811,8 @@ static_assert(sizeof(PacketType) + sizeof(PaletteDataPayload) <= MAX_PACKET_SIZE
     "PaletteDataPayload must fit inside one transport packet");
 static_assert(sizeof(PacketType) + sizeof(CharSelInputPayload) <= MAX_PACKET_SIZE,
     "CharSelInputPayload must fit inside one transport packet");
-static_assert(sizeof(HelloPayload) == 86,
-    "HelloPayload wire size must remain stable");
-static_assert(sizeof(HelloAckPayload) == 86,
-    "HelloAckPayload wire size must remain stable");
+static_assert(sizeof(PeerIdentityPayload) == 84,
+    "PeerIdentityPayload wire size must remain stable");
 static_assert(sizeof(SyncAnnouncePayload) == 8,
     "SyncAnnouncePayload wire size must remain stable");
 static_assert(sizeof(SyncConfirmPayload) == 12,
@@ -903,8 +894,6 @@ inline const char* SyncTraceDomainName(SyncTraceDomain domain) {
 
 inline const char* PacketTypeName(PacketType type) {
     switch (type) {
-        case PacketType::Hello:          return "Hello";
-        case PacketType::HelloAck:       return "HelloAck";
         case PacketType::Ready:          return "Ready";
         case PacketType::Disconnect:     return "Disconnect";
         case PacketType::SyncAnnounce:   return "SyncAnnounce";
@@ -952,6 +941,7 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::SyncHashAck:             return "SyncHashAck";
         case PacketType::TimeProbe:               return "TimeProbe";
         case PacketType::TimeProbeAck:            return "TimeProbeAck";
+        case PacketType::PeerIdentity:            return "PeerIdentity";
         default:                         return "Unknown";
     }
 }

@@ -99,11 +99,15 @@ names are renamed `link_*` at M5 together with the engine cutover.
 Deleted at M1 (were dead): `SessionMeta`, `GameplayInput`, `WinScreenConfirm`.
 Renamed at M1: `GekkoData` → `InputStream` (same id 23; carries raw Gekko bytes
 until M5, then the v2 `InputStreamPayload` schema).
-Marked LEGACY, still live until their cutover milestone (M3 session2 /
-M5 engine2): `Hello`, `HelloAck`, `DelayChangeReq/Ack`, `GekkoReady`,
-`SyncAnnounce`/`SyncConfirm` delay-negotiation fields.
-New at M1 (defined, unsent): `SessionHello/Offer/Ack/Confirm/ConfirmAck`,
-`InputStreamPayload` + `PressureReport`, `SyncHash/SyncHashAck`,
-`TimeProbe/TimeProbeAck`, `ResyncReply` (+ `ResyncRequest` payload),
-`FrontendPhaseId`, `NetTransitionKind::EpochAlign` + payload fields,
-`phase_id` in the four frontend payloads.
+Deleted at M3 (session2 cutover): `Hello` (1), `HelloAck` (2) — superseded by
+the live 5-step nonce handshake; their side data (nickname/round/timing/HUD
+style) moved to `PeerIdentity` (79, new at M3, sent post-handshake).
+Marked LEGACY, still live until the M5 cutover: `DelayChangeReq/Ack`,
+`GekkoReady`, `SyncAnnounce`/`SyncConfirm` delay-negotiation fields.
+Live from M3: `SessionHello/Offer/Ack/Confirm/ConfirmAck` (the handshake),
+`PeerIdentity`; `DisconnectReason::Busy` (5) as ENet disconnect data.
+Defined, still unsent (M4+): `InputStreamPayload` + `PressureReport`,
+`SyncHash/SyncHashAck`, `TimeProbe/TimeProbeAck`, `ResyncReply`
+(+ `ResyncRequest` payload), `FrontendPhaseId`,
+`NetTransitionKind::EpochAlign` + payload fields, `phase_id` in the four
+frontend payloads.

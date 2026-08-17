@@ -1,13 +1,18 @@
 /**
- * Alice Senki 2 - Dedicated Network Service Thread (Implementation)
+ * Alice Senki 2 - transport2: ENet worker (Implementation, re0.7 M3)
+ *
+ * Body descends from network_thread.cpp (deleted at M3); differences are the
+ * §2.2 additions: protocol_silence_ms, the pre-establishment liveness anchor,
+ * and the Busy refusal of surplus inbound connects (edges C-5/C-6).
  */
 
 #include <winsock2.h>     // Must be before windows.h
 #include <windows.h>
 #include <enet/enet.h>
 
-#include "net/network_thread.h"
+#include "net/transport2.h"
 #include "net/enet_transport.h"
+#include "net/session_types.h"
 #include "rollback/netplay_log.h"
 
 #include <thread>
@@ -51,7 +56,7 @@ struct WorkerCommand {
 
 constexpr size_t MAX_PENDING_COMMANDS = 4096;
 constexpr size_t MAX_PENDING_EVENTS   = 4096;
-constexpr DWORD  NETWORK_SERVICE_WAIT_MS = 2;
+constexpr DWORD  TRANSPORT_SERVICE_WAIT_MS = 2;
 
 static std::thread              s_worker;
 static std::mutex               s_commandMutex;
@@ -59,10 +64,19 @@ static std::condition_variable  s_commandCv;
 static std::deque<WorkerCommand> s_commands;
 
 static std::mutex               s_eventMutex;
-static std::deque<NetworkThreadEvent> s_events;
+static std::deque<Transport2Event> s_events;
 
 static std::mutex               s_statsMutex;
-static NetworkThreadStats       s_stats{};
+static Transport2Stats          s_stats{};
+// Liveness anchor (QOH99 lesson 10): stamped on the first worker poll after a
+// StartHost/StartJoin command is processed. Pre-establishment silence is
+// measured from here, never from process start. Guarded by s_statsMutex.
+static DWORD                    s_livenessAnchorTickMs = 0;
+// Last valid ENet-protocol inbound tick, derived from the peer's
+// lastReceiveTime each service pass; survives peer teardown so silence keeps
+// growing (instead of resetting) after a detach. Guarded by s_statsMutex.
+static DWORD                    s_lastProtocolInboundTickMs = 0;
+static bool                     s_anyInboundSeen = false;
 
 static std::atomic<bool>        s_initialized{false};
 static std::atomic<bool>        s_stopRequested{false};
@@ -76,11 +90,11 @@ static void UpdateOutboundDepthStatsLocked() {
 }
 
 static void PushWorkerErrorEvent(uint32_t sessionToken, const char* msg) {
-    NetworkThreadEvent ev{};
-    ev.type = NetworkThreadEventType::WorkerError;
+    Transport2Event ev{};
+    ev.type = Transport2EventType::WorkerError;
     ev.session_token = sessionToken;
     ev.transport_tick_ms = GetTickCount();
-    strncpy_s(ev.error_text, sizeof(ev.error_text), msg ? msg : "network worker error", _TRUNCATE);
+    strncpy_s(ev.error_text, sizeof(ev.error_text), msg ? msg : "transport worker error", _TRUNCATE);
 
     std::lock_guard<std::mutex> eventLock(s_eventMutex);
     std::lock_guard<std::mutex> statsLock(s_statsMutex);
@@ -92,11 +106,11 @@ static void PushWorkerErrorEvent(uint32_t sessionToken, const char* msg) {
     UpdateInboundDepthStatsLocked();
 }
 
-static void PushNetworkEvent(const NetworkThreadEvent& ev) {
+static void PushTransportEvent(const Transport2Event& ev) {
     std::lock_guard<std::mutex> eventLock(s_eventMutex);
     std::lock_guard<std::mutex> statsLock(s_statsMutex);
-    if (ev.type == NetworkThreadEventType::PacketReceived ||
-        ev.type == NetworkThreadEventType::Disconnected) {
+    if (ev.type == Transport2EventType::PacketReceived ||
+        ev.type == Transport2EventType::Disconnected) {
         s_stats.last_inbound_packet_tick_ms = ev.transport_tick_ms;
     }
     if (s_events.size() >= MAX_PENDING_EVENTS) {
@@ -143,30 +157,71 @@ static void CopyCommands(std::deque<WorkerCommand>* out) {
     UpdateOutboundDepthStatsLocked();
 }
 
+static void ResetLivenessAnchorLocked() {
+    s_livenessAnchorTickMs = 0;   // re-stamped on the next worker poll
+    s_lastProtocolInboundTickMs = 0;
+    s_anyInboundSeen = false;
+}
+
 static void UpdateStats(bool hostActive, ENetPeer* peer) {
     std::lock_guard<std::mutex> lock(s_statsMutex);
+    const DWORD now = GetTickCount();
     s_stats.host_active = hostActive;
     s_stats.peer_connected = (peer != nullptr);
-    s_stats.last_service_tick_ms = GetTickCount();
+    s_stats.last_service_tick_ms = now;
+
+    if (s_livenessAnchorTickMs == 0) {
+        // First poll after Init/Start*: anchor the liveness budget here.
+        s_livenessAnchorTickMs = now;
+    }
+
     if (peer) {
         s_stats.rtt_ms = Transport_GetPeerRTT(peer);
         s_stats.rtt_variance_ms = (float)peer->roundTripTimeVariance;
         s_stats.packets_sent = peer->packetsSent;
         s_stats.packets_lost = peer->packetsLost;
-        // ENet-level liveness: lastReceiveTime advances on ANY inbound
+
+        // ENet-protocol liveness: lastReceiveTime advances on ANY inbound
         // command (acks of our pings included), in host serviceTime units.
         ENetHost* host = Transport_GetHost();
+        uint32_t enetSilenceMs = 0;
         if (host && host->serviceTime >= peer->lastReceiveTime) {
-            s_stats.enet_silence_ms = host->serviceTime - peer->lastReceiveTime;
-        } else {
-            s_stats.enet_silence_ms = 0;
+            enetSilenceMs = host->serviceTime - peer->lastReceiveTime;
         }
+        if (now >= enetSilenceMs) {
+            s_lastProtocolInboundTickMs = now - enetSilenceMs;
+        } else {
+            s_lastProtocolInboundTickMs = now;
+        }
+        s_anyInboundSeen = true;
+
+        // Authenticated autopunch keepalives never reach ENet (raw-socket
+        // intercept) but are genuine peer traffic — fold them in (INV-14).
+        const uint32_t punchInbound = Transport_AutopunchLastInboundTickMs(host);
+        if (punchInbound != 0 &&
+            (int32_t)(punchInbound - s_lastProtocolInboundTickMs) > 0) {
+            s_lastProtocolInboundTickMs = punchInbound;
+        }
+
+        s_stats.protocol_silence_ms =
+            (now >= s_lastProtocolInboundTickMs)
+                ? (uint32_t)(now - s_lastProtocolInboundTickMs)
+                : 0;
     } else {
         s_stats.rtt_ms = 0.0f;
         s_stats.rtt_variance_ms = 0.0f;
         s_stats.packets_sent = 0;
         s_stats.packets_lost = 0;
-        s_stats.enet_silence_ms = 0xFFFFFFFFu;
+        if (s_anyInboundSeen && s_lastProtocolInboundTickMs != 0) {
+            // Peer object gone but silence keeps growing from the last
+            // genuine inbound — a detached peer must not look "fresh".
+            s_stats.protocol_silence_ms =
+                (now >= s_lastProtocolInboundTickMs)
+                    ? (uint32_t)(now - s_lastProtocolInboundTickMs)
+                    : 0;
+        } else {
+            s_stats.protocol_silence_ms = 0xFFFFFFFFu;
+        }
     }
 }
 
@@ -174,6 +229,9 @@ static void WorkerThreadMain() {
     ENetPeer* activePeer = nullptr;
     uint32_t activeSessionToken = 0;
     bool transportConnected = false;
+    // Set when our own outbound connect is pending (join role): any OTHER
+    // inbound connect during that window is refused Busy (edge C-5).
+    ENetPeer* pendingOutboundPeer = nullptr;
 
     {
         std::lock_guard<std::mutex> lock(s_statsMutex);
@@ -186,7 +244,7 @@ static void WorkerThreadMain() {
         // game-thread work is happening.
         {
             std::unique_lock<std::mutex> lock(s_commandMutex);
-            s_commandCv.wait_for(lock, std::chrono::milliseconds(NETWORK_SERVICE_WAIT_MS),
+            s_commandCv.wait_for(lock, std::chrono::milliseconds(TRANSPORT_SERVICE_WAIT_MS),
                                  [] { return s_stopRequested.load() || !s_commands.empty(); });
         }
 
@@ -198,15 +256,17 @@ static void WorkerThreadMain() {
                 case WorkerCommandType::StartHost: {
                     activeSessionToken = cmd.session_token;
                     activePeer = nullptr;
+                    pendingOutboundPeer = nullptr;
                     transportConnected = false;
                     Transport_DestroyHost();
                     {
                         std::lock_guard<std::mutex> statsLock(s_statsMutex);
                         s_stats.last_inbound_packet_tick_ms = 0;
                         s_stats.last_outbound_packet_tick_ms = 0;
+                        ResetLivenessAnchorLocked();
                     }
                     if (!Transport_CreateHost(cmd.listen_port)) {
-                        PushWorkerErrorEvent(cmd.session_token, "Network thread failed to create host");
+                        PushWorkerErrorEvent(cmd.session_token, "Transport worker failed to create host");
                     } else {
                         uint16_t boundPort = cmd.listen_port;
                         Transport_GetBoundPort(&boundPort);
@@ -233,12 +293,14 @@ static void WorkerThreadMain() {
                 case WorkerCommandType::StartJoin: {
                     activeSessionToken = cmd.session_token;
                     activePeer = nullptr;
+                    pendingOutboundPeer = nullptr;
                     transportConnected = false;
                     Transport_DestroyHost();
                     {
                         std::lock_guard<std::mutex> statsLock(s_statsMutex);
                         s_stats.last_inbound_packet_tick_ms = 0;
                         s_stats.last_outbound_packet_tick_ms = 0;
+                        ResetLivenessAnchorLocked();
                     }
                     bool hostReady = false;
                     if (cmd.listen_port > 0) {
@@ -254,7 +316,7 @@ static void WorkerThreadMain() {
                         hostReady = Transport_CreateHost(0);
                     }
                     if (!hostReady) {
-                        PushWorkerErrorEvent(cmd.session_token, "Network thread failed to create join host");
+                        PushWorkerErrorEvent(cmd.session_token, "Transport worker failed to create join host");
                         break;
                     }
                     uint16_t boundPort = cmd.listen_port;
@@ -283,12 +345,13 @@ static void WorkerThreadMain() {
                     }
                     ENetPeer* peer = Transport_Connect(cmd.target_host, cmd.target_port);
                     if (!peer) {
-                        PushWorkerErrorEvent(cmd.session_token, "Network thread failed to initiate connect");
+                        PushWorkerErrorEvent(cmd.session_token, "Transport worker failed to initiate connect");
                         Transport_DestroyHost();
                         activeSessionToken = 0;
                         break;
                     }
                     activePeer = peer;
+                    pendingOutboundPeer = peer;
                     Rollback::NetplayLog_Write("NTHREAD", -1,
                         "Worker join connect initiated: token=%u target=%s:%u hole_punch=%d",
                         cmd.session_token,
@@ -308,7 +371,7 @@ static void WorkerThreadMain() {
                                              cmd.payload_len > 0 ? cmd.payload : nullptr,
                                              cmd.payload_len,
                                              cmd.reliable)) {
-                        PushWorkerErrorEvent(cmd.session_token, "Network thread failed to send packet");
+                        PushWorkerErrorEvent(cmd.session_token, "Transport worker failed to send packet");
                     } else {
                         {
                             std::lock_guard<std::mutex> statsLock(s_statsMutex);
@@ -339,6 +402,7 @@ static void WorkerThreadMain() {
                         Transport_ForceDisconnectPeer(activePeer);
                         activePeer = nullptr;
                     }
+                    pendingOutboundPeer = nullptr;
                     transportConnected = false;
                     Transport_DestroyHost();
                     Rollback::NetplayLog_Write("NTHREAD", -1,
@@ -349,6 +413,7 @@ static void WorkerThreadMain() {
                         std::lock_guard<std::mutex> statsLock(s_statsMutex);
                         s_stats.last_inbound_packet_tick_ms = 0;
                         s_stats.last_outbound_packet_tick_ms = 0;
+                        ResetLivenessAnchorLocked();
                     }
                     break;
                 }
@@ -374,12 +439,33 @@ static void WorkerThreadMain() {
         while (!s_stopRequested.load() && Transport_Service(0, &ev) > 0) {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
+                    // Busy refusal (C-5/C-6): exactly one peer per session.
+                    // A second inbound connect while a peer is live, or any
+                    // inbound connect that is not our own pending outbound
+                    // while joining, is refused without touching the
+                    // existing peer/attempt.
+                    const bool surplus =
+                        (transportConnected && ev.peer != activePeer) ||
+                        (pendingOutboundPeer != nullptr && ev.peer != pendingOutboundPeer);
+                    if (surplus) {
+                        Rollback::NetplayLog_Write("NTHREAD", -1,
+                            "Refusing surplus inbound connect with Busy: peer=0x%llX connected=%d pending_outbound=%d token=%u",
+                            (unsigned long long)(uintptr_t)ev.peer,
+                            transportConnected ? 1 : 0,
+                            pendingOutboundPeer ? 1 : 0,
+                            activeSessionToken);
+                        Transport_DisconnectPeer(
+                            ev.peer,
+                            (uint32_t)DisconnectReason::Busy);
+                        break;
+                    }
                     activePeer = ev.peer;
+                    pendingOutboundPeer = nullptr;
                     transportConnected = true;
                     Transport_ConfigurePeerResilience(ev.peer);
                     Transport_AutopunchService(GetTickCount(), true);
-                    NetworkThreadEvent out{};
-                    out.type = NetworkThreadEventType::Connected;
+                    Transport2Event out{};
+                    out.type = Transport2EventType::Connected;
                     out.session_token = activeSessionToken;
                     out.peer_token = (uintptr_t)ev.peer;
                     out.transport_tick_ms = GetTickCount();
@@ -388,7 +474,7 @@ static void WorkerThreadMain() {
                         activeSessionToken,
                         (unsigned long long)out.peer_token,
                         (unsigned long)out.transport_tick_ms);
-                    PushNetworkEvent(out);
+                    PushTransportEvent(out);
                     break;
                 }
 
@@ -404,8 +490,8 @@ static void WorkerThreadMain() {
                         break;
                     }
 
-                    NetworkThreadEvent out{};
-                    out.type = NetworkThreadEventType::PacketReceived;
+                    Transport2Event out{};
+                    out.type = Transport2EventType::PacketReceived;
                     out.session_token = activeSessionToken;
                     out.peer_token = (uintptr_t)ev.peer;
                     out.transport_tick_ms = GetTickCount();
@@ -414,7 +500,7 @@ static void WorkerThreadMain() {
                     if (out.packet_len > 0 && ev.packet->data) {
                         memcpy(out.packet_data, ev.packet->data, out.packet_len);
                     }
-                    PushNetworkEvent(out);
+                    PushTransportEvent(out);
 
                     enet_packet_destroy(ev.packet);
                     break;
@@ -423,10 +509,13 @@ static void WorkerThreadMain() {
                 case ENET_EVENT_TYPE_DISCONNECT: {
                     if (ev.peer == activePeer) {
                         activePeer = nullptr;
+                        transportConnected = false;
                     }
-                    transportConnected = false;
-                    NetworkThreadEvent out{};
-                    out.type = NetworkThreadEventType::Disconnected;
+                    if (ev.peer == pendingOutboundPeer) {
+                        pendingOutboundPeer = nullptr;
+                    }
+                    Transport2Event out{};
+                    out.type = Transport2EventType::Disconnected;
                     out.session_token = activeSessionToken;
                     out.peer_token = (uintptr_t)ev.peer;
                     out.transport_tick_ms = GetTickCount();
@@ -437,7 +526,7 @@ static void WorkerThreadMain() {
                         (unsigned long long)out.peer_token,
                         out.disconnect_data,
                         (unsigned long)out.transport_tick_ms);
-                    PushNetworkEvent(out);
+                    PushTransportEvent(out);
                     break;
                 }
 
@@ -472,7 +561,7 @@ static void WorkerThreadMain() {
 
 } // anonymous namespace
 
-bool NetworkThread_Init() {
+bool Transport2_Init() {
     if (s_initialized.load()) {
         return true;
     }
@@ -488,8 +577,7 @@ bool NetworkThread_Init() {
     {
         std::lock_guard<std::mutex> statsLock(s_statsMutex);
         memset(&s_stats, 0, sizeof(s_stats));
-        s_stats.inbound_queue_depth = 0;
-        s_stats.outbound_queue_depth = 0;
+        ResetLivenessAnchorLocked();
     }
 
     s_stopRequested.store(false);
@@ -497,11 +585,11 @@ bool NetworkThread_Init() {
 
     s_worker = std::thread(WorkerThreadMain);
 
-    Rollback::NetplayLog_Write("NTHREAD", -1, "Network worker thread started");
+    Rollback::NetplayLog_Write("NTHREAD", -1, "transport2 worker thread started");
     return true;
 }
 
-void NetworkThread_Shutdown() {
+void Transport2_Shutdown() {
     if (!s_initialized.load()) {
         return;
     }
@@ -528,13 +616,13 @@ void NetworkThread_Shutdown() {
     }
 
     s_initialized.store(false);
-    Rollback::NetplayLog_Write("NTHREAD", -1, "Network worker thread stopped");
+    Rollback::NetplayLog_Write("NTHREAD", -1, "transport2 worker thread stopped");
 }
 
-bool NetworkThread_StartHost(uint32_t session_token, uint16_t listen_port,
-                             bool enable_autopunch,
-                             const char* punch_relay_host,
-                             uint16_t punch_relay_port) {
+bool Transport2_StartHost(uint32_t session_token, uint16_t listen_port,
+                          bool enable_autopunch,
+                          const char* punch_relay_host,
+                          uint16_t punch_relay_port) {
     WorkerCommand cmd{};
     cmd.type = WorkerCommandType::StartHost;
     cmd.session_token = session_token;
@@ -557,11 +645,11 @@ bool NetworkThread_StartHost(uint32_t session_token, uint16_t listen_port,
     return ok;
 }
 
-bool NetworkThread_StartJoin(uint32_t session_token, uint16_t listen_port,
-                             const char* target_host, uint16_t target_port,
-                             bool send_hole_punch,
-                             const char* punch_relay_host,
-                             uint16_t punch_relay_port) {
+bool Transport2_StartJoin(uint32_t session_token, uint16_t listen_port,
+                          const char* target_host, uint16_t target_port,
+                          bool send_hole_punch,
+                          const char* punch_relay_host,
+                          uint16_t punch_relay_port) {
     if (!target_host || !target_host[0]) {
         return false;
     }
@@ -592,9 +680,9 @@ bool NetworkThread_StartJoin(uint32_t session_token, uint16_t listen_port,
     return ok;
 }
 
-bool NetworkThread_SendPacket(uint32_t session_token, uint8_t channel,
-                              PacketType type, const void* payload,
-                              size_t payload_len, bool reliable) {
+bool Transport2_SendPacket(uint32_t session_token, uint8_t channel,
+                           PacketType type, const void* payload,
+                           size_t payload_len, bool reliable) {
     if (payload_len > MAX_PAYLOAD_SIZE) {
         return false;
     }
@@ -610,11 +698,10 @@ bool NetworkThread_SendPacket(uint32_t session_token, uint8_t channel,
         memcpy(cmd.payload, payload, payload_len);
     }
 
-    const bool ok = EnqueueCommand(cmd);
-    return ok;
+    return EnqueueCommand(cmd);
 }
 
-void NetworkThread_RequestDisconnect(uint32_t session_token, uint32_t data, bool force) {
+void Transport2_RequestDisconnect(uint32_t session_token, uint32_t data, bool force) {
     WorkerCommand cmd{};
     cmd.type = WorkerCommandType::RequestDisconnect;
     cmd.session_token = session_token;
@@ -629,7 +716,7 @@ void NetworkThread_RequestDisconnect(uint32_t session_token, uint32_t data, bool
     }
 }
 
-void NetworkThread_RequestDestroyHost(uint32_t session_token) {
+void Transport2_RequestDestroyHost(uint32_t session_token) {
     WorkerCommand cmd{};
     cmd.type = WorkerCommandType::RequestDestroyHost;
     cmd.session_token = session_token;
@@ -640,7 +727,7 @@ void NetworkThread_RequestDestroyHost(uint32_t session_token) {
     }
 }
 
-void NetworkThread_ClearQueues(uint32_t session_token) {
+void Transport2_ClearQueues(uint32_t session_token) {
     WorkerCommand cmd{};
     cmd.type = WorkerCommandType::ClearQueues;
     cmd.session_token = session_token;
@@ -651,7 +738,7 @@ void NetworkThread_ClearQueues(uint32_t session_token) {
     }
 }
 
-bool NetworkThread_TryPopEvent(NetworkThreadEvent* out) {
+bool Transport2_TryPopEvent(Transport2Event* out) {
     if (!out) return false;
 
     std::lock_guard<std::mutex> eventLock(s_eventMutex);
@@ -667,7 +754,7 @@ bool NetworkThread_TryPopEvent(NetworkThreadEvent* out) {
     return true;
 }
 
-void NetworkThread_GetStats(NetworkThreadStats* out) {
+void Transport2_GetStats(Transport2Stats* out) {
     if (!out) return;
     std::lock_guard<std::mutex> lock(s_statsMutex);
     *out = s_stats;

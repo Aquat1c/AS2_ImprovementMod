@@ -349,10 +349,11 @@ static void LogPregamePacketAnomaly(const char* reason,
 }
 
 // ============================================================================
-// Packet handler (registered with Session_SetPacketCallback)
+// Packet entry point (routed by net/packet_router since M3 — the router is
+// the single registered Session callback; no handoff, no re-registration)
 // ============================================================================
 
-static void OnPregamePacket(PacketType type, const void* payload, size_t payloadLen) {
+static void HandleSessionPacketInternal(PacketType type, const void* payload, size_t payloadLen) {
     Rollback::NetplayLog_Write("PREGAME", -1,
         "OnPregamePacket: type=%s payload=%zu phase=%s session=0x%08X remoteSession=0x%08X announced=%d confirmed=%d",
         PacketTypeName(type),
@@ -1142,6 +1143,10 @@ static bool PregameWinScreenSendGate() {
 
 namespace Net {
 
+void PregameSync_OnSessionPacket(PacketType type, const void* payload, size_t payloadLen) {
+    HandleSessionPacketInternal(type, payload, payloadLen);
+}
+
 void PregameSync_Init() {
     if (s_initialized) return;
     s_phase = PregamePhase::Idle;
@@ -1300,15 +1305,9 @@ bool PregameSync_Begin() {
     SetStatusFmt("Synchronizing session...");
     SetPhase(PregamePhase::SyncAnnounce, "begin");
 
-    // Register the packet handler LAST: installing it synchronously flushes
-    // any deferred control packets into OnPregamePacket, and doing that
-    // before the state reset above wiped the remote-announce latch the flush
-    // had just set (a first-announce drop). With the phase already at
-    // SyncAnnounce, flushed announces are handled normally.
-    Rollback::NetplayLog_Write("PREGAME", -1,
-        "Registering pregame packet callback");
-    Rollback::NetplayLog_Flush();
-    Session_SetPacketCallback(OnPregamePacket);
+    // M3: no callback registration — packet_router is the permanent single
+    // dispatch owner and routes pregame packets here by type. The old
+    // register-LAST/deferred-flush ordering hazard is gone with the handoff.
 
     s_beginInProgress = false;
     LOG_NETPLAY(LOG_INFO, "[PregameSync] Pre-game sync started (session=0x%08X)", s_sessionId);
@@ -1512,7 +1511,8 @@ bool PregameSync_HandleCrossPhaseSessionPacket(PacketType type,
     }
 
     ResetTrackingStateForNewRun();
-    Session_SetPacketCallback(OnPregamePacket);
+    // M3: no callback handoff — packet_router keeps routing pregame packets
+    // here regardless of regime.
     NetplayPaletteRuntime_OnDisconnect("cross-phase pregame adopt");
 
     if (type == PacketType::SyncAnnounce) {

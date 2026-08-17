@@ -1,12 +1,15 @@
 /**
- * Alice Senki 2 - Gameplay Packet Router Implementation (re0.7 M0)
+ * Alice Senki 2 - packet_router (Implementation, re0.7 M3)
  *
- * Body moved verbatim from online_wiring.cpp OnGameplayPacket; the two
- * engine-coupled cases (engine input stream, startup barrier) call back into
- * online_wiring, which still owns that state.
+ * Promotion of the M0 gameplay_packet_router: one regime-independent routing
+ * table, registered once by session2 and never handed off (§2.3). The
+ * per-type handlers are the same module entry points both legacy regimes
+ * routed to; the pregame-machine-owned set goes through
+ * PregameSync_OnSessionPacket (which also maintains the pregame lock
+ * latches for CharSelLock/StageSync).
  */
 
-#include "net/gameplay_packet_router.h"
+#include "net/packet_router.h"
 
 #include "net/charsel_sync.h"
 #include "net/churn_pause.h"
@@ -43,30 +46,55 @@ void LogRouterPacketAnomaly(const char* reason,
     Rollback::NetplayLog_Write(
         "PACKET", RouterLogFrame(),
         "%s: type=%s payload=%zu expected=%zu rollback_active=%d",
-        reason ? reason : "gameplay packet anomaly",
+        reason ? reason : "packet anomaly",
         PacketTypeName(type),
         payloadLen,
         expectedLen,
         Rollback::RollbackSession_IsActive() ? 1 : 0);
 }
 
+uint32_t s_unknownPacketCount = 0;
+
 } // anonymous namespace
 
-void GameplayPacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadLen) {
+void PacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadLen) {
     // Wire-acknowledged transition barriers must be reachable regardless of
-    // which callback owns the slot — winscreen-exit proposals arrive exactly
-    // while this handler is installed.
+    // regime — winscreen-exit proposals arrive during gameplay, cancel/restart
+    // proposals during pregame.
     if (TransitionBarrier_OnPacket(type, payload, payloadLen)) {
         return;
     }
     switch (type) {
+        // --- Pregame-machine-owned set (state lives in pregame_sync /
+        // match_bootstrap; CharSelLock/StageSync also set pregame latches) ---
+        case PacketType::SyncAnnounce:
+        case PacketType::SyncConfirm:
+        case PacketType::CharSelInput:
+        case PacketType::CharSelLock:
+        case PacketType::StageSync:
+        case PacketType::ConfigExchange:
+        case PacketType::ConfigAck:
+        case PacketType::LoadBarrier:
+        case PacketType::BaselineReady:
+        case PacketType::BaselineDigest:
+        case PacketType::BaselineBreakdown:
+        case PacketType::GameplayStart:
+            PregameSync_OnSessionPacket(type, payload, payloadLen);
+            break;
+
+        // --- Engine sinks (Gekko-era, until the engine2/match_setup cutover;
+        // both handlers self-guard against pre-live arrival) ---
         case PacketType::InputStream: {
-            // Engine input stream (Gekko internal data until the M5 cutover) —
-            // owned by online_wiring/rollback_session.
             Rollback::OnlineWiring_HandleEngineDataPacket(payload, payloadLen);
             break;
         }
 
+        case PacketType::GekkoReady: {
+            Rollback::OnlineWiring_HandleStartupBarrierPacket(payload, payloadLen);
+            break;
+        }
+
+        // --- Diagnostics ---
         case PacketType::StateDigest: {
             if (payloadLen < sizeof(StateDigestPayload)) {
                 LogRouterPacketAnomaly("Short StateDigest", type, payloadLen, sizeof(StateDigestPayload));
@@ -115,12 +143,7 @@ void GameplayPacketRouter_OnPacket(PacketType type, const void* payload, size_t 
             break;
         }
 
-        case PacketType::GekkoReady: {
-            // Startup gameplay-entry barrier — owned by online_wiring.
-            Rollback::OnlineWiring_HandleStartupBarrierPacket(payload, payloadLen);
-            break;
-        }
-
+        // --- Frontend lockstep ---
         case PacketType::CharSelFrameInput: {
             if (payloadLen < sizeof(CharSelFrameInputPayload)) {
                 LogRouterPacketAnomaly("Short CharSelFrameInput", type, payloadLen,
@@ -129,6 +152,17 @@ void GameplayPacketRouter_OnPacket(PacketType type, const void* payload, size_t 
             }
             CharSelSync_OnRemoteFrameInput(
                 static_cast<const CharSelFrameInputPayload*>(payload));
+            break;
+        }
+
+        case PacketType::WinScreenFrameInput: {
+            if (payloadLen < sizeof(WinScreenFrameInputPayload)) {
+                LogRouterPacketAnomaly("Short WinScreenFrameInput", type, payloadLen,
+                                       sizeof(WinScreenFrameInputPayload));
+                break;
+            }
+            WinScreenSync_OnRemoteFrameInput(
+                static_cast<const WinScreenFrameInputPayload*>(payload));
             break;
         }
 
@@ -176,39 +210,7 @@ void GameplayPacketRouter_OnPacket(PacketType type, const void* payload, size_t 
             break;
         }
 
-        case PacketType::CharSelLock: {
-            if (payloadLen < sizeof(CharSelLockPayload)) {
-                LogRouterPacketAnomaly("Short CharSelLock", type, payloadLen,
-                                       sizeof(CharSelLockPayload));
-                break;
-            }
-            CharSelSync_OnRemoteLock(
-                static_cast<const CharSelLockPayload*>(payload));
-            break;
-        }
-
-        case PacketType::StageSync: {
-            if (payloadLen < sizeof(StageSyncPayload)) {
-                LogRouterPacketAnomaly("Short StageSync", type, payloadLen,
-                                       sizeof(StageSyncPayload));
-                break;
-            }
-            CharSelSync_OnRemoteStage(
-                static_cast<const StageSyncPayload*>(payload));
-            break;
-        }
-
-        case PacketType::WinScreenFrameInput: {
-            if (payloadLen < sizeof(WinScreenFrameInputPayload)) {
-                LogRouterPacketAnomaly("Short WinScreenFrameInput", type, payloadLen,
-                                       sizeof(WinScreenFrameInputPayload));
-                break;
-            }
-            WinScreenSync_OnRemoteFrameInput(
-                static_cast<const WinScreenFrameInputPayload*>(payload));
-            break;
-        }
-
+        // --- Palette control-plane (50-52): single owner in every regime ---
         case PacketType::PaletteConfig: {
             if (payloadLen < sizeof(PaletteConfigPayload)) {
                 LogRouterPacketAnomaly("Short PaletteConfig", type, payloadLen,
@@ -242,31 +244,22 @@ void GameplayPacketRouter_OnPacket(PacketType type, const void* payload, size_t 
             break;
         }
 
-        case PacketType::SyncAnnounce:
-        case PacketType::SyncConfirm:
-            if (PregameSync_HandleCrossPhaseSessionPacket(type, payload, payloadLen)) {
-                break;
-            }
-            Rollback::NetplayLog_Write("HANDOFF", RouterLogFrame(),
-                "Ignored cross-phase session sync packet: type=%s pregame=%s lifecycle=%s",
-                PacketTypeName(type),
-                PregamePhaseName(PregameSync_GetPhase()),
-                MatchLifecyclePhaseName(MatchLifecycle_GetPhase()));
+        case PacketType::PauseQuit:
+            PauseHandler_OnRemotePauseQuit();
             break;
 
         default:
-            if (type == PacketType::PauseQuit) {
-                PauseHandler_OnRemotePauseQuit();
-                break;
-            }
-            // Not a gameplay packet; unhandled at this level.
-            // During gameplay, the pregame handler is not active,
-            // so non-gameplay packets are just logged.
-            Rollback::NetplayLog_Verbose("PACKET", -1,
-                "Unhandled packet during gameplay: type=%s(%u) payload=%zu",
+            // Unknown/unrouted type: log + count, never terminal (§2.3 —
+            // forward compat within a protocol version).
+            s_unknownPacketCount++;
+            Rollback::NetplayLog_Verbose("PACKET", RouterLogFrame(),
+                "Unrouted packet: type=%s(%u) payload=%zu total_unrouted=%u pregame=%s lifecycle=%s",
                 PacketTypeName(type),
                 (unsigned)type,
-                payloadLen);
+                payloadLen,
+                s_unknownPacketCount,
+                PregamePhaseName(PregameSync_GetPhase()),
+                MatchLifecyclePhaseName(MatchLifecycle_GetPhase()));
             break;
     }
 }

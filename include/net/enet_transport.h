@@ -100,6 +100,12 @@ void Transport_AutopunchStart(const char* relayHost, uint16_t relayPort,
 void Transport_AutopunchStop(const char* reason);
 void Transport_AutopunchService(uint32_t nowMs, bool peerConnected);
 
+/// GetTickCount of the last AUTHENTICATED autopunch keepalive accepted by the
+/// raw-socket intercept for this host (connectID verified against the live
+/// peer). 0 = none seen. Feeds transport2's protocol_silence_ms (INV-14):
+/// keepalives never reach ENet, so they must count as liveness separately.
+uint32_t Transport_AutopunchLastInboundTickMs(ENetHost* enetHost);
+
 bool Transport_SendHolePunchBurstForHost(ENetHost* enetHost,
                                          const char* host, uint16_t port,
                                          int burstCount, uint32_t intervalMs);

@@ -330,8 +330,9 @@ set(NET_HEADERS
     include/net/enet_transport.h
     include/net/frame_arithmetic.h
     include/net/frontend_input_sync.h
-    include/net/gameplay_packet_router.h
-    include/net/network_thread.h
+    include/net/packet_router.h
+    include/net/transport2.h
+    include/net/session2.h
     include/net/session_manager.h
     include/net/spectator_protocol.h
     include/net/spectator_manager.h
@@ -458,9 +459,9 @@ set(NET_SOURCES
     src/net/transition_barrier.cpp
     src/net/enet_transport.cpp
     src/net/frontend_input_sync.cpp
-    src/net/gameplay_packet_router.cpp
-    src/net/network_thread.cpp
-    src/net/session_manager.cpp
+    src/net/packet_router.cpp
+    src/net/transport2.cpp
+    src/net/session2.cpp
     src/net/spectator_protocol.cpp
     src/net/spectator_manager.cpp
     src/net/spectator_runtime.cpp

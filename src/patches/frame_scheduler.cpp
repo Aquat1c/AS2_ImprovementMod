@@ -417,9 +417,10 @@ void __cdecl FrameScheduler_WaitForNextFrame() {
             if (adv.wait_until - now > spinThresholdTicks) {
                 Sleep(1);
                 // Dead-clock latch: QPC frozen across ≥500 Sleep(1) rounds
-                // (§2.8.2 PacingClockDead). Terminal wiring arrives with
-                // session2 at M3; until then: log loud once, rebase, keep
-                // the loop alive rather than wedge the game thread.
+                // (§2.8.2 PacingClockDead). session2 polls the sticky latch
+                // (FrameScheduler_IsPacingClockDead) and fires the fail-closed
+                // terminal; here: log loud once, rebase, keep the loop alive
+                // rather than wedge the game thread.
                 if (now == lastSeen) {
                     if (++deadIters >= 500) {
                         if (!s_deadClockLatched) {
@@ -428,7 +429,7 @@ void __cdecl FrameScheduler_WaitForNextFrame() {
                                       "progress across %u sleep rounds", deadIters);
                             Rollback::NetplayLog_Write("PACE", s_lastTelemetryFrame,
                                 "ERROR PacingClockDead: QPC frozen; deadline rebased "
-                                "(fail-closed terminal lands with session2 at M3)");
+                                "(session2 converts this latch into the terminal)");
                         }
                         s_clock.RebaseTo(now);
                         break;
@@ -526,6 +527,10 @@ bool FrameScheduler_Install() {
 
 bool FrameScheduler_IsInstalled() {
     return s_installed;
+}
+
+bool FrameScheduler_IsPacingClockDead() {
+    return s_deadClockLatched;
 }
 
 void FrameScheduler_Shutdown() {

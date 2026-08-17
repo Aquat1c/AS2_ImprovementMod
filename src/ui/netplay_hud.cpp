@@ -4,7 +4,7 @@
  * Vanilla match HUD (decomp ~113076, mode 3/5) draws dword_816038 twice per side:
  * blend 3 @ alpha 0x80 (dark mask), then blend 2 @ alpha 0x80 (player RGB), then white text.
  * Bar spans screen edge through nickname at y=85..100 (15px). We mirror that layout with
- * configurable colors synced over Hello/HelloAck.
+ * configurable colors synced over the post-handshake PeerIdentity exchange.
  */
 
 #include "ui/netplay_hud.h"

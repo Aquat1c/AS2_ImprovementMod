@@ -14,8 +14,9 @@
  *   PregameSync_Abort() on disconnect or error
  *   PregameSync_Shutdown() at mod shutdown
  *
- * The state machine registers itself as the Session_SetPacketCallback
- * handler for pre-game packet types (11-19).
+ * Since re0.7 M3 the state machine no longer owns the Session packet
+ * callback: net/packet_router is the single registered dispatch owner and
+ * routes the pregame packet set into PregameSync_OnSessionPacket.
  */
 
 #pragma once
@@ -179,5 +180,12 @@ bool PregameSync_IsComplete();
 bool PregameSync_HandleCrossPhaseSessionPacket(PacketType type,
                                                const void* payload,
                                                size_t payloadLen);
+
+/// Pregame-owned packet entry point, called by packet_router (§2.3) for the
+/// pregame machine's packet set (SyncAnnounce/Confirm, CharSelInput/Lock,
+/// StageSync, Config/Load/Baseline/GameplayStart). Since M3 the router is the
+/// single registered Session callback; pregame_sync no longer registers or
+/// hands off the callback itself.
+void PregameSync_OnSessionPacket(PacketType type, const void* payload, size_t payloadLen);
 
 } // namespace Net

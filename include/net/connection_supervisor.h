@@ -49,7 +49,17 @@ bool ConnectionSupervisor_IsInterrupted();
 bool ConnectionSupervisor_IsDead();
 
 // Milliseconds of inbound silence the current verdict is based on.
+// Since re0.7 M3 this is PROTOCOL-level silence (INV-14): ENet acks/pings
+// and authenticated autopunch keepalives all count, via transport2.
 uint32_t ConnectionSupervisor_GetInboundSilenceMs();
+
+// §2.4 progress deadline (re0.7 M3): while gameplay runs with a transmitting
+// peer, milliseconds of zero canonical-frame progress (0 when progressing or
+// not applicable). At 8 s the warn flag latches ("opponent's game stopped
+// responding" — HUD consumer arrives at M6); at 20 s the supervisor fires a
+// Dead-equivalent teardown with the distinct reason ProgressDeadline.
+uint32_t ConnectionSupervisor_GetProgressStallMs();
+bool ConnectionSupervisor_IsProgressStallWarned();
 
 // Threshold overrides (ms). Pass 0 to keep a value unchanged.
 void ConnectionSupervisor_SetThresholds(uint32_t degradedMs,

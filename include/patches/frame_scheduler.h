@@ -53,6 +53,11 @@ bool FrameScheduler_IsInstalled();
 // Restores the original limiter bytes (mod unload).
 void FrameScheduler_Shutdown();
 
+// Sticky dead-clock latch (§2.8.2 PacingClockDead): QPC made no progress
+// across ≥500 Sleep(1) rounds inside a wait. session2 polls this and converts
+// it into the fail-closed PacingClockDead terminal (INV-20, M3).
+bool FrameScheduler_IsPacingClockDead();
+
 // The detour target. Public only so the installer can reference it; never
 // call it directly.
 void __cdecl FrameScheduler_WaitForNextFrame();

@@ -66,6 +66,10 @@ struct AutopunchState {
     uint32_t    keepalive_sent;
     uint32_t    keepalive_received;
     uint32_t    rebind_heals;
+    // GetTickCount of the last AUTHENTICATED keepalive accepted from the
+    // connected peer (connectID verified). Feeds transport2's
+    // protocol_silence_ms so autopunch keepalives count as liveness (INV-14).
+    uint32_t    last_authenticated_inbound_ms;
 };
 
 static std::mutex s_autopunchMutex;
@@ -421,6 +425,9 @@ static void AutopunchHandleKeepalive(AutopunchState& state,
     if (!peer || peer->connectID == 0 || peer->connectID != connectId) {
         return;
     }
+
+    // connectID matched the live peer: this is genuine peer traffic.
+    state.last_authenticated_inbound_ms = GetTickCount();
 
     if (from.host == peer->address.host && from.port == peer->address.port) {
         return;  // Endpoint unchanged: plain keepalive.
@@ -1048,6 +1055,12 @@ void Transport_AutopunchStopForHost(ENetHost* enetHost, const char* reason) {
 
 void Transport_AutopunchService(uint32_t nowMs, bool peerConnected) {
     Transport_AutopunchServiceForHost(s_enetHost, nowMs, peerConnected);
+}
+
+uint32_t Transport_AutopunchLastInboundTickMs(ENetHost* enetHost) {
+    std::lock_guard<std::mutex> lock(s_autopunchMutex);
+    const AutopunchState* state = FindAutopunchStateLocked(enetHost);
+    return state ? state->last_authenticated_inbound_ms : 0;
 }
 
 void Transport_AutopunchServiceForHost(ENetHost* enetHost,

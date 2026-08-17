@@ -72,7 +72,7 @@ void OnlineWiring_OnRematch();
 void OnlineWiring_OnReturnToSession();
 
 // ============================================================================
-// Packet sinks (called by Net::GameplayPacketRouter_OnPacket — M0 extraction)
+// Packet sinks (called by Net::PacketRouter_OnPacket — M0 extraction, M3 promotion)
 // ============================================================================
 
 /// Engine input stream packet (InputStream, id 23 — raw Gekko data until the

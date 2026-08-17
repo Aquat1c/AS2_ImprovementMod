@@ -60,10 +60,9 @@ namespace Net {
 inline bool BarrierProtocol_IsReliable(PacketType type) {
     switch (type) {
         // Session control — always reliable
-        case PacketType::Hello:
-        case PacketType::HelloAck:
         case PacketType::Ready:
         case PacketType::Disconnect:
+        case PacketType::PeerIdentity:
 
         // Sync barriers — always reliable
         case PacketType::SyncAnnounce:

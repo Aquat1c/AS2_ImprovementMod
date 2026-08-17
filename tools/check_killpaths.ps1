@@ -20,15 +20,20 @@ $root = Split-Path -Parent $PSScriptRoot
 $allow = @{
     # The funnel's own definition + menu-local user actions + supervisor entry.
     "src\net\netplay_menu_controller.cpp" = 99   # funnel owner (definitions + internal routing)
-    # Supervisor: the ONLY network-originated teardown (INV-1a).
-    "src\net\connection_supervisor.cpp"   = 1
+    # Supervisor: the ONLY network-originated teardown (INV-1a / re0.7 INV-12).
+    # Two typed terminals since M3: silence Dead + ProgressDeadline (§2.4).
+    "src\net\connection_supervisor.cpp"   = 2
+    # session2 (M3): PacingClockDead — LOCAL fail-closed terminal (INV-20,
+    # M2 obligation), not network-originated; routed through Session2_Terminate
+    # first, then the UI funnel.
+    "src\net\session2.cpp"                = 1
     # User actions (INV-1b):
     "src\net\pause_handler.cpp"           = 1    # remote quit from pause menu
     "src\net\mode_ownership.cpp"          = 2    # user left charsel / game left netplay context
-    # Legacy heuristic callers being burned down by M4 — DO NOT ADD, only remove:
-    "src\net\pregame_sync.cpp"            = 2    # SetPhase(Error) + session-lost guard (M4 target)
-    "src\net\match_lifecycle.cpp"         = 1    # session-lost guard (M4 target)
-    "src\patches\input_override.cpp"      = 1    # AbortRollbackDispatcher (M3/M4 target)
+    # Legacy heuristic callers being burned down by M4/M5 — DO NOT ADD, only remove:
+    "src\net\pregame_sync.cpp"            = 2    # SetPhase(Error) + session-lost guard (M5 target)
+    "src\net\match_lifecycle.cpp"         = 1    # session-lost guard (M5 target)
+    "src\patches\input_override.cpp"      = 1    # AbortRollbackDispatcher (M4 target)
 }
 
 $pattern = "(NetMenu::)?(HandleDisconnection|OpenDisconnectError)\s*\("

@@ -3,7 +3,7 @@
  *
  * This is the integration glue that connects all subsystems:
  *   - Bootstrap → RollbackSession handoff
- *   - Engine-facing packet sinks (dispatch lives in net/gameplay_packet_router)
+ *   - Engine-facing packet sinks (dispatch lives in net/packet_router)
  *   - Lifecycle phase → rollback start/stop/pause
  *   - Disconnect → safe teardown
  *   - Post-match → clean handoff
@@ -22,7 +22,7 @@
 #include "rollback/determinism_verify.h"
 #include "patches/input_sync_hooks.h"
 #include "net/gameplay_bridge.h"
-#include "net/gameplay_packet_router.h"
+#include "net/packet_router.h"
 #include "net/match_lifecycle.h"
 #include "net/set_tracker.h"
 #include "net/pregame_sync.h"
@@ -244,7 +244,7 @@ static void LogGameplayPacketAnomaly(const char* reason,
 }
 
 // ============================================================================
-// Engine-facing packet sinks (dispatch itself moved to gameplay_packet_router)
+// Engine-facing packet sinks (dispatch itself lives in net/packet_router)
 // ============================================================================
 
 void OnlineWiring_HandleEngineDataPacket(const void* payload, size_t payloadLen) {
@@ -414,9 +414,8 @@ static bool PrepareBaselineForInteractiveRelease() {
         LOG_WARN("[OnlineWiring] Baseline restore failed before intro handoff");
     }
 
-    // Switch to gameplay-phase packet callback now so startup READY/ACK can be
-    // exchanged during intro/passive startup before rollback session begin.
-    Net::Session_SetPacketCallback(Net::GameplayPacketRouter_OnPacket);
+    // M3: no callback handoff — packet_router routes startup READY/ACK and
+    // engine data here in every regime.
     ResetStartupBarrierState("interactive release armed");
     s_liveReleaseArmed = true;
 
@@ -513,10 +512,7 @@ static bool TryStartRollbackSession() {
         Net::DelayPolicy_GetStallThreshold());
     Net::DelayPolicy_LogDelayMap("rollback handoff");
 
-    // Register gameplay packet callback
-    NetplayLog_Write("HANDOFF", interactiveFrame,
-        "Registering gameplay packet callback");
-    Net::Session_SetPacketCallback(Net::GameplayPacketRouter_OnPacket);
+    // M3: no callback registration — packet_router is the permanent owner.
 
     // Start rollback session through GameplayBridge
     bool ok = Net::GameplayBridge_StartSession(rbConfig);
@@ -760,7 +756,6 @@ static void CheckLifecyclePhase() {
                     // interactive startup barrier here so first-advance cannot race.
                     s_liveReleaseArmed = true;
                     ResetStartupBarrierState("lifecycle playable fallback");
-                    Net::Session_SetPacketCallback(Net::GameplayPacketRouter_OnPacket);
                     NetplayLog_Write("STARTUP", GetStartupLogFrame(),
                         "Fallback: startup barrier armed at PlayableGameplay (handoff missing)");
                 }

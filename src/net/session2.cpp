@@ -1,16 +1,38 @@
 /**
- * Alice Senki 2 - Session Manager (Implementation)
+ * Alice Senki 2 - session2 (Implementation, re0.7 M3)
+ *
+ * Re-implementation of the session layer behind the verbatim-preserved
+ * `Session_*` facade (include/net/session_manager.h). Descends from
+ * session_manager.cpp (deleted at M3) with the §2.4 changes:
+ *
+ *   - transport2 worker underneath (protocol_silence_ms liveness, INV-14)
+ *   - 5-step nonce handshake (§4.2) replacing legacy Hello/HelloAck:
+ *     SessionHello → SessionOffer → SessionAck → SessionConfirm →
+ *     SessionConfirmAck, echo-verbatim verified (INV-13: confirm packets are
+ *     built from the received BYTES, never recomputed), 200 ms per-step
+ *     resend, 10 s step / 30 s total timeouts, fail-closed refusal naming
+ *     the exact mismatching field (C-3)
+ *   - PeerIdentity exchange after Connected fills the preserved PeerInfo
+ *     contract (full nickname / round option / frame timing / HUD style)
+ *   - Session2_Terminate teardown funnel (INV-12 caller allowlist) including
+ *     the PacingClockDead local fail-closed terminal (M2 obligation)
+ *   - packet_router is the default packet sink, registered once at init and
+ *     never handed off (§2.3)
  */
 
 #include <winsock2.h>     // Must be before windows.h
 #include <windows.h>
 
 #include "net/session_manager.h"
+#include "net/session2.h"
 #include "net/connection_supervisor.h"
 #include "net/transition_barrier.h"
-#include "net/network_thread.h"
+#include "net/transport2.h"
 #include "net/nat_traversal.h"
 #include "net/game_settings_sync.h"
+#include "net/packet_router.h"
+#include "net/netplay_menu_controller.h"
+#include "patches/frame_scheduler.h"
 #include "ui/netplay_hud_style.h"
 #include "patches/memory_utils.h"
 #include "patches/tick_hooks.h"
@@ -20,6 +42,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <random>
 #include <vector>
 
 namespace Net {
@@ -42,6 +65,7 @@ static PacketCallback s_packetCallback  = nullptr;
 static bool           s_localReady      = false;
 static bool           s_remoteReady     = false;
 static bool           s_localNatInfoSent = false;
+static bool           s_localIdentitySent = false;
 static DWORD          s_stateEnteredAt  = 0;  // GetTickCount when state entered
 static uint32_t       s_activeSessionToken = 0;
 static bool           s_joinFallbackAttempted = false;
@@ -57,8 +81,52 @@ static DWORD          s_lastDrainLagLogAt     = 0;
 static DWORD          s_lastSessionUpdateTick = 0;
 static bool           s_localBuildHashCached  = false;
 static uint32_t       s_localBuildHash        = 0;
+static bool           s_pacingClockTerminalFired = false;
 
-constexpr int MAX_DEFERRED_CONTROL_PACKETS = 64;
+// --- v2 handshake state (§4.2) ---
+
+enum class HandshakeStep : uint8_t {
+    None = 0,
+    // Client (joiner)
+    AwaitOffer,      // Hello sent, resending until Offer
+    AwaitConfirm,    // Ack sent, resending until Confirm
+    // Host
+    AwaitHello,      // ENet connected, waiting for the client's Hello
+    AwaitAck,        // Offer sent, resending until Ack
+    AwaitConfirmAck, // Confirm sent, resending until ConfirmAck
+    Done,
+};
+
+static const char* HandshakeStepName(HandshakeStep step) {
+    switch (step) {
+        case HandshakeStep::None:            return "None";
+        case HandshakeStep::AwaitOffer:      return "AwaitOffer";
+        case HandshakeStep::AwaitConfirm:    return "AwaitConfirm";
+        case HandshakeStep::AwaitHello:      return "AwaitHello";
+        case HandshakeStep::AwaitAck:        return "AwaitAck";
+        case HandshakeStep::AwaitConfirmAck: return "AwaitConfirmAck";
+        case HandshakeStep::Done:            return "Done";
+    }
+    return "?";
+}
+
+constexpr DWORD kHandshakeResendIntervalMs = 200;    // §4.2 per-step resend
+constexpr DWORD kHandshakeStepTimeoutMs    = 10000;  // §4.2 per-step cap
+constexpr DWORD kHandshakeTotalTimeoutMs   = 30000;  // §4.2 whole-handshake cap
+
+static HandshakeStep       s_hsStep = HandshakeStep::None;
+static DWORD               s_hsStepEnteredAt = 0;
+static DWORD               s_hsLastResendAt = 0;
+static SessionHelloPayload s_hsHelloSent{};      // client: bytes we sent (echo check)
+static SessionOfferPayload s_hsOfferSent{};      // host: bytes we sent (echo check)
+static SessionOfferPayload s_hsOfferReceived{};  // client: bytes received (echoed in Ack)
+static uint64_t            s_hsClientNonce = 0;
+static uint64_t            s_hsHostNonce = 0;
+static uint32_t            s_hsHostSeed = 0;
+static uint64_t            s_sessionId = 0;
+
+constexpr int    MAX_DEFERRED_CONTROL_PACKETS = 256;      // §2.3 bound
+constexpr size_t MAX_DEFERRED_CONTROL_BYTES   = 256 * 1024;
 
 struct BuildFingerprintComponent {
     char     name[16];
@@ -76,6 +144,7 @@ struct DeferredControlPacket {
 
 static DeferredControlPacket s_deferredControlPackets[MAX_DEFERRED_CONTROL_PACKETS];
 static int                  s_deferredControlCount = 0;
+static size_t               s_deferredControlBytes = 0;
 
 // ============================================================================
 // Helpers
@@ -89,7 +158,7 @@ static void SetState(SessionState newState) {
         "state",
         SessionStateName(s_state),
         SessionStateName(newState),
-        "session manager transition"
+        "session2 transition"
     );
     s_state = newState;
     s_stateEnteredAt = GetTickCount();
@@ -122,6 +191,10 @@ static bool IsUserCancelDisconnectData(uint32_t data) {
     return data == static_cast<uint32_t>(DisconnectReason::UserCancel);
 }
 
+static bool IsBusyDisconnectData(uint32_t data) {
+    return data == static_cast<uint32_t>(DisconnectReason::Busy);
+}
+
 static bool HasUsefulStats(const ConnectionStats& stats) {
     return stats.rtt_ms > 0.0f ||
            stats.rtt_variance_ms > 0.0f ||
@@ -138,8 +211,16 @@ static FrameTimingMode LocalFrameTimingMode() {
         : FrameTimingMode::Vanilla58_8;
 }
 
-static bool FrameTimingModeEnabled(FrameTimingMode mode) {
-    return mode == FrameTimingMode::Proper60;
+// §2.8.2 cadence profile rationals, handshake-carried and fail-closed
+// compared (both peers must match; QOH99 delta #8).
+static void LocalCadenceRational(uint16_t* outNum, uint16_t* outDen) {
+    if (LocalFrameTimingMode() == FrameTimingMode::Proper60) {
+        *outNum = 1;
+        *outDen = 60;    // period = QPF * 1 / 60  (60.000 Hz)
+    } else {
+        *outNum = 17;
+        *outDen = 1000;  // period = QPF * 17 / 1000  (58.82 Hz)
+    }
 }
 
 static void ClearStatsForNewSession() {
@@ -163,28 +244,17 @@ static ConnectionStats GetBestStatsSnapshot() {
     return s_lastLiveStats;
 }
 
-static void RequestCompatibilityDisconnect(const char* packetName,
-                                          const char* remoteNickname,
-                                          uint16_t remoteProtocolVersion,
-                                          uint32_t remoteBuildHash,
-                                          const char* reason) {
-    if (s_activeSessionToken == 0) {
-        return;
-    }
-
-    Rollback::NetplayLog_Write("SESSION", -1,
-        "Requesting compatibility disconnect: packet=%s nick=%s remote_ver=%u remote_hash=0x%08X data=%u reason=%s token=%u",
-        packetName ? packetName : "?",
-        remoteNickname && remoteNickname[0] ? remoteNickname : "(unknown)",
-        remoteProtocolVersion,
-        remoteBuildHash,
-        static_cast<uint32_t>(DisconnectReason::VersionMismatch),
-        reason ? reason : "?",
-        s_activeSessionToken);
-    NetworkThread_RequestDisconnect(
-        s_activeSessionToken,
-        static_cast<uint32_t>(DisconnectReason::VersionMismatch),
-        false);
+static void ResetHandshakeState() {
+    s_hsStep = HandshakeStep::None;
+    s_hsStepEnteredAt = 0;
+    s_hsLastResendAt = 0;
+    memset(&s_hsHelloSent, 0, sizeof(s_hsHelloSent));
+    memset(&s_hsOfferSent, 0, sizeof(s_hsOfferSent));
+    memset(&s_hsOfferReceived, 0, sizeof(s_hsOfferReceived));
+    s_hsClientNonce = 0;
+    s_hsHostNonce = 0;
+    s_hsHostSeed = 0;
+    s_sessionId = 0;
 }
 
 static void ResetState() {
@@ -199,18 +269,22 @@ static void ResetState() {
     s_localReady  = false;
     s_remoteReady = false;
     s_localNatInfoSent = false;
+    s_localIdentitySent = false;
     s_stateEnteredAt = 0;
     s_joinFallbackAttempted = false;
     s_joinUsingRelay = false;
     s_activeJoinHost[0] = '\0';
     s_activeJoinPort = 0;
     s_deferredControlCount = 0;
+    s_deferredControlBytes = 0;
     s_lastInboundDropCount = 0;
     s_lastOutboundDropCount = 0;
     s_lastQueueSpikeLogAt = 0;
     s_lastInboundSilenceLogAt = 0;
     s_lastDrainLagLogAt = 0;
     s_lastSessionUpdateTick = 0;
+    s_pacingClockTerminalFired = false;
+    ResetHandshakeState();
     Nat_ClearRemoteHint();
 }
 
@@ -382,158 +456,6 @@ static bool ComputeLocalBuildHash(uint32_t* outHash) {
     return true;
 }
 
-static void CopyHandshakeNickname(const char* source,
-                                  size_t sourceLen,
-                                  char* destination,
-                                  size_t destinationCap) {
-    if (!destination || destinationCap == 0) {
-        return;
-    }
-
-    memset(destination, 0, destinationCap);
-    if (!source || sourceLen == 0) {
-        return;
-    }
-
-    size_t copyLen = sourceLen;
-    if (copyLen >= destinationCap) {
-        copyLen = destinationCap - 1;
-    }
-    memcpy(destination, source, copyLen);
-}
-
-static bool ProcessHandshakeIdentity(const char* packetName,
-                                     uint16_t protocolVersion,
-                                     uint32_t buildHash,
-                                     const char* nickname,
-                                     size_t nicknameLen,
-                                     uint16_t listenPort,
-                                     uint8_t advertisedRoundOption,
-                                     uint8_t advertisedFrameTimingMode) {
-    char remoteNickname[sizeof(s_remotePeer.nickname) + 1] = {};
-    CopyHandshakeNickname(nickname, nicknameLen, remoteNickname, sizeof(remoteNickname));
-    const uint8_t normalizedRoundOption = GameSettingsSync_NormalizeRoundOption(
-        advertisedRoundOption,
-        packetName ? packetName : "handshake");
-
-    const bool validFrameTiming = FrameTimingMode_IsValid(advertisedFrameTimingMode);
-    const FrameTimingMode remoteFrameTiming = validFrameTiming
-        ? (FrameTimingMode)advertisedFrameTimingMode
-        : FrameTimingMode::Vanilla58_8;
-
-    LOG_INFO("[Session] Received %s (nick=%s, ver=%u, hash=0x%08X, port=%u, rounds=%u, fps=%s)",
-             packetName, remoteNickname, protocolVersion, buildHash, listenPort,
-             normalizedRoundOption, validFrameTiming ? FrameTimingModeDisplayName(remoteFrameTiming) : "invalid");
-    Rollback::NetplayLog_Write("SESSION", -1,
-        "Received %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s raw=%u local_timing=%s local_ver=%u local_hash=0x%08X state=%s role=%s",
-        packetName,
-        remoteNickname,
-        protocolVersion,
-        buildHash,
-        listenPort,
-        normalizedRoundOption,
-        GameSettingsSync_RoundsToWin(normalizedRoundOption),
-        validFrameTiming ? FrameTimingModeName(remoteFrameTiming) : "invalid",
-        advertisedFrameTimingMode,
-        FrameTimingModeName(LocalFrameTimingMode()),
-        PROTOCOL_VERSION,
-        s_config.build_hash,
-        SessionStateName(s_state),
-        SessionRoleName(s_role));
-
-    if (protocolVersion != PROTOCOL_VERSION) {
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "Rejecting %s from nick=%s: protocol mismatch local=%u remote=%u local_hash=0x%08X remote_hash=0x%08X",
-            packetName,
-            remoteNickname,
-            PROTOCOL_VERSION,
-            protocolVersion,
-            s_config.build_hash,
-            buildHash);
-        RequestCompatibilityDisconnect(
-            packetName,
-            remoteNickname,
-            protocolVersion,
-            buildHash,
-            "protocol mismatch");
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Protocol version mismatch: local=%u remote=%u",
-                 PROTOCOL_VERSION, protocolVersion);
-        SetError(msg);
-        return false;
-    }
-
-    if (buildHash != s_config.build_hash) {
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "Rejecting %s from nick=%s: build mismatch local=0x%08X remote=0x%08X local_ver=%u remote_ver=%u",
-            packetName,
-            remoteNickname,
-            s_config.build_hash,
-            buildHash,
-            PROTOCOL_VERSION,
-            protocolVersion);
-        RequestCompatibilityDisconnect(
-            packetName,
-            remoteNickname,
-            protocolVersion,
-            buildHash,
-            "build mismatch");
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Build hash mismatch: local=0x%08X remote=0x%08X",
-                 s_config.build_hash, buildHash);
-        SetError(msg);
-        return false;
-    }
-
-    if (!validFrameTiming) {
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "Rejecting %s from nick=%s: invalid frame timing mode=%u",
-            packetName,
-            remoteNickname,
-            advertisedFrameTimingMode);
-        RequestCompatibilityDisconnect(
-            packetName,
-            remoteNickname,
-            protocolVersion,
-            buildHash,
-            "invalid frame timing mode");
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Invalid frame timing mode from peer: %u",
-                 advertisedFrameTimingMode);
-        SetError(msg);
-        return false;
-    }
-
-    s_remotePeer.valid = true;
-    s_remotePeer.protocol_version = protocolVersion;
-    s_remotePeer.build_hash = buildHash;
-    s_remotePeer.listen_port = listenPort;
-    s_remotePeer.round_count_valid = true;
-    s_remotePeer.round_count = normalizedRoundOption;
-    s_remotePeer.frame_timing_valid = true;
-    s_remotePeer.frame_timing_mode = advertisedFrameTimingMode;
-    memset(s_remotePeer.nickname, 0, sizeof(s_remotePeer.nickname));
-    strncpy_s(s_remotePeer.nickname, sizeof(s_remotePeer.nickname), remoteNickname, _TRUNCATE);
-
-    LOG_INFO("[Session] %s accepted (nick=%s, ver=%u, hash=0x%08X)",
-             packetName,
-             s_remotePeer.nickname,
-             s_remotePeer.protocol_version,
-             s_remotePeer.build_hash);
-    Rollback::NetplayLog_Write("SESSION", -1,
-        "Accepted %s: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s local_timing=%s",
-        packetName,
-        s_remotePeer.nickname,
-        s_remotePeer.protocol_version,
-        s_remotePeer.build_hash,
-        s_remotePeer.listen_port,
-        s_remotePeer.round_count,
-        GameSettingsSync_RoundsToWin(s_remotePeer.round_count),
-        FrameTimingModeName(remoteFrameTiming),
-        FrameTimingModeName(LocalFrameTimingMode()));
-    return true;
-}
-
 static bool DeferControlPacket(uint8_t channelID, PacketType type,
                                const void* payload, size_t payloadLen) {
     if (channelID != CHANNEL_CONTROL) {
@@ -542,12 +464,15 @@ static bool DeferControlPacket(uint8_t channelID, PacketType type,
     if (payloadLen > MAX_PAYLOAD_SIZE) {
         return false;
     }
-    if (s_deferredControlCount >= MAX_DEFERRED_CONTROL_PACKETS) {
+    if (s_deferredControlCount >= MAX_DEFERRED_CONTROL_PACKETS ||
+        s_deferredControlBytes + payloadLen > MAX_DEFERRED_CONTROL_BYTES) {
         Rollback::NetplayLog_Write("SESSION", -1,
-            "Deferred control packet queue full: type=%s ch=%u payload=%zu state=%s role=%s",
+            "Deferred control packet queue full: type=%s ch=%u payload=%zu queued=%d bytes=%zu state=%s role=%s",
             PacketTypeName(type),
             channelID,
             payloadLen,
+            s_deferredControlCount,
+            s_deferredControlBytes,
             SessionStateName(s_state),
             SessionRoleName(s_role));
         Rollback::NetplayLog_Flush();
@@ -561,6 +486,7 @@ static bool DeferControlPacket(uint8_t channelID, PacketType type,
     if (payloadLen > 0 && payload) {
         memcpy(slot->payload, payload, payloadLen);
     }
+    s_deferredControlBytes += payloadLen;
 
     Rollback::NetplayLog_Write("SESSION", -1,
         "Deferred control packet awaiting callback: type=%s ch=%u payload=%zu queued=%d state=%s role=%s",
@@ -587,24 +513,10 @@ static void FlushDeferredControlPackets() {
     Rollback::NetplayLog_Flush();
 
     s_deferredControlCount = 0;
+    s_deferredControlBytes = 0;
     for (int i = 0; i < queued; i++) {
         const DeferredControlPacket* packet = &s_deferredControlPackets[i];
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "Dispatching deferred packet to callback: cb=0x%llX type=%s ch=%u payload=%zu state=%s role=%s",
-            (unsigned long long)(uintptr_t)s_packetCallback,
-            PacketTypeName(packet->type),
-            packet->channel_id,
-            packet->payload_len,
-            SessionStateName(s_state),
-            SessionRoleName(s_role));
-        Rollback::NetplayLog_Flush();
         s_packetCallback(packet->type, packet->payload, packet->payload_len);
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "Deferred packet callback returned: cb=0x%llX type=%s ch=%u",
-            (unsigned long long)(uintptr_t)s_packetCallback,
-            PacketTypeName(packet->type),
-            packet->channel_id);
-        Rollback::NetplayLog_Flush();
     }
 }
 
@@ -681,7 +593,7 @@ static bool QueueTypedPacket(uint8_t channel, PacketType type,
         return false;
     }
 
-    const bool queued = NetworkThread_SendPacket(
+    const bool queued = Transport2_SendPacket(
         s_activeSessionToken,
         channel,
         type,
@@ -768,13 +680,13 @@ static bool StartJoinAttempt(const char* host, uint16_t port,
             "Hole-punch requested but no backend is available; continuing with direct connect");
     }
 
-    return NetworkThread_StartJoin(s_activeSessionToken,
-                                   s_config.listen_port,
-                                   s_activeJoinHost,
-                                   s_activeJoinPort,
-                                   useHolePunch,
-                                   punchRelayHost,
-                                   punchRelayPort);
+    return Transport2_StartJoin(s_activeSessionToken,
+                                s_config.listen_port,
+                                s_activeJoinHost,
+                                s_activeJoinPort,
+                                useHolePunch,
+                                punchRelayHost,
+                                punchRelayPort);
 }
 
 static bool TryRelayFallback(const char* reason) {
@@ -804,8 +716,8 @@ static bool TryRelayFallback(const char* reason) {
         s_config.nat.relay_port,
         reason ? reason : "?");
 
-    NetworkThread_RequestDestroyHost(s_activeSessionToken);
-    NetworkThread_ClearQueues(s_activeSessionToken);
+    Transport2_RequestDestroyHost(s_activeSessionToken);
+    Transport2_ClearQueues(s_activeSessionToken);
 
     if (!StartJoinAttempt(s_config.nat.relay_host, s_config.nat.relay_port, true, reason)) {
         return false;
@@ -902,216 +814,577 @@ static void FlushNatTraversalOutboundSignals() {
     }
 }
 
-static void ApplyRemoteHudStyle(uint8_t trailR,
-                                uint8_t trailG,
-                                uint8_t trailB,
-                                uint8_t textR,
-                                uint8_t textG,
-                                uint8_t textB,
-                                uint8_t trailLengthWire,
-                                uint8_t scoreR,
-                                uint8_t scoreG,
-                                uint8_t scoreB,
-                                uint8_t fontSize) {
-    s_remotePeer.hud_style_valid = true;
-    s_remotePeer.hud_trail_r = trailR;
-    s_remotePeer.hud_trail_g = trailG;
-    s_remotePeer.hud_trail_b = trailB;
-    s_remotePeer.hud_text_r = textR;
-    s_remotePeer.hud_text_g = textG;
-    s_remotePeer.hud_text_b = textB;
-    s_remotePeer.hud_trail_length = trailLengthWire;
-    s_remotePeer.hud_score_r = scoreR;
-    s_remotePeer.hud_score_g = scoreG;
-    s_remotePeer.hud_score_b = scoreB;
-    s_remotePeer.hud_font_size = fontSize;
-}
-
-static void FillHelloHudStyle(HelloPayload* hello) {
-    if (!hello) {
-        return;
-    }
-    NetplayHudStyle::WireStyle wire{};
-    NetplayHudStyle::PackWire(&wire);
-    hello->hud_trail_r = wire.trail_r;
-    hello->hud_trail_g = wire.trail_g;
-    hello->hud_trail_b = wire.trail_b;
-    hello->hud_text_r = wire.text_r;
-    hello->hud_text_g = wire.text_g;
-    hello->hud_text_b = wire.text_b;
-    hello->hud_trail_length = wire.trail_length;
-    hello->hud_score_r = wire.score_r;
-    hello->hud_score_g = wire.score_g;
-    hello->hud_score_b = wire.score_b;
-    hello->hud_font_size = wire.font_size;
-    hello->hud_vertical_position = 0;
-}
-
-static void FillHelloAckHudStyle(HelloAckPayload* ack) {
-    if (!ack) {
-        return;
-    }
-    NetplayHudStyle::WireStyle wire{};
-    NetplayHudStyle::PackWire(&wire);
-    ack->hud_trail_r = wire.trail_r;
-    ack->hud_trail_g = wire.trail_g;
-    ack->hud_trail_b = wire.trail_b;
-    ack->hud_text_r = wire.text_r;
-    ack->hud_text_g = wire.text_g;
-    ack->hud_text_b = wire.text_b;
-    ack->hud_trail_length = wire.trail_length;
-    ack->hud_score_r = wire.score_r;
-    ack->hud_score_g = wire.score_g;
-    ack->hud_score_b = wire.score_b;
-    ack->hud_font_size = wire.font_size;
-    ack->hud_vertical_position = 0;
-}
-
 // ============================================================================
-// Handshake
+// v2 handshake (§4.2 — 5-step nonce exchange)
 // ============================================================================
 
-static void SendHello() {
-    HelloPayload hello{};
-    hello.protocol_version = PROTOCOL_VERSION;
-    hello.build_hash = s_config.build_hash;
-    hello.listen_port = s_config.listen_port;
-    hello.round_count = GameSettingsSync_ReadRoundOption();
-    hello.frame_timing_mode = (uint8_t)LocalFrameTimingMode();
-    memset(hello.nickname, 0, sizeof(hello.nickname));
-    strncpy(hello.nickname, s_config.nickname, sizeof(hello.nickname) - 1);
-    FillHelloHudStyle(&hello);
+static uint64_t Fnv1a64(const void* data, size_t len) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
 
-    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::Hello,
-                          &hello, sizeof(hello), true, "hello")) {
-        SetError("Failed to send Hello");
+// session_id = fnv1a64(client_nonce || host_nonce || host_seed), all
+// little-endian in wire order.
+static uint64_t ComputeSessionId(uint64_t clientNonce, uint64_t hostNonce,
+                                 uint32_t hostSeed) {
+    uint8_t buf[20];
+    memcpy(buf, &clientNonce, 8);
+    memcpy(buf + 8, &hostNonce, 8);
+    memcpy(buf + 16, &hostSeed, 4);
+    return Fnv1a64(buf, sizeof(buf));
+}
+
+// Fresh nonzero nonce per attempt (C-7: replays from prior sessions are
+// structurally inert).
+static uint64_t GenerateNonce() {
+    std::random_device rd;
+    uint64_t value = ((uint64_t)rd() << 32) ^ (uint64_t)rd();
+    LARGE_INTEGER qpc{};
+    QueryPerformanceCounter(&qpc);
+    value ^= (uint64_t)qpc.QuadPart * 0x9E3779B97F4A7C15ull;
+    if (value == 0) {
+        value = 1;
+    }
+    return value;
+}
+
+static void EnterHandshakeStep(HandshakeStep step) {
+    if (s_hsStep == step) return;
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Handshake step: %s -> %s role=%s",
+        HandshakeStepName(s_hsStep),
+        HandshakeStepName(step),
+        SessionRoleName(s_role));
+    s_hsStep = step;
+    s_hsStepEnteredAt = GetTickCount();
+    s_hsLastResendAt = 0;  // send immediately on the next pump
+}
+
+// Fail-closed refusal at the handshake (C-3): reliable Disconnect naming the
+// exact field, then ENet-level disconnect with the compatibility data word.
+static void RefuseHandshake(const char* msg) {
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Handshake refusal: %s state=%s role=%s token=%u",
+        msg ? msg : "?",
+        SessionStateName(s_state),
+        SessionRoleName(s_role),
+        s_activeSessionToken);
+    Session2_Terminate(Session2TerminalReason::HandshakeRefused, msg);
+}
+
+static void SendSessionHello(const char* context) {
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::SessionHello,
+                          &s_hsHelloSent, sizeof(s_hsHelloSent), true, context)) {
+        SetError("Failed to send SessionHello");
         return;
     }
-    LOG_INFO("[Session] Sent Hello (nick=%s, ver=%u, hash=0x%08X, rounds=%u, fps=%s)",
-             hello.nickname, hello.protocol_version, hello.build_hash, hello.round_count,
-             FrameTimingModeDisplayName((FrameTimingMode)hello.frame_timing_mode));
-    Rollback::NetplayLog_Write("SESSION", -1,
-        "Sent Hello: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s",
-        hello.nickname,
-        hello.protocol_version,
-        hello.build_hash,
-        hello.listen_port,
-        hello.round_count,
-        GameSettingsSync_RoundsToWin(hello.round_count),
-        FrameTimingModeName((FrameTimingMode)hello.frame_timing_mode));
+    Rollback::NetplayLog_Verbose("SESSION", -1,
+        "Sent SessionHello (%s): ver=%u hash=0x%08X cadence=%u/%u nonce=0x%016llX nick=%s",
+        context,
+        s_hsHelloSent.proto_ver,
+        s_hsHelloSent.build_hash,
+        s_hsHelloSent.cadence_num,
+        s_hsHelloSent.cadence_den,
+        (unsigned long long)s_hsHelloSent.client_nonce,
+        s_hsHelloSent.nickname);
 }
 
-static void SendHelloAck() {
-    HelloAckPayload ack{};
-    ack.protocol_version = PROTOCOL_VERSION;
-    ack.build_hash = s_config.build_hash;
-    ack.listen_port = s_config.listen_port;
-    ack.round_count = GameSettingsSync_ReadRoundOption();
-    ack.frame_timing_mode = (uint8_t)LocalFrameTimingMode();
-    memset(ack.nickname, 0, sizeof(ack.nickname));
-    strncpy(ack.nickname, s_config.nickname, sizeof(ack.nickname) - 1);
-    FillHelloAckHudStyle(&ack);
+static void BeginClientHandshake() {
+    memset(&s_hsHelloSent, 0, sizeof(s_hsHelloSent));
+    s_hsClientNonce = GenerateNonce();
+    s_hsHelloSent.proto_ver = PROTOCOL_VERSION;
+    s_hsHelloSent.build_hash = s_config.build_hash;
+    LocalCadenceRational(&s_hsHelloSent.cadence_num, &s_hsHelloSent.cadence_den);
+    s_hsHelloSent.client_nonce = s_hsClientNonce;
+    strncpy_s(s_hsHelloSent.nickname, sizeof(s_hsHelloSent.nickname),
+              s_config.nickname, _TRUNCATE);
 
-    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::HelloAck,
-                          &ack, sizeof(ack), true, "hello-ack")) {
-        SetError("Failed to send HelloAck");
+    EnterHandshakeStep(HandshakeStep::AwaitOffer);
+    SendSessionHello("handshake-begin");
+    s_hsLastResendAt = GetTickCount();
+}
+
+static void SendSessionOffer(const char* context) {
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::SessionOffer,
+                          &s_hsOfferSent, sizeof(s_hsOfferSent), true, context)) {
+        SetError("Failed to send SessionOffer");
+    }
+}
+
+static void SendSessionAck(const char* context) {
+    // INV-13: the Ack is built from the received Offer BYTES, never recomputed.
+    SessionAckPayload ack{};
+    ack.offer_echo = s_hsOfferReceived;
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::SessionAck,
+                          &ack, sizeof(ack), true, context)) {
+        SetError("Failed to send SessionAck");
+    }
+}
+
+static void SendSessionConfirm(const char* context) {
+    SessionConfirmPayload confirm{};
+    confirm.session_id = s_sessionId;
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::SessionConfirm,
+                          &confirm, sizeof(confirm), true, context)) {
+        SetError("Failed to send SessionConfirm");
+    }
+}
+
+static void SendSessionConfirmAck(const char* context) {
+    SessionConfirmAckPayload ack{};
+    ack.session_id = s_sessionId;
+    if (!QueueTypedPacket(CHANNEL_CONTROL, PacketType::SessionConfirmAck,
+                          &ack, sizeof(ack), true, context)) {
+        SetError("Failed to send SessionConfirmAck");
+    }
+}
+
+// One-shot identity exchange after Connected: fills the preserved PeerInfo
+// contract (full nickname / round option / frame timing / HUD style) that the
+// wire-frozen v2 handshake payloads deliberately do not carry.
+static void SendPeerIdentity() {
+    if (s_localIdentitySent ||
+        (s_state != SessionState::Connected && s_state != SessionState::Ready)) {
         return;
     }
-    LOG_INFO("[Session] Sent HelloAck (rounds=%u, fps=%s)",
-             ack.round_count,
-             FrameTimingModeDisplayName((FrameTimingMode)ack.frame_timing_mode));
+
+    PeerIdentityPayload identity{};
+    strncpy_s(identity.nickname, sizeof(identity.nickname), s_config.nickname, _TRUNCATE);
+    identity.listen_port = s_config.listen_port;
+    identity.round_count = GameSettingsSync_ReadRoundOption();
+    identity.frame_timing_mode = (uint8_t)LocalFrameTimingMode();
+    identity.hud_style_valid = 1;
+    NetplayHudStyle::WireStyle wire{};
+    NetplayHudStyle::PackWire(&wire);
+    identity.hud_trail_r = wire.trail_r;
+    identity.hud_trail_g = wire.trail_g;
+    identity.hud_trail_b = wire.trail_b;
+    identity.hud_text_r = wire.text_r;
+    identity.hud_text_g = wire.text_g;
+    identity.hud_text_b = wire.text_b;
+    identity.hud_trail_length = wire.trail_length;
+    identity.hud_score_r = wire.score_r;
+    identity.hud_score_g = wire.score_g;
+    identity.hud_score_b = wire.score_b;
+    identity.hud_font_size = wire.font_size;
+    identity.hud_vertical_position = 0;
+
+    if (QueueTypedPacket(CHANNEL_CONTROL, PacketType::PeerIdentity,
+                         &identity, sizeof(identity), true, "peer-identity")) {
+        s_localIdentitySent = true;
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Sent PeerIdentity: nick=%s listen_port=%u rounds=%u timing=%s",
+            identity.nickname,
+            identity.listen_port,
+            identity.round_count,
+            FrameTimingModeName((FrameTimingMode)identity.frame_timing_mode));
+    }
+}
+
+static void OnPeerIdentity(const void* payload, size_t payloadLen) {
+    if (payloadLen < sizeof(PeerIdentityPayload)) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "PeerIdentity payload too small: got=%zu expected=%zu",
+            payloadLen, sizeof(PeerIdentityPayload));
+        return;
+    }
+
+    const PeerIdentityPayload* identity =
+        static_cast<const PeerIdentityPayload*>(payload);
+
+    char remoteNickname[sizeof(s_remotePeer.nickname)] = {};
+    memcpy(remoteNickname, identity->nickname,
+           sizeof(remoteNickname) < sizeof(identity->nickname)
+               ? sizeof(remoteNickname)
+               : sizeof(identity->nickname));
+    remoteNickname[sizeof(remoteNickname) - 1] = '\0';
+
+    const uint8_t normalizedRoundOption = GameSettingsSync_NormalizeRoundOption(
+        identity->round_count, "peer identity");
+    const bool validTiming = FrameTimingMode_IsValid(identity->frame_timing_mode);
+
+    s_remotePeer.valid = true;
+    s_remotePeer.protocol_version = PROTOCOL_VERSION;   // handshake-verified
+    s_remotePeer.build_hash = s_config.build_hash;      // handshake-verified equal
+    s_remotePeer.listen_port = identity->listen_port;
+    s_remotePeer.round_count_valid = true;
+    s_remotePeer.round_count = normalizedRoundOption;
+    s_remotePeer.frame_timing_valid = validTiming;
+    s_remotePeer.frame_timing_mode = identity->frame_timing_mode;
+    memset(s_remotePeer.nickname, 0, sizeof(s_remotePeer.nickname));
+    strncpy_s(s_remotePeer.nickname, sizeof(s_remotePeer.nickname),
+              remoteNickname, _TRUNCATE);
+
+    if (identity->hud_style_valid) {
+        s_remotePeer.hud_style_valid = true;
+        s_remotePeer.hud_trail_r = identity->hud_trail_r;
+        s_remotePeer.hud_trail_g = identity->hud_trail_g;
+        s_remotePeer.hud_trail_b = identity->hud_trail_b;
+        s_remotePeer.hud_text_r = identity->hud_text_r;
+        s_remotePeer.hud_text_g = identity->hud_text_g;
+        s_remotePeer.hud_text_b = identity->hud_text_b;
+        s_remotePeer.hud_trail_length = identity->hud_trail_length;
+        s_remotePeer.hud_score_r = identity->hud_score_r;
+        s_remotePeer.hud_score_g = identity->hud_score_g;
+        s_remotePeer.hud_score_b = identity->hud_score_b;
+        s_remotePeer.hud_font_size = identity->hud_font_size;
+        s_remotePeer.hud_vertical_position = identity->hud_vertical_position;
+    }
+
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Sent HelloAck: nick=%s ver=%u hash=0x%08X listen_port=%u rounds_raw=%u rounds_to_win=%d frame_timing=%s",
-        ack.nickname,
-        ack.protocol_version,
-        ack.build_hash,
-        ack.listen_port,
-        ack.round_count,
-        GameSettingsSync_RoundsToWin(ack.round_count),
-        FrameTimingModeName((FrameTimingMode)ack.frame_timing_mode));
-}
+        "Remote PeerIdentity: nick=%s listen_port=%u rounds_raw=%u rounds_to_win=%d timing=%s hud=%d",
+        s_remotePeer.nickname,
+        s_remotePeer.listen_port,
+        s_remotePeer.round_count,
+        GameSettingsSync_RoundsToWin(s_remotePeer.round_count),
+        validTiming ? FrameTimingModeName((FrameTimingMode)identity->frame_timing_mode) : "invalid",
+        identity->hud_style_valid ? 1 : 0);
 
-static bool ProcessHelloPayload(const void* payload, size_t len) {
-    if (len < sizeof(HelloPayload)) {
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "Hello payload too small: got=%zu expected=%zu state=%s role=%s",
-            len, sizeof(HelloPayload), SessionStateName(s_state), SessionRoleName(s_role));
-        RequestCompatibilityDisconnect("Hello", "(unknown)", 0, 0, "hello payload too small");
-        SetError("Hello payload too small");
-        return false;
-    }
-
-    const HelloPayload* hello = static_cast<const HelloPayload*>(payload);
-    const bool accepted = ProcessHandshakeIdentity(
-        "Hello",
-        hello->protocol_version,
-        hello->build_hash,
-        hello->nickname,
-        sizeof(hello->nickname),
-        hello->listen_port,
-        hello->round_count,
-        hello->frame_timing_mode);
-    if (accepted) {
-        ApplyRemoteHudStyle(hello->hud_trail_r,
-                            hello->hud_trail_g,
-                            hello->hud_trail_b,
-                            hello->hud_text_r,
-                            hello->hud_text_g,
-                            hello->hud_text_b,
-                            hello->hud_trail_length,
-                            hello->hud_score_r,
-                            hello->hud_score_g,
-                            hello->hud_score_b,
-                            hello->hud_font_size);
-    }
-    return accepted;
-}
-
-static bool ProcessHelloAckPayload(const void* payload, size_t len) {
-    if (len < sizeof(HelloAckPayload)) {
-        Rollback::NetplayLog_Write("SESSION", -1,
-            "HelloAck payload too small: got=%zu expected=%zu state=%s role=%s",
-            len, sizeof(HelloAckPayload), SessionStateName(s_state), SessionRoleName(s_role));
-        RequestCompatibilityDisconnect("HelloAck", "(unknown)", 0, 0, "hello-ack payload too small");
-        SetError("HelloAck payload too small");
-        return false;
-    }
-
-    const HelloAckPayload* ack = static_cast<const HelloAckPayload*>(payload);
-    const bool accepted = ProcessHandshakeIdentity(
-        "HelloAck",
-        ack->protocol_version,
-        ack->build_hash,
-        ack->nickname,
-        sizeof(ack->nickname),
-        ack->listen_port,
-        ack->round_count,
-        ack->frame_timing_mode);
-    if (accepted) {
-        ApplyRemoteHudStyle(ack->hud_trail_r,
-                            ack->hud_trail_g,
-                            ack->hud_trail_b,
-                            ack->hud_text_r,
-                            ack->hud_text_g,
-                            ack->hud_text_b,
-                            ack->hud_trail_length,
-                            ack->hud_score_r,
-                            ack->hud_score_g,
-                            ack->hud_score_b,
-                            ack->hud_font_size);
-    }
-    if (accepted && s_role == SessionRole::Join) {
-        const FrameTimingMode hostTiming = (FrameTimingMode)ack->frame_timing_mode;
+    // Round option stays host-authoritative exactly as before (the joiner
+    // aligned at legacy HelloAck; now at the host's identity packet). Frame
+    // timing was already fail-closed verified equal at the handshake, so the
+    // override below is a formality that keeps the old logs/semantics.
+    if (s_role == SessionRole::Join && validTiming) {
+        const FrameTimingMode hostTiming = (FrameTimingMode)identity->frame_timing_mode;
         TickHooks_SetFrameLimiter60FpsSessionOverride(
-            FrameTimingModeEnabled(hostTiming),
-            "host hello-ack timing");
-        GameSettingsSync_ApplyRoundOption(ack->round_count, "host hello-ack");
+            hostTiming == FrameTimingMode::Proper60,
+            "host identity timing");
+        GameSettingsSync_ApplyRoundOption(normalizedRoundOption, "host identity");
         Rollback::NetplayLog_Write("SESSION", -1,
             "Join aligned FPS timing to host: timing=%s display=%s",
             FrameTimingModeName(hostTiming),
             FrameTimingModeDisplayName(hostTiming));
     }
-    return accepted;
+}
+
+// Minimal PeerInfo fill straight from the handshake so status text has a
+// nickname before the identity packet lands.
+static void SeedPeerInfoFromHandshake(const char* shortNickname) {
+    s_remotePeer.valid = true;
+    s_remotePeer.protocol_version = PROTOCOL_VERSION;
+    s_remotePeer.build_hash = s_config.build_hash;
+    memset(s_remotePeer.nickname, 0, sizeof(s_remotePeer.nickname));
+    if (shortNickname) {
+        strncpy_s(s_remotePeer.nickname, sizeof(s_remotePeer.nickname),
+                  shortNickname, _TRUNCATE);
+    }
+}
+
+static void EnterConnected(const char* how) {
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Handshake complete (%s): session_id=0x%016llX role=%s",
+        how,
+        (unsigned long long)s_sessionId,
+        SessionRoleName(s_role));
+    EnterHandshakeStep(HandshakeStep::Done);
+    SetState(SessionState::Connected);
+    SendPeerIdentity();
+    SendNatInfo();
+}
+
+// --- Handshake packet handlers -------------------------------------------
+
+static void OnSessionHello(const void* payload, size_t payloadLen) {
+    if (s_role != SessionRole::Host) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionHello in role=%s", SessionRoleName(s_role));
+        return;
+    }
+    if (payloadLen < sizeof(SessionHelloPayload)) {
+        RefuseHandshake("Handshake refused: SessionHello payload too small");
+        return;
+    }
+
+    const SessionHelloPayload* hello =
+        static_cast<const SessionHelloPayload*>(payload);
+
+    if (s_hsStep == HandshakeStep::AwaitAck ||
+        s_hsStep == HandshakeStep::AwaitConfirmAck ||
+        s_hsStep == HandshakeStep::Done) {
+        // Client resend raced our Offer: accept only the identical Hello and
+        // let the step's own resend timer re-deliver the Offer.
+        if (memcmp(hello, &s_hsOfferSent.hello_echo, sizeof(*hello)) != 0) {
+            RefuseHandshake("Handshake refused: divergent SessionHello resend");
+        }
+        return;
+    }
+
+    if (s_hsStep != HandshakeStep::AwaitHello) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionHello in handshake step %s", HandshakeStepName(s_hsStep));
+        return;
+    }
+
+    // Fail-closed validation naming the exact field (C-3).
+    char msg[128];
+    if (hello->proto_ver != PROTOCOL_VERSION) {
+        snprintf(msg, sizeof(msg),
+                 "Handshake refused: protocol version mismatch (local=%u remote=%u)",
+                 PROTOCOL_VERSION, hello->proto_ver);
+        RefuseHandshake(msg);
+        return;
+    }
+    if (hello->build_hash != s_config.build_hash) {
+        snprintf(msg, sizeof(msg),
+                 "Handshake refused: build hash mismatch (local=0x%08X remote=0x%08X)",
+                 s_config.build_hash, hello->build_hash);
+        RefuseHandshake(msg);
+        return;
+    }
+    uint16_t localNum = 0, localDen = 0;
+    LocalCadenceRational(&localNum, &localDen);
+    if (hello->cadence_num != localNum || hello->cadence_den != localDen) {
+        snprintf(msg, sizeof(msg),
+                 "Handshake refused: cadence profile mismatch (local=%u/%u remote=%u/%u)",
+                 localNum, localDen, hello->cadence_num, hello->cadence_den);
+        RefuseHandshake(msg);
+        return;
+    }
+    if (hello->client_nonce == 0) {
+        RefuseHandshake("Handshake refused: zero client nonce");
+        return;
+    }
+
+    s_hsClientNonce = hello->client_nonce;
+    s_hsHostNonce = GenerateNonce();
+    std::random_device rd;
+    s_hsHostSeed = (uint32_t)rd();
+
+    // INV-13: the Offer echoes the received Hello BYTES verbatim.
+    memset(&s_hsOfferSent, 0, sizeof(s_hsOfferSent));
+    memcpy(&s_hsOfferSent.hello_echo, hello, sizeof(s_hsOfferSent.hello_echo));
+    s_hsOfferSent.host_nonce = s_hsHostNonce;
+    s_hsOfferSent.host_seed = s_hsHostSeed;
+    strncpy_s(s_hsOfferSent.host_nickname, sizeof(s_hsOfferSent.host_nickname),
+              s_config.nickname, _TRUNCATE);
+
+    char shortNick[sizeof(hello->nickname) + 1] = {};
+    memcpy(shortNick, hello->nickname, sizeof(hello->nickname));
+    SeedPeerInfoFromHandshake(shortNick);
+
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Accepted SessionHello: nick=%s ver=%u hash=0x%08X cadence=%u/%u nonce=0x%016llX",
+        shortNick,
+        hello->proto_ver,
+        hello->build_hash,
+        hello->cadence_num,
+        hello->cadence_den,
+        (unsigned long long)hello->client_nonce);
+
+    EnterHandshakeStep(HandshakeStep::AwaitAck);
+    SendSessionOffer("hello-accepted");
+    s_hsLastResendAt = GetTickCount();
+}
+
+static void OnSessionOffer(const void* payload, size_t payloadLen) {
+    if (s_role != SessionRole::Join) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionOffer in role=%s", SessionRoleName(s_role));
+        return;
+    }
+    if (payloadLen < sizeof(SessionOfferPayload)) {
+        RefuseHandshake("Handshake refused: SessionOffer payload too small");
+        return;
+    }
+
+    const SessionOfferPayload* offer =
+        static_cast<const SessionOfferPayload*>(payload);
+
+    if (s_hsStep == HandshakeStep::AwaitConfirm || s_hsStep == HandshakeStep::Done) {
+        // Host resend raced our Ack: re-echo the identical Offer.
+        if (memcmp(offer, &s_hsOfferReceived, sizeof(*offer)) == 0) {
+            SendSessionAck("offer-resend");
+        } else {
+            RefuseHandshake("Handshake refused: divergent SessionOffer resend");
+        }
+        return;
+    }
+
+    if (s_hsStep != HandshakeStep::AwaitOffer) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionOffer in handshake step %s", HandshakeStepName(s_hsStep));
+        return;
+    }
+
+    // Echo-verbatim check (INV-13): our own Hello bytes must come back exact.
+    if (memcmp(&offer->hello_echo, &s_hsHelloSent, sizeof(s_hsHelloSent)) != 0) {
+        RefuseHandshake("Handshake refused: SessionOffer hello-echo mismatch");
+        return;
+    }
+    if (offer->host_nonce == 0) {
+        RefuseHandshake("Handshake refused: zero host nonce");
+        return;
+    }
+
+    s_hsOfferReceived = *offer;
+    s_hsHostNonce = offer->host_nonce;
+    s_hsHostSeed = offer->host_seed;
+    s_sessionId = ComputeSessionId(s_hsClientNonce, s_hsHostNonce, s_hsHostSeed);
+
+    char shortNick[sizeof(offer->host_nickname) + 1] = {};
+    memcpy(shortNick, offer->host_nickname, sizeof(offer->host_nickname));
+    SeedPeerInfoFromHandshake(shortNick);
+
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Accepted SessionOffer: host_nick=%s host_nonce=0x%016llX host_seed=0x%08X session_id=0x%016llX",
+        shortNick,
+        (unsigned long long)s_hsHostNonce,
+        s_hsHostSeed,
+        (unsigned long long)s_sessionId);
+
+    EnterHandshakeStep(HandshakeStep::AwaitConfirm);
+    SendSessionAck("offer-accepted");
+    s_hsLastResendAt = GetTickCount();
+}
+
+static void OnSessionAck(const void* payload, size_t payloadLen) {
+    if (s_role != SessionRole::Host) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionAck in role=%s", SessionRoleName(s_role));
+        return;
+    }
+    if (payloadLen < sizeof(SessionAckPayload)) {
+        RefuseHandshake("Handshake refused: SessionAck payload too small");
+        return;
+    }
+
+    const SessionAckPayload* ack = static_cast<const SessionAckPayload*>(payload);
+
+    if (s_hsStep == HandshakeStep::AwaitConfirmAck || s_hsStep == HandshakeStep::Done) {
+        // Client resend raced our Confirm; the resend timer re-delivers it.
+        return;
+    }
+
+    if (s_hsStep != HandshakeStep::AwaitAck) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionAck in handshake step %s", HandshakeStepName(s_hsStep));
+        return;
+    }
+
+    // Echo-verbatim check (INV-13): our own Offer bytes must come back exact.
+    if (memcmp(&ack->offer_echo, &s_hsOfferSent, sizeof(s_hsOfferSent)) != 0) {
+        RefuseHandshake("Handshake refused: SessionAck offer-echo mismatch");
+        return;
+    }
+
+    // The Ack's arrival fixes the peer endpoint (§4.2 step 4).
+    s_sessionId = ComputeSessionId(s_hsClientNonce, s_hsHostNonce, s_hsHostSeed);
+
+    EnterHandshakeStep(HandshakeStep::AwaitConfirmAck);
+    SendSessionConfirm("ack-accepted");
+    s_hsLastResendAt = GetTickCount();
+}
+
+static void OnSessionConfirm(const void* payload, size_t payloadLen) {
+    if (s_role != SessionRole::Join) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionConfirm in role=%s", SessionRoleName(s_role));
+        return;
+    }
+    if (payloadLen < sizeof(SessionConfirmPayload)) {
+        RefuseHandshake("Handshake refused: SessionConfirm payload too small");
+        return;
+    }
+
+    const SessionConfirmPayload* confirm =
+        static_cast<const SessionConfirmPayload*>(payload);
+
+    if (s_hsStep == HandshakeStep::Done) {
+        // Our ConfirmAck was lost; the host is resending Confirm. Re-ack.
+        if (confirm->session_id == s_sessionId) {
+            SendSessionConfirmAck("confirm-resend");
+        }
+        return;
+    }
+
+    if (s_hsStep != HandshakeStep::AwaitConfirm) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionConfirm in handshake step %s", HandshakeStepName(s_hsStep));
+        return;
+    }
+
+    // Final echo check: both sides computed the same id from the same nonces.
+    if (confirm->session_id != s_sessionId) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "Handshake refused: session_id mismatch (local=0x%016llX remote=0x%016llX)",
+                 (unsigned long long)s_sessionId,
+                 (unsigned long long)confirm->session_id);
+        RefuseHandshake(msg);
+        return;
+    }
+
+    SendSessionConfirmAck("confirm-accepted");
+    EnterConnected("client confirm");
+}
+
+static void OnSessionConfirmAck(const void* payload, size_t payloadLen) {
+    if (s_role != SessionRole::Host) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionConfirmAck in role=%s", SessionRoleName(s_role));
+        return;
+    }
+    if (payloadLen < sizeof(SessionConfirmAckPayload)) {
+        RefuseHandshake("Handshake refused: SessionConfirmAck payload too small");
+        return;
+    }
+
+    const SessionConfirmAckPayload* ack =
+        static_cast<const SessionConfirmAckPayload*>(payload);
+
+    if (s_hsStep == HandshakeStep::Done) {
+        return;  // duplicate — harmless
+    }
+
+    if (s_hsStep != HandshakeStep::AwaitConfirmAck) {
+        Rollback::NetplayLog_Write("SESSION", -1,
+            "Ignoring SessionConfirmAck in handshake step %s", HandshakeStepName(s_hsStep));
+        return;
+    }
+
+    if (ack->session_id != s_sessionId) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "Handshake refused: session_id mismatch (local=0x%016llX remote=0x%016llX)",
+                 (unsigned long long)s_sessionId,
+                 (unsigned long long)ack->session_id);
+        RefuseHandshake(msg);
+        return;
+    }
+
+    EnterConnected("host confirm-ack");
+}
+
+// Per-step 200 ms resend driver (§4.2). Runs from Session_Update while the
+// handshake is live; the resend always re-sends the CURRENT step's packet.
+static void PumpHandshakeResends() {
+    if (s_state != SessionState::Handshaking) {
+        return;
+    }
+    if (s_hsStep == HandshakeStep::None ||
+        s_hsStep == HandshakeStep::AwaitHello ||
+        s_hsStep == HandshakeStep::Done) {
+        return;  // nothing to resend in these steps
+    }
+
+    const DWORD now = GetTickCount();
+    if (s_hsLastResendAt != 0 && (now - s_hsLastResendAt) < kHandshakeResendIntervalMs) {
+        return;
+    }
+    s_hsLastResendAt = now;
+
+    switch (s_hsStep) {
+        case HandshakeStep::AwaitOffer:      SendSessionHello("resend");   break;
+        case HandshakeStep::AwaitConfirm:    SendSessionAck("resend");     break;
+        case HandshakeStep::AwaitAck:        SendSessionOffer("resend");   break;
+        case HandshakeStep::AwaitConfirmAck: SendSessionConfirm("resend"); break;
+        default: break;
+    }
 }
 
 // ============================================================================
@@ -1129,9 +1402,10 @@ static void OnTransportConnected(uintptr_t peerToken) {
 
     if (s_state == SessionState::Connecting) {
         SetState(SessionState::Handshaking);
-        // Joiner sends Hello first; Host waits
         if (s_role == SessionRole::Join) {
-            SendHello();
+            BeginClientHandshake();   // client speaks first (§4.2 step 2)
+        } else {
+            EnterHandshakeStep(HandshakeStep::AwaitHello);
         }
     }
 }
@@ -1162,6 +1436,14 @@ static void OnTransportDisconnect(uintptr_t peerToken, uint32_t data, DWORD tran
             SessionRoleName(s_role),
             s_activeSessionToken);
         SetError("Remote peer rejected session due to version/build mismatch");
+        return;
+    }
+
+    if (IsBusyDisconnectData(data) &&
+        s_state != SessionState::Idle &&
+        s_state != SessionState::Failed &&
+        s_state != SessionState::Disconnecting) {
+        SetError("Host is busy with another session");
         return;
     }
 
@@ -1241,31 +1523,50 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
             // Liveness evidence only; inbound timestamps already updated.
             return;
 
-        case PacketType::Hello:
-            if (s_state == SessionState::Handshaking || s_state == SessionState::Connecting) {
-                if (s_state == SessionState::Connecting) {
-                    // Host received Hello before we noticed the connect event
-                    s_peerToken = peerToken;
-                    SetState(SessionState::Handshaking);
-                }
-                if (ProcessHelloPayload(payload, payloadLen)) {
-                    SendHelloAck();
-                    if (s_role == SessionRole::Host) {
-                        SetState(SessionState::Connected);
-                        SendNatInfo();
-                    }
-                }
+        // --- v2 handshake (§4.2) ---
+        case PacketType::SessionHello:
+            if (s_state == SessionState::Connecting && s_role == SessionRole::Host) {
+                // Host received Hello before we noticed the connect event.
+                s_peerToken = peerToken;
+                SetState(SessionState::Handshaking);
+                EnterHandshakeStep(HandshakeStep::AwaitHello);
             }
-            break;
-
-        case PacketType::HelloAck:
             if (s_state == SessionState::Handshaking) {
-                if (ProcessHelloAckPayload(payload, payloadLen)) {
-                    SetState(SessionState::Connected);
-                    SendNatInfo();
-                }
+                OnSessionHello(payload, payloadLen);
             }
-            break;
+            return;
+
+        case PacketType::SessionOffer:
+            if (s_state == SessionState::Handshaking) {
+                OnSessionOffer(payload, payloadLen);
+            }
+            return;
+
+        case PacketType::SessionAck:
+            if (s_state == SessionState::Handshaking) {
+                OnSessionAck(payload, payloadLen);
+            }
+            return;
+
+        case PacketType::SessionConfirm:
+            // Also handled after Connected: a lost ConfirmAck makes the host
+            // resend Confirm — re-ack idempotently (see OnSessionConfirm).
+            if (s_state == SessionState::Handshaking ||
+                s_state == SessionState::Connected ||
+                s_state == SessionState::Ready) {
+                OnSessionConfirm(payload, payloadLen);
+            }
+            return;
+
+        case PacketType::SessionConfirmAck:
+            if (s_state == SessionState::Handshaking) {
+                OnSessionConfirmAck(payload, payloadLen);
+            }
+            return;
+
+        case PacketType::PeerIdentity:
+            OnPeerIdentity(payload, payloadLen);
+            return;
 
         case PacketType::NatInfo:
             if (payloadLen >= sizeof(NatInfoPayload)) {
@@ -1340,9 +1641,9 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
             Rollback::NetplayLog_Write("SESSION", -1,
                 "Remote Disconnect received: %s", reason);
             if (s_activeSessionToken != 0) {
-                NetworkThread_RequestDisconnect(s_activeSessionToken, 0, true);
-                NetworkThread_RequestDestroyHost(s_activeSessionToken);
-                NetworkThread_ClearQueues(s_activeSessionToken);
+                Transport2_RequestDisconnect(s_activeSessionToken, 0, true);
+                Transport2_RequestDestroyHost(s_activeSessionToken);
+                Transport2_ClearQueues(s_activeSessionToken);
             }
             s_peerToken = 0;
             SetError(reason && reason[0] ? reason : "Remote disconnected");
@@ -1350,7 +1651,8 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
         }
 
         default:
-            // Forward to external callback
+            // Forward to the packet sink (packet_router by default; an
+            // explicitly installed callback overrides it).
             if (s_packetCallback) {
                 s_packetCallback(type, payload, payloadLen);
             } else {
@@ -1389,13 +1691,27 @@ static void CheckTimeouts() {
                 SetError("Connection timed out");
             }
             break;
-        case SessionState::Handshaking:
-            if (elapsed > s_config.handshake_timeout_ms) {
+        case SessionState::Handshaking: {
+            // §4.2: 10 s per step, 30 s total → back to menu with reason.
+            // No session existed yet, so this is not a kill path (C-4).
+            const DWORD stepElapsed =
+                (s_hsStepEnteredAt != 0) ? (now - s_hsStepEnteredAt) : elapsed;
+            if (elapsed > kHandshakeTotalTimeoutMs) {
                 Rollback::NetplayLog_Write("SESSION", -1,
-                    "Handshake timeout after %lu ms", (unsigned long)elapsed);
+                    "Handshake total timeout after %lu ms (step=%s)",
+                    (unsigned long)elapsed, HandshakeStepName(s_hsStep));
                 SetError("Handshake timed out");
+            } else if (stepElapsed > kHandshakeStepTimeoutMs) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Handshake timed out (step %s)",
+                         HandshakeStepName(s_hsStep));
+                Rollback::NetplayLog_Write("SESSION", -1,
+                    "Handshake step timeout after %lu ms (step=%s)",
+                    (unsigned long)stepElapsed, HandshakeStepName(s_hsStep));
+                SetError(msg);
             }
             break;
+        }
         default:
             break;
     }
@@ -1406,8 +1722,8 @@ static void CheckTimeouts() {
 // ============================================================================
 
 static void UpdateStats() {
-    NetworkThreadStats netStats{};
-    NetworkThread_GetStats(&netStats);
+    Transport2Stats netStats{};
+    Transport2_GetStats(&netStats);
 
     if (netStats.peer_connected) {
         s_stats.rtt_ms = netStats.rtt_ms;
@@ -1509,9 +1825,10 @@ static void UpdateStats() {
             (s_lastInboundSilenceLogAt == 0 || (now - s_lastInboundSilenceLogAt) >= 250)) {
             s_lastInboundSilenceLogAt = now;
             Rollback::NetplayLog_Write("NTHREAD", -1,
-                "Inbound silence while outbound active: silence=%lums outbound_age=%lums worker_age=%lums "
+                "Inbound silence while outbound active: silence=%lums protocol_silence=%lums outbound_age=%lums worker_age=%lums "
                 "inbound_depth=%u outbound_depth=%u state=%s role=%s token=%u",
                 (unsigned long)inboundSilenceMs,
+                (unsigned long)netStats.protocol_silence_ms,
                 (unsigned long)outboundAgeMs,
                 (unsigned long)workerAgeMs,
                 netStats.inbound_queue_depth,
@@ -1525,12 +1842,12 @@ static void UpdateStats() {
     }
 }
 
-static void DrainNetworkEvents() {
-    NetworkThreadEvent ev{};
+static void DrainTransportEvents() {
+    Transport2Event ev{};
     int drained = 0;
     int staleDropped = 0;
 
-    while (NetworkThread_TryPopEvent(&ev)) {
+    while (Transport2_TryPopEvent(&ev)) {
         drained++;
 
         if ((ev.session_token == 0 && s_activeSessionToken != 0) ||
@@ -1540,15 +1857,15 @@ static void DrainNetworkEvents() {
         }
 
         switch (ev.type) {
-            case NetworkThreadEventType::Connected:
+            case Transport2EventType::Connected:
                 OnTransportConnected(ev.peer_token);
                 break;
 
-            case NetworkThreadEventType::Disconnected:
+            case Transport2EventType::Disconnected:
                 OnTransportDisconnect(ev.peer_token, ev.disconnect_data, ev.transport_tick_ms);
                 break;
 
-            case NetworkThreadEventType::PacketReceived:
+            case Transport2EventType::PacketReceived:
                 OnPacketReceived(ev.peer_token,
                                  ev.channel_id,
                                  ev.packet_data,
@@ -1556,7 +1873,7 @@ static void DrainNetworkEvents() {
                                  ev.transport_tick_ms);
                 break;
 
-            case NetworkThreadEventType::WorkerError:
+            case Transport2EventType::WorkerError:
                 Rollback::NetplayLog_Write("NTHREAD", -1,
                     "Worker error event: token=%u msg=%s state=%s role=%s",
                     ev.session_token,
@@ -1587,31 +1904,161 @@ static void DrainNetworkEvents() {
     }
 }
 
+// The local fail-closed PacingClockDead terminal (M2 obligation): the
+// scheduler latches the fault; session2 converts it into exactly one typed
+// terminal through the funnel, then hands the UI-level teardown to the menu
+// controller's disconnect funnel.
+static void CheckPacingClockTerminal() {
+    if (s_pacingClockTerminalFired) {
+        return;
+    }
+    if (s_state != SessionState::Connected && s_state != SessionState::Ready) {
+        return;
+    }
+    if (!FrameScheduler_IsPacingClockDead()) {
+        return;
+    }
+
+    s_pacingClockTerminalFired = true;
+    const char* reason = "Game clock stopped (PacingClockDead)";
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "PacingClockDead latch observed while session active -> terminal");
+    Rollback::NetplayLog_Flush();
+    Session2_Terminate(Session2TerminalReason::PacingClockDead, reason);
+    // Kill-path allowlisted (INV-20 local fail-closed terminal): routes the
+    // UI/wiring teardown through the single menu disconnect funnel.
+    NetMenu::HandleDisconnection(reason);
+}
+
 // ============================================================================
-// Public API
+// session2-specific surface
+// ============================================================================
+
+const char* Session2TerminalReasonName(Session2TerminalReason reason) {
+    switch (reason) {
+        case Session2TerminalReason::UserCancel:        return "UserCancel";
+        case Session2TerminalReason::GameExit:          return "GameExit";
+        case Session2TerminalReason::SupervisorDead:    return "SupervisorDead";
+        case Session2TerminalReason::ProgressDeadline:  return "ProgressDeadline";
+        case Session2TerminalReason::PacingClockDead:   return "PacingClockDead";
+        case Session2TerminalReason::HandshakeRefused:  return "HandshakeRefused";
+        case Session2TerminalReason::TransportFailed:   return "TransportFailed";
+        case Session2TerminalReason::ProtocolViolation: return "ProtocolViolation";
+        case Session2TerminalReason::ConfirmedDesync:   return "ConfirmedDesync";
+    }
+    return "?";
+}
+
+uint64_t Session2_GetSessionId() {
+    return s_sessionId;
+}
+
+void Session2_Terminate(Session2TerminalReason reason, const char* detail) {
+    if (s_state == SessionState::Idle) {
+        return;
+    }
+
+    const char* text = (detail && detail[0]) ? detail
+                                             : Session2TerminalReasonName(reason);
+    Rollback::NetplayLog_Write("SESSION", -1,
+        "Session2_Terminate: reason=%s detail=%s state=%s role=%s token=%u",
+        Session2TerminalReasonName(reason),
+        text,
+        SessionStateName(s_state),
+        SessionRoleName(s_role),
+        s_activeSessionToken);
+    Rollback::NetplayLog_Flush();
+
+    const uint32_t token = s_activeSessionToken;
+    const bool peerReachable =
+        token != 0 &&
+        (s_state == SessionState::Connected ||
+         s_state == SessionState::Ready ||
+         s_state == SessionState::Handshaking);
+
+    // Self-describing goodbye when a peer might still hear it (INV-20).
+    uint32_t disconnectData = static_cast<uint32_t>(DisconnectReason::Error);
+    switch (reason) {
+        case Session2TerminalReason::UserCancel:
+        case Session2TerminalReason::GameExit:
+            disconnectData = static_cast<uint32_t>(DisconnectReason::UserCancel);
+            break;
+        case Session2TerminalReason::HandshakeRefused:
+            disconnectData = static_cast<uint32_t>(DisconnectReason::VersionMismatch);
+            break;
+        default:
+            break;
+    }
+
+    if (peerReachable) {
+        DisconnectPayload dp{};
+        dp.reason_code = static_cast<uint16_t>(disconnectData);
+        strncpy(dp.message, text, sizeof(dp.message) - 1);
+        dp.message[sizeof(dp.message) - 1] = '\0';
+        QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect,
+                         &dp, sizeof(dp), true, "terminate");
+        Transport2_RequestDisconnect(token, disconnectData, false);
+    }
+
+    if (reason == Session2TerminalReason::GameExit) {
+        // WM_CLOSE fast-exit: give the worker a bounded moment to deliver the
+        // goodbye before the process dies; no state teardown (process exits).
+        if (peerReachable) {
+            Sleep(150);
+        }
+        return;
+    }
+
+    if (token != 0) {
+        Transport2_RequestDestroyHost(token);
+        Transport2_ClearQueues(token);
+    } else {
+        Transport2_RequestDestroyHost(0);
+        Transport2_ClearQueues(0);
+    }
+    Rollback::NetplayLog_Write("NTHREAD", -1,
+        "Session detached from network thread: token=%u", token);
+
+    s_activeSessionToken = 0;
+    Nat_StopServices();
+
+    if (reason == Session2TerminalReason::UserCancel) {
+        GameSettingsSync_RestoreLocalSession("session cancel");
+        ResetState();
+    } else {
+        // Fault terminal: surface the reason via the Failed state.
+        SetError(text);
+    }
+}
+
+// ============================================================================
+// Public API (Session_* facade — session_manager.h, preserved verbatim)
 // ============================================================================
 
 void Session_Init() {
     ResetState();
     ClearStatsForNewSession();
     s_activeSessionToken = 0;
-    if (!NetworkThread_Init()) {
+    // packet_router is the single dispatch owner (§2.3), registered once here
+    // and never handed off. Session_SetPacketCallback(nullptr) restores it.
+    s_packetCallback = PacketRouter_OnPacket;
+    if (!Transport2_Init()) {
         LOG_ERROR("[Session] Failed to initialize network service thread");
         Rollback::NetplayLog_Write("NTHREAD", -1, "ERROR: network service thread init failed");
     }
-    LOG_INFO("[Session] Session manager initialized");
+    LOG_INFO("[Session] session2 initialized");
 }
 
 void Session_Shutdown() {
     if (s_state != SessionState::Idle) {
         Session_Cancel();
     }
-    NetworkThread_Shutdown();
+    Transport2_Shutdown();
     Nat_StopServices();
     s_activeSessionToken = 0;
     ResetState();
     ClearStatsForNewSession();
-    LOG_INFO("[Session] Session manager shut down");
+    LOG_INFO("[Session] session2 shut down");
 }
 
 bool Session_StartHost(const SessionConfig* config) {
@@ -1629,6 +2076,8 @@ bool Session_StartHost(const SessionConfig* config) {
         return false;
     }
     s_role = SessionRole::Host;
+    s_pacingClockTerminalFired = false;
+    ResetHandshakeState();
     TickHooks_SetFrameLimiter60FpsSessionOverride(
         TickHooks_GetFrameLimiter60FpsPreferenceEnabled(),
         "start host timing lock");
@@ -1685,19 +2134,19 @@ bool Session_StartHost(const SessionConfig* config) {
     natCfg.traversal_log_verbosity = config->nat.traversal_log_verbosity;
     Nat_ApplyRuntimeConfig(&natCfg);
 
-    if (!NetworkThread_Init()) {
+    if (!Transport2_Init()) {
         SetError("Failed to initialize network worker");
         return false;
     }
 
     NextSessionToken();
-    NetworkThread_ClearQueues(0);
+    Transport2_ClearQueues(0);
     Nat_ClearRemoteHint();
-    if (!NetworkThread_StartHost(s_activeSessionToken,
-                                 config->listen_port,
-                                 config->nat.enable_hole_punch,
-                                 plannedPunchRelayHost,
-                                 plannedPunchRelayPort)) {
+    if (!Transport2_StartHost(s_activeSessionToken,
+                              config->listen_port,
+                              config->nat.enable_hole_punch,
+                              plannedPunchRelayHost,
+                              plannedPunchRelayPort)) {
         SetError("Failed to start network host thread command");
         return false;
     }
@@ -1728,6 +2177,8 @@ bool Session_StartJoin(const SessionConfig* config) {
         return false;
     }
     s_role = SessionRole::Join;
+    s_pacingClockTerminalFired = false;
+    ResetHandshakeState();
     TickHooks_SetFrameLimiter60FpsSessionOverride(
         TickHooks_GetFrameLimiter60FpsPreferenceEnabled(),
         "start join pending host timing");
@@ -1791,7 +2242,7 @@ bool Session_StartJoin(const SessionConfig* config) {
     natCfg.traversal_log_verbosity = config->nat.traversal_log_verbosity;
     Nat_ApplyRuntimeConfig(&natCfg);
 
-    if (!NetworkThread_Init()) {
+    if (!Transport2_Init()) {
         SetError("Failed to initialize network worker");
         return false;
     }
@@ -1863,7 +2314,7 @@ bool Session_StartJoin(const SessionConfig* config) {
     }
 
     NextSessionToken();
-    NetworkThread_ClearQueues(0);
+    Transport2_ClearQueues(0);
     s_joinFallbackAttempted = initialViaRelay;
     if (!StartJoinAttempt(initialHost, initialPort, initialViaRelay, "initial")) {
         SetError("Failed to start network join thread command");
@@ -1885,52 +2336,20 @@ void Session_Cancel() {
     LOG_INFO("[Session] Canceling session (was %s)", SessionStateName(s_state));
     Rollback::NetplayLog_Write("SESSION", -1,
         "Cancel requested from state=%s", SessionStateName(s_state));
-    GameSettingsSync_RestoreLocalSession("session cancel");
-
-    const uint32_t cancelToken = s_activeSessionToken;
-
-    // Send a disconnect packet if we have a peer
-    if (cancelToken != 0 &&
-        (s_state == SessionState::Connected ||
-         s_state == SessionState::Ready ||
-         s_state == SessionState::Handshaking)) {
-        DisconnectPayload dp;
-        dp.reason_code = static_cast<uint16_t>(DisconnectReason::UserCancel);
-        strncpy(dp.message, "Session canceled", sizeof(dp.message) - 1);
-        dp.message[sizeof(dp.message) - 1] = '\0';
-        QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect, &dp, sizeof(dp), true, "cancel");
-        NetworkThread_RequestDisconnect(
-            cancelToken,
-            static_cast<uint32_t>(DisconnectReason::UserCancel),
-            false);
-    }
-
-    if (cancelToken != 0) {
-        NetworkThread_RequestDestroyHost(cancelToken);
-        NetworkThread_ClearQueues(cancelToken);
-    } else {
-        NetworkThread_RequestDestroyHost(0);
-        NetworkThread_ClearQueues(0);
-    }
-    Rollback::NetplayLog_Write("NTHREAD", -1,
-        "Session detached from network thread: token=%u",
-        cancelToken);
-
-    s_activeSessionToken = 0;
-    Nat_StopServices();
-    ResetState();
+    Session2_Terminate(Session2TerminalReason::UserCancel, "Session canceled");
 }
 
 uint32_t Session_GetMsSinceLastInbound() {
-    NetworkThreadStats netStats{};
-    NetworkThread_GetStats(&netStats);
+    Transport2Stats netStats{};
+    Transport2_GetStats(&netStats);
 
-    // Prefer ENet-protocol-level silence: acks of our own pings count, so an
+    // Protocol-level silence (INV-14): ENet commands (acks of our own pings
+    // included) and authenticated autopunch keepalives all count, so an
     // idle-but-healthy link reads ~0 even with zero app traffic. (Field bug
     // 2026-08-17: app-level-only silence killed a healthy session parked on
     // the config screen — one side heartbeated, the other only received.)
-    if (netStats.peer_connected && netStats.enet_silence_ms != 0xFFFFFFFFu) {
-        return netStats.enet_silence_ms;
+    if (netStats.protocol_silence_ms != 0xFFFFFFFFu) {
+        return netStats.protocol_silence_ms;
     }
 
     if (netStats.last_inbound_packet_tick_ms == 0) {
@@ -1947,27 +2366,8 @@ void Session_NotifyGameExit() {
     // disconnect at all and only finds out via silence timeouts, which is
     // indistinguishable from a crash or link death on their side.
     if (s_state == SessionState::Idle) return;
-
-    const uint32_t token = s_activeSessionToken;
-    if (token != 0 &&
-        (s_state == SessionState::Connected ||
-         s_state == SessionState::Ready ||
-         s_state == SessionState::Handshaking)) {
-        LOG_INFO("[Session] Sending goodbye on game exit (state=%s)", SessionStateName(s_state));
-        DisconnectPayload dp;
-        dp.reason_code = static_cast<uint16_t>(DisconnectReason::UserCancel);
-        strncpy(dp.message, "Peer closed the game", sizeof(dp.message) - 1);
-        dp.message[sizeof(dp.message) - 1] = '\0';
-        QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect, &dp, sizeof(dp), true, "game-exit");
-        NetworkThread_RequestDisconnect(
-            token,
-            static_cast<uint32_t>(DisconnectReason::UserCancel),
-            false);
-        // The worker services ENet every ~2ms; give it a moment to deliver the
-        // goodbye before the process dies. Bounded, so a wedged worker cannot
-        // hang the exit.
-        Sleep(150);
-    }
+    LOG_INFO("[Session] Sending goodbye on game exit (state=%s)", SessionStateName(s_state));
+    Session2_Terminate(Session2TerminalReason::GameExit, "Peer closed the game");
 }
 
 void Session_SignalReady() {
@@ -1998,8 +2398,8 @@ void Session_Update() {
     if (s_lastSessionUpdateTick != 0) {
         const DWORD gapMs = now - s_lastSessionUpdateTick;
         if (gapMs >= 100) {
-            NetworkThreadStats netStats{};
-            NetworkThread_GetStats(&netStats);
+            Transport2Stats netStats{};
+            Transport2_GetStats(&netStats);
             const DWORD workerAgeMs =
                 (netStats.last_service_tick_ms > 0 && now >= netStats.last_service_tick_ms)
                     ? (now - netStats.last_service_tick_ms)
@@ -2020,14 +2420,22 @@ void Session_Update() {
     }
     s_lastSessionUpdateTick = now;
 
-    // Game thread owns packet interpretation and callback dispatch. Network
-    // thread only enqueues transport events.
-    DrainNetworkEvents();
+    // Game thread owns packet interpretation and callback dispatch; the
+    // worker only enqueues transport events. Drain-before-judge (§2.2): this
+    // runs before the supervisor evaluates in the same frame (ModOnFrame
+    // ordering unchanged).
+    DrainTransportEvents();
 
     if (s_state != SessionState::Idle && s_state != SessionState::Failed) {
         CheckTimeouts();
     }
 
+    PumpHandshakeResends();
+    CheckPacingClockTerminal();
+
+    if (s_state == SessionState::Connected || s_state == SessionState::Ready) {
+        SendPeerIdentity();
+    }
     if (s_state == SessionState::Connected) {
         SendNatInfo();
     }
@@ -2063,14 +2471,18 @@ bool Session_SendPacket(uint8_t channel, PacketType type,
 }
 
 void Session_SetPacketCallback(PacketCallback cb) {
+    // packet_router is the permanent default sink (§2.3). A non-null callback
+    // overrides it (test harnesses); null restores the router.
+    PacketCallback effective = cb ? cb : PacketRouter_OnPacket;
     Rollback::NetplayLog_Write("SESSION", -1,
-        "Packet callback change: old=0x%llX new=0x%llX state=%s role=%s",
+        "Packet callback change: old=0x%llX new=0x%llX (router=0x%llX) state=%s role=%s",
         (unsigned long long)(uintptr_t)s_packetCallback,
-        (unsigned long long)(uintptr_t)cb,
+        (unsigned long long)(uintptr_t)effective,
+        (unsigned long long)(uintptr_t)&PacketRouter_OnPacket,
         SessionStateName(s_state),
         SessionRoleName(s_role));
     Rollback::NetplayLog_Flush();
-    s_packetCallback = cb;
+    s_packetCallback = effective;
     FlushDeferredControlPackets();
 }
 

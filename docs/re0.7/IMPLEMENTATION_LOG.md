@@ -428,3 +428,269 @@ milestone must know. Plan references are to `RE07_MASTER_REBUILD_PLAN.md`.
 5. Any straggler caller of the deleted
    `SetNetplayTickScale/Target/SetNetplayPacingActive` — grep-verified
    zero remaining references at edit time.
+
+---
+
+## 2026-08-17 — M3 (transport2 + session2 swap under the unchanged `Session_*` contract)
+
+### M3-1: `net/transport2` — ENet worker with protocol_silence_ms; network_thread deleted
+
+- **Files:** `include/net/transport2.h` (new), `src/net/transport2.cpp` (new),
+  `src/net/enet_transport.cpp`, `include/net/enet_transport.h`,
+  `src/net/network_thread.cpp` (DELETED), `include/net/network_thread.h`
+  (DELETED), `CMakeLists.txt`.
+- **Done:**
+  - Worker thread/command-queue/event-queue model carried over from
+    network_thread (1-2 ms `enet_host_service` cadence, game thread never
+    touches ENet objects, callbacks fire from the `Session_Update` drain —
+    every reentrancy assumption in KEEP code preserved).
+  - **`protocol_silence_ms` (INV-14):** derived per service pass from ENet's
+    `peer->lastReceiveTime` (any inbound command counts: acks, pings,
+    fragments) folded with authenticated autopunch keepalive accepts. New
+    `Transport_AutopunchLastInboundTickMs(host)` helper +
+    `last_authenticated_inbound_ms` stamp in `AutopunchHandleKeepalive`
+    (stamped only after the connectID check passes — a spoofable foreign-IP
+    keepalive never counts as liveness). Silence keeps growing from the last
+    genuine inbound after a peer detach (a detached peer must not look
+    fresh); 0xFFFFFFFF = nothing ever received.
+  - **Liveness anchor (QOH99 lesson 10):** anchor re-stamped on the first
+    worker poll after every StartHost/StartJoin/DestroyHost — the
+    pre-establishment budget can never reference process start.
+  - **Busy refusal (C-5/C-6):** a surplus inbound ENet connect (second peer
+    while one is live, or any inbound that is not our own pending outbound
+    while joining) is refused with `DisconnectReason::Busy` (new enum value
+    5 in session_types.h) without touching the existing peer/attempt.
+    session2 surfaces the Busy data word as "Host is busy with another
+    session" on the refused side.
+  - Peer-resilience config, autopunch start/keepalive/rebind-heal service
+    calls, hole-punch bursts, and fault injection all unchanged
+    (enet_transport keeps them; `Transport_FaultInjectionActive` and the
+    `*ForHost` spectator helper set preserved verbatim).
+- **Deviations:**
+  1. Plan says "shrink enet_transport to helpers" — enet_transport already
+     IS the helper layer (host/peer/send/autopunch/fault-injection, no
+     session logic), and transport2 drives its single-peer helpers from the
+     worker exactly as network_thread did. Nothing was moved out of it;
+     network_thread.* is the deletion. No dead code remains.
+  2. Queues are mutex+deque (inherited), not literal SPSC rings — same
+     threading contract (one producer, one consumer per direction), kept to
+     avoid rewriting proven code; revisit only if profiling ever shows lock
+     contention.
+
+### M3-2: `net/session2` — Session_* facade re-implementation, 5-step handshake, teardown funnel
+
+- **Files:** `include/net/session2.h` (new), `src/net/session2.cpp` (new),
+  `src/net/session_manager.cpp` (DELETED; `session_manager.h` header stays
+  as the preserved facade), `include/net/session_manager.h` (comments only),
+  `include/net/protocol.h`, `include/net/session_types.h`,
+  `include/net/barrier_protocol.h`, `src/patches/frame_scheduler.cpp`,
+  `include/patches/frame_scheduler.h`, `src/ui/netplay_hud.cpp` (comment),
+  `docs/re0.7/API_FREEZE.md`.
+- **Done:**
+  - All 17 `Session_*` facade functions re-implemented byte/shape-stable
+    (SessionSnapshot/PeerInfo/ConnectionStats static_asserts untouched).
+    NAT plumbing, relay fallback, build-fingerprint lock, stats/status
+    machinery, worker-detach watchdog, queue-spike logging carried over.
+  - **5-step nonce handshake (§4.2)** replaces Hello/HelloAck: joiner sends
+    `SessionHello` on ENet connect; host validates proto/build/cadence
+    fail-closed with the exact field named in a reliable Disconnect + ENet
+    VersionMismatch data (C-3 — both sides show it); `SessionOffer` echoes
+    the received Hello BYTES verbatim and `SessionAck` echoes the Offer
+    BYTES (INV-13 by construction — memcmp against the sent struct, nothing
+    recomputed); both compute
+    `session_id = fnv1a64(client_nonce || host_nonce || host_seed)` and
+    exchange it via `SessionConfirm`/`SessionConfirmAck`. 200 ms per-step
+    resend, duplicate-step packets re-acked idempotently (incl. Confirm
+    after the client is already Connected), 10 s step / 30 s total timeout
+    -> `SetError` back to menu (C-4: no session existed, not a kill path).
+    Nonces from std::random_device XOR QPC (fresh nonzero per attempt, C-7).
+  - **Cadence enforcement:** `SessionHello` carries the §2.8.2 rational
+    ({1,60} proper_60 / {17,1000} compat_58 from
+    `IsFrameLimiter60FpsPatchEnabled()`); mismatch = fail-closed refusal
+    naming the field. NOTE the deliberate behavior change vs the legacy
+    handshake: the joiner no longer silently adopts host timing — the plan
+    (§2.8.2, C-3) mandates handshake-enforced equality.
+  - **`PeerIdentity` (new packet 79, reliable ch0):** one-shot exchange on
+    entering Connected carrying full nickname[64], listen_port, round
+    option, frame timing, HUD style — fills the preserved PeerInfo contract
+    (mod_main HUD-style consumer, menu round/nickname display, replay
+    naming). Joiner applies the host's round option here (was: HelloAck);
+    handshake short nickname (16 B) seeds PeerInfo until it lands.
+  - **Teardown funnel `Session2_Terminate(reason, detail)`** (session2.h):
+    typed `Session2TerminalReason`, reasoned reliable Disconnect when a
+    peer is reachable, transport disconnect/destroy/clear, Nat stop,
+    settings restore; UserCancel -> Idle, GameExit -> bounded 150 ms goodbye
+    (WM_CLOSE path, no teardown), fault reasons -> Failed with the detail as
+    error text. Callers: Session_Cancel, Session_NotifyGameExit, handshake
+    refusals, supervisor Dead/ProgressDeadline, PacingClockDead.
+  - **PacingClockDead terminal (M2 obligation):** new
+    `FrameScheduler_IsPacingClockDead()` query over the sticky M2 latch;
+    session2 polls it each `Session_Update` while Connected/Ready, fires
+    `Session2_Terminate(PacingClockDead)` exactly once, then
+    `NetMenu::HandleDisconnection` for the UI/wiring teardown.
+  - **`Session_GetMsSinceLastInbound`** re-implemented over
+    `protocol_silence_ms` (header contract survives; 0xFFFFFFFF
+    never-received semantics preserved).
+  - **protocol.h:** `Hello` (1) / `HelloAck` (2) deleted outright (enum,
+    payloads, names, size pins, barrier_protocol classification);
+    `PeerIdentityPayload` added (84 B pin). API_FREEZE §6 updated.
+- **Deviations + justification:**
+  1. **`PeerIdentity` is not in the plan's §3.2 catalog.** The v2 handshake
+     payloads are wire-frozen at M1 (34/62/62/8/8 B pins) and carry only
+     the fail-closed identity; without a carrier, deleting Hello/HelloAck
+     would break the preserved PeerInfo/HUD-style/round-option contracts
+     (G6 survivors: mod_main HUD style sync, menu controller round display,
+     replay metadata). Additive reliable packet, sent once, no INV touched.
+     M5's match_setup may absorb round/timing into config exchange and slim
+     this packet — flagged as an M5 note below.
+  2. **`SessionConfig.handshake_timeout_ms` is no longer consulted** for
+     the Handshaking state — the plan's fixed 10 s step / 30 s total caps
+     replace it (config default was 3 s, far too tight for a 5-step
+     exchange over a lossy punched path). Field kept for shape stability.
+  3. **DisconnectPayload NOT enriched** to the §3.2
+     `{code u8, reason_id u32, human[96]}` shape — the sticky 100 ms-resend
+     terminal protocol belongs to the engine terminals (M4+); the existing
+     `{reason_code u16, message[64]}` carries the reasoned strings fine for
+     the M3 flows. Wire break is legal later (v20 is dev-only until M6).
+  4. `Session2TerminalReason` values `ProtocolViolation`/`ConfirmedDesync`
+     are declared but have no callers until engine2 (M4) — placed now so
+     the funnel enum is complete per §2.4.
+
+### M3-3: packet_router promotion — single dispatch owner, both regimes
+
+- **Files:** `include/net/packet_router.h` (new), `src/net/packet_router.cpp`
+  (new), `src/net/gameplay_packet_router.cpp` + `include/net/gameplay_packet_router.h`
+  (DELETED), `src/net/pregame_sync.cpp`, `include/net/pregame_sync.h`,
+  `src/rollback/online_wiring.cpp`, `include/rollback/online_wiring.h`
+  (comment), `CMakeLists.txt`.
+- **Done:**
+  - `PacketRouter_OnPacket` merges the M0 gameplay router and pregame_sync's
+    private callback into one regime-independent table: TransitionBarrier
+    first; pregame-machine-owned set (SyncAnnounce/Confirm, CharSelInput,
+    CharSelLock, StageSync, Config/Load/Baseline/GameplayStart) ->
+    `PregameSync_OnSessionPacket` (the former static `OnPregamePacket`,
+    now public — it keeps the pregame lock latches and the cross-phase
+    Idle/GameplayHandoff restart routing); frontend lockstep, palette
+    50-52, ChurnPause, PauseQuit, diagnostics -> module handlers; engine
+    sinks InputStream/GekkoReady -> `OnlineWiring_Handle*` (self-guarding:
+    pre-live InputStream drops with logging, startup barrier ignores
+    pre-boundary READYs) — the M0 obligation "route the engine sinks
+    through the routing table" done. Unknown types: log + count, never
+    terminal (§2.3).
+  - **Registered once by session2 at `Session_Init`, never handed off.**
+    All 5 legacy `Session_SetPacketCallback` handoff sites deleted
+    (pregame Begin, pregame cross-phase adopt, online_wiring x3).
+    `Session_SetPacketCallback` survives per the header contract: non-null
+    overrides the router (test harnesses), null restores it; deferred-flush
+    queue kept in session2 with the §2.3 bounds (64->256 packets + 256 KB
+    byte cap).
+  - Palette packets 50-52 now trivially routed in every regime by
+    construction (the F-9 race class is dead).
+- **Deviations:**
+  1. The deferred queue lives in session2 (the `Session_SetPacketCallback`
+     API home, per §2.3's "kept behind the same API"), not in the router
+     TU; with the router registered from init the defer window no longer
+     occurs in practice.
+  2. InputStream/GekkoReady arriving during pregame now reach the
+     self-guarding online_wiring sinks instead of pregame's silent ignore
+     list — behavioral no-op (drop+log vs silent ignore; the startup
+     barrier resend re-asserts READY either way), but worth knowing when
+     reading STARTUP logs.
+
+### M3-4: connection_supervisor re-feed + ProgressDeadline
+
+- **Files:** `src/net/connection_supervisor.cpp`,
+  `include/net/connection_supervisor.h`.
+- **Done:**
+  - Verdict input is now protocol-level silence via the re-based
+    `Session_GetMsSinceLastInbound` (INV-14); thresholds set to the §2.4
+    bands: Healthy <1000, Degraded 1000-5000, **Interrupted 5000** (was
+    3000) -20000, Dead >=20000. Heartbeat unchanged (reliable Ping every
+    250 ms once silence >=500 ms). STAT `silence_ms` source name
+    (`ConnectionSupervisor_GetInboundSilenceMs`) unchanged per the M2 note.
+  - Supervisor Dead now routes through
+    `Session2_Terminate(SupervisorDead)` before `NetMenu::HandleDisconnection`
+    (typed terminal + reasoned Disconnect on the wire, then the existing UI
+    funnel).
+  - **ProgressDeadline (§2.4, new input):** counts only while a rollback
+    session is running AND silence < Interrupted (R-9: the silence ladder
+    owns a quiet transport) AND no churn-pause grace/force-hold is active
+    (ExternalSuspension). Zero canonical-frame progress
+    (`RollbackSession_GetCurrentFrame` frozen) for 8 s -> warn latch + log
+    ("opponent's game stopped responding" — HUD readout is
+    `ConnectionSupervisor_GetProgressStallMs`/`IsProgressStallWarned`,
+    consumer arrives at M6); 20 s ->
+    `Session2_Terminate(ProgressDeadline)` + `HandleDisconnection`, fired
+    once per session.
+- **Deviation:** the 8 s HUD warning is exposed as a query + log line only;
+  netplay_hud wiring is scheduled with the M6 HUD update (the plan's HUD
+  task list lives there).
+
+### M3-5: kill-path gate allowlist (INV-12)
+
+- **Files:** `tools/check_killpaths.ps1`.
+- **Done:** `connection_supervisor.cpp` 1->2 (silence Dead +
+  ProgressDeadline); `session2.cpp` = 1 added with justification
+  (PacingClockDead — local fail-closed terminal INV-20, routed through
+  `Session2_Terminate` first). Legacy heuristic entries retagged to their
+  actual cutover milestones (pregame/lifecycle -> M5, input_override -> M4);
+  counts unchanged. `session_manager.cpp` had no entry, so its deletion
+  needs none removed.
+
+### Build-system summary (M3)
+
+- CMake `NET_HEADERS`: -`gameplay_packet_router.h`, -`network_thread.h`;
+  +`packet_router.h`, +`transport2.h`, +`session2.h`
+  (`session_manager.h` stays — preserved facade).
+- CMake `NET_SOURCES`: -`gameplay_packet_router.cpp`, -`network_thread.cpp`,
+  -`session_manager.cpp`; +`packet_router.cpp`, +`transport2.cpp`,
+  +`session2.cpp`.
+- Deleted files: `src/net/network_thread.cpp`, `include/net/network_thread.h`,
+  `src/net/session_manager.cpp`, `src/net/gameplay_packet_router.cpp`,
+  `include/net/gameplay_packet_router.h`.
+- GekkoNet untouched in lib/ (the `AS2_WITH_GEKKO` gate is an M4 task). No
+  test targets link the changed TUs (frontend_sync_tests stubs
+  `Session_*`/`PregameSync_GetPhase` itself).
+
+### Obligations for next milestones
+
+- **M4 (engine2):** `Session2_Terminate` reasons `ProtocolViolation` and
+  `ConfirmedDesync` are reserved for the ingest/verify terminals; feed them
+  from engine2's typed results. `RollbackSession_IsSessionRunning` is what
+  arms the ProgressDeadline — keep that meaning ("gameplay timeline
+  advancing is expected") in the engine2 adapter.
+- **M5 (match_setup + stream cutover):** enforce `session_id`
+  (`Session2_GetSessionId()`) on gameplay-phase packets at the router/ingest
+  (§3.1 — drop before any state mutation); retire `DelayChangeReq/Ack`,
+  `GekkoReady`, the SyncAnnounce/SyncConfirm delay fields, and the
+  `phase_serial` acceptance keys per the M1 notes; consider folding
+  `PeerIdentity`'s round/timing fields into the config exchange and
+  slimming the packet to nickname+HUD style.
+- **M6 (HUD):** consume `ConnectionSupervisor_GetProgressStallMs`/
+  `IsProgressStallWarned` for the 8 s "opponent's game stopped responding"
+  banner; surface `Session2TerminalReasonName` in the disconnect UI.
+
+### Compile risks to check first (M3 build session)
+
+1. `session2.cpp` is a ~2.5k-line new TU aggregating winsock2/windows,
+   `<random>`, and the netplay stack — first place an include-order or
+   namespace slip surfaces. `FrameScheduler_IsPacingClockDead` is a
+   global-namespace function called from `namespace Net` (ordinary lookup —
+   same pattern as netplay_pacing's scheduler calls).
+2. `SessionOffer/Ack` echo checks memcmp whole packed structs — if MSVC
+   padded them the M1 static_asserts (34/62/62 B) fire first; trust the
+   asserts.
+3. `PeerIdentityPayload == 84` static_assert is hand-computed
+   (64+2+1+1+1+12+3 under pack(1)); if it fires, the compiler's number is
+   the truth — fix the constant.
+4. `connection_supervisor.cpp` now includes `rollback/rollback_session.h` +
+   `net/churn_pause.h` + `net/session2.h` — check for macro collisions with
+   `ui/log_window.h` (LOG_* macros) in that TU.
+5. transport2.cpp compares tick domains
+   (`(int32_t)(punchInbound - s_lastProtocolInboundTickMs) > 0`) — both are
+   GetTickCount-domain; ENet `serviceTime` is only ever used as a duration
+   difference, never mixed absolutely.
+6. Grep-verified zero remaining references: `NetworkThread_*`,
+   `GameplayPacketRouter_OnPacket`, `PacketType::Hello/HelloAck`,
+   `HelloPayload/HelloAckPayload`, `enet_silence_ms` (spectator's own
+   `Spectator::PacketType::Hello` namespace is unrelated and untouched).
