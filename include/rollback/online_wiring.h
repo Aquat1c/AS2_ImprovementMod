@@ -79,10 +79,10 @@ void OnlineWiring_OnReturnToSession();
 // Packet sinks (called by Net::PacketRouter_OnPacket — M0 extraction, M3 promotion)
 // ============================================================================
 
-/// Engine input stream packet (InputStream, id 23 — raw Gekko data under
-/// AS2_WITH_GEKKO=ON, v2 InputStreamPayload under engine2). Feeds the
-/// rollback session when active. (The startup gameplay-entry barrier rides
-/// TransitionBarrier kind GameplayStart since M5 — GekkoReady is retired.)
+/// Engine input stream packet (InputStream, id 23 — the v2
+/// InputStreamPayload). Feeds the rollback session when active. (The
+/// startup gameplay-entry barrier rides TransitionBarrier kind
+/// GameplayStart since M5 — the 0.6 startup-barrier packet is retired.)
 void OnlineWiring_HandleEngineDataPacket(const void* payload, size_t payloadLen);
 
 // ============================================================================

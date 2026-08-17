@@ -231,6 +231,20 @@ public:
     using PredictionTap = uint16_t (*)(uint16_t predicted);
     void SetPredictionTap(PredictionTap tap) { prediction_tap_ = tap; }
 
+    /// Forced-rollback mode (determinism suite / stress hooks): while
+    /// depth > 0, every pass whose sim frontier advanced since the last
+    /// forced transaction synthesizes a depth-N correction — a genuine
+    /// BeginRollback/replay/Finish cycle over the SAME sealed local and
+    /// actual/predicted remote inputs — even when every prediction was
+    /// correct. A deterministic sim therefore reproduces identical state;
+    /// any divergence surfaces as a SyncHash / confirmed-stream mismatch.
+    /// The synthetic mismatch is clamped to the current epoch's frame
+    /// origin (state identity changed there, §2.6.5) and yields to a real
+    /// pending mismatch. Fully deterministic (INV-16: no clock, no RNG);
+    /// 0 disables (production default).
+    void SetForcedRollback(uint8_t depth);
+    uint8_t ForcedRollbackDepth() const { return forced_rollback_depth_; }
+
     // ── Per-opportunity decision (§2.7.4, INV-1/INV-4) ──────────────────────
 
     /// Evaluated once per scheduler pass (and between batch iterations):
@@ -423,6 +437,11 @@ private:
     bool     lifecycle_exact_next_ = false;
     bool     producer_fenced_ = false;
     PredictionTap prediction_tap_ = nullptr;
+
+    // Forced-rollback mode (test-only; see SetForcedRollback).
+    uint8_t  forced_rollback_depth_ = 0;
+    uint32_t forced_rollback_done_ = 0;      // frontier already force-corrected
+    bool     forced_rollback_done_valid_ = false;
 
     // Peer advisory (PressureReport; INV-23: never applied locally).
     uint8_t  peer_adv_delay_ = 0;

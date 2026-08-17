@@ -59,6 +59,18 @@ void StressHooks_ForceNextMismatches(int count);
 int  StressHooks_GetRemainingForcedMismatches();
 
 // ============================================================================
+// Forced Rollback Every Frame (determinism verification)
+// ============================================================================
+
+/// Force a rollback transaction of depth N on EVERY advanced frame
+/// (engine2 SetForcedRollback passthrough; QOH99 selftest model:
+/// save → tick → restore → replay N → compare). 0 = off. Deterministic —
+/// the replay re-consumes the same sealed inputs, so a clean sim reproduces
+/// identical state; any divergence surfaces as a SyncHash desync.
+void StressHooks_SetForcedRollbackDepth(int depth);
+int  StressHooks_GetForcedRollbackDepth();
+
+// ============================================================================
 // Delayed Input Delivery
 // ============================================================================
 
@@ -100,6 +112,7 @@ struct StressHooksSnapshot {
     int      drop_percent;
     int      input_delivery_delay;
     int      forced_mismatches_remaining;
+    int      forced_rollback_depth;
     int      total_packets_dropped;
     int      total_packets_delayed;
     int      total_mismatches_forced;

@@ -25,7 +25,7 @@
  *     - GameplayStart: coordinated gameplay kickoff
  *     → All reliable, CHANNEL_CONTROL
  *
- *   GAMEPLAY STREAM (rollback_session.cpp):
+ *   GAMEPLAY STREAM (rollback_session_engine2.cpp):
  *     - InputStream: rollback input sync
  *     → Unreliable sequenced, CHANNEL_GAMEPLAY
  *     → Redundant input batch for packet loss resilience

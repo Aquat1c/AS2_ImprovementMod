@@ -1,12 +1,8 @@
 /**
  * Alice Senki 2 - RollbackSession facade over engine2 (re0.7 M4, plan §2.7.8)
  *
- * The engine2 adapter behind the UNCHANGED rollback_session.h header:
- * compiled when the CMake option AS2_WITH_GEKKO is OFF. Until the M6
- * cutover gate passes, field builds keep AS2_WITH_GEKKO=ON and ship the
- * GekkoNet implementation in rollback_session.cpp; this TU is the
- * engine-bring-up build (M4 exit gate: engine core unit-tested offline,
- * adapter compiling against the whole tree).
+ * The engine2 adapter behind the UNCHANGED rollback_session.h header — the
+ * sole provider since the post-M8 legacy-backend removal.
  *
  * Division of labor (§2.7): the RollbackEngine core (rollback/engine2) is
  * socket-free/clock-free/game-memory-free; THIS adapter owns everything it
@@ -17,8 +13,8 @@
  *
  * Dispatcher contract preserved (two-phase, §2.7.8): BeginFrame(localInput)
  * captures + plans; ProcessNextEvent() drains the pass plan — rollback
- * transaction steps first, then advances — exactly like the Gekko adapter,
- * so input_override's netplay branch keeps its shape at the M6 rewiring.
+ * transaction steps first, then advances — exactly like the 0.6 adapter,
+ * so input_override's netplay branch kept its shape at the M6 rewiring.
  */
 
 #include "rollback/rollback_session.h"
@@ -234,7 +230,7 @@ void DrainConfirmSeam() {
         DesyncDump_StoreChecksum(rb, (uint32_t)cf.pre_state_hash);
 
         // Match-relative numbering (0-based per epoch): the sidecar protocol
-        // and the replay tape keep the per-match frame identity the Gekko
+        // and the replay tape keep the per-match frame identity the 0.6
         // per-match engine produced; the canonical counter spans the session
         // (INV-15) and stays internal. A record from before the current epoch
         // origin (rotation raced the drain) is skipped — its match is over
@@ -306,7 +302,7 @@ bool SavePreTick(uint32_t frame, uint64_t* hash,
 void RollbackSession_Init() {
     StateHistory_Init();
     s_initialized = true;
-    LOG_INFO("[RollbackSession/engine2] Initialized (custom engine, AS2_WITH_GEKKO=OFF)");
+    LOG_INFO("[RollbackSession/engine2] Initialized (custom engine)");
 }
 
 void RollbackSession_Shutdown() {
@@ -320,6 +316,15 @@ void RollbackSession_Shutdown() {
 // never actuals (INV-19).
 static uint16_t StressPredictionTap(uint16_t predicted) {
     return StressHooks_MaybeCorruptPrediction(predicted);
+}
+
+// Stress hook application (M6 tap + post-M8 forced-rollback depth): kept in
+// one place so every arm/rotate/poll site applies the identical mapping.
+static void ApplyStressHooks(RollbackEngine& engine) {
+    const bool on = StressHooks_IsEnabled();
+    engine.SetPredictionTap(on ? &StressPredictionTap : nullptr);
+    engine.SetForcedRollback(on
+        ? (uint8_t)StressHooks_GetForcedRollbackDepth() : (uint8_t)0);
 }
 
 bool RollbackSession_Begin(const RollbackSessionConfig& config) {
@@ -371,8 +376,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
                     s_engine.RequestInputDelay((uint8_t)delay);
                 }
 
-                s_engine.SetPredictionTap(
-                    StressHooks_IsEnabled() ? &StressPredictionTap : nullptr);
+                ApplyStressHooks(s_engine);
 
                 s_active = true;
                 s_suspended = false;
@@ -437,8 +441,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     StateHistory_SetTagContext(s_epoch, /*phase=*/(uint32_t)MODE_MATCH);
     DesyncDump_Reset();
 
-    s_engine.SetPredictionTap(
-        StressHooks_IsEnabled() ? &StressPredictionTap : nullptr);
+    ApplyStressHooks(s_engine);
 
     s_active = true;
     s_suspended = false;
@@ -463,6 +466,7 @@ void RollbackSession_End() {
     s_rollingBack = false;
     memset(s_delayedStream, 0, sizeof(s_delayedStream));
     s_engine.SetPredictionTap(nullptr);
+    s_engine.SetForcedRollback(0);
     s_engine.Disarm();
     StateHistory_SetTagContext(0, 0);
     NetplayLog_Write("ROLLBACK", frame,
@@ -539,9 +543,9 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
 bool RollbackSession_PollSession() {
     if (!s_active) return false;
     // Stress hooks can be toggled live from the mod menu — keep the
-    // prediction tap and delayed-queue state coherent (M6).
-    s_engine.SetPredictionTap(
-        StressHooks_IsEnabled() ? &StressPredictionTap : nullptr);
+    // prediction tap, forced-rollback depth, and delayed-queue state
+    // coherent (M6).
+    ApplyStressHooks(s_engine);
     DrainDelayedStreamQueue();
     // Producer fence (§2.7.3-P, M5 obligation closed): the stalled-producer
     // must not feed the gameplay stream while a frontend lockstep phase owns

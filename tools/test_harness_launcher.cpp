@@ -434,7 +434,7 @@ static void AnalyzeCurrentLogs(const char* gameDir, DWORD pid, const char* label
                 strstr(line, "=== SESSION BEGIN ===") ||
                 strstr(line, "[RollbackSession] BEGIN:") ||
                 strstr(line, "engine2 session begin") ||   // re0.7 engine2 adapter
-                strstr(line, "GekkoNet session started"))  // AS2_WITH_GEKKO fallback
+                strstr(line, "GekkoNet session started"))  // legacy 0.6/0.7 log line (old-log triage only)
                 rollbackStart = true;
             if (strstr(line, "FSYNC")) {
                 frameSync = true;

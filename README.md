@@ -42,7 +42,6 @@ The mod is built on a small set of vendored or workspace-pinned projects:
 
 | Project | Location | Used for |
 |---------|----------|----------|
-| [GekkoNet](https://github.com/HeatXD/GekkoNet) | `lib/GekkoNet` | Gameplay rollback session, prediction, and rollback event flow |
 | [ENet](https://github.com/lsalzman/enet) | `lib/enet` | UDP transport, channels, reliability, RTT/loss stats |
 | [SDL3](https://github.com/libsdl-org/SDL) | `lib/SDL3` | Keyboard/gamepad input runtime (`SDL3.dll` ships next to the game) |
 | [Dear ImGui](https://github.com/ocornut/imgui) | `lib/imgui` | In-game overlay, debug UI, test harness UI |

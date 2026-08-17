@@ -2,7 +2,7 @@
  * Alice Senki 2 - Input Timeline (re0.7 M4 resurrection, master plan §2.7.3)
  *
  * Canonical-frame input ring for the custom rollback engine (engine2).
- * This is the pre-Gekko mod-owned input store, resurrected and finished for
+ * This is the 0.5-era mod-owned input store, resurrected and finished for
  * the §2.7 pipeline: wrap-safe u32 canonical frames (INV-15), capture-once
  * slot immutability (INV-18), and typed set results so the engine can map
  * an occupied-slot write to adopt / DuplicateIdentical / Conflict without

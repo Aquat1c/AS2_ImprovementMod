@@ -103,10 +103,43 @@ constexpr uint16_t kCarrySuppressMask = (uint16_t)(INPUT_A | INPUT_C);
 // Same mask WinScreenSync uses for advance intent (winscreen_sync.cpp).
 constexpr uint16_t kAdvanceMask = (uint16_t)(INPUT_A | INPUT_C | INPUT_START);
 
+// ── Game-memory boundary ────────────────────────────────────────────────────
+// AS2_FRONTEND_SYNC_TESTING (frontend_sync_tests) drives this state machine
+// with no game process mapped: mode/sub/timers/cursor live in shim variables
+// and the BGM stop is swallowed. Production reads/writes the live addresses.
+// Same seam pattern as frontend_input_sync.cpp's test clock.
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+static uint32_t s_shimGameMode = 0;
+static uint32_t s_shimSubState = 0;
+static uint32_t s_shimSubStateTimer = 0;
+static uint32_t s_shimMatchPhaseTimer = 0;
+static uint8_t  s_shimContinueCursor = 0;
+
+static uint32_t FlowGameMode() { return s_shimGameMode; }
+static uint32_t FlowSubstate() { return s_shimSubState; }
+static void FlowWriteSubState(uint32_t v) { s_shimSubState = v; }
+static void FlowWriteSubStateTimer(uint32_t v) { s_shimSubStateTimer = v; }
+static void FlowWriteMatchPhaseTimer(uint32_t v) { s_shimMatchPhaseTimer = v; }
+static void FlowWriteContinueCursor(uint8_t v) { s_shimContinueCursor = v; }
+static void FlowBgmStop() {}
+#else
 // BGM_PlayTrack(track): 255 stops — vanilla NO branch parity (the game's own
 // NO branch never runs because the prompt suppresses its inputs).
 using BgmPlayTrack_t = int(__cdecl*)(int track);
 static BgmPlayTrack_t s_bgmPlay = reinterpret_cast<BgmPlayTrack_t>(ADDR_BGM_PLAY_TRACK);
+
+static uint32_t FlowGameMode() { return GetGameMode(); }
+static uint32_t FlowSubstate() { return GetSubstate(); }
+static void FlowWriteSubState(uint32_t v) { WriteMemory<uint32_t>(ADDR_SUB_STATE, v); }
+static void FlowWriteSubStateTimer(uint32_t v) { WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, v); }
+static void FlowWriteMatchPhaseTimer(uint32_t v) { WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, v); }
+static void FlowWriteContinueCursor(uint8_t v) { WriteMemory<uint8_t>(ADDR_CONTINUE_CURSOR, v); }
+static void FlowBgmStop() {
+    if (s_bgmPlay) {
+        s_bgmPlay(255);
+    }
+}
+#endif
 
 // Local game side, same idiom as the HUD (mod_main.cpp): bootstrap-assigned
 // player slot with session-role fallback (host = P1). Display-only — the
@@ -134,9 +167,9 @@ static void SetState(FlowState next, const char* why) {
 // (0x8EA3B0)=0 at the point sub 3 would otherwise advance. Assets/SEs are
 // loaded unconditionally by sub_5FBEE0 for every mode-9 entry — no asset work.
 static void ForceContinueScreen(const char* why) {
-    WriteMemory<uint32_t>(ADDR_SUB_STATE, (uint32_t)STORY_SUB_DIALOGUE_END);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0u);
-    WriteMemory<uint8_t>(ADDR_CONTINUE_CURSOR, 0u);
+    FlowWriteSubState((uint32_t)STORY_SUB_DIALOGUE_END);
+    FlowWriteSubStateTimer(0u);
+    FlowWriteContinueCursor(0u);
     Rollback::NetplayLog_Write("CONTINUE", -1,
         "Forced continue screen (sub=4): %s consume=%u",
         why ? why : "?", WinScreenSync_GetConsumeFrame());
@@ -165,15 +198,13 @@ static void ResolveDecline(const char* why) {
 
     // Skip the 1920-frame GAME OVER slide (sub 6): sub 8 is the plain
     // 25-frame fade -> sub 36 -> charsel (today's post-match flow).
-    WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, 0u);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE, (uint32_t)STORY_SUB_PREMATCH);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0u);
+    FlowWriteMatchPhaseTimer(0u);
+    FlowWriteSubState((uint32_t)STORY_SUB_PREMATCH);
+    FlowWriteSubStateTimer(0u);
 
     // Vanilla NO stops the BGM in sub_601BB0; that branch never ran under
     // input suppression, so issue the stop ourselves for parity.
-    if (s_bgmPlay) {
-        s_bgmPlay(255);
-    }
+    FlowBgmStop();
 
     s_declineCarryClear = false;
     SetState(FlowState::DeclineCooldown, why);
@@ -222,9 +253,9 @@ static void ResolveRematch() {
     // Vanilla YES path: sub 5 (25f fade on 0x816370) -> 36 -> mode change.
     // Mode 7 re-reads the live charsel globals — nothing on this path may
     // touch 0x8E9F10/14, 0x8E9FE0/E4, 0x816470/71.
-    WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, 0u);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE, (uint32_t)STORY_SUB_EVENT_SETUP);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0u);
+    FlowWriteMatchPhaseTimer(0u);
+    FlowWriteSubState((uint32_t)STORY_SUB_EVENT_SETUP);
+    FlowWriteSubStateTimer(0u);
 
     s_rematchLatched = true;
     SetState(FlowState::RematchPending, "both locked YES");
@@ -240,9 +271,9 @@ static void ResolveRematch() {
         // Undo the YES routing: without a pregame fast path the mode-7 route
         // would start an unsynchronized match. Fall back to the charsel flow.
         s_rematchLatched = false;
-        WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, 0u);
-        WriteMemory<uint32_t>(ADDR_SUB_STATE, (uint32_t)STORY_SUB_PREMATCH);
-        WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0u);
+        FlowWriteMatchPhaseTimer(0u);
+        FlowWriteSubState((uint32_t)STORY_SUB_PREMATCH);
+        FlowWriteSubStateTimer(0u);
         SetState(FlowState::DeclineCooldown, "rematch begin failed");
         return;
     }
@@ -259,8 +290,8 @@ static void StepPrompt(uint16_t p1, uint16_t p2) {
     // Fail-closed sanity: the prompt owns mode 9 sub 4 (input suppression
     // keeps sub_601BB0 from self-transitioning). Anything else means we lost
     // the screen — route to the safe decline path.
-    const uint32_t mode = GetGameMode();
-    const uint32_t sub = GetSubstate();
+    const uint32_t mode = FlowGameMode();
+    const uint32_t sub = FlowSubstate();
     if (mode != MODE_WINSCREEN || sub != STORY_SUB_DIALOGUE_END) {
         LOG_NETPLAY(LOG_WARNING,
             "[ContinueFlow] Prompt sanity failed (mode=%u sub=%u) — declining",
@@ -293,7 +324,7 @@ static void StepPrompt(uint16_t p1, uint16_t p2) {
 
     // Per-machine display of our own cursor only; game-state effects come
     // exclusively from resolution.
-    WriteMemory<uint8_t>(ADDR_CONTINUE_CURSOR, s_cursor[ResolveLocalSide()]);
+    FlowWriteContinueCursor(s_cursor[ResolveLocalSide()]);
 
     s_promptFrames++;
 
@@ -385,12 +416,12 @@ void ContinueFlow_SetEnabled(bool enabled) {
 void ContinueFlow_OnWinScreenAdvance() {
     if (!s_initialized || !s_enabled) return;
     if (s_state != FlowState::Armed) return;
-    if (GetGameMode() != MODE_WINSCREEN) return;
+    if (FlowGameMode() != MODE_WINSCREEN) return;
     // Both-advance is latched (level-triggered) in WinScreenSync; enter the
     // prompt as soon as the win pose (sub 3) is on screen. The consume path
     // usually beats this — it exists for advance intents latched before the
     // interactive sub (pre-skips during the mode-9 fade-in).
-    if (GetSubstate() == STORY_SUB_DIALOGUE_ADV) {
+    if (FlowSubstate() == STORY_SUB_DIALOGUE_ADV) {
         BeginPrompt("both-advance observed (winscreen sync)");
     }
 }
@@ -400,7 +431,7 @@ void ContinueFlow_OnConsumedFrame(uint16_t p1Inputs, uint16_t p2Inputs) {
 
     switch (s_state) {
         case FlowState::Idle:
-            if (GetGameMode() == MODE_WINSCREEN &&
+            if (FlowGameMode() == MODE_WINSCREEN &&
                 MatchLifecycle_IsMatchOwned() &&
                 Session_IsConnected()) {
                 SetState(FlowState::Armed, "mode 9 entered (owned netplay match)");
@@ -408,10 +439,10 @@ void ContinueFlow_OnConsumedFrame(uint16_t p1Inputs, uint16_t p2Inputs) {
             break;
 
         case FlowState::Armed: {
-            if (GetGameMode() != MODE_WINSCREEN) {
+            if (FlowGameMode() != MODE_WINSCREEN) {
                 break;  // mode-8 sub-5 tail — keep tracking prev inputs only
             }
-            const uint32_t sub = GetSubstate();
+            const uint32_t sub = FlowSubstate();
             if (sub == STORY_SUB_DIALOGUE_ADV) {
                 s_sawWinPose = true;
                 if (((uint16_t)(p1Inputs | p2Inputs) & kAdvanceMask) != 0) {
@@ -501,7 +532,7 @@ void ContinueFlow_ConsumeRematchLatch() {
     if (!s_rematchLatched) return;
     s_rematchLatched = false;
     Rollback::NetplayLog_Write("CONTINUE", -1,
-        "Rematch latch consumed (mode=%u sub=%u)", GetGameMode(), GetSubstate());
+        "Rematch latch consumed (mode=%u sub=%u)", FlowGameMode(), FlowSubstate());
     ResetAll("rematch latch consumed");
 }
 
@@ -512,5 +543,20 @@ ContinueChoiceState ContinueFlow_GetLocalChoiceState() {
 ContinueChoiceState ContinueFlow_GetRemoteChoiceState() {
     return SideChoiceState(1 - ResolveLocalSide());
 }
+
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+void ContinueFlow_Test_SetGameState(uint32_t mode, uint32_t sub) {
+    s_shimGameMode = mode;
+    s_shimSubState = sub;
+}
+
+uint32_t ContinueFlow_Test_GetSubState() {
+    return s_shimSubState;
+}
+
+uint8_t ContinueFlow_Test_GetCursor() {
+    return s_shimContinueCursor;
+}
+#endif
 
 } // namespace Net

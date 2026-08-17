@@ -61,7 +61,7 @@ uint32_t s_sessionIdDropCount = 0;
 // §3.1: gameplay-phase packets carry the 64-bit handshake session_id; a
 // wrong id is dropped BEFORE any state mutation (stale, replayed, and
 // port-reuse datagrams are structurally inert). A zero id (peer not yet
-// confirmed / legacy Gekko bytes) passes through — the sinks self-guard.
+// confirmed) passes through — the sinks self-guard.
 bool SessionIdGateDrops(uint64_t packetSessionId, PacketType type) {
     const uint64_t sid = Net::Session2_GetSessionId();
     if (sid == 0 || packetSessionId == 0 || packetSessionId == sid) {
@@ -107,11 +107,10 @@ void PacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadL
             break;
 
         // --- Engine sinks (both handlers self-guard against pre-live
-        // arrival). NOTE on the §3.1 session_id gate: under AS2_WITH_GEKKO=ON
-        // the InputStream payload is still raw GekkoNet bytes, so the id can
-        // only be validated at the engine2 adapter's typed ingest — the
-        // adapter drops foreign session_ids before any state mutation. The
-        // v2-only SyncHash packets are gated here. ---
+        // arrival). NOTE on the §3.1 session_id gate: the InputStream id is
+        // validated at the engine2 adapter's typed ingest — the adapter
+        // drops foreign session_ids before any state mutation. The SyncHash
+        // packets are gated here. ---
         case PacketType::InputStream: {
             Rollback::OnlineWiring_HandleEngineDataPacket(payload, payloadLen);
             break;

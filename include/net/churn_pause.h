@@ -3,7 +3,7 @@
  *
  * During local gamepad/USB device I/O, coordinates a mutual gameplay hold so
  * rollback netplay stalls both sides instead of running ahead, disconnecting,
- * or desyncing. Reuses existing StallHold pacing — no changes to GekkoNet or
+ * or desyncing. Reuses existing StallHold pacing — no changes to the
  * rollback input flow beyond an early hold gate.
  */
 

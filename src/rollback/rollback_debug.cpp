@@ -208,7 +208,7 @@ void RollbackDebug_FrameUpdate() {
     const int32_t gameAbsFrame = RollbackSession_GetCurrentGameAbsFrame();
     const int32_t frameOriginAbs = RollbackSession_GetFrameOriginAbs();
 
-    // Compute authoritative gameplay checksum (Gekko save/load equivalent).
+    // Compute authoritative gameplay checksum (savestate save/load equivalent).
     s_currentChecksum = RollbackDebug_ComputeAuthoritativeChecksum();
 
     StoreChecksumForFrame(rbFrame, s_currentChecksum);

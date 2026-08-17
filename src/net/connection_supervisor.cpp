@@ -19,8 +19,9 @@ namespace {
 // Default thresholds (ms), re-based on protocol-level silence (INV-14):
 // Healthy <1 s, Degraded 1-5 s, Interrupted 5-20 s, Dead >=20 s. Sane
 // because ENet pings every 150 ms, so 1 s of protocol silence is genuinely
-// abnormal. Dead is deliberately far above GekkoNet's legacy 5 s timer — the
-// supervisor, not Gekko, decides when a session is over.
+// abnormal. Dead is deliberately far above the 0.6 backend's legacy 5 s
+// timer — the supervisor, not the rollback backend, decides when a session
+// is over.
 constexpr uint32_t kDefaultDegradedMs    = 1000;
 constexpr uint32_t kDefaultInterruptedMs = 5000;
 constexpr uint32_t kDefaultDeadMs        = 20000;

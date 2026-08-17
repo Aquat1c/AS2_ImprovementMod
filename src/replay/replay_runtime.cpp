@@ -598,7 +598,7 @@ static bool AppendReplayPaletteTrailer(const fs::path& path,
 // boundary IS the chapter boundary). Consumes the recorder.
 static bool AppendReplayConfirmedTrailer(const fs::path& path) {
     if (s_recRecords.empty() || s_recFirstGameAbs < 0) {
-        return true;   // nothing recorded (offline match / Gekko fallback)
+        return true;   // nothing recorded (offline match)
     }
 
     std::vector<uint8_t> payload;

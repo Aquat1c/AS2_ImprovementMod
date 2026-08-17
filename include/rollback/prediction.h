@@ -1,8 +1,8 @@
 /**
  * Alice Senki 2 - Input Prediction (re0.7 M4 resurrection, master plan §2.7.3-R)
  *
- * Hold-last-actual prediction for missing remote inputs. Resurrected from the
- * pre-Gekko module as a pure, instantiable policy object for engine2.
+ * Hold-last-actual prediction for missing remote inputs. Resurrected from
+ * the 0.5-era module as a pure, instantiable policy object for engine2.
  *
  * The predictor itself is trivial by design (QOH99 §2.2): predict the last
  * *actual* remote input. Earliest-mismatch tracking lives in the engine —

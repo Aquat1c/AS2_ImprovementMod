@@ -234,7 +234,7 @@ static int AbortRollbackDispatcher(const char* fallbackReason) {
     InputSyncHooks_SetTimesyncFreeze(false);
     s_rollbackSessionWasActive = false;  // force re-init on next session
 
-    // End the GekkoNet session immediately so subsequent dispatcher calls
+    // End the rollback session immediately so subsequent dispatcher calls
     // cannot re-enter this path through RollbackSession_IsActive().
     Rollback::RollbackSession_End();
 
@@ -2318,7 +2318,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         InputSyncHooks_SetTimesyncFreeze(false);
     }
 
-// (The 0.6 GekkoNet frames-ahead throttle block was deleted at the M6
+// (The 0.6 backend's frames-ahead throttle block was deleted at the M6
 // cutover: engine2 owns holds via typed NextAction stalls; the scheduler
 // owns the clock. See RE07_MASTER_REBUILD_PLAN.md sections 2.7.4/2.8.)
     if (Rollback::RollbackSession_IsActive()) {

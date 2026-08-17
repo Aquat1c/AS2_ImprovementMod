@@ -94,10 +94,6 @@ void LogWindow_LogPacketV(LogLevel level, const char* fmt, va_list args);
 void LogWindow_LogNet(LogLevel level, const char* fmt, ...);
 void LogWindow_LogNetV(LogLevel level, const char* fmt, va_list args);
 
-// Gekko log (separate file: as2_gekko.log — always enabled, not shown in imgui)
-void LogWindow_LogGekko(LogLevel level, const char* fmt, ...);
-void LogWindow_LogGekkoV(LogLevel level, const char* fmt, va_list args);
-
 // Category management
 void LogWindow_SetCategoryEnabled(LogCategory cat, bool enabled);
 bool LogWindow_IsCategoryEnabled(LogCategory cat);
@@ -144,12 +140,6 @@ const char* LogWindow_GetCategoryName(LogCategory cat);
 #define LOG_NET_INFO(fmt, ...)    LogWindow_LogNet(LOG_INFO, fmt, ##__VA_ARGS__)
 #define LOG_NET_WARN(fmt, ...)    LogWindow_LogNet(LOG_WARNING, fmt, ##__VA_ARGS__)
 #define LOG_NET_ERROR(fmt, ...)   LogWindow_LogNet(LOG_ERROR, fmt, ##__VA_ARGS__)
-
-// Gekko log macros (separate file: as2_gekko.log — always written)
-#define LOG_GEKKO_DEBUG(fmt, ...)   LogWindow_LogGekko(LOG_DEBUG, fmt, ##__VA_ARGS__)
-#define LOG_GEKKO_INFO(fmt, ...)    LogWindow_LogGekko(LOG_INFO, fmt, ##__VA_ARGS__)
-#define LOG_GEKKO_WARN(fmt, ...)    LogWindow_LogGekko(LOG_WARNING, fmt, ##__VA_ARGS__)
-#define LOG_GEKKO_ERROR(fmt, ...)   LogWindow_LogGekko(LOG_ERROR, fmt, ##__VA_ARGS__)
 
 // Render the log window (call from ImGui render loop)
 void LogWindow_Render(bool* pOpen);

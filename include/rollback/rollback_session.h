@@ -1,19 +1,16 @@
 /**
- * Alice Senki 2 - Rollback Session (GekkoNet-driven)
+ * Alice Senki 2 - Rollback Session facade (engine2-backed)
  *
- * GekkoNet event-driven rollback session. GekkoNet owns all rollback
- * logic: prediction, misprediction detection, savestate management,
- * resimulation scheduling, and timesync.
- *
- * The mod provides:
- *   - Transport adapter (ENet ↔ GekkoNet)
- *   - State capture/restore callbacks
- *   - Input injection into game buffers
- *   - Frame advance via game's match handler
+ * The stable dispatcher-facing API over the engine2 rollback backend
+ * (rollback/engine2.h + rollback_session_engine2.cpp). The engine owns
+ * prediction, misprediction detection, and the rollback transaction; the
+ * adapter behind this header owns savestates, wire send/ingest, and the
+ * game-memory boundary.
  *
  * Two-phase API for the input dispatcher hook:
- *   1. BeginFrame(localInput) — feed local input to GekkoNet, update session
- *   2. ProcessNextEvent() — iterate GekkoNet events (save/load/advance)
+ *   1. BeginFrame(localInput) — capture local input, refresh the pass plan
+ *   2. ProcessNextEvent() — drain the pass plan (corrections first, then
+ *      at most one visible advance)
  *      Returns Advance → dispatcher writes inputs, returns 0 (game steps)
  *      Returns Done → dispatcher returns -1 (break game's loop)
  *
@@ -42,7 +39,7 @@ struct RollbackSessionConfig {
     int      local_player;       // 0 = P1, 1 = P2
     int      remote_player;      // 0 = P1, 1 = P2
     int      initial_delay;      // Input delay for local player
-    int      rollback_budget;    // Max prediction window (GekkoNet input_prediction_window)
+    int      rollback_budget;    // Max prediction window (engine R_local)
     uint32_t baseline_checksum;  // CRC32 of baseline state (for verification)
     int32_t  frame_origin_abs;   // Absolute engine frame where rollback rb_frame 0 begins
 };
@@ -52,7 +49,7 @@ struct RollbackSessionConfig {
 // ============================================================================
 
 enum class EventResult {
-    Advance,     // GekkoNet wants one frame advanced — inputs written to game buffers
+    Advance,     // one frame must advance — inputs written to game buffers
     Done,        // No more events this update — break game's dispatcher loop
     Error        // Session error — caller should end session
 };
@@ -61,30 +58,28 @@ enum class EventResult {
 // Lifecycle
 // ============================================================================
 
-/// Initialize rollback subsystems (state history, GekkoNet). Called once at mod init.
+/// Initialize rollback subsystems (state history, engine). Called once at mod init.
 void RollbackSession_Init();
 
 /// Shutdown rollback subsystems.
 void RollbackSession_Shutdown();
 
-/// Begin a GekkoNet rollback session after bootstrap handoff.
+/// Begin a rollback session after bootstrap handoff.
 bool RollbackSession_Begin(const RollbackSessionConfig& config);
 
-/// End the current session. Destroys GekkoNet session and cleans up.
+/// End the current session. Disarms the engine and cleans up.
 void RollbackSession_End();
 
 /// Match-boundary suspension (M6, §2.6.3): the match ended but the SESSION
 /// lives on (winscreen → continue prompt → rematch). Dispatch/queries behave
 /// as inactive, but the engine2 backend keeps its engine armed so the next
 /// `RollbackSession_Begin` under a higher epoch ROTATES (canonical frame
-/// counter continues, INV-15) instead of re-arming. The Gekko adapter maps
-/// this to a full `RollbackSession_End` (per-match engine lifetime).
+/// counter continues, INV-15) instead of re-arming.
 void RollbackSession_SuspendBetweenMatches(const char* reason);
 
 /// Mirror of the director-derived match-exit signal (M6, §2.7.6/INV-25):
 /// true while the mode-8 exit router is armed (match result resolved), so
 /// the engine's exact-input window covers the irreversible handoff tick(s).
-/// No-op on the Gekko adapter.
 void RollbackSession_SetMatchExitPending(bool pending);
 
 /// Is a rollback session currently active?
@@ -94,16 +89,16 @@ bool RollbackSession_IsActive();
 // Two-Phase Frame Processing (called from input dispatcher hook)
 // ============================================================================
 
-/// Phase 1: Feed local input to GekkoNet, trigger session update.
+/// Phase 1: Feed local input to the engine, refresh the pass plan.
 /// Call ONCE per game loop iteration before ProcessNextEvent.
 void RollbackSession_BeginFrame(uint16_t localInput);
 
-/// Poll GekkoNet network/session state without feeding local input or
+/// Poll network/session state without feeding local input or
 /// generating gameplay events. Used while gameplay is intentionally frozen so
 /// disconnects and session state changes still propagate.
 bool RollbackSession_PollSession();
 
-/// Phase 2: Process the next GekkoNet event.
+/// Phase 2: Process the next engine event.
 /// Call repeatedly until it returns Done or Error.
 ///   Advance → inputs written to game buffers; dispatcher should return 0
 ///   Done    → no more events; dispatcher should return -1
@@ -125,16 +120,13 @@ void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2);
 // Wire packet ingestion (routed by net/packet_router)
 // ============================================================================
 
-/// Ingest a received InputStream (23) payload. Under AS2_WITH_GEKKO=ON the
-/// payload is raw GekkoNet bytes buffered for the Gekko session to drain;
-/// under the engine2 adapter it is the v2 InputStreamPayload (§3.2), with
-/// the session_id gate applied before any state mutation (§3.1).
-/// (M5: renamed from RollbackSession_BufferGekkoPacket — inventory §11.)
+/// Ingest a received InputStream (23) payload: the v2 InputStreamPayload
+/// (§3.2), with the session_id gate applied before any state mutation
+/// (§3.1).
 void RollbackSession_OnInputStreamPacket(const void* data, size_t len);
 
 /// Ingest a received SyncHash (75) payload (§2.7.7 confirmed-frame
-/// verification). No-op on the Gekko adapter (its desync detection rides
-/// StateDigest); the engine2 adapter feeds the engine's hash queue.
+/// verification). Feeds the engine's hash queue.
 void RollbackSession_OnSyncHashPacket(const void* data, size_t len);
 
 // ============================================================================
@@ -156,21 +148,21 @@ int32_t RollbackSession_RbFrameToGameAbs(int32_t rb_frame);
 /// Whether the current advance event is a rollback resimulation frame.
 bool RollbackSession_IsRollingBack();
 
-/// Whether GekkoNet has completed its initial sync and is producing game events.
+/// Whether the session has completed its initial sync and is producing game events.
 bool RollbackSession_IsSessionRunning();
 
-/// True while GekkoNet reports the remote peer as interrupted (inbound silence
-/// past the interrupt timeout, but before the disconnect timeout). Non-fatal:
+/// True while the backend reports the remote peer as interrupted (inbound
+/// silence past the interrupt timeout, but before the disconnect timeout). Non-fatal:
 /// gameplay should freeze-and-wait; cleared automatically on PlayerResumed.
 bool RollbackSession_IsPeerInterrupted();
 
-/// GekkoNet's frame advantage metric for timesync decisions.
+/// Frame advantage metric for timesync decisions (telemetry only, INV-1).
 float RollbackSession_FramesAhead();
 
 /// Current active delay.
 int RollbackSession_GetActiveDelay();
 
-/// Apply a new local input delay to the active Gekko session.
+/// Apply a new local input delay to the active session.
 /// Returns true if accepted by the active session.
 bool RollbackSession_SetLocalDelay(int delay);
 
@@ -188,7 +180,8 @@ const char* RollbackSession_GetErrorReason();
 bool RollbackSession_TakeErrorReason(char* out, size_t outSize);
 
 // RollbackTimesyncTelemetry now lives in rollback/rollback_telemetry.h (M0
-// extraction; gekko_avg_ping/gekko_jitter renamed link_avg_ping/link_jitter).
+// extraction; the 0.6 *_avg_ping/*_jitter fields renamed link_avg_ping/
+// link_jitter).
 
 /// Lightweight runtime telemetry for pacing/timesync logic.
 /// Unlike RollbackSession_GetSnapshot, this does NOT compute large-state CRCs.
@@ -225,7 +218,7 @@ struct RollbackSessionSnapshot {
     int32_t  max_rollback_distance;
     int32_t  predicted_frames_outstanding;
 
-    // GekkoNet state
+    // Engine state
     bool     is_rolling_back;
     bool     side_effects_suppressed;
     float    frames_ahead;
@@ -247,14 +240,13 @@ struct RollbackSessionSnapshot {
     int32_t  local_inputs_sent;
     int32_t  remote_inputs_received;
 
-    // Link stats (M5 rename per inventory §11: gekko_* → link_*; fed by the
-    // backend's own RTT estimate — time_probe from M6 on the engine2 path)
+    // Link stats (M5 rename per inventory §11; fed by the backend's own
+    // RTT estimate — time_probe from M6 on the engine2 path)
     float    link_avg_ping;
     float    link_jitter;
 
-    // Peer advisory readouts from the freshest PressureReport (M6 HUD;
-    // engine2 only — zeros on the Gekko adapter). INV-23: advisory display
-    // data, never applied locally.
+    // Peer advisory readouts from the freshest PressureReport (M6 HUD).
+    // INV-23: advisory display data, never applied locally.
     uint32_t peer_produced_frontier;   // one past newest frame the peer sealed
     uint8_t  peer_prediction_depth;
     uint8_t  peer_run_state;           // Rollback::RunState byte
@@ -264,7 +256,7 @@ struct RollbackSessionSnapshot {
 
 void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out);
 
-/// Authoritative gameplay checksum (Gekko save/load equivalent: main match region + effect index).
+/// Authoritative gameplay checksum (savestate save/load equivalent: main match region + effect index).
 uint32_t RollbackSession_ComputeLiveStateChecksum();
 
 } // namespace Rollback

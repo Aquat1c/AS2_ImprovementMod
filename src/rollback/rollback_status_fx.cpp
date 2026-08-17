@@ -450,7 +450,7 @@ void RollbackStatusFx_OnSessionEnd(const char* reason) {
     s_drawSuppressCount = 0;
 }
 
-void RollbackStatusFx_OnGekkoLoad(int32_t load_rb_frame, int32_t load_game_abs_frame) {
+void RollbackStatusFx_OnEngineLoad(int32_t load_rb_frame, int32_t load_game_abs_frame) {
     if (!s_sessionActive) {
         return;
     }
@@ -504,7 +504,7 @@ void RollbackStatusFx_OnAdvanceBegin(int32_t rb_frame, int32_t game_abs_frame, b
         (unsigned)s_committed.size());
 }
 
-void RollbackStatusFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) {
+void RollbackStatusFx_OnEngineBatchEnd(int32_t rb_frame, int32_t game_abs_frame) {
     if (!s_sessionActive) {
         return;
     }

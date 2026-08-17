@@ -13,7 +13,7 @@
  * layer routes that to the correct game-side slot.
  *
  * Consumers:
- *   - rollback_session.cpp (input collection)
+ *   - rollback_session_engine2.cpp (input collection)
  *   - online_wiring.cpp (session start)
  *   - pregame_sync.cpp (side assignment)
  *   - match_bootstrap.cpp (config exchange)

@@ -72,7 +72,8 @@ static int32_t s_lastRollbackLength    = 0;
 /// Write input pair (local + remote) into game buffers for the next frame advance.
 /// local_player: 0 = P1 is local, 1 = P2 is local.
 static void WriteInputsForFrame(int32_t frame, int local_player) {
-    // Dead code — GekkoNet handles rollback resimulation internally.
+    // Dead code — the engine2 adapter drives resimulation through the
+    // rollback transaction (BeginRollback/CommitReplayFrame), not this path.
     // Kept as a compilation stub for Resim_Execute (also dead code).
     (void)frame;
     (void)local_player;
@@ -349,7 +350,7 @@ int32_t Resim_Execute(int32_t rollback_frame, int32_t target_frame, int local_pl
         s_resimFrame = f;
 
         NetplayLog_Verbose("RESIM", f,
-            "Replay frame %d (dead path — GekkoNet owns rollback)", f);
+            "Replay frame %d (dead path — the engine2 transaction owns rollback)", f);
 
         // Write the correct inputs for this frame
         WriteInputsForFrame(f, local_player);

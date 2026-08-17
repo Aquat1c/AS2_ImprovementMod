@@ -5,8 +5,10 @@ criteria), §8.3 (fallback criteria). This document is self-contained: it lists
 every run, its exact configuration, the expected outcome, and the judge
 command. The code/tooling side of M8 is complete (see IMPLEMENTATION_LOG.md
 M8 entry); everything below is a FIELD RUN the operator performs on real
-builds. GekkoNet removal and the 0.7-fallback decision are both gated on the
-outcomes recorded here (§6/§7 below).
+builds. The 0.7-fallback decision is gated on the outcomes recorded here
+(§7 below). GekkoNet removal (§6) was EXECUTED 2026-08-17 on operator
+authority, overriding the field-gate deferral — the acceptance runs below
+now execute on the engine2-only tree.
 
 ---
 
@@ -14,15 +16,17 @@ outcomes recorded here (§6/§7 below).
 
 ### 1.1 Builds
 
-- **Primary config:** default CMake (`AS2_WITH_GEKKO=OFF`) = engine2 backend.
-  All acceptance runs use this config.
-- **Fallback config sanity:** `-DAS2_WITH_GEKKO=ON` must still configure and
-  compile (it is the §8.3 partial-fallback ship vehicle). No acceptance runs
-  use it; one smoke build is enough.
+- **Primary config:** default CMake = engine2 backend — the ONLY backend
+  since the §6 removal (the `AS2_WITH_GEKKO` option no longer exists; a
+  partial fallback would ship branch `0.7` itself, §7).
 - Unit suite green first: `frame_arithmetic_tests`, `frame_scheduler_tests`,
   `engine2_tests` (includes the 100k-frame socket-free soak + microbench),
-  `frontend_sync_tests`, `transition_barrier_tests`, `async_log_tests`, and
-  `tools/check_killpaths.ps1` (CI kill-path gate, INV-12).
+  `determinism_tests` (offline R-DET twin: network-profile matrix,
+  forced-rollback-every-frame, multi-epoch, full-speed hold invariants),
+  `frontend_sync_tests` (now includes simultaneous-navigation and
+  continue-flow rematch-handoff coverage), `transition_barrier_tests`,
+  `async_log_tests`, and `tools/check_killpaths.ps1` (CI kill-path gate,
+  INV-12).
 
 ### 1.2 Machines
 
@@ -221,29 +225,44 @@ suites; `harness` = covered by a §2 run; `manual` = §2.6 spot check.
 | S-1..S-6 | R-SPEC + R-REPLAY |
 | B-1..B-7 | R-SOAK-100 (B-1/B-4/B-5 arise naturally) + manual B-2/B-6/B-7 |
 
-## 6. GekkoNet removal criteria (§8 / M6-M7 deferral)
+## 6. GekkoNet removal criteria (§8 / M6-M7 deferral) — **EXECUTED 2026-08-17**
 
-GekkoNet (CMake `AS2_WITH_GEKKO` option, `rollback_session.cpp` Gekko
-adapter, `lib/GekkoNet`, `gekko_input_tests`) is removed **only after ALL**:
+> **STATUS: the removal task list below was EXECUTED in one commit on
+> 2026-08-17, on explicit operator authority overriding the field-gate
+> criteria 1–5 (the operator decided GekkoNet is no longer needed).**
+> Executed items: CMake `AS2_WITH_GEKKO` option + every conditional block
+> (GekkoNet subdir/link/defines, adapter selection, `gekko_input_tests`)
+> deleted; `src/rollback/rollback_session.cpp` deleted; the soak's
+> `AS2_WITH_GEKKO` guard removed (engine2 strict INV-15 branch kept); the
+> fallback-config wording in this doc + CMakeLists updated; dead-symbol
+> sweep (`*_OnGekko*` sidecar hooks → `*_OnEngine*`, the `LOG_GEKKO`
+> channel deleted). `lib/GekkoNet/` stays ON DISK for history but is
+> unwired from the build (`AS2_PATCHES.md` carries the retirement note).
+> Post-condition verified: `grep "AS2_WITH_GEKKO|Gekko"` over
+> `src/ include/ tests/ CMakeLists.txt` returns nothing; the only `tools/`
+> hits are `test_harness_launcher.cpp`'s OLD-log triage strings (reading
+> logs produced by 0.6/0.7 builds), kept by design.
+> See IMPLEMENTATION_LOG.md "Post-M8" entry for the full file list.
+
+Original criteria (retained for the record — removal was to happen **only
+after ALL**; superseded by the user's explicit 2026-08-17 instruction to
+complete the Gekko deprecation, quoted in IMPLEMENTATION_LOG.md "Post-M8"):
 
 1. §3 checklist items 1–5 all pass on real builds (the M6 cutover gate has
    actually RUN, not just compiled).
 2. R-LE1 passes on min-spec — the field-log scenario is demonstrably fixed.
 3. R-SOAK-100 passes on both instances (both routes exercised).
-4. R-DET: desync rate ≤ 1/100 harness matches.
+4. R-DET: desync rate ≤ 1/100 harness matches. (Now ALSO covered offline by
+   the `determinism_tests` CTest target: network-profile matrix +
+   forced-rollback-every-frame + multi-epoch, runs in CI unconditionally.)
 5. No §8.3 fallback trigger (below) is active.
-
-Removal task list (one commit, after sign-off): delete the CMake option +
-conditional blocks (GekkoNet subdir/link/defines, adapter selection,
-`gekko_input_tests`), `src/rollback/rollback_session.cpp`, `lib/GekkoNet`,
-the `AS2_WITH_GEKKO` guard in `src/testing/rematch_soak.cpp` (keep the
-engine2 strict branch), and the fallback-config wording in this doc +
-CMakeLists comments. Grep `AS2_WITH_GEKKO|Gekko` must then return docs only.
 
 ## 7. 0.7-fallback criteria (§8.3)
 
 Fallback = ship branch `0.7` (GekkoNet + resilience M-work) while re0.7
-continues in dev. Trigger if ANY:
+continues in dev. NOTE (post-§6 removal): the in-tree
+`AS2_WITH_GEKKO=ON` partial-fallback config no longer exists — any
+fallback now means shipping branch `0.7` itself. Trigger if ANY:
 
 1. The cutover gate (§3 above) is not green within 3 weeks of code-complete —
    desync rate >1/100 harness matches unresolved, or any INV structurally
@@ -255,10 +274,10 @@ continues in dev. Trigger if ANY:
 4. A frontend regression class (charsel/rematch) with no drop+log downgrade
    available.
 
-Partial fallback (pre-planned): M2 (scheduler) + M3 (transport/session/
-supervisor) are individually shippable on top of GekkoNet
-(`AS2_WITH_GEKKO=ON` config) — they fix INV-5/14/17 independently and are
-strictly better than 0.7 alone.
+Partial fallback (pre-planned, HISTORICAL): M2 (scheduler) + M3
+(transport/session/supervisor) were individually shippable on top of
+GekkoNet via the `AS2_WITH_GEKKO=ON` config. That config was removed with
+§6 — resurrecting it means reverting the removal commit on a side branch.
 
 ## 8. Known analysis caveats
 

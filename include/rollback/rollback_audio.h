@@ -13,9 +13,9 @@ void RollbackAudio_Shutdown();
 void RollbackAudio_OnSessionBegin(int rollback_budget);
 void RollbackAudio_OnSessionEnd(const char* reason);
 
-void RollbackAudio_OnGekkoLoad(int32_t load_rb_frame, int32_t load_game_abs_frame);
+void RollbackAudio_OnEngineLoad(int32_t load_rb_frame, int32_t load_game_abs_frame);
 void RollbackAudio_OnAdvanceBegin(int32_t rb_frame, int32_t game_abs_frame, bool rolling_back);
-void RollbackAudio_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame);
+void RollbackAudio_OnEngineBatchEnd(int32_t rb_frame, int32_t game_abs_frame);
 
 char __cdecl Hook_SE_Play(int sound_id);
 

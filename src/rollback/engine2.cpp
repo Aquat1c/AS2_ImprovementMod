@@ -146,6 +146,9 @@ bool RollbackEngine::Arm(const EngineConfig& config, uint32_t epoch) {
     advance_plan_valid_ = false;
     lifecycle_exact_next_ = false;
     producer_fenced_ = false;
+    // Forced-rollback depth survives re-arm (like the prediction tap: the
+    // installer owns it); the per-frontier marker must not.
+    forced_rollback_done_valid_ = false;
 
     peer_adv_delay_ = 0;
     peer_adv_rollback_ = 0;
@@ -199,6 +202,11 @@ bool RollbackEngine::RotateEpoch(uint32_t new_epoch, uint32_t epoch_frame_origin
 
 void RollbackEngine::Disarm() {
     armed_ = false;
+}
+
+void RollbackEngine::SetForcedRollback(uint8_t depth) {
+    forced_rollback_depth_ = depth > 15 ? (uint8_t)15 : depth;
+    forced_rollback_done_valid_ = false;
 }
 
 // ============================================================================
@@ -461,6 +469,31 @@ EngineAction RollbackEngine::NextAction() {
         action.replay_until = sim_frontier_;
         ClassifyPass(WorkKind::Correct, HoldCause::None);
         return action;
+    }
+
+    // Test-only forced rollback (SetForcedRollback): synthesize a depth-N
+    // correction once per advanced frontier. Runs AFTER real corrections (a
+    // genuine mismatch always wins the earliest-frame rule) and never
+    // crosses the epoch frame origin — state identity changed there and
+    // older snapshots are the director's to invalidate (§2.6.5). The
+    // synthetic mismatch reuses the BeginRollback contract verbatim, so the
+    // transaction is indistinguishable from a real one to the caller.
+    if (forced_rollback_depth_ > 0 &&
+        !(forced_rollback_done_valid_ && forced_rollback_done_ == sim_frontier_)) {
+        const uint32_t executed = forwardDistance(epoch_frame_origin_, sim_frontier_);
+        uint32_t depth = forced_rollback_depth_;
+        if (depth > executed) depth = executed;
+        if (depth > 0) {
+            forced_rollback_done_ = sim_frontier_;
+            forced_rollback_done_valid_ = true;
+            pending_mismatch_ = sim_frontier_ - depth;
+            pending_mismatch_valid_ = true;
+            action.kind = EngineActionKind::Rollback;
+            action.frame = pending_mismatch_;
+            action.replay_until = sim_frontier_;
+            ClassifyPass(WorkKind::Correct, HoldCause::None);
+            return action;
+        }
     }
 
     const bool remote_actual_here = remote_.Has(sim_frontier_);

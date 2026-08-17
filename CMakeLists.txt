@@ -10,7 +10,6 @@
 #   - SDL3: https://github.com/libsdl-org/SDL (DLL - no static prebuilt available)
 #   - Dear ImGui: https://github.com/ocornut/imgui (static lib)
 #   - ENet: https://github.com/lsalzman/enet (static lib)
-#   - GekkoNet: https://github.com/HeatXD/GekkoNet (static lib)
 #   - libjuice: https://github.com/paullouisageneau/libjuice (optional NAT traversal)
 #   - miniupnpc: https://github.com/miniupnp/miniupnp (optional UPnP)
 #   - libpcpnatpmp: https://github.com/libpcp/pcp (optional PCP/NAT-PMP)
@@ -47,19 +46,16 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /EHa /FS")
 
 option(USE_VCPKG "Use vcpkg for dependencies" OFF)
 option(AS2_ENABLE_LEGACY_CUMULATIVE_PACKETS "Build the legacy cumulative packet experiment" OFF)
-# re0.7 M6 CUTOVER (plan §6 M6): engine2 is the LIVE gameplay path — the
-# default is OFF. ON is the legacy/fallback configuration only (§8.3 partial
-# fallback): rollback_session.cpp (GekkoNet) + GekkoNet lib/link. It must
-# keep COMPILING until the M8 field acceptance retires it for good; the
-# vendored lib/GekkoNet tree stays untouched either way.
-option(AS2_WITH_GEKKO "Legacy GekkoNet rollback backend (fallback config; default engine2)" OFF)
+# re0.7 post-M8: engine2 is the ONLY rollback backend. The legacy fallback
+# option and its vendored library were unwired after the M8 acceptance
+# sign-off (see docs/re0.7/M8_ACCEPTANCE_RUNBOOK.md §6); the vendored tree
+# stays on disk for history but is not part of the build.
 option(AS2_ENABLE_NAT_TRAVERSAL "Enable NAT traversal backend integration" ON)
 option(AS2_ENABLE_UPNP_FALLBACK "Enable miniupnpc UPnP fallback mapping" ON)
 option(AS2_ENABLE_PCPNATPMP_FALLBACK "Enable libpcpnatpmp PCP/NAT-PMP fallback mapping" ON)
 set(MINHOOK_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/minhook_src" CACHE PATH "MinHook source directory")
 set(SDL3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/SDL3" CACHE PATH "SDL3 directory")
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/imgui" CACHE PATH "ImGui directory")
-set(GEKKONET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/GekkoNet" CACHE PATH "GekkoNet directory")
 set(MINIUPNPC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniupnp_suite/miniupnpc" CACHE PATH "miniupnpc directory")
 set(LIBJUICE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libjuice" CACHE PATH "libjuice directory")
 set(PCPNATPMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpcpnatpmp/lib" CACHE PATH "libpcpnatpmp directory")
@@ -175,32 +171,6 @@ if(EXISTS "${ENET_DIR}/CMakeLists.txt")
     set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED}")
 else()
     message(FATAL_ERROR "ENet not found at ${ENET_DIR}; networking will not work.")
-endif()
-
-# ============================================================================
-# GekkoNet Library (static)
-# Pinned workspace dependency used for the gameplay rollback bridge.
-# ============================================================================ 
-
-if(AS2_WITH_GEKKO AND EXISTS "${GEKKONET_DIR}/GekkoLib/CMakeLists.txt")
-    set(BUILD_DOCS OFF CACHE BOOL "Build GekkoNet docs" FORCE)
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build GekkoNet shared libraries" FORCE)
-    set(NO_ASIO_BUILD OFF CACHE BOOL "Build GekkoNet without ASIO" FORCE)
-    add_subdirectory("${GEKKONET_DIR}/GekkoLib" "${CMAKE_CURRENT_BINARY_DIR}/GekkoNet" EXCLUDE_FROM_ALL)
-    if(TARGET GekkoNet)
-        if(MSVC)
-            # Force runtime parity with this project for all configs.
-            set_property(TARGET GekkoNet PROPERTY
-                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-        endif()
-        target_include_directories(GekkoNet PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-        )
-    endif()
-elseif(AS2_WITH_GEKKO)
-    message(WARNING "GekkoNet not found at ${GEKKONET_DIR}; gameplay bridge build will fail until it is added.")
-else()
-    message(STATUS "AS2_WITH_GEKKO=OFF: building the custom engine2 backend; GekkoNet excluded.")
 endif()
 
 # ============================================================================
@@ -460,14 +430,10 @@ set(ROLLBACK_SOURCES
     src/rollback/rematch_cleanup.cpp
 )
 
-# re0.7 M4: the RollbackSession_* facade has two providers behind the same
-# unchanged header (plan §6 M4 "facade adapter"): the GekkoNet backend or the
-# engine2 adapter, selected by AS2_WITH_GEKKO.
-if(AS2_WITH_GEKKO)
-    list(APPEND ROLLBACK_SOURCES src/rollback/rollback_session.cpp)
-else()
-    list(APPEND ROLLBACK_SOURCES src/rollback/rollback_session_engine2.cpp)
-endif()
+# The RollbackSession_* facade (unchanged header, plan §6 M4 "facade
+# adapter") has exactly one provider since the post-M8 legacy-backend
+# removal: the engine2 adapter.
+list(APPEND ROLLBACK_SOURCES src/rollback/rollback_session_engine2.cpp)
 
 set(NET_SOURCES
     src/net/baseline_sync.cpp
@@ -530,15 +496,11 @@ set(REPLAY_SOURCES
     src/replay/replay_runtime.cpp
 )
 
-# standalone_rollback_tests disabled — legacy source files moved to old_files/
-# add_executable(standalone_rollback_tests tests/test_runner_main.cpp tests/standalone_rollback_tests.cpp tests/test_packet_codec.cpp src/netplay/packet_codec.cpp)
-# target_include_directories(standalone_rollback_tests PRIVATE include/netplay include/ui)
-# target_link_libraries(standalone_rollback_tests PRIVATE ws2_32)
-
 add_executable(frontend_sync_tests
     tests/frontend_sync_tests.cpp
     src/net/frontend_input_sync.cpp
     src/net/winscreen_sync.cpp
+    src/net/continue_flow.cpp
     src/net/delay_policy.cpp
     src/net/time_probe.cpp
     src/net/stagesel_sync.cpp
@@ -623,30 +585,6 @@ set_target_properties(async_log_tests PROPERTIES
 
 add_test(NAME async_log_tests COMMAND async_log_tests)
 
-if(AS2_WITH_GEKKO)
-    add_executable(gekko_input_tests
-        tests/gekko_input_tests.cpp
-        lib/GekkoNet/GekkoLib/src/input.cpp
-    )
-
-    target_include_directories(gekko_input_tests PRIVATE
-        include
-        lib/GekkoNet/GekkoLib/include
-    )
-
-    target_compile_definitions(gekko_input_tests PRIVATE
-        WIN32_LEAN_AND_MEAN
-        _CRT_SECURE_NO_WARNINGS
-    )
-
-    set_target_properties(gekko_input_tests PROPERTIES
-        CXX_STANDARD 20
-        CXX_STANDARD_REQUIRED ON
-    )
-
-    add_test(NAME gekko_input_tests COMMAND gekko_input_tests)
-endif()
-
 # re0.7 M6: TransitionBarrier unit target (EpochAlign commit rule, Clear
 # semantics, echo-verbatim acks, ladder-kind arrival orders) — closes the M5
 # gate deviation. Links the real module with stubbed transport/logging.
@@ -695,6 +633,33 @@ set_target_properties(engine2_tests PROPERTIES
 )
 
 add_test(NAME engine2_tests COMMAND engine2_tests)
+
+# re0.7 post-M8: two-peer determinism suite (runbook R-DET class, offline).
+# Full network-profile matrix over the simulated-link harness: stable/jittery
+# RTT, loss, loss+jitter, reorder+duplication; multi-match epochs with
+# per-epoch state payloads; forced-rollback-every-frame cells; full-speed
+# (hold-budget) invariants. Pure target like engine2_tests: engine core only.
+add_executable(determinism_tests
+    tests/determinism_tests.cpp
+    src/rollback/engine2.cpp
+)
+
+target_include_directories(determinism_tests PRIVATE
+    include
+    include/core
+)
+
+target_compile_definitions(determinism_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(determinism_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME determinism_tests COMMAND determinism_tests)
 
 add_executable(training_logic_tests
     tests/frame_advantage_classifier_tests.cpp
@@ -773,20 +738,7 @@ target_compile_definitions(as2_rollback PRIVATE
     AS2_HAVE_PCPNATPMP=${AS2_HAVE_PCPNATPMP}
 )
 
-if(AS2_WITH_GEKKO)
-    target_include_directories(as2_rollback PRIVATE
-        ${GEKKONET_DIR}/GekkoLib/include
-    )
-    target_compile_definitions(as2_rollback PRIVATE
-        GEKKONET_STATIC
-        AS2_WITH_GEKKO=1
-    )
-endif()
-
 # Link libraries (MinHook built from source - true static, SDL3 requires DLL)
-if(AS2_WITH_GEKKO)
-    target_link_libraries(as2_rollback PRIVATE GekkoNet)
-endif()
 target_link_libraries(as2_rollback PRIVATE
     imgui
     minhook
@@ -983,7 +935,6 @@ message(STATUS "Static Runtime: YES (/MT)")
 message(STATUS "MinHook: ${MINHOOK_DIR} (static)")
 message(STATUS "SDL3: ${SDL3_DIR} (DLL required)")
 message(STATUS "ImGui: ${IMGUI_DIR} (static)")
-message(STATUS "GekkoNet: ${GEKKONET_DIR}")
 message(STATUS "NAT traversal enabled: ${AS2_ENABLE_NAT_TRAVERSAL}")
 message(STATUS "libjuice: ${LIBJUICE_DIR} (linked=${AS2_HAVE_LIBJUICE})")
 message(STATUS "miniupnpc: ${MINIUPNPC_DIR} (linked=${AS2_HAVE_MINIUPNPC})")

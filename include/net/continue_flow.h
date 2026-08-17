@@ -84,4 +84,12 @@ void ContinueFlow_ConsumeRematchLatch();
 ContinueChoiceState ContinueFlow_GetLocalChoiceState();
 ContinueChoiceState ContinueFlow_GetRemoteChoiceState();
 
+#if defined(AS2_FRONTEND_SYNC_TESTING)
+// Test-only game-memory shim (frontend_sync_tests): the state machine runs
+// against shim mode/sub/cursor variables instead of live game memory.
+void ContinueFlow_Test_SetGameState(uint32_t mode, uint32_t sub);
+uint32_t ContinueFlow_Test_GetSubState();
+uint8_t ContinueFlow_Test_GetCursor();
+#endif
+
 } // namespace Net

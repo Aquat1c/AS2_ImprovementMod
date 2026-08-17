@@ -30,10 +30,10 @@ void RollbackComboFx_Init();
 void RollbackComboFx_Shutdown();
 void RollbackComboFx_OnSessionBegin(int rollback_budget);
 void RollbackComboFx_OnSessionEnd(const char* reason);
-void RollbackComboFx_OnGekkoSave(int32_t rb_frame, int32_t game_abs_frame);
-void RollbackComboFx_OnGekkoLoad(int32_t rb_frame, int32_t game_abs_frame);
+void RollbackComboFx_OnEngineSave(int32_t rb_frame, int32_t game_abs_frame);
+void RollbackComboFx_OnEngineLoad(int32_t rb_frame, int32_t game_abs_frame);
 void RollbackComboFx_OnAdvanceBegin(int32_t rb_frame, int32_t game_abs_frame, bool rolling_back);
-void RollbackComboFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame);
+void RollbackComboFx_OnEngineBatchEnd(int32_t rb_frame, int32_t game_abs_frame);
 
 int __cdecl Hook_Match_UpdateComboTimers(int match);
 int __cdecl Hook_Entity_UpdateComboStats(int entity,

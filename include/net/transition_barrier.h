@@ -8,8 +8,8 @@ namespace Net {
 // ============================================================================
 // TransitionBarrier — wire-acknowledged cross-peer phase transitions (M4).
 //
-// Model: the GekkoReady 4-way barrier (the only transition in the 0.6 code
-// that never failed in the field). A transition COMMITS only once both sides
+// Model: the 0.6 startup-readiness 4-way barrier (the only transition in
+// the 0.6 code that never failed in the field). A transition COMMITS only once both sides
 // have proposed it and each has seen the other's proposal/ack. Proposals are
 // resent until acked; stale/duplicate proposals are re-acked idempotently so
 // packet ordering can never wedge or kill a session (INV-4/INV-6).

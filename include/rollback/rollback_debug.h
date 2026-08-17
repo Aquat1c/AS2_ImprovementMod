@@ -50,7 +50,7 @@ bool RollbackDebug_IsRbFrameReadyToCompare(int32_t frame, int32_t remote_confirm
 /// Feed a remote state digest for comparison.
 void RollbackDebug_OnRemoteDigest(int32_t frame, uint32_t remote_crc);
 
-/// Report confirmed simulation drift from any detection path (StateDigest, Gekko, SyncTrace).
+/// Report confirmed simulation drift from any detection path (StateDigest, SyncHash, SyncTrace).
 void RollbackDebug_ReportDrift(const char* source,
                                int32_t frame,
                                uint32_t local_crc,

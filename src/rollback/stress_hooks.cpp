@@ -21,6 +21,7 @@ static int  s_jitterMs             = 0;
 static int  s_dropPercent          = 0;
 static int  s_inputDeliveryDelay   = 0;
 static int  s_forcedMismatches     = 0;
+static int  s_forcedRollbackDepth  = 0;
 
 // Stats
 static int  s_totalDropped         = 0;
@@ -38,6 +39,7 @@ void StressHooks_Init() {
     s_dropPercent = 0;
     s_inputDeliveryDelay = 0;
     s_forcedMismatches = 0;
+    s_forcedRollbackDepth = 0;
     s_totalDropped = 0;
     s_totalDelayed = 0;
     s_totalMismatchesForced = 0;
@@ -108,6 +110,20 @@ void StressHooks_ForceNextMismatches(int count) {
 
 int StressHooks_GetRemainingForcedMismatches() { return s_forcedMismatches; }
 
+void StressHooks_SetForcedRollbackDepth(int depth) {
+    if (depth < 0) depth = 0;
+    if (depth > 15) depth = 15;
+    if (depth != s_forcedRollbackDepth) {
+        NetplayLog_ValueChange("STRESS", -1, "forced_rollback_depth",
+            s_forcedRollbackDepth, depth, "user set");
+        LOG_INFO("[StressHooks] Forced rollback depth: %d -> %d (every frame)",
+            s_forcedRollbackDepth, depth);
+    }
+    s_forcedRollbackDepth = depth;
+}
+
+int StressHooks_GetForcedRollbackDepth() { return s_forcedRollbackDepth; }
+
 void StressHooks_SetInputDeliveryDelay(int frames) {
     if (frames < 0) frames = 0;
     if (frames > 30) frames = 30;
@@ -175,6 +191,7 @@ void StressHooks_GetSnapshot(StressHooksSnapshot* out) {
     out->drop_percent = s_dropPercent;
     out->input_delivery_delay = s_inputDeliveryDelay;
     out->forced_mismatches_remaining = s_forcedMismatches;
+    out->forced_rollback_depth = s_forcedRollbackDepth;
     out->total_packets_dropped = s_totalDropped;
     out->total_packets_delayed = s_totalDelayed;
     out->total_mismatches_forced = s_totalMismatchesForced;

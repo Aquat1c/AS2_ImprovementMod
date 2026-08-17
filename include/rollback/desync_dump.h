@@ -22,7 +22,7 @@ struct DesyncDumpParams {
     uint32_t local_crc;
     uint32_t remote_crc;
     int      dump_number;     // Sequential dump count
-    const char* source;       // Detection path (StateDigest, Gekko, SyncTrace, ...)
+    const char* source;       // Detection path (StateDigest, SyncHash, SyncTrace, ...)
     const char* detail;       // Optional extra context
 };
 

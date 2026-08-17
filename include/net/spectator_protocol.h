@@ -54,13 +54,13 @@ constexpr uint8_t HELLO_FLAG_ACCEPT_REDIRECT = 1 << 0;
 
 constexpr uint8_t FRAME_FLAG_CONFIRMED = 1 << 0;
 // Retired at re0.7 M7 (S-6): the engine2 confirm seam pushes confirmed-only
-// frames, so the host never sets this anymore. Kept for the legacy
-// AS2_WITH_GEKKO source (which still overwrites archive slots in place) and
-// for wire compatibility — clients continue to honor it when present.
+// frames, so the host never sets this anymore. Kept for wire compatibility
+// with legacy hosts that overwrote archive slots in place — clients
+// continue to honor it when present.
 constexpr uint8_t FRAME_FLAG_ROLLBACK_REWRITE = 1 << 1;
 // M7 (S-4): the record's `hash24` bytes carry a 24-bit truncation of the
-// host's confirmed pre-state gameplay digest (Block64). Absent (old hosts,
-// Gekko fallback) => bytes are zero and the flag is unset.
+// host's confirmed pre-state gameplay digest (Block64). Absent (old hosts)
+// => bytes are zero and the flag is unset.
 constexpr uint8_t FRAME_FLAG_HAS_HASH = 1 << 2;
 
 constexpr uint8_t CLIENT_STATUS_FLAG_FAST_FORWARD = 1 << 0;

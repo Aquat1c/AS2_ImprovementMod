@@ -249,7 +249,7 @@ void RollbackComboFx_OnSessionEnd(const char* reason) {
     s_sessionActive = false;
 }
 
-void RollbackComboFx_OnGekkoSave(int32_t rb_frame, int32_t game_abs_frame) {
+void RollbackComboFx_OnEngineSave(int32_t rb_frame, int32_t game_abs_frame) {
     if (!s_sessionActive) return;
 
     const ComboSnapshot p1 = CaptureEntity(ADDR_P1_ENTITY_BASE);
@@ -280,7 +280,7 @@ void RollbackComboFx_OnGekkoSave(int32_t rb_frame, int32_t game_abs_frame) {
     s_hasLastSaveSnapshot = true;
 }
 
-void RollbackComboFx_OnGekkoLoad(int32_t rb_frame, int32_t game_abs_frame) {
+void RollbackComboFx_OnEngineLoad(int32_t rb_frame, int32_t game_abs_frame) {
     if (!s_sessionActive) return;
     LogSnapshot("LOAD", rb_frame, game_abs_frame);
 }
@@ -296,7 +296,7 @@ void RollbackComboFx_OnAdvanceBegin(int32_t rb_frame, int32_t game_abs_frame, bo
     }
 }
 
-void RollbackComboFx_OnGekkoBatchEnd(int32_t rb_frame, int32_t game_abs_frame) {
+void RollbackComboFx_OnEngineBatchEnd(int32_t rb_frame, int32_t game_abs_frame) {
     if (!s_sessionActive) return;
     s_currentRbFrame = rb_frame;
     s_currentGameAbsFrame = game_abs_frame;

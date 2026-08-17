@@ -255,20 +255,14 @@ void RematchSoak_FrameUpdate(const char* autoconnectStateName, uint32_t frameCou
         if (epoch > s_soak.epochMaxSeen) s_soak.epochMaxSeen = epoch;
     }
 
-    // (b) Canonical frame counter never goes backward (INV-15). On the
-    //     engine2 backend the engine stays armed across matches (suspend +
-    //     rotate), so the counter must be monotonic for the WHOLE session.
-    //     On the Gekko fallback config the engine lifetime is per-match, so
-    //     the assertion only holds while the session is continuously active.
+    // (b) Canonical frame counter never goes backward (INV-15). The engine2
+    //     backend keeps the engine armed across matches (suspend + rotate),
+    //     so the counter must be monotonic for the WHOLE session.
     {
         const bool rbActive = Rollback::RollbackSession_IsActive();
         if (rbActive) {
             const int32_t rb = Rollback::RollbackSession_GetCurrentFrame();
-#if defined(AS2_WITH_GEKKO)
-            const bool comparable = s_soak.canonValid && s_soak.canonWasActive;
-#else
             const bool comparable = s_soak.canonValid;
-#endif
             if (comparable && rb < s_soak.canonMax) {
                 FailSoak("canonical frame counter regressed: %d -> %d (INV-15)",
                          s_soak.canonMax, rb);
@@ -280,12 +274,6 @@ void RematchSoak_FrameUpdate(const char* autoconnectStateName, uint32_t frameCou
                 s_soak.canonValid = true;
             }
         }
-#if defined(AS2_WITH_GEKKO)
-        if (!rbActive) {
-            // Per-match engine lifetime: forget the high-water across gaps.
-            s_soak.canonValid = false;
-        }
-#endif
         s_soak.canonWasActive = rbActive;
     }
 

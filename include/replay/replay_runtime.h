@@ -38,7 +38,6 @@ void ReplayRuntime_OnDispatcherAdvance(int16_t* outputInputs);
 /// game's own per-match frame-counter domain, i.e. the native replay tape
 /// index space. `pre_state_hash` is the Block64 confirmed pre-tick gameplay
 /// digest; the recorder keeps one every 30 frames for playback verification.
-/// No-op provider on the AS2_WITH_GEKKO fallback (nothing calls it there).
 void ReplayRuntime_OnConfirmedFrame(uint32_t epoch,
                                     int32_t game_abs_frame,
                                     uint16_t p1_input,

@@ -1997,3 +1997,157 @@ M0 first). Ship/merge decision = runbook §3 checklist; GekkoNet removal =
 runbook §6; fallback to `0.7` = runbook §7. The product bar remains plan
 §1 G1: a 155 ms / 0% loss link at a flat 60.00 fps with zero holds —
 judged by `python tools/analyze_stat.py --profile le1`.
+
+---
+
+## 2026-08-17 — Post-M8: GekkoNet removal + determinism suite (one session)
+
+The M8-7 field-gate deferral was superseded by an explicit user
+instruction (2026-08-17, during the rebuild session): "Verify that the
+plan is fully done (Gekko deprecation as well, it's not needed
+anymore)". On that instruction the runbook §6 one-commit removal task
+list is EXECUTED, and the offline determinism suite (R-DET class)
+lands alongside it.
+
+### R-1: GekkoNet removal (runbook §6 task list, one commit)
+
+- **Deleted files:** `src/rollback/rollback_session.cpp` (the Gekko
+  adapter), `tests/gekko_input_tests.cpp`, `temp_session.cpp` (flagged-dead
+  untracked root file), and the three dead legacy test sources the disabled
+  `standalone_rollback_tests` block still referenced
+  (`tests/standalone_rollback_tests.cpp`, `tests/test_runner_main.cpp`,
+  `tests/test_packet_codec.cpp` — their support code moved to old_files/
+  pre-M0; the commented-out CMake block is gone too).
+- **CMakeLists.txt:** `AS2_WITH_GEKKO` option deleted; `GEKKONET_DIR` cache
+  var deleted; GekkoNet subdirectory/link/define blocks deleted; the
+  adapter selection is unconditional (`rollback_session_engine2.cpp` is the
+  sole facade provider); `gekko_input_tests` target deleted; dependency
+  list + status messages swept.
+- **`#if AS2_WITH_GEKKO` sweep:** `src/testing/rematch_soak.cpp` keeps only
+  the engine2 strict INV-15 branch (whole-session canonical monotonicity;
+  the per-match relaxation is gone). No other TU had live branches.
+- **API renames (grep-clean requirement):** the dead-after-removal sidecar
+  hooks `RollbackAudio_OnGekkoLoad/OnGekkoBatchEnd`,
+  `RollbackComboFx_OnGekkoSave/OnGekkoLoad/OnGekkoBatchEnd`,
+  `RollbackStatusFx_OnGekkoLoad/OnGekkoBatchEnd` → `*_OnEngine*` (their
+  only callers lived in the deleted Gekko adapter; definitions retained as
+  dormant API for future engine2 wiring).
+- **Gekko log channel deleted:** `LogWindow_LogGekko/LogGekkoV`, the
+  `LOG_GEKKO_*` macros, and the `as2_gekko_<pid>.log` file plumbing removed
+  from `ui/log_window.{h,cpp}` (zero live callers remained).
+- **Comment/doc-string sweep (engine2-only wording, no Gekko mentions in
+  compiled code):** `rollback_session.h` (facade header rewritten),
+  `rollback_session_engine2.cpp`, `packet_router.{h,cpp}`, `protocol.h`,
+  `online_wiring.h`, `spectator_protocol.h`, `spectator_runtime.h`,
+  `transition_barrier.h`, `replay_runtime.{h,cpp}`, `churn_pause.h`,
+  `input_timeline.h`, `prediction.h`, `desync_dump.h`,
+  `rollback_debug.{h,cpp}`, `resimulation.cpp`, `connection_supervisor.cpp`,
+  `input_override.cpp`, `mod_main.cpp`, `harness_shared_memory.h`,
+  `rematch_soak.h`.
+- **Kept by explicit allowance:** `tools/test_harness_launcher.cpp` still
+  greps `"GekkoNet session started"` and `as2_gekko` log filenames — those
+  read OLD field logs (triage tool), comment updated to say so.
+- **`lib/GekkoNet/` retained on disk** (history only, unwired);
+  `AS2_PATCHES.md` carries the retirement note. `M8_ACCEPTANCE_RUNBOOK.md`
+  §6 marked EXECUTED (override noted), §1.1 fallback-build wording updated.
+- **Post-condition:** `grep -r "Gekko" src/ include/ tests/ CMakeLists.txt`
+  → zero hits; `tools/` hits are the old-log triage strings only.
+
+### R-2: Forced-rollback mode (engine2 + stress hooks)
+
+- **Files:** `include/rollback/engine2.h`, `src/rollback/engine2.cpp`,
+  `include/rollback/stress_hooks.h`, `src/rollback/stress_hooks.cpp`,
+  `src/rollback/rollback_session_engine2.cpp`.
+- **Done:** `RollbackEngine::SetForcedRollback(depth)` — the offline analog
+  of QOH99's selftest (save → tick → restore → replay K → compare): while
+  depth > 0, every pass whose sim frontier advanced synthesizes a depth-N
+  correction through the normal BeginRollback contract (a synthetic
+  pending-mismatch), clamped to the epoch frame origin (§2.6.5), yielding
+  to real mismatches (earliest-frame rule), one transaction per advanced
+  frontier (marker-gated). Deterministic: no clock, no RNG (INV-16); depth
+  0 = production default. Exposed live via
+  `StressHooks_Set/GetForcedRollbackDepth` (0..15, snapshot field added);
+  the adapter applies it wherever the prediction tap was applied (new
+  `ApplyStressHooks()` at arm/rotate/poll; End clears to 0).
+
+### R-3: Determinism suite (`tests/determinism_tests.cpp`, new CTest target)
+
+- **Files:** `tests/determinism_tests.cpp` (new), `CMakeLists.txt`
+  (`determinism_tests` target: engine2.cpp + the test TU, `add_test` wired).
+- **Harness:** two full peers in the engine2_tests soak style (socket-free,
+  clock-free, seeded xorshift only); link extended with duplication;
+  per-epoch state-blob generator (fresh Block64 seed + epoch-salted tick =
+  different characters/config per match); 3 epochs per cell via
+  `RotateEpoch` at fully-confirmed boundaries (battle → park-at-boundary →
+  align → rotate, the EpochAlign analog).
+- **Matrix:** 17 cells — stable-low (~20 ms), stable-high (~150 ms),
+  jittery-low (20±15), jittery-high (150±60), loss 3%/10%, loss+jitter,
+  reorder+duplication; each profile at budgets 8 AND 12;
+  forced-rollback-every-frame in 9/17 cells (depths 1/2/3/8, incl. depth-8
+  under budget 12).
+- **Assertions per cell:** zero terminals; SyncHash chains identical (and
+  provably exercised); per-frame confirmed streams byte-identical
+  (frame/epoch/inputs/pre-hash); canonical counter monotonic + epochs
+  non-decreasing across all rotations (INV-15); forced cells prove one
+  transaction per advanced frame at the requested max depth; full-speed
+  invariant — `DeriveHoldBound` derives the PredictionLimit-hold budget
+  from (D + R) vs worst transit: ZERO asserted in the stable cells,
+  loss-proportional bounds elsewhere. Plus `TestForcedRollbackUnit` pins:
+  once-per-frame gating, real-mismatch precedence, epoch-origin clamp,
+  depth-0 disable.
+
+### R-4: Frontend determinism (`tests/frontend_sync_tests.cpp` extension)
+
+- **Files:** `tests/frontend_sync_tests.cpp`, `src/net/continue_flow.cpp`,
+  `include/net/continue_flow.h`, `CMakeLists.txt` (frontend_sync_tests now
+  links the real `continue_flow.cpp`).
+- **Simultaneous navigation:** charsel + stagesel + winscreen phases, two
+  peers streaming interleaved nav inputs concurrently over a jittery/
+  reordering/duplicating simulated link (existing transport stubs record
+  the outbound stream). Asserts: consumed remote stream byte-identical to
+  the peer script; outbound redundant windows internally consistent and
+  byte-identical to the consumed local stream (= the peer's consumed view);
+  zero ResyncRequest / zero interrogation cycles in the clean cells.
+- **Rematch handoff cycles:** the REAL continue_flow state machine driven
+  at >= 3 winscreen → EpochAlign → next-phase handoffs with mixed YES/NO
+  outcomes, fed exclusively through `WinScreenSync_ConsumeCurrentFrame` →
+  `ContinueFlow_OnConsumedFrame`. Pins: entry carry gate (held confirm
+  never locks), YES fast path (latch, sub-5 route, BeginRematch once,
+  WinScreenExit before PostMatchDecision(Rematch), latch consumes once),
+  NO route (cursor toggle → LockedNo, sub-8 route, A/C carry gate,
+  finalize hold, PostMatchDecision(CharselRestart), abort-on-mode-exit
+  proposes WinScreenExit), epoch rebind adoption every cycle.
+- **Test seam:** continue_flow.cpp gained the `AS2_FRONTEND_SYNC_TESTING`
+  game-memory shim (mode/sub/timers/cursor in shim variables; BGM stop
+  swallowed) — same pattern as frontend_input_sync's test clock; live
+  builds compile the direct-address branch unchanged.
+  `ContinueFlow_Test_SetGameState/GetSubState/GetCursor` added under the
+  same guard. The test TU's ContinueFlow stubs were replaced by
+  director-side stubs (locked config, BeginRematch, MatchLifecycle
+  owned/rematch, PlayerMapping slot, OnlineWiring intent hooks, recording
+  TransitionBarrier_Propose).
+
+### Deferred obligations
+
+- **None code-side.** Field-only: rerun the runbook §2 acceptance matrix on
+  the post-removal build (the removal is compile-clean by construction but
+  M8's rule stands — no builds were run this session); R-DET now has an
+  offline twin (`determinism_tests`) that CI runs unconditionally.
+
+### Compile risks to check first (this session)
+
+1. `frontend_sync_tests` now links `continue_flow.cpp`: verify the
+   `AS2_FRONTEND_SYNC_TESTING` shim covers every game-memory touch (a
+   missed `WriteMemory`/`GetGameMode` in that TU would AV the test, not
+   fail to compile) and that no stub/definition duplicate symbols remain.
+2. `determinism_tests.cpp`: MSVC Win32 — check the `CELL_CHECK` printf
+   format args (`%zu` on size_t) and the aggregate `CellSpec` table braces.
+3. The forced-rollback insert in `RollbackEngine::NextAction` runs before
+   the stall checks — re-run the FULL engine2_tests suite to prove depth-0
+   behavior is byte-identical (all existing tests must stay green).
+4. `stress_hooks.h` snapshot gained `forced_rollback_depth` — any
+   out-of-tree initializer lists of `StressHooksSnapshot` (mod menu panel)
+   compile-check.
+5. Deleted `LogWindow_LogGekko`: grep proved zero live callers, but the
+   mod-menu/log-window ImGui panel should be compiled to confirm no
+   stragglers behind macros.

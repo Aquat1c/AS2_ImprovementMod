@@ -26,9 +26,7 @@
  *     previous one (§2.5 rotation). Violation = FAIL.
  *   - Canonical-counter assertion: RollbackSession_GetCurrentFrame() must be
  *     monotonic for the whole session on the engine2 backend (the engine
- *     stays armed across matches, INV-15); on the AS2_WITH_GEKKO fallback
- *     config the check only applies while the session is continuously
- *     active (per-match engine lifetime).
+ *     stays armed across matches, INV-15).
  *   - PASS lines carry epoch/path/canonical; SUMMARY carries fastpath vs
  *     charsel counts. The F-7 contradiction terminal needs no dedicated
  *     probe here: it tears the session down (ProtocolViolation), which the

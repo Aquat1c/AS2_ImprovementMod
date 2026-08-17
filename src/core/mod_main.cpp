@@ -555,9 +555,7 @@ static void DeferredInit() {
     Net::DelayPolicy_Init();
     LogInitStep("DelayPolicy_Init", "END");
 
-    // Initialize gameplay bridge (checks GekkoNet availability for future use)
-
-    // Initialize rollback gameplay subsystems
+    // Initialize rollback gameplay subsystems (engine2 session facade)
     LogInitStep("RollbackSession_Init", "BEGIN");
     Rollback::RollbackSession_Init();
     LogInitStep("RollbackSession_Init", "END");

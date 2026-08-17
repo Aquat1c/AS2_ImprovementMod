@@ -17,7 +17,7 @@
  *     (self-guarding: pre-live drops with logging; §3.1 session_id enforced
  *     at the typed engine2 ingest), SyncHash -> RollbackSession (session_id
  *     gated here). The startup barrier rides TransitionBarrier GameplayStart
- *     since M5 (GekkoReady retired).
+ *     since M5 (the retired 0.6 startup-barrier packet, id 24).
  *   - ResyncRequest/Reply (INV-11) -> frontend interrogation handlers
  *   - unknown types: log + count, never terminal (forward compat within a
  *     protocol version)

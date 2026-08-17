@@ -1,5 +1,13 @@
 # AS2 local patches to vendored GekkoNet
 
+> **RETIRED (2026-08-17, re0.7 post-M8):** GekkoNet is no longer part of the
+> build. The `AS2_WITH_GEKKO` CMake option, the Gekko adapter
+> (`src/rollback/rollback_session.cpp`), and the `gekko_input_tests` target
+> were all deleted in the one-commit removal recorded in
+> `docs/re0.7/M8_ACCEPTANCE_RUNBOOK.md` §6; the engine2 backend is the sole
+> rollback implementation. This `lib/GekkoNet` directory is retained on disk
+> for history only and is not referenced by CMake.
+
 Local modifications to the vendored GekkoNet source (`GekkoLib/`) made for the
 Alice Senki 2 netplay mod. Review this file when syncing with upstream — every
 change below must be re-applied (or upstreamed) after a vendor drop. All hunks

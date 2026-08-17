@@ -48,8 +48,8 @@ constexpr uint8_t NUM_CHANNELS      = 3;
 // PeerIdentity (79) after the handshake completes.
 // Retired at M5 (deleted outright): DelayChangeReq (21) / DelayChangeAck (22)
 // — INV-23: delay is a peer-local knob, the frontend delay is derived
-// locally, no negotiation wire flow exists; GekkoReady (24) — the startup
-// gameplay-entry barrier now rides TransitionBarrier kind GameplayStart;
+// locally, no negotiation wire flow exists; the 0.6 startup-barrier packet
+// (24) — gameplay entry now rides TransitionBarrier kind GameplayStart;
 // the SyncAnnounce/SyncConfirm delay-negotiation fields (INV-13/INV-23) —
 // announce/confirm survive as pregame wake-up/identity packets only.
 enum class PacketType : uint16_t {
@@ -92,9 +92,8 @@ enum class PacketType : uint16_t {
     PaletteAck         = 52,
 
     // Gameplay input stream (unreliable-sequenced, channel 1).
-    // v20: replaces GekkoData under the same id. In the AS2_WITH_GEKKO=ON
-    // configuration the Gekko backend still transports raw GekkoNet bytes
-    // under this id; the engine2 backend sends the v2 InputStreamPayload.
+    // v20: replaces the raw 0.6-backend byte stream under the same id; the
+    // engine2 backend sends the v2 InputStreamPayload.
     InputStream     = 23,
 
     // Debug / diagnostics (unreliable, channel 2)
@@ -710,7 +709,7 @@ struct SessionConfirmAckPayload {
     uint64_t session_id;
 };
 
-// --- Gameplay input stream (replaces GekkoData semantics at the M5 cutover) ---
+// --- Gameplay input stream (v2 semantics since the M5 cutover) ---
 
 constexpr uint32_t INPUT_STREAM_MAX_INPUTS = 32;
 

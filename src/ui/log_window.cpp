@@ -54,7 +54,6 @@ static bool g_scrollToBottom = false;
 static FILE* g_logFile = nullptr;
 static FILE* g_packetLogFile = nullptr;
 static FILE* g_netcodeLogFile = nullptr;
-static FILE* g_gekkoLogFile = nullptr;
 
 // Category enabled flags (default: most enabled, verbose ones disabled)
 static bool g_categoryEnabled[LOG_CAT_COUNT] = {
@@ -96,7 +95,6 @@ static bool g_packetLogEnabled = false;
 static unsigned int g_logLinesSinceFlush = 0;
 static unsigned int g_pktLinesSinceFlush = 0;
 static unsigned int g_netLinesSinceFlush = 0;
-static unsigned int g_gekkoLinesSinceFlush = 0;
 static bool g_forceFlush = false;
 
 static void FlushIfNeeded(FILE* f, LogLevel level, unsigned int* linesSinceFlush, unsigned int flushEveryLines) {
@@ -200,16 +198,6 @@ void LogWindow_Init(void) {
         fflush(g_netcodeLogFile);
     }
 
-    // Gekko log — always enabled, separate file for rollback transport internals
-    snprintf(path, sizeof(path), "%s\\as2_gekko_%lu.log", logDir, pid);
-    g_gekkoLogFile = fopen(path, "w");
-    if (g_gekkoLogFile) {
-        setvbuf(g_gekkoLogFile, nullptr, _IOFBF, 256 * 1024);
-        fprintf(g_gekkoLogFile, "=== ALICE SENKI 2 - GEKKO LOG ===\n");
-        fprintf(g_gekkoLogFile, "=== PID: %lu ===\n\n", pid);
-        fflush(g_gekkoLogFile);
-    }
-    
     LOG_INFO("Log window initialized (PID %lu, logDir=%s)", pid, logDir);
 }
 
@@ -230,13 +218,9 @@ void LogWindow_Flush(void) {
     if (g_netcodeLogFile) {
         fflush(g_netcodeLogFile);
     }
-    if (g_gekkoLogFile) {
-        fflush(g_gekkoLogFile);
-    }
     g_logLinesSinceFlush = 0;
     g_pktLinesSinceFlush = 0;
     g_netLinesSinceFlush = 0;
-    g_gekkoLinesSinceFlush = 0;
 }
 
 void LogWindow_PeriodicFlush(void) {
@@ -246,7 +230,7 @@ void LogWindow_PeriodicFlush(void) {
     // most once per second.
     static DWORD s_lastPeriodicFlushTick = 0;
     const bool dirty = g_logLinesSinceFlush || g_pktLinesSinceFlush ||
-                       g_netLinesSinceFlush || g_gekkoLinesSinceFlush;
+                       g_netLinesSinceFlush;
     if (!dirty) {
         return;
     }
@@ -273,11 +257,6 @@ void LogWindow_Shutdown(void) {
         fflush(g_netcodeLogFile);
         fclose(g_netcodeLogFile);
         g_netcodeLogFile = nullptr;
-    }
-    if (g_gekkoLogFile) {
-        fflush(g_gekkoLogFile);
-        fclose(g_gekkoLogFile);
-        g_gekkoLogFile = nullptr;
     }
     g_logEntries.clear();
 }
@@ -420,27 +399,6 @@ void LogWindow_LogNet(LogLevel level, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     LogWindow_LogNetV(level, fmt, args);
-    va_end(args);
-}
-
-void LogWindow_LogGekkoV(LogLevel level, const char* fmt, va_list args) {
-    if (!g_gekkoLogFile) return;
-
-    char msgBuf[2048];
-    vsnprintf(msgBuf, sizeof(msgBuf), fmt, args);
-
-    char timeBuf[32];
-    GetTimestamp(timeBuf, sizeof(timeBuf));
-
-    DWORD ms = GetTickCount() % 1000;
-    fprintf(g_gekkoLogFile, "[%s.%03u] [%s] %s\n", timeBuf, (unsigned)ms, g_levelNames[level], msgBuf);
-    FlushIfNeeded(g_gekkoLogFile, level, &g_gekkoLinesSinceFlush, 256);
-}
-
-void LogWindow_LogGekko(LogLevel level, const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    LogWindow_LogGekkoV(level, fmt, args);
     va_end(args);
 }
 

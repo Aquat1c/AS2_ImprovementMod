@@ -1,22 +1,28 @@
 #include "net/barrier_protocol.h"
+#include "net/continue_flow.h"
 #include "net/delay_policy.h"
 #include "net/frontend_input_sync.h"
 #include "net/match_lifecycle.h"
+#include "net/player_side_mapping.h"
 #include "net/pregame_sync.h"
 #include "net/session_manager.h"
 #include "net/transition_barrier.h"
 #include "net/stagesel_sync.h"
 #include "net/stage_watchdog_tracker.h"
 #include "net/winscreen_sync.h"
+#include "core/game_state.h"
 #include "input/input_system.h"
 #include "rollback/netplay_log.h"
+#include "rollback/online_wiring.h"
 #include "rollback/rollback_session.h"
 #include "ui/log_window.h"
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -33,6 +39,18 @@ static Net::SessionRole g_sessionRole = Net::SessionRole::Host;
 static Net::ConnectionStats g_sessionStats = {};
 static int g_testChecks = 0;
 static int g_testFailures = 0;
+
+// Continue-flow / director stub state (rematch handoff cycles).
+struct BarrierProposal {
+    Net::NetTransitionKind kind;
+    uint8_t intent;
+};
+static std::vector<BarrierProposal> g_barrierProposals;
+static bool g_matchOwned = false;
+static bool g_lockedConfigAvailable = false;
+static int g_beginRematchCalls = 0;
+static int g_onRematchCalls = 0;
+static uint8_t g_lastExpectedPostMatchIntent = 0;
 
 #define TEST_CHECK(cond, msg)                                                     \
     do {                                                                          \
@@ -99,8 +117,15 @@ static void ResetSubsystems(uint32_t nowMs = 100) {
     g_sessionConnected = false;
     g_sessionRole = Net::SessionRole::Host;
     memset(&g_sessionStats, 0, sizeof(g_sessionStats));
+    g_barrierProposals.clear();
+    g_matchOwned = false;
+    g_lockedConfigAvailable = false;
+    g_beginRematchCalls = 0;
+    g_onRematchCalls = 0;
+    g_lastExpectedPostMatchIntent = 0;
 
     Net::FrontendInputSync_Test_SetClockMs(nowMs);
+    Net::ContinueFlow_Shutdown();
     Net::WinScreenSync_Shutdown();
     Net::FrontendInputSync_Shutdown();
     Net::DelayPolicy_Shutdown();
@@ -110,6 +135,8 @@ static void ResetSubsystems(uint32_t nowMs = 100) {
     Net::FrontendInputSync_Init();
     Net::WinScreenSync_Init();
     Net::StageSelSync_Init();
+    Net::ContinueFlow_Init();
+    Net::ContinueFlow_Test_SetGameState(0, 0);
 }
 
 // M5: the frontend delay is a locally derived, peer-local value (INV-23) —
@@ -715,6 +742,434 @@ static void TestFrontendInputPacketsCarrySixteenFramesOfHistory() {
         "frontend input history should preserve the sixteenth newest input");
 }
 
+// ── Simultaneous navigation over a jittery simulated link ──────────────────
+//
+// Two peers streaming interleaved frontend inputs concurrently: peer A is
+// the module under test; peer B is a deterministic scripted model whose
+// frame-input packets arrive through a jittery/reordering/duplicating link
+// (the existing test transport stubs capture A's outbound stream). Per
+// phase (charsel, stagesel, winscreen) the test asserts:
+//   - A consumes B's script byte-identically and in frame order
+//   - A's outbound redundant windows are internally consistent and carry
+//     exactly the values A consumed for its own side — i.e. B's consumed
+//     stream is byte-identical by construction
+//   - a clean (delivering) cell never triggers the INV-11 starvation
+//     interrogation (zero ResyncRequest packets)
+
+struct TestRng {
+    uint32_t s;
+    explicit TestRng(uint32_t seed) : s(seed ? seed : 1) {}
+    uint32_t Next() {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        return s;
+    }
+    uint32_t Below(uint32_t n) { return n ? Next() % n : 0; }
+};
+
+static uint16_t NavWord(TestRng& rng) {
+    static const uint16_t words[8] = {
+        0, INPUT_LEFT, INPUT_RIGHT, INPUT_UP, INPUT_DOWN, INPUT_A, 0, 0,
+    };
+    return words[rng.Below(8)];
+}
+
+struct JitterFrontendLink {
+    struct Entry {
+        Net::CharSelFrameInputPayload p;
+        uint32_t at;
+    };
+    std::vector<Entry> q;
+    TestRng rng;
+    uint32_t base;
+    uint32_t jitter;
+    bool winscreen_route;
+
+    JitterFrontendLink(uint32_t seed, uint32_t b, uint32_t j, bool ws)
+        : rng(seed), base(b), jitter(j), winscreen_route(ws) {}
+
+    void Send(const Net::CharSelFrameInputPayload& p, uint32_t now, bool dup) {
+        q.push_back(Entry{p, now + base + rng.Below(jitter + 1)});
+        if (dup) {
+            q.push_back(Entry{p, now + base + rng.Below(jitter + 1)});
+        }
+    }
+
+    void DeliverOne(const Net::CharSelFrameInputPayload& p) {
+        if (!winscreen_route) {
+            Net::FrontendInputSync_OnRemoteCharSelFrameInput(&p);
+            return;
+        }
+        Net::WinScreenFrameInputPayload w{};
+        w.epoch_id = p.epoch_id;
+        w.phase = p.phase;
+        w.phase_id = p.phase_id;
+        w.frame = p.frame;
+        w.ack_frame = p.ack_frame;
+        w.input_count = 1;
+        w.inputs[0] = p.inputs[0];
+        Net::FrontendInputSync_OnRemoteWinScreenFrameInput(&w);
+    }
+
+    void DeliverDue(uint32_t now) {
+        for (size_t i = 0; i < q.size();) {
+            if ((int32_t)(now - q[i].at) >= 0) {
+                DeliverOne(q[i].p);           // swap-remove pop = reorder shim
+                q[i] = q.back();
+                q.pop_back();
+            } else {
+                ++i;
+            }
+        }
+    }
+};
+
+static void RunSimultaneousNavigationPhase(Net::FrontendSyncPhase phase,
+                                           uint32_t frames,
+                                           uint32_t seed) {
+    const bool winscreenRoute = phase == Net::FrontendSyncPhase::WinScreen;
+    const Net::PacketType packetType = winscreenRoute
+        ? Net::PacketType::WinScreenFrameInput
+        : Net::PacketType::CharSelFrameInput;
+    if (winscreenRoute) {
+        // Production invariant: the WinScreen input phase is only ever begun
+        // by WinScreenSync_Begin (which activates the sync BEFORE the phase).
+        // SendInputPacket gates WinScreenFrameInput on WinScreenSync_IsActive,
+        // so a raw BeginInputPhase here would silently drop every outbound
+        // window and void the coverage assertions below.
+        Net::WinScreenSync_Begin();
+        TEST_CHECK(Net::WinScreenSync_IsActive(),
+            "simnav winscreen leg activated the winscreen sync");
+    } else {
+        Net::FrontendInputSync_BeginInputPhase(phase, packetType, "simnav phase");
+    }
+    ClearSentPackets();
+
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    const uint16_t delay = Net::FrontendInputSync_GetFrontendDelay();
+    JitterFrontendLink link(seed, 1, 4, winscreenRoute);
+    TestRng remoteScript(seed ^ 0x51D0u);
+    TestRng localScript(seed ^ 0x10CAu);
+
+    std::vector<uint16_t> remoteExpected(frames);
+    for (uint32_t f = 0; f < frames; ++f) {
+        remoteExpected[f] = NavWord(remoteScript);
+    }
+
+    std::vector<uint16_t> consumedLocal;
+    std::vector<uint16_t> consumedRemote;
+    uint32_t nextRemoteSend = 0;
+    uint32_t now = 0;
+    int64_t guard = (int64_t)frames * 40;   // int64: exhaustion goes negative
+
+    while (consumedRemote.size() < frames && guard-- > 0) {
+        ++now;
+        Net::FrontendInputSync_Test_SetClockMs(1000 + now * 16);
+        link.DeliverDue(now);
+
+        // Peer B streams one frame per tick, jittered; every 7th duplicated.
+        if (nextRemoteSend < frames) {
+            Net::CharSelFrameInputPayload p = MakeFrameInput(
+                epochId, phase, nextRemoteSend, remoteExpected[nextRemoteSend]);
+            p.ack_frame = (uint32_t)consumedRemote.size();
+            link.Send(p, now, (nextRemoteSend % 7) == 6);
+            ++nextRemoteSend;
+        }
+
+        // Peer A navigates concurrently (send-ahead capped internally).
+        Net::FrontendInputSync_CaptureLocalInput(NavWord(localScript));
+
+        while (consumedRemote.size() < frames &&
+               Net::FrontendInputSync_HasInputsForCurrentFrame()) {
+            uint16_t l = 0;
+            uint16_t r = 0;
+            if (!Net::FrontendInputSync_ConsumeCurrentFrame(&l, &r, nullptr)) {
+                break;
+            }
+            consumedLocal.push_back(l);
+            consumedRemote.push_back(r);
+        }
+
+        Net::FrontendInputSync_FrameUpdate();   // starvation-counter driver
+    }
+
+    TEST_CHECK(guard > 0, "simnav phase completed without wedging");
+    TEST_CHECK(consumedRemote.size() == frames,
+        "simnav phase consumed the full remote stream");
+
+    // A consumed B's script byte-identically, in frame order.
+    bool remoteIdentical = consumedRemote.size() == frames;
+    for (uint32_t f = 0; f < frames && remoteIdentical; ++f) {
+        if (consumedRemote[f] != remoteExpected[f]) remoteIdentical = false;
+    }
+    TEST_CHECK(remoteIdentical,
+        "consumed remote stream is byte-identical to the peer's script "
+        "despite jitter/reorder/duplication");
+
+    // Reconstruct what peer B consumes for A's side from A's outbound
+    // redundant windows: internally consistent (a frame never resent with a
+    // different value) and equal to A's own consumed local stream.
+    std::map<uint32_t, uint16_t> sentByFrame;
+    bool contradiction = false;
+    for (const SentPacket& sp : g_sentPackets) {
+        if (sp.type != packetType) continue;
+        // CharSel and WinScreen frame-input payloads share the leading
+        // layout the reconstruction needs.
+        if (sp.payload.size() < sizeof(Net::CharSelFrameInputPayload)) continue;
+        const auto* p = reinterpret_cast<const Net::CharSelFrameInputPayload*>(
+            sp.payload.data());
+        if (p->phase != (uint16_t)phase) continue;
+        for (uint16_t i = 0; i < p->input_count; ++i) {
+            const uint32_t f = p->frame - i;   // inputs[0] = newest
+            const uint16_t v = p->inputs[i];
+            auto it = sentByFrame.find(f);
+            if (it == sentByFrame.end()) {
+                sentByFrame[f] = v;
+            } else if (it->second != v) {
+                contradiction = true;
+            }
+        }
+    }
+    TEST_CHECK(!contradiction,
+        "outbound redundant windows never contradict an earlier send");
+    bool localIdentical = true;
+    uint32_t coveredFrames = 0;
+    for (const auto& kv : sentByFrame) {
+        if (kv.first >= consumedLocal.size()) continue;   // beyond consume
+        ++coveredFrames;
+        if (consumedLocal[kv.first] != kv.second) localIdentical = false;
+    }
+    TEST_CHECK(localIdentical,
+        "the peer's reconstructed view of A's stream is byte-identical to "
+        "A's consumed local stream");
+    TEST_CHECK(coveredFrames + delay >= frames,
+        "outbound windows cover every consumed frame past the delay prefix");
+
+    // Clean cell: zero starvation interrogation.
+    TEST_CHECK(FindLastPacket(Net::PacketType::ResyncRequest) == nullptr,
+        "a delivering (jittery) cell must never trigger the INV-11 interrogation");
+    Net::FrontendInputSyncSnapshot snap{};
+    Net::FrontendInputSync_GetSnapshot(&snap);
+    TEST_CHECK(snap.resync_cycles == 0,
+        "no interrogation cycles were consumed in a clean cell");
+
+    if (winscreenRoute) {
+        Net::WinScreenSync_Abort();   // production teardown: stops the phase
+    } else {
+        Net::FrontendInputSync_EndPhase("simnav phase end");
+    }
+}
+
+static void TestSimultaneousNavigationOverJitteryLink() {
+    ResetSubsystems(100);
+    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x600u, 3,
+        "simnav epoch");
+    RunSimultaneousNavigationPhase(Net::FrontendSyncPhase::CharSel, 240, 0x51AA01u);
+    RunSimultaneousNavigationPhase(Net::FrontendSyncPhase::StageSel, 160, 0x51AA02u);
+    RunSimultaneousNavigationPhase(Net::FrontendSyncPhase::WinScreen, 160, 0x51AA03u);
+}
+
+// ── Continue-flow rematch handoff cycles (state-machine level) ─────────────
+//
+// Drives the REAL continue_flow state machine through >= 3 winscreen ->
+// EpochAlign -> next-phase handoffs with mixed YES/NO outcomes, feeding
+// ContinueFlow_OnConsumedFrame exclusively through the winscreen lockstep
+// consume path (the only legal input source). The game-memory boundary is
+// the AS2_FRONTEND_SYNC_TESTING shim; the director side (barrier proposals,
+// pregame rematch begin, epoch rebind) is recorded by the test stubs.
+
+// One winscreen lockstep step: capture local, deliver the remote frame, and
+// consume (which steps the continue flow). Returns the consumed pair.
+static bool StepWinScreenFrame(uint32_t frame, uint16_t localWord,
+                               uint16_t remoteWord,
+                               uint16_t* outP1, uint16_t* outP2) {
+    Net::WinScreenSync_CaptureLocalInput(localWord);
+    Net::WinScreenFrameInputPayload remote = MakeWinScreenFrameInput(
+        Net::FrontendInputSync_GetEpochId(), frame, remoteWord);
+    remote.ack_frame = frame;
+    Net::WinScreenSync_OnRemoteFrameInput(&remote);
+    return Net::WinScreenSync_ConsumeCurrentFrame(outP1, outP2);
+}
+
+static size_t CountProposals(Net::NetTransitionKind kind, uint8_t intent) {
+    size_t n = 0;
+    for (const BarrierProposal& bp : g_barrierProposals) {
+        if (bp.kind == kind && bp.intent == intent) ++n;
+    }
+    return n;
+}
+
+static void TestContinueRematchHandoffCycles() {
+    ResetSubsystems(100);
+    g_sessionConnected = true;
+    g_matchOwned = true;
+    g_lockedConfigAvailable = true;
+
+    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x700u, 2,
+        "handoff epoch");
+
+    // Cycle outcomes: YES (fast path), NO (charsel route), YES again — the
+    // mixed-outcome ladder repeated across three epochs.
+    const bool cycleYes[3] = {true, false, true};
+    uint32_t epochId = 0x700u;
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        const bool yes = cycleYes[cycle];
+        const size_t proposalsBefore = g_barrierProposals.size();
+        const int beginRematchBefore = g_beginRematchCalls;
+
+        // Mode 9 win pose on screen; winscreen lockstep begins (this also
+        // resets the continue flow to Idle for the new phase).
+        Net::ContinueFlow_Test_SetGameState(MODE_WINSCREEN, STORY_SUB_DIALOGUE_ADV);
+        Net::WinScreenSync_Begin();
+        TEST_CHECK(Net::WinScreenSync_IsActive(),
+            "winscreen lockstep must begin for every cycle");
+
+        uint16_t p1 = 0;
+        uint16_t p2 = 0;
+
+        // f0: neutral — flow arms (mode 9, owned match, connected session).
+        TEST_CHECK(StepWinScreenFrame(0, 0, 0, &p1, &p2),
+            "winscreen frame 0 consumes");
+        // f1: remote advance at the win pose — the consumed stream carries
+        // the (skip-propagated) advance and the prompt is forced (sub 4).
+        TEST_CHECK(StepWinScreenFrame(1, 0, INPUT_A, &p1, &p2),
+            "winscreen frame 1 consumes");
+        TEST_CHECK(Net::ContinueFlow_IsPromptActive(),
+            "advance in the consumed stream at the win pose forces the prompt");
+        TEST_CHECK(Net::ContinueFlow_Test_GetSubState() == STORY_SUB_DIALOGUE_END,
+            "the prompt owns mode 9 sub 4");
+
+        // f2: confirm still held — the entry carry gate must not lock.
+        TEST_CHECK(StepWinScreenFrame(2, 0, INPUT_A, &p1, &p2), "carry frame");
+        TEST_CHECK(Net::ContinueFlow_GetLocalChoiceState() ==
+                       Net::ContinueChoiceState::Deciding &&
+                   Net::ContinueFlow_GetRemoteChoiceState() ==
+                       Net::ContinueChoiceState::Deciding,
+            "the held confirm at prompt entry never locks a choice");
+        // f3: both released.
+        TEST_CHECK(StepWinScreenFrame(3, 0, 0, &p1, &p2), "release frame");
+
+        if (yes) {
+            // Fresh confirms after the release: the local A captured at
+            // step 4 surfaces at consumed frame 6 through the 2-frame
+            // frontend delay; the remote A at step 5 locks live. Both sides
+            // end LockedYes on frame 6 -> rematch resolution.
+            TEST_CHECK(StepWinScreenFrame(4, INPUT_A, 0, &p1, &p2),
+                "delay-fill frame consumes");
+            TEST_CHECK(StepWinScreenFrame(5, 0, INPUT_A, &p1, &p2),
+                "resolution frame consumes");
+            // Local A captured at step 4 surfaces at f6; remote locks at f5.
+            TEST_CHECK(Net::ContinueFlow_GetRemoteChoiceState() ==
+                           Net::ContinueChoiceState::LockedYes,
+                "remote fresh confirm locks YES");
+            TEST_CHECK(StepWinScreenFrame(6, 0, 0, &p1, &p2),
+                "local delayed confirm frame consumes");
+            TEST_CHECK(Net::ContinueFlow_IsRematchLatched(),
+                "both YES resolves to a rematch latch");
+            TEST_CHECK(Net::ContinueFlow_Test_GetSubState() == STORY_SUB_EVENT_SETUP,
+                "YES routes the vanilla sub 5 fade");
+            TEST_CHECK(g_beginRematchCalls == beginRematchBefore + 1,
+                "rematch resolution begins the pregame fast path exactly once");
+            TEST_CHECK(g_lastExpectedPostMatchIntent ==
+                           (uint8_t)Net::PostMatchIntentWire::Rematch,
+                "the director is told the lockstep-derived Rematch intent");
+            TEST_CHECK(!Net::WinScreenSync_IsActive(),
+                "rematch resolution finalizes the winscreen lockstep");
+
+            // Barrier ladder: WinScreenExit then PostMatchDecision(Rematch).
+            size_t exitIdx = SIZE_MAX;
+            size_t decisionIdx = SIZE_MAX;
+            for (size_t i = proposalsBefore; i < g_barrierProposals.size(); ++i) {
+                if (g_barrierProposals[i].kind ==
+                        Net::NetTransitionKind::WinScreenExit &&
+                    exitIdx == SIZE_MAX) {
+                    exitIdx = i;
+                }
+                if (g_barrierProposals[i].kind ==
+                        Net::NetTransitionKind::PostMatchDecision &&
+                    g_barrierProposals[i].intent ==
+                        (uint8_t)Net::PostMatchIntentWire::Rematch) {
+                    decisionIdx = i;
+                }
+            }
+            TEST_CHECK(exitIdx != SIZE_MAX && decisionIdx != SIZE_MAX &&
+                           exitIdx < decisionIdx,
+                "YES cycle proposes WinScreenExit before PostMatchDecision(Rematch)");
+
+            // EpochAlign commit -> next phase (fast path: straight to the
+            // locked pregame; the latch is consumed by mode ownership).
+            epochId += 1;
+            Net::FrontendInputSync_RebindEpoch(epochId, "epoch align commit (test)");
+            Net::ContinueFlow_ConsumeRematchLatch();
+            TEST_CHECK(!Net::ContinueFlow_IsRematchLatched(),
+                "the rematch latch consumes exactly once");
+            TEST_CHECK(Net::ContinueFlow_GetSuppressMask() == 0,
+                "no suppression after the latch is consumed");
+        } else {
+            // f4: remote toggles the cursor (RIGHT -> NO).
+            TEST_CHECK(StepWinScreenFrame(4, 0, INPUT_RIGHT, &p1, &p2),
+                "cursor toggle frame consumes");
+            // f5: remote locks NO; local A captured this step surfaces at f7.
+            TEST_CHECK(StepWinScreenFrame(5, INPUT_A, INPUT_A, &p1, &p2),
+                "remote lock frame consumes");
+            TEST_CHECK(Net::ContinueFlow_GetRemoteChoiceState() ==
+                           Net::ContinueChoiceState::LockedNo,
+                "remote locks NO after the cursor toggle");
+            TEST_CHECK(StepWinScreenFrame(6, 0, 0, &p1, &p2), "gap frame");
+            TEST_CHECK(StepWinScreenFrame(7, 0, 0, &p1, &p2),
+                "local delayed lock frame consumes");
+            TEST_CHECK(!Net::ContinueFlow_IsPromptActive(),
+                "any-NO resolves the prompt");
+            TEST_CHECK(Net::ContinueFlow_Test_GetSubState() == STORY_SUB_PREMATCH,
+                "NO routes the plain sub 8 fade (GAME OVER slide skipped)");
+            TEST_CHECK(Net::ContinueFlow_GetSuppressMask() ==
+                           (uint16_t)(INPUT_A | INPUT_C),
+                "decline holds the A/C carry gate");
+            TEST_CHECK(Net::ContinueFlow_ShouldHoldWinScreenFinalize(),
+                "decline holds the winscreen finalize until the carry clears");
+            TEST_CHECK(g_lastExpectedPostMatchIntent ==
+                           (uint8_t)Net::PostMatchIntentWire::CharselRestart,
+                "the director is told the lockstep-derived CharselRestart intent");
+            TEST_CHECK(CountProposals(Net::NetTransitionKind::PostMatchDecision,
+                           (uint8_t)Net::PostMatchIntentWire::CharselRestart) >=
+                           1,
+                "NO cycle proposes PostMatchDecision(CharselRestart)");
+            TEST_CHECK(g_beginRematchCalls == beginRematchBefore,
+                "a decline never begins the pregame fast path");
+
+            // Native exit: the sub-8 fade leaves mode 9 -> the winscreen
+            // sync aborts (state-machine analog of the FrameUpdate route
+            // check) and the exit barrier fires.
+            const size_t exitsBefore =
+                CountProposals(Net::NetTransitionKind::WinScreenExit, 0);
+            Net::ContinueFlow_Test_SetGameState(MODE_CHARSEL, 0);
+            Net::WinScreenSync_Abort();
+            TEST_CHECK(CountProposals(Net::NetTransitionKind::WinScreenExit, 0) ==
+                           exitsBefore + 1,
+                "leaving the winscreen proposes the exit barrier");
+            TEST_CHECK(!Net::ContinueFlow_ShouldHoldWinScreenFinalize(),
+                "the abort path resets the continue flow");
+
+            // EpochAlign commit -> charsel input phase (any-NO route).
+            epochId += 1;
+            Net::FrontendInputSync_RebindEpoch(epochId, "epoch align commit (test)");
+            Net::FrontendInputSync_BeginInputPhase(
+                Net::FrontendSyncPhase::CharSel,
+                Net::PacketType::CharSelFrameInput,
+                "post-decline charsel (test)");
+            TEST_CHECK(Net::FrontendInputSync_GetPhase() ==
+                           Net::FrontendSyncPhase::CharSel,
+                "the NO route lands in a fresh charsel phase");
+            Net::FrontendInputSync_EndPhase("post-decline charsel end (test)");
+        }
+        TEST_CHECK(Net::FrontendInputSync_GetEpochId() == epochId,
+            "every handoff adopts the aligned epoch");
+    }
+
+    TEST_CHECK(g_onRematchCalls == 2,
+        "both YES cycles notified the director rematch hook");
+}
+
 } // namespace
 
 namespace Net {
@@ -754,19 +1209,44 @@ void Session_GetStats(ConnectionStats* out) {
 
 PregamePhase PregameSync_GetPhase() { return PregamePhase::Idle; }
 MatchLifecyclePhase MatchLifecycle_GetPhase() { return MatchLifecyclePhase::Inactive; }
-void TransitionBarrier_Propose(NetTransitionKind, uint8_t, uint32_t) {}
 
-// ContinueFlow stubs (winscreen_sync.cpp references these; the continue flow
-// itself is not under test here — stubs keep the legacy finalize path).
-void ContinueFlow_Reset(const char*) {}
-void ContinueFlow_OnWinScreenAdvance() {}
-void ContinueFlow_OnConsumedFrame(uint16_t, uint16_t) {}
-bool ContinueFlow_IsPromptActive() { return false; }
-bool ContinueFlow_ShouldHoldWinScreenFinalize() { return false; }
+void TransitionBarrier_Propose(NetTransitionKind kind, uint8_t intent, uint32_t) {
+    g_barrierProposals.push_back(BarrierProposal{kind, intent});
+}
+
+// Continue-flow dependency stubs (the REAL continue_flow.cpp is linked since
+// the rematch-handoff cycles test drives its state machine directly).
+bool MatchLifecycle_IsMatchOwned() { return g_matchOwned; }
+void MatchLifecycle_OnRematch() {}
+int PlayerMapping_GetLocalGameSlot() { return 0; }
+
+const LockedMatchConfig* PregameSync_GetLockedConfig() {
+    static LockedMatchConfig cfg = [] {
+        LockedMatchConfig c{};
+        c.p1_character = 3;
+        c.p1_palette = 1;
+        c.p2_character = 7;
+        c.p2_palette = 2;
+        c.stage_id = 4;
+        c.host_side = 0;
+        return c;
+    }();
+    return g_lockedConfigAvailable ? &cfg : nullptr;
+}
+
+bool PregameSync_BeginRematch(const LockedMatchConfig*) {
+    ++g_beginRematchCalls;
+    return true;
+}
 
 } // namespace Net
 
 namespace Rollback {
+
+void OnlineWiring_OnRematch() { ++g_onRematchCalls; }
+void OnlineWiring_SetExpectedPostMatchIntent(uint8_t intentWire) {
+    g_lastExpectedPostMatchIntent = intentWire;
+}
 
 bool RollbackSession_IsActive() {
     return false;
@@ -808,8 +1288,6 @@ void LogWindow_LogPacket(LogLevel, const char*, ...) {}
 void LogWindow_LogPacketV(LogLevel, const char*, va_list) {}
 void LogWindow_LogNet(LogLevel, const char*, ...) {}
 void LogWindow_LogNetV(LogLevel, const char*, va_list) {}
-void LogWindow_LogGekko(LogLevel, const char*, ...) {}
-void LogWindow_LogGekkoV(LogLevel, const char*, va_list) {}
 void LogWindow_SetCategoryEnabled(LogCategory, bool) {}
 bool LogWindow_IsCategoryEnabled(LogCategory) { return true; }
 void LogWindow_SetAllCategoriesEnabled(bool) {}
@@ -848,8 +1326,11 @@ int main() {
     TestGameplayDelaySharedSafeAndExpertModes();
     TestLocalInputLatchPreservesTapWhileLeadCapped();
     TestFrontendInputPacketsCarrySixteenFramesOfHistory();
+    TestSimultaneousNavigationOverJitteryLink();
+    TestContinueRematchHandoffCycles();
 
     Net::FrontendInputSync_Test_ClearClockOverride();
+    Net::ContinueFlow_Shutdown();
     Net::WinScreenSync_Shutdown();
     Net::FrontendInputSync_Shutdown();
     Net::DelayPolicy_Shutdown();
