@@ -6,6 +6,7 @@
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -38,6 +39,11 @@ static int  s_totalMismatchesForced= 0;
 // ============================================================================
 
 void StressHooks_Init() {
+    // Settings-file arming (NetMenu::Init) runs BEFORE this init in the boot
+    // sequence — zeroing unconditionally wiped forced_rollback= on every
+    // launch (only env-var launches survived, because the env re-arms below).
+    const int preArmedDepth = s_forcedRollbackDepth;
+    const bool preArmedEnabled = s_enabled && preArmedDepth > 0;
     s_enabled = false;
     s_addedLatencyMs = 0;
     s_jitterMs = 0;
@@ -45,6 +51,10 @@ void StressHooks_Init() {
     s_inputDeliveryDelay = 0;
     s_forcedMismatches = 0;
     s_forcedRollbackDepth = 0;
+    if (preArmedEnabled) {
+        s_enabled = true;
+        s_forcedRollbackDepth = preArmedDepth;
+    }
     s_totalDropped = 0;
     s_totalDelayed = 0;
     s_totalMismatchesForced = 0;
@@ -54,6 +64,34 @@ void StressHooks_Init() {
     // two-instance loopback pair sustains real prediction depth ~N (forcing
     // deep restore/replay under combat without a WAN shim). Menu toggles
     // still work on top.
+    // Dedicated stress config: as2_stress.cfg in the game directory. The
+    // settings ini is rewritten (and its tail corrupted) by the game's own
+    // save path, and env vars never reach user-launched sessions — this file
+    // is touched by nobody but the user/harness. Format: forced_rollback=N
+    {
+        FILE* sf = nullptr;
+        if (fopen_s(&sf, "as2_stress.cfg", "r") == 0 && sf) {
+            char line[128];
+            while (fgets(line, sizeof(line), sf)) {
+                int depth = 0;
+                if (sscanf_s(line, "forced_rollback=%d", &depth) == 1 && depth > 0) {
+                    s_enabled = true;
+                    s_forcedRollbackDepth = depth > 48 ? 48 : depth;
+                }
+                int dd = 0;
+                if (sscanf_s(line, "delivery_delay=%d", &dd) == 1 && dd > 0) {
+                    s_enabled = true;
+                    s_inputDeliveryDelay = dd;
+                }
+            }
+            fclose(sf);
+            if (s_forcedRollbackDepth > 0) {
+                LOG_INFO("[StressHooks] as2_stress.cfg armed: forced_rollback=%d",
+                         s_forcedRollbackDepth);
+            }
+        }
+    }
+
     char env[16] = {};
     if (GetEnvironmentVariableA("AS2_STRESS_DELIVERY_DELAY", env, sizeof(env)) > 0) {
         const int frames = atoi(env);
