@@ -10,6 +10,7 @@
 #include "net/mode_ownership.h"
 #include "net/session_manager.h"
 #include "net/transition_barrier.h"
+#include "rollback/stress_hooks.h"
 #include "net/session_types.h"
 #include "net/nat_traversal.h"
 #include "net/netplay_menu_ui.h"
@@ -313,6 +314,10 @@ static void SaveSettings() {
     fprintf(f, "remote_palette_preview=%d\n", s_remotePalettePreviewEnabled ? 1 : 0);
     fprintf(f, "continue_screen=%d\n", s_continueScreenEnabled ? 1 : 0);
     fprintf(f, "debug_logging=%d\n", s_debugLoggingEnabled ? 1 : 0);
+    // Persist stress arming so the game's own settings rewrite can't drop it.
+    if (Rollback::StressHooks_GetForcedRollbackDepth() > 0) {
+        fprintf(f, "forced_rollback=%d\n", Rollback::StressHooks_GetForcedRollbackDepth());
+    }
     NetplayHudStyle::Settings hudStyle{};
     NetplayHudStyle::GetLocal(&hudStyle);
     fprintf(f, "hud_trail_r=%u\n", hudStyle.trail_r);
@@ -440,6 +445,16 @@ static void LoadSettings() {
             s_remotePalettePreviewEnabled = (atoi(val) != 0);
         } else if (_stricmp(key, "continue_screen") == 0) {
             s_continueScreenEnabled = (atoi(val) != 0);
+        } else if (_stricmp(key, "forced_rollback") == 0) {
+            // Stress mode from the settings file so EVERY launch gets it —
+            // env-var-only arming silently missed user-launched sessions.
+            const int depth = atoi(val);
+            if (depth > 0) {
+                Rollback::StressHooks_SetEnabled(true);
+                Rollback::StressHooks_SetForcedRollbackDepth(depth);
+                LOG_NETPLAY(LOG_INFO,
+                    "[NetMenu] forced_rollback=%d armed from settings file", depth);
+            }
         } else if (_stricmp(key, "debug_logging") == 0 ||
                    _stricmp(key, "verbose_logging") == 0) {
             s_debugLoggingEnabled = (atoi(val) != 0);
