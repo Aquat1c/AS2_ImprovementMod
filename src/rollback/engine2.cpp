@@ -741,7 +741,9 @@ bool RollbackEngine::CommitReplayFrame(uint32_t frame, uint64_t pre_state_hash,
     if (!sameInputs) {
         replay_prefix_identical_ = false;
     }
-    if (sameInputs && replay_prefix_identical_) {
+    const bool suppressed = suppress_replay_verify_;
+    suppress_replay_verify_ = false;
+    if (sameInputs && replay_prefix_identical_ && !suppressed) {
         last_replay_verify_.checked = true;
         last_replay_verify_.expected = rec->pre_hash;
         last_replay_verify_.match = (rec->pre_hash == pre_state_hash);

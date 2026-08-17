@@ -160,6 +160,13 @@ static bool CaptureFrameInternal(int32_t frame, uint64_t* out_hash, bool want_ha
     return true;
 }
 
+uint64_t StateHistory_GetFrameHash(int32_t frame) {
+    if (!s_historyInit || !s_slots) return 0;
+    const StateSlot* slot = &s_slots[SlotIndexFor(frame)];
+    if (!slot->snap.valid || slot->snap.frame != frame) return 0;
+    return slot->gameplay_hash;
+}
+
 bool StateHistory_CaptureFrame(int32_t frame) {
     return CaptureFrameInternal(frame, nullptr, false);
 }

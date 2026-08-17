@@ -289,6 +289,18 @@ public:
     /// — truncating below the confirmed frontier would regress the canonical
     /// counter (INV-15).
     uint32_t ReplayCursor() const { return replay_cursor_; }
+    uint32_t ReplayTarget() const { return replay_target_; }
+    /// True while every frame replayed so far in this transaction re-ran with
+    /// byte-identical inputs — i.e. the replay is reproducing stored state
+    /// rather than computing new state.
+    bool ReplayPrefixIdentical() const { return replay_prefix_identical_; }
+
+    /// Suppress the determinism comparison for the next CommitReplayFrame.
+    /// Set by the adapter when it reused a STORED digest instead of hashing
+    /// live memory: comparing a stored value against itself is a tautology,
+    /// and counting it would inflate replay_verifications with checks that
+    /// cannot fail.
+    void SuppressNextReplayVerify() { suppress_replay_verify_ = true; }
 
     // ── Confirm pipeline (§2.7.3-F) ─────────────────────────────────────────
 
@@ -532,6 +544,7 @@ private:
     // Determinism self-test scope: true while every frame replayed so far in
     // this transaction re-ran with byte-identical inputs.
     bool replay_prefix_identical_ = false;
+    bool suppress_replay_verify_ = false;
 };
 
 } // namespace Rollback

@@ -436,6 +436,9 @@ struct ForcedTrace {
     uint64_t live_hash_before = 0;   // hash of live memory before the restore
     uint64_t live_hash_after = 0;    // ... and after: MUST differ on a rewind
     uint64_t expect_frontier_hash = 0;
+    // Cost split, so optimisation targets evidence instead of intuition.
+    double   save_hash_us = 0.0;   // snapshot capture + gameplay hash
+    double   restore_us = 0.0;
 };
 static ForcedTrace s_trace = {};
 static DWORD s_traceLastMs = 0;
@@ -445,6 +448,9 @@ static DWORD s_traceLastMs = 0;
 // replay frames and this says 0, the ticks never ran.
 static uint32_t s_replayTicksExecuted = 0;
 static uint32_t s_replayTicksWindow = 0;
+// Replayed frames whose capture+hash was elided because they were provably
+// reproducing stored state (see the elision comment in the replay branch).
+static uint32_t s_replayFramesElided = 0;
 
 // Live game-memory sample, read defensively (the game can be mid-teardown).
 struct GameWitness {
@@ -846,10 +852,46 @@ EventResult RollbackSession_ProcessNextEvent() {
             uint64_t hash = 0;
             uint32_t rng = 0;
             uint16_t hp0 = 0, hp1 = 0;
-            if (!SavePreTick(frame, &hash, &rng, &hp0, &hp1)) {
+            // ── Redundant capture elision ──────────────────────────────────
+            // Measured cost of a replayed frame (live, forced depth 30):
+            //   457 us total = 436 save+hash, 83 restore, 18 SIM.
+            // The simulation is 4% of it. The other 96% is capturing and
+            // hashing a 253 KB snapshot for a frame that is re-running with
+            // byte-identical inputs from an identical starting state — so the
+            // snapshot it would write is the one already sitting in the slot,
+            // and the digest is the one already recorded beside it.
+            //
+            // Elide both when the transaction is FORCED and the replayed
+            // prefix has stayed input-identical. A genuine correction fails
+            // that test on its very first replayed frame (the mispredicted
+            // input differs), so real rollbacks always take the full path and
+            // always refresh their snapshots.
+            //
+            // The last frame of the transaction is never elided: it re-hashes
+            // for real, and since it accumulates all 30 replayed frames, any
+            // divergence anywhere in the window shows up there. That keeps the
+            // determinism self-test honest at 60 verifications/s instead of
+            // 1800. Tracing also forces the full path so the trace never
+            // reports numbers the fast path did not actually compute.
+            const bool lastReplayFrame = (frame + 1 == s_engine.ReplayTarget());
+            const bool reproducingStored =
+                s_engine.GetStats().last_rollback_forced &&
+                s_engine.ReplayPrefixIdentical() &&
+                !lastReplayFrame &&
+                !s_trace.armed;
+
+            LARGE_INTEGER saveStart{};
+            if (s_trace.armed) QueryPerformanceCounter(&saveStart);
+            if (reproducingStored) {
+                hash = StateHistory_GetFrameHash(RbFrame(frame));
+                ReadSyncHashDiagnostics(&rng, &hp0, &hp1);
+                ++s_replayFramesElided;
+                s_engine.SuppressNextReplayVerify();
+            } else if (!SavePreTick(frame, &hash, &rng, &hp0, &hp1)) {
                 LOG_ERROR("[RollbackSession/engine2] replay pre-save failed at %u", frame);
                 return EventResult::Error;
             }
+            if (s_trace.armed) s_trace.save_hash_us += QpcMicros(saveStart);
             const bool traceThisFrame = s_trace.armed;
             uint64_t expectBefore = 0;
             const bool haveExpect =
@@ -939,6 +981,8 @@ EventResult RollbackSession_ProcessNextEvent() {
             }
 
             // Tag-validated restore (fail-closed, §2.7.5).
+            LARGE_INTEGER restoreStart{};
+            if (s_trace.armed) QueryPerformanceCounter(&restoreStart);
             if (!StateHistory_LoadFrameTagged(RbFrame(action.frame), s_epoch)) {
                 snprintf(s_sessionError, sizeof(s_sessionError),
                          "restore failed at frame %d (epoch %u)",
@@ -953,6 +997,7 @@ EventResult RollbackSession_ProcessNextEvent() {
                 s_engine.GetStats().last_rollback_length);
 
             if (s_trace.armed) {
+                s_trace.restore_us = QpcMicros(restoreStart);
                 const GameWitness after = ReadGameWitness();
                 s_trace.game_frame_after = after.sim_frame;
                 s_trace.p1x_after = after.p1_x;
@@ -1091,12 +1136,18 @@ void NoteRollbackTransactionDone(bool truncated) {
         // many times the game was actually stepped during this transaction.
         NetplayLog_Write("FORCEDTRACE", RbFrame(s_engine.SimFrontier()),
             "=== TX END%s: depth=%u replayed=%u verified=%u mismatched=%u "
-            "unverifiable=%u | game_ticks_executed=%u | %.0f us "
-            "(%.1f us/frame) | frontier now f%d sim_frame=%u p1_x=%d ===",
+            "unverifiable=%u | game_ticks_executed=%u | %.0f us total "
+            "(%.1f us/frame: %.1f save+hash, %.1f restore, %.1f sim) | "
+            "frontier now f%d sim_frame=%u p1_x=%d ===",
             truncated ? " (TRUNCATED AT BOUNDARY)" : "",
             s_trace.depth, s_trace.replayed, s_trace.verified,
             s_trace.mismatched, s_trace.unverifiable, s_replayTicksExecuted,
             us, s_trace.replayed ? us / (double)s_trace.replayed : 0.0,
+            s_trace.replayed ? s_trace.save_hash_us / (double)s_trace.replayed : 0.0,
+            s_trace.restore_us,
+            s_trace.replayed
+                ? (us - s_trace.save_hash_us - s_trace.restore_us) / (double)s_trace.replayed
+                : 0.0,
             RbFrame(s_engine.SimFrontier()), end.sim_frame, end.p1_x);
         if (s_replayTicksExecuted < s_trace.replayed) {
             LOG_NETPLAY(LOG_WARNING,

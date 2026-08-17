@@ -88,6 +88,11 @@ int32_t StateHistory_GetNewestFrame();
 /// Get the number of states currently stored.
 int32_t StateHistory_GetCount();
 
+/// Gameplay digest recorded when `frame` was captured, or 0 if the slot does
+/// not hold that frame. Lets a replay that is provably reproducing stored
+/// state reuse the stored digest instead of recomputing it.
+uint64_t StateHistory_GetFrameHash(int32_t frame);
+
 // ============================================================================
 // Resimulation Execution
 // ============================================================================
