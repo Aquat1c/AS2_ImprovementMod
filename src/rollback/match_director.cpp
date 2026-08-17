@@ -1034,6 +1034,14 @@ void OnlineWiring_SetExpectedPostMatchIntent(uint8_t intentWire) {
 // (ReturnToSession / Disconnect) come from the post-match menu, not from a
 // derivation, and are exempt (a strict compare there would kill healthy
 // sessions on legitimate asymmetric choices).
+// Only these two are DERIVED FROM THE SHARED LOCKSTEP STREAM, so only these
+// two may be compared fail-closed. RecoveryRestart is deliberately excluded:
+// it is what every non-lockstep exit announces (ForceExitToCharsel,
+// WinScreenSync_Abort, the auto-rematch heuristic, cross-phase restart).
+// Before it existed those routes announced CharselRestart, and this guard
+// killed healthy sessions whenever one peer merely RECOVERED while the other
+// cleanly resolved Rematch — an asymmetric recovery is not evidence of
+// divergent streams.
 static bool IsLockstepDerivedIntent(uint8_t intent) {
     return intent == (uint8_t)Net::PostMatchIntentWire::Rematch ||
            intent == (uint8_t)Net::PostMatchIntentWire::CharselRestart;

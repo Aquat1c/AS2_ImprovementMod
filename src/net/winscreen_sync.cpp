@@ -330,7 +330,14 @@ bool WinScreenSync_FrameUpdate() {
         return true;
     }
 
-    if (s_activeSinceMs != 0) {
+    // The continue prompt owns this exit and carries its own DETERMINISTIC,
+    // frame-counted timeout: 640 consumed frames to enter the prompt plus 3600
+    // to decide, ~71 s at 60 Hz. This 45 s wall clock preempted it outright,
+    // so the prompt's own timeout was unreachable — two idle players had the
+    // win screen aborted from under them before the prompt could resolve, and
+    // the abort then routes through recovery. While the prompt is holding the
+    // finalize, its frame clock is the only one allowed to end this phase.
+    if (s_activeSinceMs != 0 && !ContinueFlow_ShouldHoldWinScreenFinalize()) {
         const DWORD elapsed = GetTickCount() - s_activeSinceMs;
         if (elapsed >= kWinScreenHandoffTimeoutMs &&
             !FrontendInputSync_BothAdvanceObserved()) {

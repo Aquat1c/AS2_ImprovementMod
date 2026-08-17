@@ -2940,7 +2940,7 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
     const bool wireSuggestsRematch =
         Net::TransitionBarrier_IsCommitted(Net::NetTransitionKind::WinScreenExit) ||
         remotePmdIntent == (uint8_t)Net::PostMatchIntentWire::Rematch ||
-        remotePmdIntent == (uint8_t)Net::PostMatchIntentWire::CharselRestart;
+        Net::PostMatchIntentIsRestart(remotePmdIntent);
 
     if (!staleGameplayHandoff && !lifecycleSuggestsPostMatch && !wireSuggestsRematch) {
         return;
@@ -2951,8 +2951,12 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
     // lockstep-derived "any NO" charsel route, so it announces CharselRestart
     // — the same value continue_flow's decline proposed — never Rematch
     // (which now exclusively means the YES,YES fast path).
+    // RECOVERY route, not a lockstep decision. Announcing CharselRestart here
+    // made this indistinguishable from continue_flow's decline, and the
+    // director's F-7 guard terminated the session as a protocol violation
+    // whenever the peer had cleanly resolved Rematch instead.
     Net::TransitionBarrier_Propose(Net::NetTransitionKind::PostMatchDecision,
-                                   (uint8_t)Net::PostMatchIntentWire::CharselRestart, 0);
+                                   (uint8_t)Net::PostMatchIntentWire::RecoveryRestart, 0);
 
     const DWORD now = GetTickCount();
     if ((now - s_autoRematchLastAttemptAt) < 250) {

@@ -275,7 +275,25 @@ enum class PostMatchIntentWire : uint8_t {
     // Rematch vs CharselRestart across the wire can only mean divergent
     // lockstep streams (F-7 protocol-violation terminal).
     CharselRestart   = 4,
+    // 2026-08-18 (F-7 false-positive fix): a RECOVERY route's restart, not a
+    // lockstep decision. Every non-lockstep exit from the win screen
+    // (ForceExitToCharsel, WinScreenSync_Abort, the auto-rematch heuristic,
+    // cross-phase pregame restart) used to announce CharselRestart, which is
+    // indistinguishable on the wire from the lockstep-derived "any NO" route.
+    // The director's F-7 guard then read Rematch-vs-CharselRestart as proof of
+    // divergent lockstep streams and TERMINATED a healthy session whenever one
+    // peer merely recovered while the other resolved cleanly. Recovery routes
+    // announce this instead: it routes exactly like CharselRestart but is NOT
+    // lockstep-derived, so it can never trip the contradiction guard.
+    RecoveryRestart  = 5,
 };
+
+/// Both restart intents send the peer to character select. Only the
+/// lockstep-derived one may be compared fail-closed against a peer's value.
+inline bool PostMatchIntentIsRestart(uint8_t intent) {
+    return intent == (uint8_t)PostMatchIntentWire::CharselRestart ||
+           intent == (uint8_t)PostMatchIntentWire::RecoveryRestart;
+}
 
 inline const char* PostMatchIntentWireName(PostMatchIntentWire intent) {
     switch (intent) {
@@ -284,6 +302,7 @@ inline const char* PostMatchIntentWireName(PostMatchIntentWire intent) {
         case PostMatchIntentWire::ReturnToSession: return "ReturnToSession";
         case PostMatchIntentWire::Disconnect:      return "Disconnect";
         case PostMatchIntentWire::CharselRestart:  return "CharselRestart";
+        case PostMatchIntentWire::RecoveryRestart: return "RecoveryRestart";
     }
     return "?";
 }
