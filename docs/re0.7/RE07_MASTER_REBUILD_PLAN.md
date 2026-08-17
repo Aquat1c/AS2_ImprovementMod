@@ -1156,18 +1156,17 @@ independently and are strictly better than 0.7 alone.
 
 ---
 
-## 9. Open questions for the user (short)
+## 9. Open questions — RESOLVED (user, 2026-08-17)
 
-1. **Default cadence:** exact 60.000 Hz (`proper_60`) as the netplay default with `compat_58`
-   (58.82) as opt-in — confirm? (Both peers must match; handshake enforces.)
-2. **Spectator scope for the first re0.7 release:** ship M7 in the same release as M5/M6, or flag
-   spectating off until a follow-up? (Player path has zero dependency on it.)
-3. **Mid-session delay hotkeys** (`-`/`=` local delay, `[`/`]` local rollback): keep exposing, or
-   config-file only for the first release?
-4. **Min-spec definition** for §7.5 acceptance: is the weakest known field machine available for
-   the perf gate, or should we define min-spec as "the 0.7 field-log machines"?
-5. **Interim builds:** may protocol v20 dev builds go to testers before M6's cutover gate
-   (frontend + transport only, Gekko gameplay), or field-test only after full cutover?
+1. **Default cadence: CONFIRMED** — exact 60.000 Hz (`proper_60`) netplay default, `compat_58`
+   opt-in, handshake-enforced match.
+2. **Spectator scope: SHIP** — M7 ships in the same release as M5/M6.
+3. **Mid-session delay hotkeys: SHIP** — keep the hotkeys exposed in the first release.
+4. **Min-spec: pragmatic** — "whatever works best": use the 0.7 field-log machines as the de-facto
+   perf-gate reference; tighten later if a weaker field machine appears.
+5. **Interim builds: none to testers before functional readiness** — development continues on
+   re0.7; field testing begins only once the netcode is functionally ready (M6 cutover gate).
+   No v20 dev builds distributed before then.
 
 ---
 
