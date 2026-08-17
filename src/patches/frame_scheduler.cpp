@@ -80,7 +80,9 @@ bool  s_compat58 = false;
 float s_periodAdjustUs = 0.0f;
 float s_lastSpeedScale = 1.0f;
 
-// Pace-slew sample (no producer until the v2 PressureReport is live).
+// Pace-slew sample. Producer: rollback_session_engine2's IngestInputStreamNow,
+// which feeds the peer's PressureReport prediction depth alongside the local
+// depth on every InputStream arrival (§2.8.4).
 uint64_t s_slewSampleQpc = 0;
 int32_t  s_slewPeerDepth = 0;
 int32_t  s_slewLocalDepth = 0;
