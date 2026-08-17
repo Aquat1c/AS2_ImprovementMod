@@ -1544,22 +1544,51 @@ static void UpdateFrontendLocked() {
     CharSelSyncSnapshot csSnap{};
     CharSelSync_GetSnapshot(&csSnap);
 
-    LockedMatchConfig_Clear(&s_lockedConfig);
-    s_lockedConfig.p1_character = csSnap.p1_character;
-    s_lockedConfig.p1_palette = csSnap.p1_palette;
-    s_lockedConfig.p2_character = csSnap.p2_character;
-    s_lockedConfig.p2_palette = csSnap.p2_palette;
-    s_lockedConfig.stage_id = csSnap.stage_id;
+    const SessionRole role = Session_GetRole();
 
-    s_lockedConfig.host_side = s_assignedSide;
+    // ── Early-host-config guard (2026-08-17, run 23-17) ───────────────────
+    // The host's ConfigExchange can land BEFORE the join reaches this phase
+    // (observed: packet logged at phase=FrontendLocked). OnConfigExchange
+    // adopts it into s_lockedConfig — host-authoritative, including the
+    // fields the join cannot know: round_count, rng_seed, session_seed.
+    //
+    // Rebuilding from the local charsel snapshot here would clear all of
+    // that and leave round_count at 0, and the guard inside
+    // BeginConfigExchangeInternal cannot save it — that guard only skips its
+    // own overwrite, so it happily applies the struct this function already
+    // wiped. The join then ACKs the hash of a config the host never sent:
+    //   "Config rejected by peer (local=0xC7F21AD9 remote=0x9931F247)"
+    // and the session dies in mode 7 before a single match starts.
+    //
+    // Once the host's config is in hand it is the only config there is.
+    const bool hostConfigAuthoritative =
+        (role != SessionRole::Host) && s_configReceived;
 
-    SessionRole role = Session_GetRole();
-    if (role == SessionRole::Host) {
-        s_lockedConfig.rng_seed = GetTickCount() ^ 0xDEADBEEF;
-        s_lockedConfig.session_seed = s_sessionId;
-        s_lockedConfig.round_count = GetOutgoingSyncRoundOption("pregame frontend locked");
-        s_lockedConfig.time_limit = 0;
-        GameSettingsSync_ApplyLockedConfig(&s_lockedConfig, "host config build");
+    if (hostConfigAuthoritative) {
+        LOG_NETPLAY(LOG_INFO,
+            "[MatchSetup] Frontend locked with host config already received — "
+            "keeping it (rounds_raw=%u rng_seed=0x%08X)",
+            s_lockedConfig.round_count, s_lockedConfig.rng_seed);
+        Rollback::NetplayLog_Write("PREGAME", -1,
+            "Frontend locked: retaining early host config (rounds_raw=%u hash=0x%08X)",
+            s_lockedConfig.round_count, LockedMatchConfig_Hash(&s_lockedConfig));
+    } else {
+        LockedMatchConfig_Clear(&s_lockedConfig);
+        s_lockedConfig.p1_character = csSnap.p1_character;
+        s_lockedConfig.p1_palette = csSnap.p1_palette;
+        s_lockedConfig.p2_character = csSnap.p2_character;
+        s_lockedConfig.p2_palette = csSnap.p2_palette;
+        s_lockedConfig.stage_id = csSnap.stage_id;
+
+        s_lockedConfig.host_side = s_assignedSide;
+
+        if (role == SessionRole::Host) {
+            s_lockedConfig.rng_seed = GetTickCount() ^ 0xDEADBEEF;
+            s_lockedConfig.session_seed = s_sessionId;
+            s_lockedConfig.round_count = GetOutgoingSyncRoundOption("pregame frontend locked");
+            s_lockedConfig.time_limit = 0;
+            GameSettingsSync_ApplyLockedConfig(&s_lockedConfig, "host config build");
+        }
     }
 
     // Front-end selections are fully resolved — end CharSel lockstep before
