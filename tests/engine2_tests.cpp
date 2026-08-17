@@ -1124,7 +1124,12 @@ static void TestProducerNeverOutrunsLocalInput() {
         "the producer never seals further past the sim than the input-latency cap");
 
     // And it stays bounded as the sim advances — the lead must not ratchet.
-    for (int step = 0; step < 40; ++step) {
+    // Remote actuals must keep arriving here: a session BLOCKED on its peer is
+    // required to produce ahead (that is what breaks a mutual stall, run
+    // 01-34), so an unfed engine would be testing the opposite rule. See
+    // TestProducerRunsAheadOnlyWhenBlocked for that direction.
+    for (uint32_t step = 0; step < 40; ++step) {
+        e.ReceiveRemoteInput(step, 0x0001);
         e.CaptureLocalInput(e.SimFrontier(), 0x0001);
         const EngineAction a = e.NextAction();
         if (a.kind == EngineActionKind::Advance) e.CommitAdvance(a.frame, 1);
@@ -1132,8 +1137,66 @@ static void TestProducerNeverOutrunsLocalInput() {
         const int32_t lead =
             Net::signedLead(e.ProducedFrontier(), e.SimFrontier());
         TEST_CHECK(lead <= (int32_t)ENGINE_PRODUCER_SIM_LEAD_CAP,
-                   "producer lead stays bounded as the match runs");
+                   "producer lead stays bounded while the sim can advance");
         if (lead > (int32_t)ENGINE_PRODUCER_SIM_LEAD_CAP) break;
+    }
+}
+
+// The producer sits between two live failures, one from each direction:
+//   run 23-25: producing ahead while RUNNING sealed 28-40 frames past the sim
+//              and cost ~1s of dead input (sealed frames are immutable).
+//   run 01-34: refusing to produce ahead while BLOCKED deadlocked both peers
+//              (sim_fps=0.00, hold_pred=61/s, both reported "opponent's game
+//              stopped responding") -- each side waiting for inputs the other
+//              would not produce.
+// Both directions are pinned here so neither fix can silently undo the other.
+static void TestProducerRunsAheadOnlyWhenBlocked() {
+    // Direction 1: running normally -> bounded, no runaway lead.
+    {
+        RollbackEngine e;
+        e.Arm(MakeConfig(0, 0, 8), 1);
+        Net::PressureReport wide{};
+        wide.adv_delay = 15;
+        wide.adv_rollback = 15;        // peer would accept the full window
+        e.SetPeerAdvisory(wide);
+
+        // Remote actuals keep arriving, so we are never blocked.
+        for (uint32_t f = 0; f < 40; ++f) {
+            e.ReceiveRemoteInput(f, 0x0001);
+            e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+            const EngineAction a = e.NextAction();
+            if (a.kind == EngineActionKind::Advance) e.CommitAdvance(a.frame, 1);
+            while (e.ProduceLocalInputAhead(0x0001)) {}
+            const int32_t lead = Net::signedLead(e.ProducedFrontier(), e.SimFrontier());
+            TEST_CHECK(lead <= (int32_t)ENGINE_PRODUCER_SIM_LEAD_CAP,
+                       "an unblocked producer never runs away from the sim");
+            if (lead > (int32_t)ENGINE_PRODUCER_SIM_LEAD_CAP) break;
+        }
+    }
+    // Direction 2: blocked at the prediction limit -> MUST keep feeding the
+    // peer, or the session deadlocks.
+    {
+        RollbackEngine e;
+        e.Arm(MakeConfig(0, 0, 8), 1);
+        Net::PressureReport wide{};
+        wide.adv_delay = 15;
+        wide.adv_rollback = 15;
+        e.SetPeerAdvisory(wide);
+
+        // No remote input ever arrives: speculate to the limit, then stall.
+        for (int i = 0; i < 40; ++i) {
+            e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+            const EngineAction a = e.NextAction();
+            if (a.kind == EngineActionKind::Advance) e.CommitAdvance(a.frame, 1);
+            else break;
+        }
+        TEST_CHECK(e.SpeculativeFrames() >= 8,
+                   "engine reached its prediction limit");
+
+        int sealedWhileBlocked = 0;
+        while (e.ProduceLocalInputAhead(0x0002)) ++sealedWhileBlocked;
+        TEST_CHECK(sealedWhileBlocked > (int)ENGINE_PRODUCER_SIM_LEAD_CAP,
+                   "a blocked producer keeps feeding the peer past the latency cap");
     }
 }
 
@@ -1147,6 +1210,7 @@ int main() {
     TestWindowMath();           // T-ENG-7
     TestProducer();             // T-ENG-8
     TestProducerNeverOutrunsLocalInput();
+    TestProducerRunsAheadOnlyWhenBlocked();
     TestPredictionLimitPin();   // T-ENG-9
     TestWrapSafety();           // T-ENG-10
     TestEpochRotation();        // T-ENG-11

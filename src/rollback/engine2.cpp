@@ -352,10 +352,24 @@ bool RollbackEngine::ProduceLocalInputAhead(uint16_t fresh_sample) {
     // half a second of dead input, permanent because produced_frontier never
     // regresses. Frames the local player has not lived through yet are not
     // ours to seal.
-    const int32_t sim_lead_signed = signedLead(produced_frontier_, sim_frontier_);
-    const uint32_t sim_lead = sim_lead_signed > 0 ? (uint32_t)sim_lead_signed : 0u;
-    if (sim_lead >= (uint32_t)delay_active_ + ENGINE_PRODUCER_SIM_LEAD_CAP) {
-        return false;
+    //
+    // AMENDED (live run 01-34): the bound above must apply ONLY while the sim
+    // can still advance. Producing ahead is the one thing that breaks a mutual
+    // stall — each side needs the other's inputs, and if neither produces
+    // ahead neither ever can. Capping the lead unconditionally deadlocked both
+    // peers: sim_fps=0.00, hold_pred=61/s, sent=104 vs recv=28722, and BOTH
+    // sides reported "opponent's game stopped responding". Frames sealed while
+    // blocked each carry the sample taken at that moment, so they are frames
+    // the player genuinely lived through — unlike a lead accumulated while
+    // running fine, which is what cost a second of input in run 23-25.
+    const bool blocked_on_peer =
+        SpeculativeFrames() >= (uint32_t)config_.max_rollback;
+    if (!blocked_on_peer) {
+        const int32_t sim_lead_signed = signedLead(produced_frontier_, sim_frontier_);
+        const uint32_t sim_lead = sim_lead_signed > 0 ? (uint32_t)sim_lead_signed : 0u;
+        if (sim_lead >= (uint32_t)delay_active_ + ENGINE_PRODUCER_SIM_LEAD_CAP) {
+            return false;
+        }
     }
     if (!SealLocal(produced_frontier_, (uint16_t)(fresh_sample & ENGINE_INPUT_VALID_MASK))) {
         return false;
