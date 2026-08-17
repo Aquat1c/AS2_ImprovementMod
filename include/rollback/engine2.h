@@ -529,6 +529,9 @@ private:
     Stats stats_{};
     ReplayVerify last_replay_verify_{};
     bool pending_mismatch_forced_ = false;
+    // Determinism self-test scope: true while every frame replayed so far in
+    // this transaction re-ran with byte-identical inputs.
+    bool replay_prefix_identical_ = false;
 };
 
 } // namespace Rollback

@@ -654,6 +654,7 @@ bool RollbackEngine::BeginRollback(uint32_t from) {
         return false;
     }
     in_rollback_ = true;
+    replay_prefix_identical_ = true;
     replay_cursor_ = from;
     replay_target_ = sim_frontier_;
     replay_inputs_pending_ = false;
@@ -727,10 +728,20 @@ bool RollbackEngine::CommitReplayFrame(uint32_t frame, uint64_t pre_state_hash,
     last_replay_verify_.inputs[0] = replay_pending_inputs_[0];
     last_replay_verify_.inputs[1] = replay_pending_inputs_[1];
     last_replay_verify_.remote_predicted = replay_pending_predicted_;
-    if (rec->valid && rec->committed && rec->frame == frame &&
+    // The pre-state of frame N is a function of every frame before it, so a
+    // comparison is only meaningful while the WHOLE replayed prefix has re-run
+    // with identical inputs. Once any frame in this transaction is corrected
+    // (the normal case under real prediction depth), later frames legitimately
+    // land elsewhere and must not be reported as nondeterminism.
+    const bool sameInputs =
+        rec->valid && rec->committed && rec->frame == frame &&
         rec->epoch == epoch_ &&
         rec->inputs[0] == replay_pending_inputs_[0] &&
-        rec->inputs[1] == replay_pending_inputs_[1]) {
+        rec->inputs[1] == replay_pending_inputs_[1];
+    if (!sameInputs) {
+        replay_prefix_identical_ = false;
+    }
+    if (sameInputs && replay_prefix_identical_) {
         last_replay_verify_.checked = true;
         last_replay_verify_.expected = rec->pre_hash;
         last_replay_verify_.match = (rec->pre_hash == pre_state_hash);

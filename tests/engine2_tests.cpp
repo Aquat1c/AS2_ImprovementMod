@@ -1044,6 +1044,35 @@ static void TestReplayDeterminismSelfTest() {
     }
 }
 
+// A real correction moves every frame after it, legitimately. The self-test
+// must scope itself to the input-identical prefix, or deep prediction (where
+// corrections are the norm) reports constant false nondeterminism — observed
+// live at delivery_delay=30: replay_bad climbing into the hundreds with a
+// perfectly deterministic sim.
+static void TestReplaySelfTestIgnoresCorrectedSuffix() {
+    RollbackEngine e;
+    e.Arm(MakeConfig(0, 0, 8), 1);
+    for (uint32_t f = 0; f < 6; ++f) {
+        e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+        const EngineAction a = e.NextAction();
+        e.CommitAdvance(a.frame, 100 + f);   // remote predicted as neutral
+    }
+    // The real remote input for frame 2 turns out to be different.
+    e.ReceiveRemoteInput(2, 0x0208);
+    const EngineAction a = e.NextAction();
+    TEST_CHECK(a.kind == EngineActionKind::Rollback && a.frame == 2,
+               "correction rolls back to the mispredicted frame");
+    TEST_CHECK(e.BeginRollback(a.frame), "begin");
+
+    uint32_t f = 0; uint16_t in[2];
+    while (e.NextReplayInputs(&f, in)) {
+        // Frame 2 onward legitimately lands somewhere new.
+        e.CommitReplayFrame(f, 900 + f);
+    }
+    TEST_CHECK(e.GetStats().replay_mismatches == 0,
+               "a corrected frame and everything after it is never called nondeterminism");
+}
+
 int main() {
     TestCaptureOnce();          // T-ENG-1
     TestDelayRelabel();         // T-ENG-2
@@ -1060,6 +1089,7 @@ int main() {
     TestDesyncDiagnostics();    // post-M8 divergence diagnostics
     TestLifecycleWindow();      // INV-25 / M4-7 predicate
     TestReplayDeterminismSelfTest();  // QOH99-model local determinism check
+    TestReplaySelfTestIgnoresCorrectedSuffix();
     SoakRun();                  // §7.2 socket-free soak (M4 exit gate)
     Microbench();               // §7.5 #4
 
