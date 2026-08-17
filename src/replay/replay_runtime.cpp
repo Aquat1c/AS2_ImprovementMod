@@ -921,7 +921,18 @@ static char __cdecl Hook_ReplaySave(int matchBase) {
     const ReplayDirectorySnapshot after = CaptureReplayDirectorySnapshot();
     fs::path replayPath;
     if (!ResolveReplaySavePath(before, after, &replayPath)) {
-        LOG_WARN("[Replay] Saved replay could not be resolved for post-save processing");
+        // No file changed in the replay directory. If the vanilla save itself
+        // reported nothing saved, that is simply "there was no replay to
+        // post-process" — an ordinary outcome (and the norm in automated soak
+        // runs), not an anomaly. Only the inconsistent case deserves a warning:
+        // vanilla says it saved, yet no file appeared.
+        if (result) {
+            LOG_WARN("[Replay] Saved replay could not be resolved for post-save "
+                     "processing (vanilla save reported success)");
+        } else {
+            LOG_INFO("[Replay] No replay written by the vanilla save — nothing to "
+                     "post-process");
+        }
         return result;
     }
 
