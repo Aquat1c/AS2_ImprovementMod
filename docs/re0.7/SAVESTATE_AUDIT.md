@@ -475,3 +475,160 @@ Files touched: `game_snapshot.{h,cpp}`, `match_director.cpp`,
    unaudited. The digest mask removes the false-alarm class; a confirmed
    script reader would make the render-side termination write (+440 ← 1) a
    true desync source requiring a render-phase freeze during netplay.
+
+## 9. F7 — frame-0 confirmed desync: frontend residue inside the hashed input spans (found+fixed 2026-08-17, live run 17-25-3x)
+
+**Evidence** (host `logs/2026-08-17_17-25-32`, instB `...17-25-34`,
+`desync_dump_*_f29.txt` both sides): handoff byte-identical (config hash,
+folded baseline checksum 0xF864B352, main-region CRC 0x1BAFBA29 all equal
+cross-side), rng/hp identical every ring frame, all ring inputs 0x0000 —
+yet the very first confirmed sync hash differs (rb f0:
+host dd535585332365b6 vs instB b71097673c26e21f; detected at the f29
+exchange cadence). Diverging regions: p1/p2_inputbuf and (downstream)
+p1/p2_entity only.
+
+**Root cause** — the engine2 sync hash (GameSnapshot input_p1/p2) covers the
+two 208-byte global input spans (0x8E9E62 / 0x8E9F32), but the baseline
+AGREEMENT digest did not, and nothing normalized them cross-side:
+
+1. Held/just-pressed navigation words (span offsets +4/+6, +32/+34) held
+   each side's LAST charsel keypress — different by construction (host
+   pressed word-2 key, instB word-3).
+2. The P2 span's final two bytes (0x8EA000–01) overlap the LOWORD of the
+   title-screen state dword (decomp `dword_8EA000`: attract counter 0..1800,
+   BYTE2 = title cursor). Pure wall-time residue: host 0x0072, instB 0x0000.
+   Nicknames verified NOT in these spans (they exist only in HUD render
+   code paths).
+3. The 25 deterministic intro frames then consumed the differing residue
+   (entity input-action arrays at entity+0x444 feed off these words), so
+   the entity blocks diverged too. Old 0.6/Gekko zeroed input history at
+   MatchSyncInit; the engine2 Hook_MatchSyncInit clears only the BIG
+   history arrays (0x8164A0/0x87FC24) — the 208-byte spans sit ABOVE both
+   and were never cleared.
+
+**Fix (three parts, all 2026-08-17):**
+
+1. `match_setup.cpp ZeroFrontendInputResidueForBaseline()` — at the frozen
+   bootstrap boundary immediately before `Savestate_CaptureRollbackBaseline`,
+   BOTH sides zero: the frontend-safe 56 input words per span, the 20-byte
+   just-pressed state per span, and the 2 title-counter bytes
+   (`ADDR_TITLE_SCREEN_STATE`). The unsafe charsel tail (committed char
+   IDs/palettes, offsets +76..+205) is session-synced and is NOT cleared
+   (rematch_cleanup.cpp tail-guard constraint holds).
+2. `baseline_sync.cpp` — `p1_input_crc`/`p2_input_crc` are now part of the
+   agreement digest: any residual cross-side divergence in the spans fails
+   loud at the baseline rendezvous (retry, then terminal), never at f0.
+   NOTE: agreement-digest membership change — cross-build incompatible,
+   like any hash-membership change (constraint 3).
+3. `input_override.cpp readSdlFrontendInputs` — while connected in mode 8
+   with the rollback session NOT active (bootstrap freeze, deterministic
+   intro, post-match transition), local raw P1 input is forced neutral so
+   a human holding a button during the intro cannot bake per-side residue
+   into the f0 state. (Non-SDL input mode retains the old exposure —
+   accepted residual, SDL input is the shipped configuration.)
+
+Capture/restore membership is UNCHANGED (the spans were already captured,
+restored, and hashed — correctly so, the sim reads them); only their
+*pre-capture normalization* and the agreement digest changed.
+
+**Related diagnostic fix**: `match_director.cpp` pre/post-restore log lines
+compared a RAW main-region CRC against the FOLDED savestate checksum
+({main_crc, effect_index} re-CRC'd) and always printed `match=NO` — the
+restore itself was verified byte-exact by the savestate layer
+("RESTORED OK ... (match)"). Both lines now use
+`ComputeBaselineComparableCRC()` (the folded form).
+
+### F7b — attempt-2 refinement (same day): the live-word window is pass-cadence volatile, not just baseline residue
+
+Attempt 1 (fix F7 deployed, run 17-47-0x) still desynced at f0 with the
+SAME p1-span byte pattern (LEFT vs RIGHT at +4/+32 vs +6/+34) even though
+the pre-capture zeroing ran (ok=1) and the enriched agreement digest
+AGREED — proving the spans were identical at capture and the residue is
+RE-ACQUIRED after restore. Decomp truth: the span is `word_8E9E62[28]` —
+current-frame button block (words 0-13) + previous-frame block (words
+14-27, shifted by sub_562350). The VANILLA input updater rewrites these
+blocks from its own per-side hardware view (the mod's SDL/harness feed)
+at PASS cadence; the mod's netplay overwrite fixes only words 0-9, also
+at pass cadence, while engine2's pre-tick hashing runs at SIM cadence.
+The window is therefore per-side volatile by construction (catch-up
+passes make even mod-written words stale-by-one per side).
+
+In netplay the sim's input authority is the mod timeline (dispatcher-fed;
+vanilla `Input_PackButtons` packs words 0-9 on non-netplay paths only)
+and entity-consumed inputs are hashed inside the entity blocks — so the
+live-word window is a frontend MIRROR, not sim state (INV-22: same class
+as F2/F4/F5).
+
+**Fix**: `HashInputSpanMasked` in game_snapshot.cpp — the gameplay digest
+folds only bytes [76,208) of each span (charsel committed data + the
+baseline-zeroed title word). Capture/restore remain FULL-span. The
+baseline agreement breakdown's `p1/p2_input_crc` cover the same stable
+tail (the peers compute breakdowns at different wall instants, so
+volatile bytes would false-fail the rendezvous). Hash-membership change —
+cross-build incompatible (constraint 3 applies).
+
+### F7c — attempt-2 second finding (run 17-58-4x): per-pass sound-dedup scratch hashed at sim cadence
+
+With F7/F7b deployed, the pair ran 780 clean confirmed frames (vs 0
+before) and desynced at f780 — one frame before the match's FIRST attack
+input (0x0009 at f781), rng/hp still identical, and the two 64-bit hashes
+agreeing in their LOW 32 bits. Block64's prime is 2^32+0x1b3, so the low
+half of the digest depends only on the low half of each 8-byte block: the
+divergent bytes sat exclusively at +4..+7 of hashed 8-byte blocks.
+
+That fingerprint identified `per_frame_temp` (0x76CCF8, main offset
+0x700, 68 bytes): the per-PASS sound-dedup array (byte per sound id;
+vanilla clears it at the top of each Game_Update_MatchLoop pass, entities
+mark bytes when sounds trigger, `rollback_audio.cpp` reads it for
+dedup). It evolves at PASS cadence but was hashed at SIM cadence: the
+2nd+ tick of any multi-tick pass (engine2 replay ticks after a rollback,
+straight-path catch-up passes) captures the previous same-pass tick's
+marks, and pass boundaries are inherently per-side. First sound of the
+match (attack whiff, ids 4-7 = high half of the 0x700 block) + first
+rollback = guaranteed mismatch.
+
+**Fix**: new leading entry in `kMainDigestMasks`
+({MATCH_PER_FRAME_TEMP_OFFSET, MATCH_PER_FRAME_TEMP_SIZE}) — same class
+as F2/F4/F5 (pass-cadence state, audio-only, no sim reader). Capture and
+restore are unchanged (restore's explicit clear = vanilla pass-top
+semantics). Digest-membership change — constraint 3 applies.
+
+### F7d — OPEN: one more per-side volatile window in the hashed membership (attempt-3 run 18-03-4x)
+
+With F7+F7b+F7c deployed, attempt 3 reached f649 confirmed frames clean
+and then hit the SAME fingerprint again: `rollbacks=0 on BOTH sides`
+(engine session end lines), all confirmed inputs 0x0000 for 8+ frames
+before the divergence, rng/hp identical, and the two hashes equal in
+their LOW 32 bits (f649: xxxx6ce9002a / f659: xxxxdab19d90).
+
+What the fingerprint proves:
+- No rollback ⇒ the divergence arises in STRAIGHT-PATH pre-tick captures
+  — a pass-cadence writer sampled at sim cadence (the run was heavily
+  loaded: sim_fps 35-37, slew_ppm up to 10000, frames_ahead ±5, so
+  multi-tick catch-up passes were constant and per-side).
+- Low-32 equality ⇒ every divergent byte sits at offset 4..7 of an
+  8-byte block relative to its fold-segment start (Block64 prime is
+  2^32+0x1b3; the low half of the state never sees a block's high half).
+- Header scalars that appear in LOW halves (rng, match_phase_timer,
+  input_read_idx=0x816490, input_write_idx, frame_display) are therefore
+  PROVEN equal — which also rules out sim_frame (same address as
+  read_idx). Remaining header high-half candidates: substate, game_type
+  (static), effect_index (0x76C5E8 — sole writer Effect_Enqueue looks
+  sim-cadence, but sub_4AB0F0, the render-phase effect-queue draw, is
+  still the audit's un-disassembled TODO). Otherwise: an odd-dword-
+  aligned window inside match_context (weather/camera/HUD sub-blocks).
+
+Next-step diagnostics (not yet run):
+1. Extend DesyncDump to persist the raw SimHeader + per-64-byte-window
+   CRCs of match_context AT THE CONFIRM SEAM for the ring frames (the
+   current region CRCs are detection-instant live memory — post-
+   divergence, useless for localization).
+2. Set AS2_SYNC_TRACE=1 (not just _INTEGRITY) so the synctrace CSVs get
+   rows — integrity mode alone compares but does not write CSV.
+3. One-off disassembly of sub_4AB0F0 (constraint TODO #2) to close the
+   effect_index question.
+
+Verified progression across the three 2026-08-17 live attempts:
+f29 (attempt 1, pre-F7b) → f780 (attempt 2, F7b) → f649-with-zero-
+rollbacks (attempt 3, F7c): each mask removed a confirmed volatile
+window; at least one remains.

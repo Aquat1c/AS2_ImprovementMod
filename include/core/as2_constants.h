@@ -289,6 +289,16 @@
 // Just-pressed array is 10 words (20 bytes) at base + 56.
 #define INPUT_STATE_SIZE        20
 
+// Title-screen state dword (decomp dword_8EA000): LOWORD = attract-timeout
+// counter (0..1800), BYTE2 = title menu cursor. Its low WORD sits INSIDE the
+// last two bytes of the P2 input-buffer span (0x8E9F32 + 208 = 0x8EA002), so
+// per-side title wall-time residue leaks into every baseline capture and
+// engine2 sync hash unless zeroed at the synchronized pre-capture point
+// (2026-08-17 f0 confirmed-desync root cause, live-verified: host held 0x0072
+// there, instB 0x0000).
+#define ADDR_TITLE_SCREEN_STATE          0x8EA000
+#define TITLE_STATE_IN_INPUT_SPAN_SIZE   2
+
 #define ADDR_INPUT_READ_IDX     0x816490
 #define ADDR_INPUT_DISPLAY_IDX  0x816494
 #define ADDR_INPUT_WRITE_IDX    0x816498
@@ -333,10 +343,15 @@
 #define ADDR_GAME_MAINLOOP      0x5D2AC0
 #define DXLIB_PHANTOM_WINKEY_VK 0x07
 
-// Frame-limiter busy-spin cluster inside Game_MainLoop (decomp L266504–266510):
-//   call sub_635F80 / sub eax,[ADDR_LAST_FRAME_TIME] / cmp eax,17 / jl (spin)
-// The re0.7 FrameScheduler byte-signature-scans this window and detours the
-// cluster to FrameScheduler_WaitForNextFrame (src/patches/frame_scheduler.cpp);
+// Frame-limiter busy-spin cluster inside Game_MainLoop (decomp L266504–266510).
+// REAL shipping-exe bytes (cluster at 0x5D2C01, verified 2026-08-17 — the
+// decomp's `sub eax,[mem]` form does not exist in the binary): two identical
+// 21-byte blocks `push 0 / call sub_635F80 / mov edx,[ADDR_LAST_FRAME_TIME] /
+// add esp,4 / sub eax,edx / cmp eax,17`, joined head `7D 17` (jge over the
+// loop) and loop `7C E9` (jl back) — 46 bytes; the dword_816360 re-stamp at
+// 0x5D2C2F follows and is left untouched. The re0.7 FrameScheduler
+// byte-signature-scans this window and detours the cluster to
+// FrameScheduler_WaitForNextFrame (src/patches/frame_scheduler.cpp);
 // the signature must match exactly once or the install fails loud (risk R-1).
 #define ADDR_FRAME_LIMITER_SCAN_BEGIN  ADDR_GAME_MAINLOOP
 #define ADDR_FRAME_LIMITER_SCAN_SIZE   0x600

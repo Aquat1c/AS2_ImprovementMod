@@ -704,6 +704,17 @@ static void UpdateStarvationInterrogation() {
     if (!s_epochActive || !s_inputPhaseActive) {
         return;
     }
+    if (!s_receivedRemoteInputThisPhase) {
+        // Phase-begin grace: the counter only ARMS once the first remote frame
+        // of this phase has ever arrived. Peers enter a phase at different
+        // wall times, so a fresh phase legitimately starts silent — the
+        // 2026-08-17 live run fired this interrogation at charsel frame 0 on a
+        // healthy link (both sides, §4 checklist violation). Pre-first-contact
+        // silence belongs to the supervisor's silence ladder (INV-14), not to
+        // the INV-11 interrogation.
+        s_starvedFrames = 0;
+        return;
+    }
     if (HasRemoteInputFrame(s_consumeFrame)) {
         s_starvedFrames = 0;
         s_resyncAwaitingReply = false;

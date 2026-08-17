@@ -337,6 +337,24 @@ static void AiLearnGuard_Restore(const char* why) {
 // Bootstrap → Rollback Handoff
 // ============================================================================
 
+// Mirrors savestate.cpp ComputeMainChecksum(): CRC of {main-region CRC,
+// effect_index}. The 2026-08-17 run compared a RAW region CRC against the
+// baseline's FOLDED checksum here and logged "match=NO" for a restore the
+// savestate layer itself had verified byte-exact ("RESTORED OK ... match") —
+// apples to oranges, not a failed restore. Comparisons against
+// bootSnap.local_baseline_crc must use this folded form.
+static uint32_t ComputeBaselineComparableCRC() {
+    struct ChecksumParts {
+        uint32_t main_crc;
+        uint32_t effect_index;
+    } parts{};
+    parts.main_crc = CalcCRC32(
+        (const void*)ADDR_MATCH_BASE,
+        (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+    parts.effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
+    return CalcCRC32(&parts, sizeof(parts));
+}
+
 static bool PrepareBaselineForInteractiveRelease() {
     if (s_liveReleaseArmed) {
         return true;
@@ -369,9 +387,9 @@ static bool PrepareBaselineForInteractiveRelease() {
         bootSnap.gameplay_start_host_game_abs_frame);
 
     // Preserve hard startup alignment before deterministic intro runs.
-    uint32_t preRestoreCRC = CalcCRC32(
-        (const void*)ADDR_MATCH_BASE,
-        (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+    // Folded form (main CRC + effect_index) — the like-for-like comparand of
+    // s_baselineCRC (see ComputeBaselineComparableCRC above).
+    uint32_t preRestoreCRC = ComputeBaselineComparableCRC();
     NetplayLog_Write("HANDOFF", preIntroGameAbsFrame,
         "Pre-restore CRC=0x%08X (baseline=0x%08X match=%s)",
         preRestoreCRC,
@@ -382,9 +400,7 @@ static bool PrepareBaselineForInteractiveRelease() {
         WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, 0);
         WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, 0);
 
-        uint32_t postRestoreCRC = CalcCRC32(
-            (const void*)ADDR_MATCH_BASE,
-            (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
+        uint32_t postRestoreCRC = ComputeBaselineComparableCRC();
         NetplayLog_Write("HANDOFF", 0,
             "Baseline RESTORED before intro: crc=0x%08X match=%s sim=0 writeIdx=0",
             postRestoreCRC,

@@ -506,6 +506,31 @@ static void TestStarvationInterrogationAndEscalationLadder() {
     Net::FrontendInputSync_CaptureLocalInput(0);
     ClearSentPackets();
 
+    // Phase-begin grace: before the FIRST remote frame of the phase has ever
+    // arrived, the starvation clock stays disarmed no matter how long the
+    // phase runs — peers enter a phase at different wall times, so a fresh
+    // phase legitimately starts silent (the 2026-08-17 live run fired the
+    // interrogation at charsel frame 0 on a healthy link; §4 requires zero
+    // interrogations on healthy links).
+    for (int i = 0; i < 300; ++i) {
+        Net::FrontendInputSync_FrameUpdate();
+    }
+    TEST_CHECK(FindLastPacket(Net::PacketType::ResyncRequest) == nullptr,
+        "a phase that has never seen a remote frame must not interrogate");
+
+    // Arm the clock: deliver and consume the phase's first remote frame, then
+    // starve on frame 1.
+    const uint32_t epochId = Net::FrontendInputSync_GetEpochId();
+    Net::CharSelFrameInputPayload frame0 =
+        MakeFrameInput(epochId, Net::FrontendSyncPhase::CharSel, 0, 0x0000);
+    Net::FrontendInputSync_OnRemoteCharSelFrameInput(&frame0);
+    uint16_t armLocal = 0;
+    uint16_t armRemote = 0;
+    TEST_CHECK(Net::FrontendInputSync_ConsumeCurrentFrame(&armLocal, &armRemote, nullptr),
+        "the arming remote frame should consume normally");
+    Net::FrontendInputSync_CaptureLocalInput(0);
+    ClearSentPackets();
+
     // 120 lockstep ticks of zero accepted remote frames -> ResyncRequest
     // (INV-11: interrogate on a live transport, never time out silently).
     for (int i = 0; i < 120; ++i) {

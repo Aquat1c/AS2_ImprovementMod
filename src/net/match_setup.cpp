@@ -1725,6 +1725,51 @@ static void HandleBaselineMismatch() {
     SetPhase(PregamePhase::Error, "baseline mismatch (after retry)");
 }
 
+// ── Baseline input-residue normalization (2026-08-17 f0 desync fix) ─────────
+// The engine2 sync hash covers both 208-byte global input spans
+// (ADDR_P1/P2_INPUT_BUFFER → GameSnapshot input_p1/p2), but the baseline
+// AGREEMENT digest historically did not — per-side frontend residue inside
+// those spans sailed through "baseline agreed" and guaranteed a confirmed
+// desync at rb frame 0. Live evidence (logs 2026-08-17_17-25-3x, both dumps):
+//   (a) held/just-pressed navigation words (span offsets +4/+6 and +32/+34)
+//       held each side's LAST charsel key — differing by construction;
+//   (b) the P2 span's final two bytes overlap the title-screen attract
+//       counter LOWORD (dword_8EA000): 0x0072 host vs 0x0000 instB — pure
+//       wall-time residue (nicknames verified NOT in these spans).
+// Fix: at this synchronized frozen boundary (both peers halted by the load
+// barrier immediately before capture) zero the frontend-SAFE input words,
+// the 20-byte just-pressed states, and the 2 title-counter bytes on BOTH
+// sides. The unsafe charsel tail (committed char IDs/palettes) is
+// session-synced data and must NOT be cleared (rematch_cleanup.cpp tail
+// guard); it is covered by the agreement digest instead (baseline_sync.cpp),
+// so residual divergence there fails loud at baseline, not at f0.
+static void ZeroFrontendInputResidueForBaseline() {
+    constexpr size_t kSafeSpan = ADDR_P1_INPUT_STATE - ADDR_P1_INPUT_BUFFER;
+    static_assert(kSafeSpan == 56,
+        "frontend-safe input span changed; re-verify charsel tail layout");
+    static const uint8_t zeroSafe[kSafeSpan] = {};
+    static const uint8_t zeroState[INPUT_STATE_SIZE] = {};
+    static const uint8_t zeroTitle[TITLE_STATE_IN_INPUT_SPAN_SIZE] = {};
+
+    bool ok = true;
+    ok &= WriteMemoryBlockSafe((void*)ADDR_P1_INPUT_BUFFER, zeroSafe, sizeof(zeroSafe));
+    ok &= WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_BUFFER, zeroSafe, sizeof(zeroSafe));
+    ok &= WriteMemoryBlockSafe((void*)ADDR_P1_INPUT_STATE, zeroState, sizeof(zeroState));
+    ok &= WriteMemoryBlockSafe((void*)ADDR_P2_INPUT_STATE, zeroState, sizeof(zeroState));
+    ok &= WriteMemoryBlockSafe((void*)ADDR_TITLE_SCREEN_STATE, zeroTitle, sizeof(zeroTitle));
+
+    Rollback::NetplayLog_Write("BASELINE", -1,
+        "Pre-capture input-residue zero: safe=%u state=%u title=%u ok=%d "
+        "(hashed spans must be cross-side identical by construction)",
+        (unsigned)sizeof(zeroSafe),
+        (unsigned)sizeof(zeroState),
+        (unsigned)sizeof(zeroTitle),
+        ok ? 1 : 0);
+    LOG_NETPLAY(LOG_INFO,
+        "[MatchSetup] Zeroed frontend input residue before baseline capture (ok=%d)",
+        ok ? 1 : 0);
+}
+
 static void UpdateBootstrapBaseline() {
     UpdateBootstrapFreezeForBoundary();
 
@@ -1757,6 +1802,10 @@ static void UpdateBootstrapBaseline() {
             // Both peers must have identical CRT rand state for the captured
             // savestate CRCs to match.
             DetVer_SetRngSeed(s_lockedConfig.session_seed);
+
+            // Hashed input spans must be cross-side identical by
+            // construction before the capture (f0 desync fix, 2026-08-17).
+            ZeroFrontendInputResidueForBaseline();
 
             if (Savestate_CaptureRollbackBaseline()) {
                 const SavestateInfo* info = Savestate_GetRollbackBaselineInfo();

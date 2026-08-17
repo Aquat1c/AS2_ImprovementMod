@@ -39,6 +39,19 @@ constexpr size_t kP1EntityOff = ADDR_P1_ENTITY_BASE - ADDR_MATCH_BASE;
 constexpr size_t kP2EntityOff = ADDR_P2_ENTITY_BASE - ADDR_MATCH_BASE;
 
 constexpr MaskRange kMainDigestMasks[] = {
+    // F7c: the 68-byte per-PASS sound-dedup scratch (vanilla clears it at
+    // the top of each Game_Update_MatchLoop pass; entities mark bytes when
+    // sounds trigger; audio-only, no sim reader — rollback_audio.cpp owns
+    // rollback-safe dedup). Pre-tick hashes sample it at SIM cadence while
+    // it evolves at PASS cadence: the 2nd+ tick of ANY multi-tick pass
+    // (engine2 replay ticks, straight-path catch-up passes) sees the
+    // previous same-pass tick's marks, and pass boundaries are per-side —
+    // guaranteed cross-side hash noise the moment any sound plays
+    // (2026-08-17 attempt-2 f780 desync: first attack whiff of the match,
+    // low-32 hash halves equal = divergent bytes only at +4..7 of 8-byte
+    // blocks = sound ids 4-7). Captured+restored as before (restore's
+    // explicit clear = vanilla pass-top semantics); digest-masked only.
+    { (size_t)MATCH_PER_FRAME_TEMP_OFFSET, (size_t)MATCH_PER_FRAME_TEMP_SIZE },        // F7c
     { kP1EntityOff + ENTITY_OFF_RENDER_TINT_STATE, ENTITY_RENDER_TINT_MASK_SIZE },     // F5
     { kP1EntityOff + ENTITY_OFF_SUPERBG_STATE,     ENTITY_SUPERBG_SCRATCH_MASK_SIZE }, // F2
     { kP1EntityOff + ENTITY_OFF_VOICE_BOOKKEEPING, ENTITY_VOICE_BOOKKEEPING_SIZE },    // F4
@@ -74,6 +87,41 @@ uint64_t HashMainMasked(uint64_t h, const uint8_t* mainBytes) {
         pos = kMainDigestMasks[i].offset + kMainDigestMasks[i].size;
     }
     return Block64_Update(h, mainBytes + pos, kMainSize - pos);
+}
+
+// ── Input-span digest mask (F7b, 2026-08-17 live run 17-47-0x) ──────────────
+// Each 208-byte global input span (word_8E9E62[28] layout) is:
+//   +0..+55     current-frame button block (words 0-13) + vanilla
+//               previous-frame block (words 14-27). The VANILLA input
+//               updater rewrites these from its own per-side hardware view
+//               (harness/SDL feed) at PASS cadence; the mod's netplay
+//               overwrite fixes only words 0-9 and runs at pass cadence
+//               too, while pre-tick hashing runs at SIM cadence — catch-up
+//               passes make even the mod-written words stale-by-one
+//               per side. Attempt-1 live evidence (17-47-0x): prev-block
+//               LEFT vs RIGHT at +32/+34 diverged the f0 hash with ALL
+//               confirmed inputs 0x0000 and rng/hp identical.
+//   +56..+75    just-pressed state — mod-written from the same pass-cadence
+//               values: identical skew hazard.
+//   +76..+205   charsel committed data — session-synced, static: hashed.
+//   +206..+207  (P2 span only) title-counter LOWORD overlap — zeroed at
+//               baseline capture, inert during the session: hashed.
+// In netplay the sim's input authority is the mod timeline (the dispatcher
+// feeds it directly; vanilla Input_PackButtons packs words 0-9 only on
+// non-netplay paths), and entity-consumed inputs live in the hashed entity
+// blocks — so masking the live-word window [0,76) cannot hide a real
+// divergence; it removes the per-side-volatile frontend mirror from the
+// digest (same class as the F2/F4/F5 main-region masks). Capture/restore
+// stay FULL-span (rollback must reproduce the bytes locally); only digest
+// membership changes. Segmentation is part of the Block64 value →
+// cross-build incompatible, and HashGameplay/HashGameplayLive MUST share
+// this helper.
+constexpr size_t kInputSpanVolatileEnd = 76; // button blocks + just-pressed
+
+uint64_t HashInputSpanMasked(uint64_t h, const uint8_t* span) {
+    h = Block64_Update(h, span + kInputSpanVolatileEnd,
+                       GAME_SNAPSHOT_INPUT_SIZE - kInputSpanVolatileEnd);
+    return h;
 }
 
 uint32_t SnapshotChecksum(const uint8_t* mainState, size_t mainSize, uint32_t effectIndex) {
@@ -278,8 +326,8 @@ uint64_t GameSnapshot_HashGameplay(const GameSnapshot* snapshot) {
     h = Block64_Update(h, &header, sizeof(header));
     h = HashMainMasked(h, snapshot->main_state);
     h = Block64_Update(h, snapshot->ai_learn, sizeof(snapshot->ai_learn));
-    h = Block64_Update(h, snapshot->input_p1, sizeof(snapshot->input_p1));
-    h = Block64_Update(h, snapshot->input_p2, sizeof(snapshot->input_p2));
+    h = HashInputSpanMasked(h, snapshot->input_p1);
+    h = HashInputSpanMasked(h, snapshot->input_p2);
     return h;
 }
 
@@ -323,8 +371,8 @@ bool GameSnapshot_HashGameplayLive(uint64_t* outHash) {
         h = Block64_Update(h, &header, sizeof(header));
         h = HashMainMasked(h, (const uint8_t*)kMainStart);
         h = Block64_Update(h, (const void*)kAiLearnStart, kAiLearnSize);
-        h = Block64_Update(h, (const void*)kInputP1Start, kInputSize);
-        h = Block64_Update(h, (const void*)kInputP2Start, kInputSize);
+        h = HashInputSpanMasked(h, (const uint8_t*)kInputP1Start);
+        h = HashInputSpanMasked(h, (const uint8_t*)kInputP2Start);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }

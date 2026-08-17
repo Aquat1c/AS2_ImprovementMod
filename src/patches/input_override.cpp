@@ -2715,7 +2715,7 @@ int __cdecl Hook_InputProcess(int gameState) {
         }
     };
 
-    auto readSdlFrontendInputs = [](uint16_t* outP1, uint16_t* outP2) {
+    auto readSdlFrontendInputs = [gameMode](uint16_t* outP1, uint16_t* outP2) {
         const uint16_t allowedMask = (INPUT_UP | INPUT_DOWN | INPUT_LEFT | INPUT_RIGHT |
                                       INPUT_A | INPUT_B | INPUT_C | INPUT_D |
                                       INPUT_START | INPUT_SELECT);
@@ -2730,6 +2730,17 @@ int __cdecl Hook_InputProcess(int gameState) {
         // accidentally reintroduce a second local controller.
         if (Net::Session_IsConnected()) {
             currentP2 = 0;
+
+            // Connected mode-8 frames NOT owned by the rollback session are
+            // the bootstrap freeze + the 25-frame deterministic intro + the
+            // post-match transition. The live input words are part of the
+            // engine2 sync hash (GameSnapshot input_p1/p2): local raw input
+            // written here during the intro would bake per-side residue into
+            // the rb frame 0 state — same class as the 2026-08-17 f0
+            // confirmed desync. Neutral is the only deterministic value.
+            if (gameMode == MODE_MATCH && !Rollback::RollbackSession_IsActive()) {
+                currentP1 = 0;
+            }
         }
 
         if (InputSystem_GetControlSwap()) {

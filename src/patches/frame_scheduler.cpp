@@ -4,15 +4,23 @@
  * Win32 driver around the pure core (frame_scheduler_core.h):
  *
  *   - Install: byte-signature scan of the frame-limiter busy-spin cluster at
- *     the bottom of Game_MainLoop (0x5D2AC0, decomp L266504–266510):
- *         E8 <rel32 → sub_635F80>   call Sys_GetTimeMs
- *         2B 05 60 63 81 00         sub  eax, dword_816360
+ *     the bottom of Game_MainLoop (0x5D2AC0). The decomp-derived pattern
+ *     (`sub eax,[816360]`) does NOT exist in the shipping exe; the REAL bytes
+ *     (read from as2.exe .text, verified 2026-08-17, cluster at 0x5D2C01) are
+ *     a head check + spin loop, each block being:
+ *         6A 00                     push 0
+ *         E8 <rel32 → sub_635F80>   call Sys_GetTimeMs(0)
+ *         8B 15 60 63 81 00         mov  edx, dword_816360
+ *         83 C4 04                  add  esp, 4
+ *         2B C2                     sub  eax, edx
  *         83 F8 11                  cmp  eax, 17
- *         7C xx / 0F 8C xx..        jl   (backward, the spin)
- *     The whole cluster is replaced with `call FrameScheduler_WaitForNextFrame`
- *     + NOPs, so the vanilla `jl` is structurally neutralized. The re-stamp
- *     that follows (`call sub_635F80; mov dword_816360, eax`) is untouched, so
- *     `dword_816360` and the vanilla FPS counter stay coherent.
+ *     head block + `7D 17` (jge over the loop), then the identical loop block
+ *     + `7C E9` (jl back to the loop head) — 46 bytes total.
+ *     The whole 46-byte cluster is replaced with
+ *     `call FrameScheduler_WaitForNextFrame` + NOPs, so both vanilla jumps are
+ *     structurally neutralized. The re-stamp that follows at 0x5D2C2F
+ *     (`push 0; call sub_635F80; mov dword_816360, eax`) is untouched, so
+ *     `dword_816360` and the vanilla FPS counter stay coherent (M2 journal).
  *     The signature must match EXACTLY once or the install fails loud and the
  *     legacy virtual-clock path stays active (risk R-1).
  *
@@ -52,7 +60,7 @@ namespace {
 
 // ── Install state ───────────────────────────────────────────────────────────
 
-constexpr uint32_t kMaxPatchLen = 20;
+constexpr uint32_t kMaxPatchLen = 46;
 
 bool      s_installed = false;
 uintptr_t s_patchAddr = 0;
@@ -148,6 +156,31 @@ bool ReadSchedulerEnabledSetting() {
     return !(value[0] == L'0' && value[1] == L'\0');
 }
 
+// One elapsed-time check block of the limiter (21 bytes):
+//   push 0 / call Sys_GetTimeMs / mov edx,[dword_816360] / add esp,4 /
+//   sub eax,edx / cmp eax,17
+// Empirical bytes from the shipping exe (0x5D2C01 / 0x5D2C18) — the decomp's
+// `sub eax,[mem]` form never matched (2026-08-17 live-run finding).
+constexpr uint32_t kLimiterBlockLen = 21;
+// Full cluster: head block + jge-short over the loop + loop block + jl-short
+// back to the loop head.
+constexpr uint32_t kLimiterClusterLen = kLimiterBlockLen + 2 + kLimiterBlockLen + 2;
+static_assert(kLimiterClusterLen <= kMaxPatchLen, "patch buffer too small");
+
+bool MatchLimiterBlock(const uint8_t* p) {
+    if (p[0] != 0x6A || p[1] != 0x00) return false;          // push 0
+    if (p[2] != 0xE8) return false;                          // call rel32
+    const int32_t rel = *reinterpret_cast<const int32_t*>(p + 3);
+    const uintptr_t target = (uintptr_t)(p + 7) + (intptr_t)rel;
+    if (target != (uintptr_t)ADDR_GET_TICK) return false;
+    if (p[7] != 0x8B || p[8] != 0x15) return false;          // mov edx, [imm32]
+    if (*reinterpret_cast<const uint32_t*>(p + 9) != (uint32_t)ADDR_LAST_FRAME_TIME) return false;
+    if (p[13] != 0x83 || p[14] != 0xC4 || p[15] != 0x04) return false;  // add esp, 4
+    if (p[16] != 0x2B || p[17] != 0xC2) return false;        // sub eax, edx
+    if (p[18] != 0x83 || p[19] != 0xF8 || p[20] != 0x11) return false;  // cmp eax, 17
+    return true;
+}
+
 // Finds the limiter cluster. Must match exactly once in the Game_MainLoop
 // scan window or the install refuses (fail loud, R-1).
 bool FindLimiterCluster(uintptr_t* outAddr, uint32_t* outLen) {
@@ -156,32 +189,22 @@ bool FindLimiterCluster(uintptr_t* outAddr, uint32_t* outLen) {
     uintptr_t addr = 0;
     uint32_t len = 0;
 
-    for (uint32_t off = 0; off + kMaxPatchLen <= ADDR_FRAME_LIMITER_SCAN_SIZE; ++off) {
+    for (uint32_t off = 0; off + kLimiterClusterLen <= ADDR_FRAME_LIMITER_SCAN_SIZE; ++off) {
         const uint8_t* p = base + off;
-        if (p[0] != 0xE8) continue;
-        const int32_t rel = *reinterpret_cast<const int32_t*>(p + 1);
-        const uintptr_t target = (uintptr_t)(p + 5) + (intptr_t)rel;
-        if (target != (uintptr_t)ADDR_GET_TICK) continue;
-        // sub eax, dword_816360
-        if (p[5] != 0x2B || p[6] != 0x05) continue;
-        if (*reinterpret_cast<const uint32_t*>(p + 7) != (uint32_t)ADDR_LAST_FRAME_TIME) continue;
-        // cmp eax, 17
-        if (p[11] != 0x83 || p[12] != 0xF8 || p[13] != 0x11) continue;
-        uint32_t thisLen = 0;
-        if (p[14] == 0x7C) {
-            // jl short — must be a backward jump (the spin)
-            if ((int8_t)p[15] >= 0) continue;
-            thisLen = 16;
-        } else if (p[14] == 0x0F && p[15] == 0x8C) {
-            // jl near — backward
-            if (*reinterpret_cast<const int32_t*>(p + 16) >= 0) continue;
-            thisLen = 20;
-        } else {
-            continue;
-        }
+        // Head check block, then jge short hopping exactly over the spin loop.
+        if (!MatchLimiterBlock(p)) continue;
+        const uint8_t* jge = p + kLimiterBlockLen;
+        if (jge[0] != 0x7D) continue;
+        if ((int8_t)jge[1] != (int8_t)(kLimiterBlockLen + 2)) continue;
+        // The spin-loop body: identical block, then jl short back to its head.
+        const uint8_t* loop = jge + 2;
+        if (!MatchLimiterBlock(loop)) continue;
+        const uint8_t* jl = loop + kLimiterBlockLen;
+        if (jl[0] != 0x7C) continue;
+        if ((int8_t)jl[1] != -(int8_t)(kLimiterBlockLen + 2)) continue;
         ++found;
         addr = (uintptr_t)p;
-        len = thisLen;
+        len = kLimiterClusterLen;
     }
 
     if (found != 1) {
@@ -510,11 +533,10 @@ bool FrameScheduler_Install() {
     s_installed = true;
 
     LOG_INFO("[FrameScheduler] Limiter detour installed at 0x%08X (len=%u, "
-             "jl_form=%s): cadence=%s qpf=%llu period_ticks=%llu — mod owns "
-             "the clock (INV-5/INV-17); Hook_GetTick pinned to 1.0",
+             "head+jge+loop+jl cluster): cadence=%s qpf=%llu period_ticks=%llu "
+             "— mod owns the clock (INV-5/INV-17); Hook_GetTick pinned to 1.0",
              (unsigned)addr,
              len,
-             len == 16 ? "short" : "near",
              s_compat58 ? Sched::kCadenceCompat58.name : Sched::kCadenceProper60.name,
              (unsigned long long)s_qpf,
              (unsigned long long)s_clock.PeriodTicks());

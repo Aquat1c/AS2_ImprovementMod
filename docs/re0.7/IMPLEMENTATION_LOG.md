@@ -2356,3 +2356,76 @@ frame_arithmetic 31/0, frame_scheduler 44/0, engine2 293/0 (microbench
 snapshot=253 KB, save p99 4 µs / restore p99 3 µs / hash p99 99 µs),
 transition_barrier PASS, determinism 608/0 (includes the forced-rollback
 and multi-epoch savestate-path cells).
+
+---
+
+## 2026-08-17 — Live bring-up: f0 confirmed-desync root cause + fix (F7)
+
+### Problem
+
+First two-instance acceptance run (logs 2026-08-17_17-25-3x) hit a
+ConfirmedDesync at rb f29 (first hash-exchange cadence point) with f0
+already divergent. Handoff was byte-identical cross-side; divergence was
+confined to the two 208-byte global input spans + the entity blocks.
+
+### Root cause (full narrative in SAVESTATE_AUDIT.md §9, F7)
+
+Per-side frontend residue inside the hashed input spans at baseline
+capture: charsel navigation held/just words (+4/+6, +32/+34) and the
+title-screen attract-counter LOWORD (dword_8EA000) overlapping the last
+two bytes of the P2 span (host 0x0072 vs instB 0x0000). The baseline
+agreement digest did not cover the spans, so "baseline agreed" passed;
+the engine2 sync hash does cover them, so f0 mismatched by construction,
+and the 25-frame deterministic intro spread the divergence into the
+entity input-action arrays.
+
+### Changes
+
+- `as2_constants.h`: `ADDR_TITLE_SCREEN_STATE` (0x8EA000) +
+  `TITLE_STATE_IN_INPUT_SPAN_SIZE` (2) with overlap documentation.
+- `match_setup.cpp`: `ZeroFrontendInputResidueForBaseline()` — symmetric
+  zero of frontend-safe words + just-pressed states + title-counter bytes
+  at the frozen boundary right before every baseline capture (first match
+  AND rematch epochs). Charsel tail untouched (rematch tail-guard
+  constraint).
+- `baseline_sync.cpp`: agreement digest now folds `p1_input_crc` /
+  `p2_input_crc` — span divergence fails loud at the rendezvous.
+- `input_override.cpp`: SDL frontend path forces neutral local input for
+  connected mode-8 frames not owned by the rollback session (intro
+  keypress hole).
+- `match_director.cpp`: `ComputeBaselineComparableCRC()` — pre/post-restore
+  handoff log lines now compare folded-vs-folded (the old raw-vs-folded
+  comparison printed a false "match=NO"; the restore was verified
+  byte-exact by the savestate layer all along).
+
+### Also reconciled (source ↔ deployed 17:25:02 DLL)
+
+frame_scheduler.cpp real two-block limiter cluster (46 bytes at 0x5D2C01,
+head+jge(7D 17)+loop+jl(7C E9)) and frontend_input_sync.cpp starvation
+interrogation phase-begin grace (arms only after first remote frame of the
+phase) were already present in the working tree — verified, not re-applied.
+
+### Attempt-2 refinement (F7b, same day)
+
+Attempt 1 with the F7 zeroing still desynced at f0: the span residue is
+re-acquired AFTER restore because the vanilla input updater maintains the
+current+previous button blocks from each side's local hardware view at
+pass cadence (span layout `word_8E9E62[28]`, prev block at +28 shifted by
+sub_562350). The window is a frontend mirror, not sim state (dispatcher
+feeds the sim from the mod timeline in netplay; entity blocks carry the
+consumed inputs). Fix: `HashInputSpanMasked` — gameplay digest and the
+baseline breakdown span CRCs now cover only the stable tail [76,208)
+(charsel data + title word); capture/restore stay full-span. F2/F4/F5
+mask precedent; hash-membership change.
+
+### Attempt-3 fix (F7c, same day)
+
+Attempt 2 reached f780 clean (0 → 780 confirmed frames) and desynced on
+the match's first attack + first rollback with low-32 hash halves equal —
+Block64's 2^32+0x1b3 prime makes the low half independent of each
+block's high half, pinning the divergence to bytes +4..7 of hashed
+blocks: the per-pass sound-dedup scratch (main+0x700, 68 B). It is
+pass-cadence audio bookkeeping sampled by sim-cadence pre-tick hashes;
+multi-tick passes (replay ticks, catch-up) expose intra-pass marks and
+pass boundaries are per-side. Fixed by digest-masking it in
+kMainDigestMasks (F2/F4/F5 class); capture/restore unchanged.

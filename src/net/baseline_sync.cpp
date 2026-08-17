@@ -424,8 +424,17 @@ static BaselineBreakdownPayload CaptureCurrentBreakdown() {
     out.p2_agreement_crc = BuildEntityAgreementCRC(ADDR_P2_ENTITY_BASE);
 
     out.pre_match_gap_crc = SafeRegionCRC(ADDR_PRE_MATCH_GAP, PRE_MATCH_GAP_SIZE);
-    out.p1_input_crc = SafeRegionCRC(ADDR_P1_INPUT_BUFFER, INPUT_BUFFER_SIZE);
-    out.p2_input_crc = SafeRegionCRC(ADDR_P2_INPUT_BUFFER, INPUT_BUFFER_SIZE);
+    // Stable tail only (charsel committed data + title word): the first 76
+    // bytes are the pass-cadence live-word window (button blocks +
+    // just-pressed) that the vanilla updater rewrites per side — the same
+    // window the gameplay digest masks (game_snapshot.cpp F7b). The two
+    // peers compute their breakdowns at different wall instants, so any
+    // volatile byte here would false-fail the baseline rendezvous.
+    constexpr size_t kInputSpanStableOffset = 76;
+    out.p1_input_crc = SafeRegionCRC(ADDR_P1_INPUT_BUFFER + kInputSpanStableOffset,
+                                     INPUT_BUFFER_SIZE - kInputSpanStableOffset);
+    out.p2_input_crc = SafeRegionCRC(ADDR_P2_INPUT_BUFFER + kInputSpanStableOffset,
+                                     INPUT_BUFFER_SIZE - kInputSpanStableOffset);
     out.per_frame_temp_crc = SafeRegionCRC(ADDR_MATCH_PER_FRAME_TEMP, MATCH_PER_FRAME_TEMP_SIZE);
 
     out.rng_seed = DetVer_GetRngSeed();
@@ -661,12 +670,19 @@ uint32_t BaselineSync_ComputeAgreementDigest(const BaselineBreakdownPayload& pay
         uint32_t frame_simulation;
         uint32_t frame_write_idx;
         uint32_t frame_net_idx;
+        uint32_t p1_input_crc;
+        uint32_t p2_input_crc;
     } fields{};
 
     // Use only authoritative bootstrap state here. Raw header/context/full
     // entity CRCs still remain in the breakdown payload for diagnostics, but
     // they currently include process-local loader handles and frame-local UI
     // counters that differ even when the actual match configuration agrees.
+    // The 208-byte input spans ARE part of the agreement (2026-08-17 f0
+    // desync fix): the engine2 sync hash covers them, so the baseline
+    // rendezvous must fail loud if they differ — match_setup zeroes the
+    // frontend residue in them right before capture, leaving only
+    // session-synced charsel data, which must agree.
     fields.header_agreement_crc = payload.header_agreement_crc;
     fields.summon_crc = payload.summon_crc;
     fields.p1_agreement_crc = payload.p1_agreement_crc;
@@ -680,6 +696,8 @@ uint32_t BaselineSync_ComputeAgreementDigest(const BaselineBreakdownPayload& pay
     fields.frame_simulation = payload.frame_simulation;
     fields.frame_write_idx = payload.frame_write_idx;
     fields.frame_net_idx = payload.frame_net_idx;
+    fields.p1_input_crc = payload.p1_input_crc;
+    fields.p2_input_crc = payload.p2_input_crc;
 
     return CalcCRC32(&fields, sizeof(fields));
 }
