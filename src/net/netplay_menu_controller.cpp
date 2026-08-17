@@ -210,6 +210,11 @@ struct AutoConnectConfig {
     int      matchDurationSec;
     int      matchCount;
     int      continueNoEvery;   // M8 soak: answer NO on every Nth continue prompt (0 = always YES)
+    // Deep-soak variation (2026-08-17 expanded acceptance): per-iteration
+    // character/stage cycling so successive games use different matchups on
+    // different stages. 0 = fixed (legacy behavior).
+    int      charCycleStep;     // grid-index stride added per completed match
+    int      stageCycleStep;    // stage-grid RIGHT taps added per completed match
 };
 
 static AutoConnectConfig s_autoConnect = {};
@@ -238,6 +243,14 @@ static bool             s_autoConnectWinScreenPressed = false;
 static bool             s_autoConnectContinuePressed = false;
 static bool             s_autoConnectContinueNoToggled = false;
 static int              s_autoConnectContinueToggleFrame = 0;
+// Deep-soak variation: stage-grid navigation plan (RIGHT taps before the
+// grid confirm) and the safe cycling ranges. The char grid has 17 roster
+// cells in 3 columns; cycling stays within the first 15 (5 full rows) so a
+// navigation plan never walks into the partial last row. Stage cycling taps
+// RIGHT n times on the stage grid — the cursor wraps, so any stride is safe.
+static int              s_autoConnectStageNavRemaining = 0;
+static const int        kAutoConnectCharCycleCells = 15;
+static const int        kAutoConnectStageCycleSlots = 6;
 static int              s_autoConnectCompletedMatches = 0;
 static bool             s_autoRematchCleanupApplied = false;
 static DWORD            s_autoRematchLastAttemptAt = 0;
@@ -1763,6 +1776,19 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
     if (next == AutoConnectState::SelectingStage) {
         s_autoConnectStageGridPressed = false;
         s_autoConnectStageConfirmPressed = false;
+        // Deep-soak stage variation: tap RIGHT n times on the stage grid
+        // before confirming. Both peers compute the same plan (the match
+        // counter advances in lockstep), and only the stage owner's cursor
+        // is authoritative — the other side's identical taps are harmless.
+        s_autoConnectStageNavRemaining = s_autoConnect.stageCycleStep > 0
+            ? (s_autoConnectCompletedMatches * s_autoConnect.stageCycleStep)
+                  % kAutoConnectStageCycleSlots
+            : 0;
+        if (s_autoConnectStageNavRemaining > 0) {
+            LOG_NETPLAY(LOG_INFO,
+                "[AutoConnect] Stage navigation plan: match=%d -> right_taps=%d",
+                s_autoConnectCompletedMatches + 1, s_autoConnectStageNavRemaining);
+        }
     }
 
     if (next == AutoConnectState::SelectingCharacter) {
@@ -1770,8 +1796,20 @@ static void AutoConnectTransition(AutoConnectState next, const char* why) {
         // so index -> (index/3) DOWN taps + (index%3) RIGHT taps from the
         // default top-left cursor. Every rematch charsel re-enters this
         // state, so the plan resets with it.
-        const int grid = s_autoConnect.characterGridIndex > 0
+        // Deep-soak character variation: add a per-iteration stride so each
+        // game (via the NO->charsel route) is a different matchup. Cycling
+        // stays within the 15 full grid cells.
+        int grid = s_autoConnect.characterGridIndex > 0
             ? s_autoConnect.characterGridIndex : 0;
+        if (s_autoConnect.charCycleStep > 0) {
+            grid = (grid + s_autoConnectCompletedMatches * s_autoConnect.charCycleStep)
+                       % kAutoConnectCharCycleCells;
+            LOG_NETPLAY(LOG_INFO,
+                "[AutoConnect] CharSel cycle: match=%d base=%d step=%d -> grid=%d",
+                s_autoConnectCompletedMatches + 1,
+                s_autoConnect.characterGridIndex,
+                s_autoConnect.charCycleStep, grid);
+        }
         s_autoConnectNavDownRemaining = grid / kAutoConnectCharGridColumns;
         s_autoConnectNavRightRemaining = grid % kAutoConnectCharGridColumns;
         s_autoConnectConfirmAttempts = 0;
@@ -1937,6 +1975,14 @@ static void LoadAutoConnectConfig() {
             }
         } else if (_stricmp(key, "character_id") == 0) {
             s_autoConnect.characterGridIndex = atoi(val);
+        } else if (_stricmp(key, "char_cycle_step") == 0) {
+            // Deep-soak variation: grid-index stride per completed match.
+            int v = atoi(val);
+            if (v >= 0 && v < kAutoConnectCharCycleCells) s_autoConnect.charCycleStep = v;
+        } else if (_stricmp(key, "stage_cycle_step") == 0) {
+            // Deep-soak variation: stage-grid RIGHT taps per completed match.
+            int v = atoi(val);
+            if (v >= 0 && v < 16) s_autoConnect.stageCycleStep = v;
         } else if (_stricmp(key, "palette") == 0) {
             s_autoConnect.palette = atoi(val);
         } else if (_stricmp(key, "match_duration_sec") == 0) {
@@ -2223,10 +2269,33 @@ static void HandleAutoConnect() {
             }
 
             if (mode == MODE_CHARSEL && sub == CHARSEL_SUB_STAGESEL_GRID &&
-                (!s_autoConnectStageGridPressed ||
-                 (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
-                AutoConnectInjectPress(INPUT_A, "open stage confirm");
-                s_autoConnectStageGridPressed = true;
+                s_autoConnectStateFrames >= 31 &&
+                (s_autoConnectStateFrames % 20) == 0) {
+                // Deep-soak stage variation: walk the cursor before confirm,
+                // and never confirm a LOCKED stage — the grid handler
+                // (sub_5C0B20) silently refuses the confirm when
+                // byte_815FFF[cursor] != 1, which would strand the driver
+                // in an A-retry loop until the stage timeout. The cursor is
+                // the shared merged-input cursor, identical on both peers,
+                // so both sides converge on the same available slot.
+                const uint8_t stageCursor =
+                    *(volatile uint8_t*)ADDR_STAGE_CURSOR;
+                const uint8_t stageAvail = (stageCursor < 24)
+                    ? *(volatile uint8_t*)(ADDR_STAGE_AVAIL_TABLE + stageCursor)
+                    : (uint8_t)0;
+                if (s_autoConnectStageNavRemaining > 0 || stageAvail != 1) {
+                    AutoConnectInjectPress(INPUT_RIGHT,
+                        s_autoConnectStageNavRemaining > 0
+                            ? "navigate stage grid" : "skip locked stage");
+                    if (s_autoConnectStageNavRemaining > 0) {
+                        s_autoConnectStageNavRemaining--;
+                    }
+                } else if (!s_autoConnectStageGridPressed ||
+                           (s_autoConnectStateFrames > 300 &&
+                            (s_autoConnectStateFrames % 120) == 0)) {
+                    AutoConnectInjectPress(INPUT_A, "open stage confirm");
+                    s_autoConnectStageGridPressed = true;
+                }
             } else if (mode == MODE_CHARSEL && sub == CHARSEL_SUB_STAGESEL_CONFIRM &&
                        (!s_autoConnectStageConfirmPressed ||
                         (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
@@ -2339,7 +2408,23 @@ static void HandleAutoConnect() {
 
             if (sub == 3 && (!s_autoConnectWinScreenPressed ||
                              (s_autoConnectStateFrames > 300 && (s_autoConnectStateFrames % 120) == 0))) {
-                AutoConnectInjectPress(INPUT_A, "confirm win screen");
+                // NO-route fix (2026-08-17, run 19-53-3x evidence): the
+                // continue prompt consumes the winscreen LOCKSTEP stream, so
+                // the sub-3 confirm tap arrives inside the prompt ~frame 2 as
+                // a rising A and locks YES before this driver ever SEES
+                // sub 4 (prompt lifetime was 3 frames — the sub-4 toggle
+                // branch below can never win that race). ContinueFlow
+                // processes cursor toggles BEFORE lock edges within a frame,
+                // so injecting RIGHT+A as the confirm makes the same
+                // stream-delayed word toggle the cursor to NO and lock NO
+                // atomically. Both peers compute the same answer (match
+                // counter is lockstep), and any-NO routes both to charsel.
+                const bool answerNo = s_autoConnect.continueNoEvery > 0 &&
+                    ((s_autoConnectCompletedMatches + 1) % s_autoConnect.continueNoEvery == 0);
+                AutoConnectInjectPress(
+                    answerNo ? (uint16_t)(INPUT_RIGHT | INPUT_A) : INPUT_A,
+                    answerNo ? "confirm win screen (continue answer NO)"
+                             : "confirm win screen");
                 s_autoConnectWinScreenPressed = true;
             }
 

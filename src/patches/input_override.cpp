@@ -2489,7 +2489,21 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 Net::MatchRollbackPhaseName(rollbackPhase));
         }
 
-        Rollback::EventResult result = Rollback::RollbackSession_ProcessNextEvent();
+        // ── §2.8.3 pacing invariant: ONE visible advance per pass ───────────
+        // (2026-08-17 finding, run 19-53-3x: after the input-seam fix the
+        // per-pass BeginFrame + the INV-24 producer can seal MORE than one
+        // local frame per pass; on loopback the engine then grants a second
+        // straight-path Advance inside the same scheduler-paced pass and the
+        // pair settles at a mutual ~72 sim fps — 20% overspeed with
+        // present/pacing still at 60 Hz. The scheduler paces PASSES; extra
+        // ticks within a pass are legal only for rollback-transaction
+        // replays and the debt-gated hidden catch-up below.)
+        Rollback::EventResult result;
+        if (s_passSawAdvance && !Rollback::RollbackSession_IsRollingBack()) {
+            result = Rollback::EventResult::Done;
+        } else {
+            result = Rollback::RollbackSession_ProcessNextEvent();
+        }
 
         if (result == Rollback::EventResult::Error) {
             s_rollbackFrameStarted = false;
@@ -2504,7 +2518,11 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_passSawAdvance = true;
 
             const bool hadRollback = Rollback::RollbackSession_IsRollingBack();
-            Rollback::NetplayLog_Write("INPUT", Rollback::RollbackSession_GetCurrentFrame(),
+            // Verbose since 2026-08-17: at forced deep-rollback depth 30 this
+            // line fires ~1900x/s (each replay tick is an Advance) — the
+            // FORCED per-second line + rollback-begin depth lines carry the
+            // evidence instead.
+            Rollback::NetplayLog_Verbose("INPUT", Rollback::RollbackSession_GetCurrentFrame(),
                 "Dispatcher: Advance -> P1=0x%04X P2=0x%04X rollback=%d",
                 p1, p2, hadRollback ? 1 : 0);
 
@@ -2828,6 +2846,10 @@ int __cdecl Hook_InputProcess(int gameState) {
     }
 
     if (Net::CharSelSync_IsLockstepActive()) {
+        // B2: keep the palette catalog exchange alive across rematch-charsel
+        // begin skew (rate-limited inside; no-op once the peer's lockstep
+        // frames flow).
+        Net::CharSelPaletteSelect_PumpCatalogResend();
         if (gameMode == MODE_CHARSEL && IsStageSelRawLockstepSubstate(subState)) {
             // On phase entry, reset edge detection baseline.
             // During subs 5-6 (non-interactive animation), the SDL path wrote

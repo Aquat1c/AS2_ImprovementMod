@@ -902,35 +902,14 @@ void InputSystem_ResetDefaults(int player) {
 // Override / Background / Swap
 // ============================================================================
 
-// TEMP DIAG (2026-08-17 input-eater hunt): rate-limited caller logging for
-// override set/clear on player 0 — the harness AI's combat inputs reach
-// SetOverride but the dispatcher samples zeros; name the clearer.
-#include <intrin.h>
-static uint32_t s_ovrSetLogCount = 0;
-static uint32_t s_ovrClearLogCount = 0;
-
 void InputSystem_SetOverride(int player, uint16_t input) {
     if (player < 0 || player > 1) return;
-    if (player == 0 && input != 0) {
-        ++s_ovrSetLogCount;
-        if (s_ovrSetLogCount <= 20 || (s_ovrSetLogCount % 600) == 0) {
-            printf("[Input] SetOverride #%u p0=0x%04X caller=%p\n",
-                   s_ovrSetLogCount, input, _ReturnAddress());
-        }
-    }
     g_overrideActive[player] = true;
     g_overrideInput[player] = input;
 }
 
 void InputSystem_ClearOverride(int player) {
     if (player < 0 || player > 1) return;
-    if (player == 0 && g_overrideActive[0]) {
-        ++s_ovrClearLogCount;
-        if (s_ovrClearLogCount <= 20 || (s_ovrClearLogCount % 600) == 0) {
-            printf("[Input] ClearOverride #%u p0 (was 0x%04X) caller=%p\n",
-                   s_ovrClearLogCount, g_overrideInput[0], _ReturnAddress());
-        }
-    }
     g_overrideActive[player] = false;
     g_overrideInput[player] = 0;
 }

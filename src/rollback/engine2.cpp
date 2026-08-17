@@ -107,8 +107,12 @@ bool RollbackEngine::Arm(const EngineConfig& config, uint32_t epoch) {
     // A failed previous Arm (BadConfig) must not poison a valid retry.
     terminal_ = EngineTerminal::None;
     terminal_detail_[0] = '\0';
+    // max_rollback cap raised 15 -> 32 (2026-08-17 deep-rollback cells,
+    // then budgets >= 30 for depth-30 forced runs): uint8 advisory wire
+    // fields and the adapter's 64-slot StateHistory accommodate 32; the
+    // producer hard cap (30) independently bounds run-ahead.
     if (config.local_player > 1 ||
-        config.max_rollback < 1 || config.max_rollback > 15 ||
+        config.max_rollback < 1 || config.max_rollback > 32 ||
         config.input_delay > 15 ||
         config.neutral_input == ENGINE_INPUT_INVALID_WORD ||
         (config.neutral_input & ~ENGINE_INPUT_VALID_MASK) != 0 ||
@@ -206,8 +210,23 @@ void RollbackEngine::Disarm() {
 }
 
 void RollbackEngine::SetForcedRollback(uint8_t depth) {
-    forced_rollback_depth_ = depth > 15 ? (uint8_t)15 : depth;
-    forced_rollback_done_valid_ = false;
+    // Cap raised 15 -> 48 (2026-08-17 deep-rollback acceptance: sustained
+    // per-frame depth-30 forced transactions in live runs). Bound: the
+    // adapter's StateHistory is 64 direct-mapped slots; forced replays
+    // re-capture their whole window every frame, so a restore point
+    // forced_depth back is always fresh, and 48 + speculation(<=16) stays
+    // within one ring revolution.
+    //
+    // The done-latch is NEVER reset here (2026-08-17, run 20-46 livelock):
+    // the adapter refreshes stress hooks every pass, and near a round
+    // boundary its fight-substate gate flaps the depth 0<->N as replays
+    // re-run the transition — a depth-change-keyed reset re-armed the SAME
+    // frontier every pass and the identical depth-30 transaction
+    // re-synthesized forever (observed: from=4067 until=4097 x5916, frontier
+    // pinned 20 s -> ProgressDeadline teardown). The latch clears at Arm;
+    // a mid-session depth change simply takes effect from the NEXT advanced
+    // frontier.
+    forced_rollback_depth_ = depth > 48 ? (uint8_t)48 : depth;
 }
 
 // ============================================================================
@@ -489,6 +508,7 @@ EngineAction RollbackEngine::NextAction() {
             forced_rollback_done_valid_ = true;
             pending_mismatch_ = sim_frontier_ - depth;
             pending_mismatch_valid_ = true;
+            ++stats_.forced_transactions;  // unambiguous live evidence
             action.kind = EngineActionKind::Rollback;
             action.frame = pending_mismatch_;
             action.replay_until = sim_frontier_;

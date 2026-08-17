@@ -281,6 +281,14 @@ public:
     /// full actual prefix: stop before it (frontier truncates to cursor).
     bool FinishRollbackBeforeBoundary();
     bool InRollback() const { return in_rollback_; }
+    /// Next frame the open transaction will replay (valid while InRollback).
+    /// The adapter's §2.8.6(d) boundary bail consults it: replaying a
+    /// CONFIRMED frame across a native boundary is a faithful re-run (forced
+    /// deep-rollback mode replays confirmed spans every frame), so the bail
+    /// may only truncate once the cursor has reached the speculative suffix
+    /// — truncating below the confirmed frontier would regress the canonical
+    /// counter (INV-15).
+    uint32_t ReplayCursor() const { return replay_cursor_; }
 
     // ── Confirm pipeline (§2.7.3-F) ─────────────────────────────────────────
 
@@ -344,6 +352,7 @@ public:
 
     struct Stats {
         uint32_t rollbacks = 0;
+        uint32_t forced_transactions = 0;  // SetForcedRollback-synthesized
         uint32_t max_rollback_depth = 0;
         uint32_t last_rollback_from = 0;
         uint32_t last_rollback_length = 0;

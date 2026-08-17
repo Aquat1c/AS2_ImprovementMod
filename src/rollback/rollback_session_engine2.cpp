@@ -77,19 +77,46 @@ char     s_sessionError[160] = "";
 bool     s_terminalReported = false;
 
 // M6 stress ingest: bounded delivery-delay queue for InputStream payloads
-// (StressHooks_SetInputDeliveryDelay — held packets are released once the
-// sim frontier has advanced past their release frame).
+// (StressHooks_SetInputDeliveryDelay).
+//
+// Release is WALL-CLOCK, not sim-frame (2026-08-17 deep-rollback fix, run
+// 20-22-3x): the original release condition compared against the SIM
+// frontier, but the frontier stalls exactly when the sim runs out of remote
+// actuals — the queue then never released (inputs waited for the sim, the
+// sim waited for inputs) until the 64-slot overflow burst-delivered a
+// second's worth at once. Observed: rollbacks=1/s at depth 12, hold_pred
+// 18-24/s, sim ~20-28 fps, 31 ms pass intervals. A delivery delay emulates
+// NETWORK latency, which is wall-clock by nature and keeps flowing while
+// the receiver stalls; stress-only code, so no INV-16 sim-decision concern.
 struct DelayedStreamPacket {
     Net::InputStreamPayload payload;
-    int32_t release_rb_frame;
+    DWORD   release_at_ms;
     bool    valid;
 };
-constexpr size_t kDelayedStreamMax = 16;
+// 16 -> 64 (2026-08-17 deep-rollback cells): at ~60 sends/s + idle resends a
+// 10-14 frame delivery delay keeps ~13-20 packets in flight — the 16-slot
+// queue overflowed constantly and the overflow path delivered packets
+// IMMEDIATELY, silently defeating the configured delay (observed: DD10 run
+// with zero effective input lag and zero rollbacks).
+constexpr size_t kDelayedStreamMax = 64;
 DelayedStreamPacket s_delayedStream[kDelayedStreamMax] = {};
 
 // Forward decls (defined with the ingest section below).
 void IngestInputStreamNow(const Net::InputStreamPayload& p);
 void DrainDelayedStreamQueue();
+
+// Forced-deep-rollback visibility (2026-08-17 acceptance): one line per
+// second while StressHooks forced rollback is armed, so a live run SHOWS the
+// sustained per-frame transaction rate and the achieved depths (the engine
+// clamps depth only at the epoch origin; nothing else may truncate it).
+DWORD    s_forcedStatWindowStartMs = 0;
+uint32_t s_forcedStatTx = 0;
+uint32_t s_forcedStatDepthMin = 0;
+uint32_t s_forcedStatDepthMax = 0;
+uint32_t s_forcedStatTruncated = 0;
+uint32_t s_forcedStatEngineBase = 0;   // stats_.forced_transactions at window start
+
+void NoteRollbackTransactionDone(bool truncated);
 
 // Two-phase pass plan.
 enum class PassStep : uint8_t {
@@ -368,13 +395,57 @@ static uint16_t StressPredictionTap(uint16_t predicted) {
     return StressHooks_MaybeCorruptPrediction(predicted);
 }
 
+// Forced-rollback round-seam clamp state (see ApplyStressHooks).
+static uint32_t s_forcedFightWindowOrigin = 0;
+static bool     s_forcedFightWindowValid = false;
+
 // Stress hook application (M6 tap + post-M8 forced-rollback depth): kept in
 // one place so every arm/rotate/poll site applies the identical mapping.
 static void ApplyStressHooks(RollbackEngine& engine) {
     const bool on = StressHooks_IsEnabled();
     engine.SetPredictionTap(on ? &StressPredictionTap : nullptr);
-    engine.SetForcedRollback(on
-        ? (uint8_t)StressHooks_GetForcedRollbackDepth() : (uint8_t)0);
+    uint8_t forced = on ? (uint8_t)StressHooks_GetForcedRollbackDepth()
+                        : (uint8_t)0;
+    if (forced > 0) {
+        // Forced transactions only inside the FIGHT substate (2026-08-17):
+        // outside sub 3 the dispatcher is consulted at most ONCE per outer
+        // pass (the multi-tick while loop lives only in the fight handler),
+        // so a depth-30 transaction would dribble one replay tick per pass
+        // and collapse intros / round transitions / winscreens to ~2 sim
+        // fps. The confirmed-gated §2.8.6(d) bail covers any transaction
+        // already straddling a seam when the gate flips.
+        uint32_t mode = 0, sub = 0;
+        __try {
+            mode = ReadMemory<uint32_t>(ADDR_GAME_MODE);
+            sub = ReadMemory<uint32_t>(ADDR_SUB_STATE);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            mode = 0;
+        }
+        if (mode != (uint32_t)LIFECYCLE_MODE_MATCH ||
+            sub != (uint32_t)LIFECYCLE_SUBSTATE_FIGHT) {
+            forced = 0;
+            s_forcedFightWindowValid = false;
+        } else {
+            // ── Round-seam clamp (run 20-46 livelock root cause) ────────
+            // A forced window must NEVER span a round transition: replaying
+            // the KO re-runs round-init against the live state, the
+            // substate flaps, and the seam thrashes (observed livelock:
+            // identical from=4067 until=4097 depth-30 transaction repeated
+            // 20 s). Clamp the depth to the frames executed since the
+            // CURRENT fight window began; after every round start the depth
+            // ramps 0 -> cfg over cfg frames and stays there mid-round.
+            if (!s_forcedFightWindowValid) {
+                s_forcedFightWindowOrigin = engine.SimFrontier();
+                s_forcedFightWindowValid = true;
+            }
+            const uint32_t sinceFight = Net::forwardDistance(
+                s_forcedFightWindowOrigin, engine.SimFrontier());
+            if ((uint32_t)forced > sinceFight) {
+                forced = (uint8_t)sinceFight;
+            }
+        }
+    }
+    engine.SetForcedRollback(forced);
 }
 
 bool RollbackSession_Begin(const RollbackSessionConfig& config) {
@@ -398,7 +469,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
         const bool configCompatible =
             (uint8_t)(config.local_player & 1) == (uint8_t)(s_localPlayer & 1) &&
             (uint8_t)(config.rollback_budget < 1 ? 1
-                : config.rollback_budget > 15 ? 15 : config.rollback_budget)
+                : config.rollback_budget > 32 ? 32 : config.rollback_budget)
                 == s_engine.MaxRollback();
         if (newEpoch > s_epoch && configCompatible) {
             if (s_engine.RotateEpoch(newEpoch, s_engine.SimFrontier())) {
@@ -457,7 +528,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     ec.input_delay = (uint8_t)(config.initial_delay < 0 ? 0
                         : config.initial_delay > 15 ? 15 : config.initial_delay);
     ec.max_rollback = (uint8_t)(config.rollback_budget < 1 ? 1
-                        : config.rollback_budget > 15 ? 15 : config.rollback_budget);
+                        : config.rollback_budget > 32 ? 32 : config.rollback_budget);
     ec.neutral_input = 0x0000;
     ec.first_frame = 0;          // canonical origin; epochs never reset it
     ec.max_remote_future = 120;
@@ -584,25 +655,19 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
 
     RefreshLifecycleWindow();
 
+    // Refresh stress hooks on healthy passes too (idempotent): the forced
+    // deep-rollback fight-substate gate must react within a frame of a
+    // substate change (PollSession only runs on stall passes).
+    ApplyStressHooks(s_engine);
+
+    // Stress delivery-delay queue drains on healthy passes too (wall-clock
+    // release; PollSession covers the stalled passes).
+    DrainDelayedStreamQueue();
+
     // Capture-once keyed to the sim frontier (§2.7.3-C): repeats during a
     // stall adopt; the sealed word schedules at source + D_local.
     if (!s_engine.InRollback()) {
-        const bool sealed =
-            s_engine.CaptureLocalInput(s_engine.SimFrontier(), localInput);
-        // TEMP DIAG (input-eater hunt): nonzero local samples that get
-        // ADOPTED instead of sealed are being replaced by whatever the
-        // producer sealed earlier — name the path.
-        if (localInput != 0) {
-            static uint32_t s_bfLog = 0;
-            ++s_bfLog;
-            if (s_bfLog <= 30 || (s_bfLog % 300) == 0) {
-                NetplayLog_Write("INPUTDIAG", RbFrame(s_engine.SimFrontier()),
-                    "BeginFrame nonzero local=0x%04X sealed=%d frontier=%u "
-                    "fenced=%d",
-                    localInput, sealed ? 1 : 0, s_engine.SimFrontier(),
-                    s_engine.ProducerFenced() ? 1 : 0);
-            }
-        }
+        s_engine.CaptureLocalInput(s_engine.SimFrontier(), localInput);
     }
     SendInputStreamIfDue(/*force=*/true);
     s_passStep = PassStep::Idle;  // plan is derived lazily in ProcessNextEvent
@@ -627,17 +692,6 @@ bool RollbackSession_PollSession() {
     // Producer while stalled (INV-24): one seal per frame period; the
     // scheduler paces the caller, so one call per pass is the cadence.
     if (s_engine.ProduceLocalInputAhead(s_lastLocalSample)) {
-        // TEMP DIAG (input-eater hunt): how often does the producer seal,
-        // and with what sample?
-        {
-            static uint32_t s_prodLog = 0;
-            ++s_prodLog;
-            if (s_prodLog <= 30 || (s_prodLog % 600) == 0) {
-                NetplayLog_Write("INPUTDIAG", RbFrame(s_engine.SimFrontier()),
-                    "Producer seal #%u sample=0x%04X frontier=%u",
-                    s_prodLog, s_lastLocalSample, s_engine.SimFrontier());
-            }
-        }
         SendInputStreamIfDue(/*force=*/true);
     } else {
         SendInputStreamIfDue(/*force=*/false);
@@ -659,6 +713,18 @@ EventResult RollbackSession_ProcessNextEvent() {
         // crossed a native mode/substate boundary earlier than the
         // speculative timeline did, truncate the frontier at the cursor
         // instead of replaying a stale speculative suffix.
+        //
+        // Deep-forced-rollback amendment (2026-08-17): the bail may only
+        // fire once the replay cursor has reached the CONFIRMED frontier.
+        // Forced transactions (SetForcedRollback) replay confirmed spans
+        // every frame; when such a window covers a round transition the
+        // live substate legitimately leaves FIGHT mid-replay, and the old
+        // unconditional truncation would set the sim frontier BELOW the
+        // confirmed frontier — a canonical-counter regression (INV-15).
+        // Confirmed frames are final: re-running them across a native
+        // boundary is a faithful re-run, not stale speculation. Real
+        // corrections are unaffected (a mismatch is always at/after the
+        // confirmed frontier, so their cursors satisfy the gate already).
         {
             uint32_t mode = 0, substate = 0;
             bool readOk = true;
@@ -670,7 +736,9 @@ EventResult RollbackSession_ProcessNextEvent() {
             }
             if (readOk &&
                 (mode != (uint32_t)LIFECYCLE_MODE_MATCH ||
-                 substate != (uint32_t)LIFECYCLE_SUBSTATE_FIGHT)) {
+                 substate != (uint32_t)LIFECYCLE_SUBSTATE_FIGHT) &&
+                !Net::frameBefore(s_engine.ReplayCursor(),
+                                  s_engine.ConfirmedFrontier())) {
                 NetplayLog_Write("ROLLBACK", RbFrame(s_engine.SimFrontier()),
                     "engine2 replay crossed a native boundary (mode=%u sub=%u) — "
                     "truncating at replay cursor (§2.8.6-d)",
@@ -680,6 +748,7 @@ EventResult RollbackSession_ProcessNextEvent() {
                     return EventResult::Error;
                 }
                 Net::DelayPolicy_OnRollbackApplied(s_engine.ActiveDelay());
+                NoteRollbackTransactionDone(/*truncated=*/true);
                 s_rollingBack = false;
                 DrainConfirmSeam();
                 return EventResult::Done;
@@ -709,6 +778,7 @@ EventResult RollbackSession_ProcessNextEvent() {
             return EventResult::Error;
         }
         Net::DelayPolicy_OnRollbackApplied(s_engine.ActiveDelay());
+        NoteRollbackTransactionDone(/*truncated=*/false);
         s_rollingBack = false;
         DrainConfirmSeam();
         // Fall through: the driver re-reads frontiers and may still advance
@@ -819,16 +889,58 @@ void IngestInputStreamNow(const Net::InputStreamPayload& p) {
                                          localDepth);
 }
 
-// M6 stress ingest: release queued delivery-delayed packets whose release
-// frame has been reached (called from PollSession/BeginFrame drains).
+// M6 stress ingest: release queued delivery-delayed packets whose wall-clock
+// release time has arrived (called from the BeginFrame and PollSession
+// drains, so it runs on healthy AND stalled passes — see the wall-clock
+// rationale at DelayedStreamPacket).
 void DrainDelayedStreamQueue() {
-    const int32_t now = RbFrame(s_engine.SimFrontier());
+    const DWORD now = GetTickCount();
     for (size_t i = 0; i < kDelayedStreamMax; ++i) {
         if (s_delayedStream[i].valid &&
-            now >= s_delayedStream[i].release_rb_frame) {
+            (int32_t)(now - s_delayedStream[i].release_at_ms) >= 0) {
             s_delayedStream[i].valid = false;
             IngestInputStreamNow(s_delayedStream[i].payload);
         }
+    }
+}
+
+// Forced-deep-rollback per-second visibility line (declared above).
+void NoteRollbackTransactionDone(bool truncated) {
+    const int cfgDepth = StressHooks_IsEnabled()
+        ? StressHooks_GetForcedRollbackDepth() : 0;
+    if (cfgDepth <= 0) return;
+    const uint32_t depth = s_engine.GetStats().last_rollback_length;
+    if (s_forcedStatTx == 0) {
+        s_forcedStatDepthMin = depth;
+        s_forcedStatDepthMax = depth;
+    } else {
+        if (depth < s_forcedStatDepthMin) s_forcedStatDepthMin = depth;
+        if (depth > s_forcedStatDepthMax) s_forcedStatDepthMax = depth;
+    }
+    ++s_forcedStatTx;
+    if (truncated) ++s_forcedStatTruncated;
+    const DWORD now = GetTickCount();
+    if (s_forcedStatWindowStartMs == 0) {
+        s_forcedStatWindowStartMs = now;
+        s_forcedStatEngineBase = s_engine.GetStats().forced_transactions;
+    }
+    if ((DWORD)(now - s_forcedStatWindowStartMs) >= 1000) {
+        const uint32_t engForced = s_engine.GetStats().forced_transactions;
+        const uint32_t forcedTx = engForced - s_forcedStatEngineBase;
+        const uint32_t realTx =
+            s_forcedStatTx > forcedTx ? s_forcedStatTx - forcedTx : 0;
+        // Evidence line: `transactions` counts ENGINE-SYNTHESIZED forced
+        // restore/replay cycles only (SetForcedRollback pending-mismatch
+        // path); real prediction corrections are reported separately.
+        NetplayLog_Write("FORCED", RbFrame(s_engine.ConfirmedFrontier()),
+            "forced_rb: transactions=%u/s depth=%d achieved_min=%u max=%u "
+            "real_corrections=%u truncated=%u",
+            forcedTx, cfgDepth, s_forcedStatDepthMin,
+            s_forcedStatDepthMax, realTx, s_forcedStatTruncated);
+        s_forcedStatWindowStartMs = now;
+        s_forcedStatEngineBase = engForced;
+        s_forcedStatTx = 0;
+        s_forcedStatTruncated = 0;
     }
 }
 
@@ -856,11 +968,15 @@ void RollbackSession_OnInputStreamPacket(const void* data, size_t len) {
     const int deliveryDelay = StressHooks_IsEnabled()
         ? StressHooks_GetInputDeliveryDelay() : 0;
     if (deliveryDelay > 0) {
+        // Wall-clock release: N frames of emulated one-way latency at the
+        // 60 Hz cadence (16.67 ms/frame, integer ms is plenty for a stress
+        // knob). Stall-independent by construction.
+        const DWORD releaseAt =
+            GetTickCount() + (DWORD)((deliveryDelay * 1667) / 100);
         for (size_t i = 0; i < kDelayedStreamMax; ++i) {
             if (!s_delayedStream[i].valid) {
                 s_delayedStream[i].payload = p;
-                s_delayedStream[i].release_rb_frame =
-                    RbFrame(s_engine.SimFrontier()) + deliveryDelay;
+                s_delayedStream[i].release_at_ms = releaseAt;
                 s_delayedStream[i].valid = true;
                 return;
             }
@@ -869,8 +985,7 @@ void RollbackSession_OnInputStreamPacket(const void* data, size_t len) {
         // slot — the redundant window makes ordering irrelevant.
         IngestInputStreamNow(s_delayedStream[0].payload);
         s_delayedStream[0].payload = p;
-        s_delayedStream[0].release_rb_frame =
-            RbFrame(s_engine.SimFrontier()) + deliveryDelay;
+        s_delayedStream[0].release_at_ms = releaseAt;
         return;
     }
 

@@ -904,6 +904,7 @@
 #define ADDR_MATCH_CONFIG_FLAGS  0x816470  // DWORD - round/stage/training match config block
 #define ADDR_MATCH_ROUND_COUNT   0x816470  // LOBYTE(dword_816470) = vanilla round option (wins required = value + 1)
 #define ADDR_STAGE_CURSOR       0x816024  // During sub=7 (Preview): LOBYTE=cursor pos, BYTE1=confirmed, BYTE2=roulette counter
+#define ADDR_STAGE_AVAIL_TABLE  0x815FFF  // byte_815FFF[24]: 1 = stage selectable (grid confirm refused otherwise)
 #define ADDR_CHARSEL_STAGE_ID   0x816471  // BYTE1(dword_816470) = stage ID
 #define ADDR_CHARSEL_TEAM_COLOR 0x815FFE  // Team color selection
 

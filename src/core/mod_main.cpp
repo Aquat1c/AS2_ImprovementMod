@@ -1006,6 +1006,7 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
         out->ping_ms = -1.0f;
         out->delay_frames = 0;
         out->rollback_frames = 0;
+        out->rollback_depth_now = 0;
         out->local_frame = spectatorPlayback.local_playback_rb_frame;
         out->remote_frame = spectatorPlayback.confirmed_edge_rb_frame;
 
@@ -1189,12 +1190,17 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
         Rollback::RollbackSession_GetSnapshot(&rbSnap);
         out->delay_frames = Net::DelayPolicy_GetActiveDelay();
         out->rollback_frames = rbSnap.rollback_budget;
+        // Live achieved depth (2026-08-17): the user-visible proof that deep
+        // rollback is actually RUNNING — in forced depth-N mode this reads N
+        // every frame during combat.
+        out->rollback_depth_now = rbSnap.last_rollback_replay_length;
         out->local_frame = rbSnap.rb_frame_current;
         out->remote_frame = rbSnap.rb_frame_last_remote_received;
     } else {
         // Pre-match: use delay policy values
         out->delay_frames = Net::DelayPolicy_GetActiveDelay();
         out->rollback_frames = 0;
+        out->rollback_depth_now = 0;
         out->local_frame = 0;
         out->remote_frame = 0;
     }

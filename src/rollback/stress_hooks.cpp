@@ -9,6 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 namespace Rollback {
 
 // ============================================================================
@@ -43,6 +48,37 @@ void StressHooks_Init() {
     s_totalDropped = 0;
     s_totalDelayed = 0;
     s_totalMismatchesForced = 0;
+
+    // Deep-rollback acceptance cells (2026-08-17): AS2_STRESS_DELIVERY_DELAY=N
+    // arms the hooks at launch with an N-frame input delivery delay so the
+    // two-instance loopback pair sustains real prediction depth ~N (forcing
+    // deep restore/replay under combat without a WAN shim). Menu toggles
+    // still work on top.
+    char env[16] = {};
+    if (GetEnvironmentVariableA("AS2_STRESS_DELIVERY_DELAY", env, sizeof(env)) > 0) {
+        const int frames = atoi(env);
+        if (frames > 0) {
+            s_enabled = true;
+            s_inputDeliveryDelay = frames > 15 ? 15 : frames;
+            LOG_INFO("[StressHooks] Env-armed: delivery_delay=%d frames (AS2_STRESS_DELIVERY_DELAY)",
+                     s_inputDeliveryDelay);
+        }
+    }
+
+    // AS2_STRESS_FORCED_ROLLBACK=N arms per-frame forced depth-N rollback
+    // transactions (engine SetForcedRollback passthrough): every advanced
+    // frontier performs a genuine depth-N restore/replay during live combat.
+    // The adapter emits a per-second [FORCED] line with achieved depths.
+    char envFr[16] = {};
+    if (GetEnvironmentVariableA("AS2_STRESS_FORCED_ROLLBACK", envFr, sizeof(envFr)) > 0) {
+        const int depth = atoi(envFr);
+        if (depth > 0) {
+            s_enabled = true;
+            s_forcedRollbackDepth = depth > 48 ? 48 : depth;
+            LOG_INFO("[StressHooks] Env-armed: forced_rollback_depth=%d per frame (AS2_STRESS_FORCED_ROLLBACK)",
+                     s_forcedRollbackDepth);
+        }
+    }
 }
 
 void StressHooks_Shutdown() {
@@ -112,7 +148,7 @@ int StressHooks_GetRemainingForcedMismatches() { return s_forcedMismatches; }
 
 void StressHooks_SetForcedRollbackDepth(int depth) {
     if (depth < 0) depth = 0;
-    if (depth > 15) depth = 15;
+    if (depth > 48) depth = 48;  // engine cap (SetForcedRollback, ring-bound)
     if (depth != s_forcedRollbackDepth) {
         NetplayLog_ValueChange("STRESS", -1, "forced_rollback_depth",
             s_forcedRollbackDepth, depth, "user set");

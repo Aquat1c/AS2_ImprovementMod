@@ -67,8 +67,17 @@ struct FineDiagEntry {
 };
 
 FineDiagEntry s_ring[FINE_DIAG_RING_CAPACITY];   // ~1.9 MB BSS
+// OPT-IN since 2026-08-17 (was default-on): the per-tick record costs
+// ~100 µs+ (per-window CRCs + raw captures over a ~2 MB static ring). At
+// normal depth that was tolerable, but forced deep-rollback mode runs
+// 30+ ticks per pass — ~3-4 ms/pass of pure diagnostics — and the cost is
+// load-dependent (effect-heavy windows like supers capture more), which
+// read as "the game slows down during supers". Live builds run with it
+// OFF; set AS2_FINE_DIAG=1 for a diagnosis run when a desync needs
+// byte-level naming (the always-on DesyncDiagRing still localizes the
+// frame/field in every dump).
 bool s_envChecked = false;
-bool s_enabled = true;
+bool s_enabled = false;
 
 uint32_t Fold32(uint64_t h) {
     return (uint32_t)(h ^ (h >> 32));
@@ -79,8 +88,8 @@ bool Enabled() {
         s_envChecked = true;
         char v[8] = {};
         const DWORD n = GetEnvironmentVariableA("AS2_FINE_DIAG", v, sizeof(v));
-        if (n == 1 && v[0] == '0') {
-            s_enabled = false;
+        if (n == 1 && v[0] == '1') {
+            s_enabled = true;
         }
     }
     return s_enabled;

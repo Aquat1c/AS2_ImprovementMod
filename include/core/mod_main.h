@@ -67,7 +67,9 @@ struct MatchHudData {
     uint8_t  p2_font_size;
     float    ping_ms;
     int      delay_frames;
-    int      rollback_frames;
+    int      rollback_frames;      // configured rollback budget (R_local)
+    int      rollback_depth_now;   // last rollback transaction's replay length
+                                   // (per-frame achieved depth in forced mode)
     int      local_frame;
     int      remote_frame;
     bool     is_host;

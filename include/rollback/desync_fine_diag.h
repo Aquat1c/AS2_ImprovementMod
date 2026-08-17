@@ -24,7 +24,9 @@
  *
  * Storage: ~1.9 MB static ring. Cost per seam record: one 13.9 KB memcpy +
  * one Block64 pass over 253 KB (~100 µs — same order as the digest hash
- * itself). Enabled by default during netplay; AS2_FINE_DIAG=0 disables.
+ * itself). OPT-IN since 2026-08-17: OFF by default (load-dependent per-tick
+ * cost read as gameplay slowdown under deep forced rollback); set
+ * AS2_FINE_DIAG=1 to enable for a byte-level diagnosis run.
  */
 
 #pragma once

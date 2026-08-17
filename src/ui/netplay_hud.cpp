@@ -442,12 +442,19 @@ void NetplayHud_Render() {
 
     char stats[160] = {};
     if (hud.show_connection_stats) {
+        // RB shows achieved/budget (2026-08-17): the first number is the
+        // LIVE rollback depth (last transaction's replay length — reads 30
+        // every frame in forced depth-30 mode), the second the configured
+        // budget. The old single-number RB was the budget alone, which
+        // reads "RB:0"-ish while deep rollback is demonstrably running.
         if (hud.ping_ms >= 0.0f) {
-            snprintf(stats, sizeof(stats), "PING:%dms  D:%d  RB:%d",
-                     (int)(hud.ping_ms + 0.5f), hud.delay_frames, hud.rollback_frames);
+            snprintf(stats, sizeof(stats), "PING:%dms  D:%d  RB:%d/%d",
+                     (int)(hud.ping_ms + 0.5f), hud.delay_frames,
+                     hud.rollback_depth_now, hud.rollback_frames);
         } else {
-            snprintf(stats, sizeof(stats), "PING:--  D:%d  RB:%d",
-                     hud.delay_frames, hud.rollback_frames);
+            snprintf(stats, sizeof(stats), "PING:--  D:%d  RB:%d/%d",
+                     hud.delay_frames,
+                     hud.rollback_depth_now, hud.rollback_frames);
         }
 
         // Coverage badge (M6, INV-6): the delay-policy verdict is shown,

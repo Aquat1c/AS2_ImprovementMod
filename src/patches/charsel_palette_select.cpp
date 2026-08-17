@@ -3,6 +3,7 @@
 #include "core/as2_constants.h"
 #include "core/game_state.h"
 #include "net/barrier_protocol.h"
+#include "net/frontend_input_sync.h"
 #include "net/session_manager.h"
 #include "net/netplay_palette_runtime.h"
 #include "rollback/netplay_log.h"
@@ -1445,6 +1446,32 @@ bool CharSelPaletteSelect_IsCatalogReady() {
         return true;
     }
     return s_catalogReceived[0] && s_catalogReceived[1];
+}
+
+void CharSelPaletteSelect_PumpCatalogResend() {
+    // B2 fix (2026-08-17 run 20-30-4x): the epoch-2 (any-NO rematch) charsel
+    // can begin with ~2 s skew between peers; the catalog packet sent at
+    // BeginFrontend then arrives before the LAGGING peer's pregame accepts
+    // CharSelInput and is dropped — with no resend, that peer waits at
+    // "Step 0: Waiting for palette catalog sync" forever, the leading peer
+    // times out waiting for remote lockstep frames, and the recovery
+    // restart deadlocks at SyncAnnounce. Resend the local catalog on a
+    // 2-second cadence while the netplay charsel frontend is active and the
+    // peer has shown NO lockstep progress yet (first remote frame ends the
+    // resends; idempotent receive).
+    if (!s_frontendActive || !s_frontendNetplay) {
+        return;
+    }
+    static uint32_t s_resendPump = 0;
+    if ((++s_resendPump % 120) != 0) {
+        return;
+    }
+    if (Net::FrontendInputSync_GetRemoteLatestFrame() != 0) {
+        return;
+    }
+    SendLocalCatalog();
+    Rollback::NetplayLog_Write("CHARPAL", -1,
+        "Catalog resend (peer shows no lockstep progress yet)");
 }
 
 bool CharSelPaletteSelect_IsSelectionLocked(uint8_t gameSlot) {

@@ -29,7 +29,14 @@ constexpr int DELAY_MAX                = 6;
 constexpr int DELAY_DEFAULT_PREF       = 0;
 
 constexpr int ROLLBACK_BUDGET_MIN      = 4;
-constexpr int ROLLBACK_BUDGET_MAX      = 10;
+// Raised 10 -> 16 -> 32 (2026-08-17 deep-rollback acceptance: R12/R16 cells,
+// then budgets >= 30 for the depth-30 per-frame forced-rollback runs). The
+// engine validates R <= 32; wire advisory fields are uint8; the 64-slot
+// StateHistory covers restore points 32 back with forced windows re-captured
+// every frame. NOTE: the producer bound min(peerR+peerD+2, 30) caps how far
+// the INV-24 producer runs ahead — a 30+ budget is a speculation CAP, not a
+// promise the producer fills it.
+constexpr int ROLLBACK_BUDGET_MAX      = 32;
 constexpr int ROLLBACK_BUDGET_DEFAULT  = 7;
 
 constexpr int ROLLBACK_TOLERANCE_MIN   = 0;

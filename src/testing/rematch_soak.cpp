@@ -255,16 +255,25 @@ void RematchSoak_FrameUpdate(const char* autoconnectStateName, uint32_t frameCou
         if (epoch > s_soak.epochMaxSeen) s_soak.epochMaxSeen = epoch;
     }
 
-    // (b) Canonical frame counter never goes backward (INV-15). The engine2
-    //     backend keeps the engine armed across matches (suspend + rotate),
-    //     so the counter must be monotonic for the WHOLE session.
+    // (b) Canonical CONFIRMED frontier never goes backward (INV-15). The
+    //     engine2 backend keeps the engine armed across matches (suspend +
+    //     rotate), so the counter must be monotonic for the WHOLE session.
+    //     2026-08-17: the assertion tracks the CONFIRMED frontier, not the
+    //     sim frontier — §2.8.6(d)/FinishRollbackAtBoundary legitimately
+    //     truncates SPECULATIVE frames when a corrected replay crosses a
+    //     native boundary early (routine at round seams under forced deep
+    //     rollback: a speculative KO gets corrected and the stale suffix is
+    //     discarded, retreating the sim frontier by a frame or two). The
+    //     immutable INV-15 quantity is the confirmed seam.
     {
         const bool rbActive = Rollback::RollbackSession_IsActive();
         if (rbActive) {
-            const int32_t rb = Rollback::RollbackSession_GetCurrentFrame();
+            Rollback::RollbackSessionSnapshot rbSnap{};
+            Rollback::RollbackSession_GetSnapshot(&rbSnap);
+            const int32_t rb = rbSnap.rb_frame_last_confirmed;
             const bool comparable = s_soak.canonValid;
             if (comparable && rb < s_soak.canonMax) {
-                FailSoak("canonical frame counter regressed: %d -> %d (INV-15)",
+                FailSoak("canonical confirmed frontier regressed: %d -> %d (INV-15)",
                          s_soak.canonMax, rb);
                 EmitSummary("canonical counter regression");
                 return;

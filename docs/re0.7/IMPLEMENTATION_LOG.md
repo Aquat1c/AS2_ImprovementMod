@@ -2639,3 +2639,204 @@ FAILs are pacing follow-ups, filed:
 5. TEMP diagnostics still in tree (INPUTDIAG rate-limited logs in the
    adapter, override caller logs in input_system) — strip once the pair
    is declared stable.
+
+---
+
+## 2026-08-17 (night) — expanded acceptance loop: TRUE rollback unlocked, deep cells, variation driver, blockers B1/B2
+
+### The route-byte sentinel (the biggest one): every earlier live run was accidentally LOCKSTEP
+
+`UpdateMatchExitPendingMirror` treated the vanilla exit-route byte
+(match+10) `!= 0` as "exit armed"; the byte idles at **0xFF** in this
+build, so `match_exit_pending` was TRUE from f1 of every match →
+INV-25 exact-input mode every tick → the engine NEVER PREDICTED.
+On same-frame loopback this was invisible (actuals present at the
+frontier), which is why every "clean" run to date (incl. the 19-53
+SOAK-PASS) showed rollbacks=0. The moment inputs arrived late the pair
+degraded to 30 fps lockstep. Fixed: 0 and 0xFF are "no route". With the
+fix the pair runs the DESIGNED regime: continuous prediction with 20-30
+shallow rollbacks/s at a flat 60.03 sim fps.
+
+### One-visible-advance-per-pass (§2.8.3) enforced
+
+After the input-seam fix the per-pass BeginFrame + INV-24 producer could
+seal 2 local frames per pass; on loopback the engine then granted a 2nd
+straight-path Advance inside one scheduler-paced pass → the mutual
+~72 fps overspeed seen in run 19-53 matches 2-3. The dispatcher now
+returns Done after the pass's first non-replay Advance (replays and the
+debt-gated hidden catch-up are the only multi-tick sources). 60.00
+verified.
+
+### Deep-rollback cells (R12/R16 enablement)
+
+- delay_policy ROLLBACK_BUDGET_MAX 10→16, engine cap 15→16, adapter
+  clamps 16 (wire fields uint8; 32-slot window bound R+D+2≤30 holds).
+- `AS2_STRESS_DELIVERY_DELAY=N` env arms an N-frame input delivery delay
+  at launch; delayed-queue 16→64 slots and (user fix) WALL-CLOCK release
+  (sim-frame release deadlocked: inputs waited for the sim while the sim
+  waited for inputs). `AS2_STRESS_FORCED_ROLLBACK=N` (user) arms
+  per-frontier forced depth-N transactions.
+- R12 + DD10 cell result: **depth-12 restore/replay verified under real
+  combat** — 3850 confirmed frames, 100+ depth-10..12 transactions,
+  hp/rng/effects in cross-side lockstep throughout, sim ~20-28 fps
+  (expected: 11-13 ticks per pass on this box; R-UNDER-class cell).
+
+### Blocker B1 (precisely characterized, OPEN): round-end commit under deep skew
+
+Run 20-22-3x, f3869 dumps: at f3850 EVERY hashed byte agreed (all 4043
+fine windows); at f3851 side A committed the round-2 reset state while
+side B committed the round-1 KO state (sub 3 vs 2, hp 11000/10000 vs
+3577/0). A tick from identical hashed state diverged ⇒ the KO/round-end
+path reads one of the DIGEST-MASKED (per-side-divergent by design)
+render/display bytes — chief suspect the F5 flash/tint block
+(p1+0x1BC A=3f vs B=a5 at f3850; super-finisher darken timing). Masks
+only hide digest noise — they cannot cause this; the reader was always
+there, exposed now that deep skew misaligns the masked bytes' windows
+across the KO tick. Fix direction (F8): identify the masked byte the KO
+branch consumes (decomp hunt around the round-end/finisher path) and
+make it deterministic (cadence fix or capture/zero), NOT more masking.
+Does not reproduce at shallow (depth≤1) rollback.
+
+### Blocker B2 (FIXED): any-NO rematch charsel palette-catalog race
+
+Run 20-30-4x: the epoch-2 charsel began with ~2 s peer skew; the
+catalog packet sent at BeginFrontend reached the lagging peer before
+its pregame accepted CharSelInput and was dropped; no resend existed →
+lagging peer stuck at "Step 0: Waiting for palette catalog sync",
+leading peer timed out waiting for remote frames, recovery restart
+deadlocked at SyncAnnounce (peer never re-announced), SOAK-FAIL. Fixed:
+`CharSelPaletteSelect_PumpCatalogResend()` — 2 s-cadence catalog resend
+while the netplay charsel frontend is active and the peer has produced
+no lockstep frames (idempotent receive; called from the charsel
+lockstep dispatcher gate).
+
+### Soak driver: variation + NO route
+
+- `char_cycle_step` / `stage_cycle_step` cfg knobs: per-completed-match
+  grid-index stride (safe 15-cell char range) and stage-grid RIGHT-tap
+  navigation before confirm — different matchup and stage each game.
+- NO answer rides the winscreen sub-3 confirm as RIGHT|A (ContinueFlow
+  toggles cursor before lock within a frame): the prompt consumes the
+  lockstep stream, so prompt-time toggling can never beat the in-flight
+  YES lock (prompt lifetime observed: 3 frames).
+
+---
+
+## 2026-08-17 (final loop, part 2) — forced depth-30 per-frame rollback in live runs; delivery-delay release deadlock; round-seam livelock; f3869 desync chain
+
+### Expanded bar (operator, mid-loop)
+
+Deep rollback escalated from "delivery-delay 8-14, depth 10+" to: FORCED
+depth-30 restore/replay transaction on EVERY advanced frontier during live
+combat, budgets >= 30 both sides, user-visible evidence (HUD + per-second
+log), plus: supers must not slow the sim, round transitions must not kill
+it, per-game char/stage variety, both rematch routes, zero desync.
+
+### Root causes found and fixed (in evidence order)
+
+1. **Delivery-delay release deadlock** (run 20-22-3x: sim 20-28 fps,
+   hold_pred 18-24/s, rollbacks=1/s at depth 12, 31 ms passes). The
+   delayed-ingest queue released packets when the SIM FRONTIER passed
+   `receipt_frontier + delay` — but the frontier stalls exactly when it
+   runs out of remote actuals: inputs waited for the sim, the sim waited
+   for inputs, until the queue overflow burst-delivered ~1 s of packets at
+   once. Fix: WALL-CLOCK release (emulated network latency is wall-clock
+   by nature; stress-only code) + the drain now also runs in BeginFrame
+   (it only ran in PollSession = stall passes). Queue 16 -> 64 slots (the
+   overflow path silently defeated the configured delay).
+
+2. **f3869 confirmed desync** (same run, first divergent f3851): under the
+   above pathology the two sides crossed a ROUND transition with wildly
+   different pass/stall skew; side A's transition state machine was one
+   step ahead of B at the same confirmed frame (A: sub=3 hp reset
+   11000/10000, B: sub=2 hp 3577/0; fine-diag: sim skew 3876/3875).
+   F7i-class seam driven far outside its healthy envelope by the pacing
+   pathology — fix (1) removes the driver. Dumps preserved to
+   `latest logs/f7_evidence_2026-08-17/` (2026-08-17_20-22-3x pair).
+   The user-observed "one side at continue DECIDING, other at next-match
+   VS" was consumption-lag fallout of the same degraded pacing (winscreen
+   lockstep stream consumed at 20 vs 60 fps), not a prompt divergence.
+
+3. **Forced-rollback round-seam livelock** (run 20-46-3x: instB frontier
+   pinned 20 s -> ProgressDeadline teardown, `from=4067 until=4097
+   depth=30` repeated 5916 times with "New round init" each cycle). A
+   forced window spanning the round end re-ran round-init against live
+   state; the fight-substate gate then flapped 0<->30, and
+   SetForcedRollback's depth-change re-arm re-synthesized the SAME
+   transaction every pass. Fixes: (a) engine SetForcedRollback never
+   resets the done-latch; (b) adapter clamps forced depth to frames
+   executed since the CURRENT fight window began (ramps 0->N after every
+   round start; a forced window can never span a round seam); (c) forced
+   mode gated to mode 8 sub 3 (outside the fight handler's while-loop the
+   dispatcher gets one tick per pass — a depth-30 transaction would
+   dribble at ~2 sim fps); (d) §2.8.6(d) boundary bail additionally gated
+   on `replay_cursor >= confirmed_frontier` — forced transactions replay
+   CONFIRMED spans, and the old unconditional truncation could have set
+   the sim frontier below the confirmed frontier (INV-15 regression).
+   Real corrections are unaffected (mismatch >= confirmed always).
+
+4. **Supers slow the sim / load-dependent slowdown**: the F7d fine-diag
+   confirm-seam ring (~100 µs+/tick, more under effect load) was
+   DEFAULT-ON; at 30+ ticks per pass that is 3-4 ms/pass of pure
+   diagnostics. Now OPT-IN (`AS2_FINE_DIAG=1`); the always-on
+   DesyncDiagRing still localizes desyncs to frame/field. Also demoted
+   the per-advance "Dispatcher: Advance" log line to Verbose (~1900
+   lines/s at forced depth 30).
+
+5. **Caps lifted for budgets >= 30**: DelayPolicy ROLLBACK_BUDGET_MAX
+   10 -> 32, engine Arm bound 15 -> 32, adapter clamps -> 32, engine
+   SetForcedRollback clamp 15 -> 48. StateHistory stays 64 direct-mapped
+   slots: forced windows are re-captured every frame, so restore points
+   30-48 back are always fresh; producer hard cap (30) independently
+   bounds run-ahead. Both cfgs run `rollback=30`.
+
+6. **Visibility**: new per-second `[FORCED]` line (tx/s, achieved
+   depth min/max, truncation count); HUD RB field now shows
+   `achieved/budget` (`RB:30/30` steady in forced combat) — the old
+   single number was the BUDGET, which read as "no rollback" while
+   deep rollback was demonstrably running. `AS2_STRESS_FORCED_ROLLBACK=N`
+   env arms forced mode at launch (live/autoconnect path);
+   `AS2_STRESS_DELIVERY_DELAY=N` unchanged.
+
+7. **Housekeeping**: INPUTDIAG temp logging stripped from the adapter,
+   SetOverride/ClearOverride caller printf diagnostics stripped from
+   input_system; driver stage-grid navigation refuses to confirm a locked
+   stage (walks RIGHT past `byte_815FFF[cursor] != 1` — the grid handler
+   silently ignores confirms on locked stages, which would have stranded
+   the new stage-variety navigation).
+
+### The ~72 fps overspeed (filed follow-up #1) — root cause
+
+STAT evidence (19-53 run): 63-72 sim fps IN MATCH 1 TOO, debt=0, zero
+holds, both sides in step, present p50 16.6 ms. The vanilla fight handler
+loops `while (!Input_TryGetNextFrame(...))`; vanilla's own
+`Frame_Inputs > Frame_Simulation` gate produced exactly one tick per pass,
+but the engine2 branch bypassed it: whenever remote actuals leapfrogged on
+loopback the engine granted a second straight-path Advance inside the same
+scheduler-paced pass. Fixed with a one-visible-advance-per-pass gate
+(replays and debt-gated catch-up exempt). Not a RotateEpoch/CadenceDebt
+issue as originally filed.
+
+### Verification (this chunk)
+
+Suites 8/8 green after every change (engine2 293, determinism 608,
+frontend_sync, frame_scheduler, frame_arithmetic, async_log,
+transition_barrier, training_logic). Live two-instance results appended
+below as runs complete.
+
+### Expanded-bar status at handoff (2026-08-17 ~21:00)
+
+Full-bar soak v2 (run 20-49-41, B2 fix live, 5-match/4-rematch config):
+match 1 clean at 60.00 under true rollback, iteration 1 PASS (fastpath,
+epoch 2), iteration 2 took the any-NO CHARSEL route and progressed
+through catalog sync + char cycling (match-3 plan grid=8) — externally
+stopped mid-iteration (no desync, no failure; user took over the rig
+for depth-30/R32 forced-rollback cells and raised the caps tree-wide:
+budget max 32, forced-rollback cap 48, exec ring 1024). Suites 8/8
+green on the aligned tree; identical DLLs deployed to both folders.
+
+Open items for the next loop: (1) B1 — the round-end masked-byte sim
+reader under deep skew (F8 hunt; byte suspects listed above); (2) a
+completed full-length SOAK-PASS with char/stage variation + both routes
+under the aligned build; (3) analyzer profile for boundary lifecycle
+holds (54/soak currently counted against online-clean).

@@ -770,10 +770,20 @@ static void UpdateMatchExitPendingMirror() {
     }
     Net::MatchLifecycleSnapshot lifeSnap{};
     Net::MatchLifecycle_GetSnapshot(&lifeSnap);
+    // Route-byte sentinel fix (2026-08-17, deep-rollback cell R12/DD10):
+    // the vanilla route byte (match+10) idles at 0xFF during NORMAL
+    // gameplay in this build — `route != 0` read that as "exit armed" and
+    // held the engine in exact-input (no-prediction) mode for the ENTIRE
+    // match. Invisible on same-frame loopback (remote actuals present at
+    // the frontier anyway), but the moment inputs arrived late the pair
+    // degraded to full lockstep: zero rollbacks, sim ~30 fps,
+    // Stall(LifecycleBoundary) spam. Only a REAL route value arms the
+    // exact window; 0 and 0xFF are "no route".
+    const uint8_t route = lifeSnap.match_end_route;
     const bool exitPending =
         lifeSnap.phase == Net::MatchLifecyclePhase::MatchEnd ||
         lifeSnap.phase == Net::MatchLifecyclePhase::PostMatchRoute ||
-        lifeSnap.match_end_route != 0;
+        (route != 0 && route != 0xFF);
     if (exitPending != s_matchExitPendingMirror) {
         s_matchExitPendingMirror = exitPending;
         RollbackSession_SetMatchExitPending(exitPending);

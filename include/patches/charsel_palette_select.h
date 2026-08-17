@@ -35,6 +35,11 @@ void CharSelPaletteSelect_SetExternalCustomHint(uint8_t game_slot,
                                                 bool available);
 
 bool CharSelPaletteSelect_IsCatalogReady();
+/// B2 (2026-08-17): rate-limited catalog resend while the peer shows no
+/// charsel-lockstep progress — call once per pass while the charsel
+/// lockstep regime is active (covers the rematch-charsel begin-skew race
+/// where the initial catalog packet predates the peer's accepting phase).
+void CharSelPaletteSelect_PumpCatalogResend();
 bool CharSelPaletteSelect_IsSelectionLocked(uint8_t game_slot);
 bool CharSelPaletteSelect_CanCancelSelection(uint8_t game_slot);
 bool CharSelPaletteSelect_CancelSelection(uint8_t game_slot);
