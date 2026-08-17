@@ -214,6 +214,17 @@ bool InstallHooks() {
         LOG_INFO("Hooked Audio_IsPlaying (record/replay for rollback determinism)");
     }
 
+    LOG_INFO("ADDR_AUDIO_PLAY_VOICE = 0x%08X (Audio_Play_Wrapper)", ADDR_AUDIO_PLAY_VOICE);
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_AUDIO_PLAY_VOICE),
+            reinterpret_cast<void*>(&Rollback::Hook_Audio_Play_Wrapper),
+            reinterpret_cast<void**>(&Rollback::g_origAudioPlayWrapper));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook Audio_Play_Wrapper! Status: %d", status);
+    } else {
+        LOG_INFO("Hooked Audio_Play_Wrapper (canonical voice-start stamps)");
+    }
+
     LOG_INFO("ADDR_EFFECT_SPAWN = 0x%08X (sub_4A92C0 Effect_Enqueue)", ADDR_EFFECT_SPAWN);
     status = MH_CreateHook(
             reinterpret_cast<void*>(ADDR_EFFECT_SPAWN),

@@ -99,6 +99,10 @@
 // branches. Hooked for record/replay (rollback_audio), the qoh99 hkSoundStatus
 // pattern; masking the resulting bytes only hid the divergence.
 #define ADDR_AUDIO_IS_PLAYING   0x62C840
+// Audio_Play_Wrapper (0x5D3410): Audio_Stop + Audio_Play. Hooked so the
+// canonical voice model knows the frame a voice STARTED, without which
+// Audio_IsPlaying cannot be answered deterministically.
+#define ADDR_AUDIO_PLAY_VOICE 0x5D3410
 #define ADDR_MATCH_SCORE_STATS  (GAME_BASE + 0x15BCD0)  // sub_55BCD0 — Match_UpdateScoreStats: cumulative
                                                         // score/rank/continuation `+=` globals OUTSIDE the snapshot
                                                         // regions, called on the round-end commit tick. Hooked so a

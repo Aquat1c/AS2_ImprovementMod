@@ -28,6 +28,20 @@ typedef int(__cdecl* AudioIsPlaying_t)(int handle);
 extern AudioIsPlaying_t g_origAudioIsPlaying;
 int __cdecl Hook_Audio_IsPlaying(int handle);
 
+/// Audio_Play_Wrapper: records the canonical frame a voice started, which is
+/// what lets Audio_IsPlaying be answered from frame arithmetic instead of the
+/// device's playback cursor.
+typedef int(__cdecl* AudioPlayWrapper_t)(int handle);
+extern AudioPlayWrapper_t g_origAudioPlayWrapper;
+int __cdecl Hook_Audio_Play_Wrapper(int handle);
+
+/// Clear the canonical voice model (session begin / epoch rotation).
+void RollbackAudio_ResetVoiceModel();
+/// model_answers: status answered from frame arithmetic (deterministic).
+/// device_answers: fell through to the live device (should be 0 in a match).
+void RollbackAudio_GetVoiceModelStats(uint32_t* model_answers,
+                                      uint32_t* device_answers);
+
 /// Record/replay counters for the status hook. A nonzero `misses` means a
 /// replay queried more times than the truth tick recorded — i.e. the branch
 /// diverged or the window is too small.

@@ -499,12 +499,97 @@ AudioStatusFrame& StatusSlot(int32_t rb_frame) {
 
 } // namespace
 
+// ── Canonical voice model (qoh99 DeterministicAudioPolicy model) ──────────
+// Record/replay above fixes truth-vs-replay on ONE machine. It cannot fix the
+// peers disagreeing, and they do: Entity_UpdateAudio writes audioStatePtr[1]
+// and [2] at match+149184/149188 — inside the match region, BELOW P2's entity,
+// so hashed and NOT masked. Two peers whose DirectSound buffers sit at
+// different playback positions take different branches and write different
+// values into HASHED state. Live desync f13319 has exactly that fingerprint:
+// rng identical, hp identical, state hash different.
+//
+// qoh99's answer (DeterministicAudioPolicy.h): never consult the playback
+// cursor for a status the simulation consumes. Expire the voice on a canonical
+// TICK instead, so "is it still playing" is frame arithmetic and every peer
+// computes the same answer — "a .wav on disk must not be able to decide how
+// long the game waits".
+//
+// Rollback-safe without touching the snapshot: the model stores the canonical
+// START frame per voice slot. A replayed play call re-stamps the same
+// canonical frame (idempotent), and a start frame in the future of a restored
+// frame simply reads as not-yet-started, so a restore needs no undo.
+namespace {
+
+constexpr size_t   kVoiceSlots = 4096;          // handle low 16 bits, masked
+constexpr int32_t  kVoiceDurationFrames = 61;   // qoh99's fallback one-shot length
+
+int32_t s_voiceStartFrame[kVoiceSlots];
+bool    s_voiceModelReady = false;
+uint32_t s_voiceModelAnswers = 0;
+uint32_t s_voiceDeviceAnswers = 0;
+
+void VoiceModelReset() {
+    for (size_t i = 0; i < kVoiceSlots; ++i) s_voiceStartFrame[i] = INT32_MIN;
+    s_voiceModelReady = true;
+}
+
+inline size_t VoiceSlot(int handle) {
+    return (size_t)((uint32_t)handle & 0x0FFFu);
+}
+
+} // namespace
+
+void RollbackAudio_ResetVoiceModel() {
+    VoiceModelReset();
+}
+
+void RollbackAudio_GetVoiceModelStats(uint32_t* model_answers,
+                                      uint32_t* device_answers) {
+    if (model_answers) *model_answers = s_voiceModelAnswers;
+    if (device_answers) *device_answers = s_voiceDeviceAnswers;
+}
+
+AudioPlayWrapper_t g_origAudioPlayWrapper = nullptr;
+
+int __cdecl Hook_Audio_Play_Wrapper(int handle) {
+    if (!g_origAudioPlayWrapper) return 0;
+    if (RollbackSession_IsActive()) {
+        if (!s_voiceModelReady) VoiceModelReset();
+        // Canonical start stamp. Replays re-stamp the same value, so this is
+        // idempotent under rollback.
+        s_voiceStartFrame[VoiceSlot(handle)] = RollbackSession_GetCurrentFrame();
+        // Suppress the actual device call during replay so a re-simulated
+        // frame does not retrigger a voice the player already heard.
+        if (RollbackSession_IsRollingBack()) {
+            return 0;
+        }
+    }
+    return g_origAudioPlayWrapper(handle);
+}
+
 AudioIsPlaying_t g_origAudioIsPlaying = nullptr;
 
 int __cdecl Hook_Audio_IsPlaying(int handle) {
     if (!g_origAudioIsPlaying) return -1;
     if (!RollbackSession_IsActive()) {
         return g_origAudioIsPlaying(handle);
+    }
+
+    // Canonical answer: identical on both peers by construction, and
+    // reproducible across truth and replay.
+    if (s_voiceModelReady) {
+        const int32_t started = s_voiceStartFrame[VoiceSlot(handle)];
+        if (started != INT32_MIN) {
+            const int32_t now = RollbackSession_GetCurrentFrame();
+            const int32_t elapsed = now - started;
+            ++s_voiceModelAnswers;
+            // Not yet started (restored below the stamp) reads as silent.
+            if (elapsed < 0) return 0;
+            return elapsed < kVoiceDurationFrames ? 1 : 0;
+        }
+        // Never played in this session: silent, deterministically.
+        ++s_voiceModelAnswers;
+        return 0;
     }
 
     const int32_t frame = RollbackSession_GetCurrentFrame();
@@ -524,9 +609,11 @@ int __cdecl Hook_Audio_IsPlaying(int handle) {
         // value, and count it — a nonzero miss rate means the record window is
         // too small or the branch genuinely diverged.
         ++s_statusMisses;
+        ++s_voiceDeviceAnswers;
         return g_origAudioIsPlaying(handle);
     }
 
+    ++s_voiceDeviceAnswers;
     const int result = g_origAudioIsPlaying(handle);
     AudioStatusFrame& slot = StatusSlot(frame);
     if (slot.rb_frame != frame) {
