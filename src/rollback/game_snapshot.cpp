@@ -71,7 +71,9 @@ constexpr MaskRange kMainDigestMasks[] = {
       ENTITY_RENDER_ANIM_TIMER_MASK_SIZE },                                            // F7f
     { kP1EntityOff + ENTITY_RENDER_FLASH_TINT_MASK_OFF,
       ENTITY_RENDER_FLASH_TINT_MASK_SIZE },                                            // F5+F7e
-    { kP1EntityOff + ENTITY_SUPERBG_MASK_OFF,      ENTITY_SUPERBG_MASK_SIZE },         // F2+F7g
+    { kP1EntityOff + ENTITY_SUPERBG_MASK_LOW_OFF,  ENTITY_SUPERBG_MASK_LOW_SIZE },     // F2+F7g (low)
+    // GAP: +0x4D4..+0x4DB is HASHED — sim pause/hitstop timers, see as2_constants.h
+    { kP1EntityOff + ENTITY_SUPERBG_MASK_HIGH_OFF, ENTITY_SUPERBG_MASK_HIGH_SIZE },    // F2 (high)
     { kP1EntityOff + ENTITY_HIT_REACTION_DISPLAY_MASK_OFF,
       ENTITY_HIT_REACTION_DISPLAY_MASK_SIZE },                                         // F7e
     { kP1EntityOff + ENTITY_RENDER_OUTPUT_BLOCK_OFF,
@@ -82,7 +84,9 @@ constexpr MaskRange kMainDigestMasks[] = {
       ENTITY_RENDER_ANIM_TIMER_MASK_SIZE },                                            // F7f
     { kP2EntityOff + ENTITY_RENDER_FLASH_TINT_MASK_OFF,
       ENTITY_RENDER_FLASH_TINT_MASK_SIZE },                                            // F5+F7e
-    { kP2EntityOff + ENTITY_SUPERBG_MASK_OFF,      ENTITY_SUPERBG_MASK_SIZE },         // F2+F7g
+    { kP2EntityOff + ENTITY_SUPERBG_MASK_LOW_OFF,  ENTITY_SUPERBG_MASK_LOW_SIZE },     // F2+F7g (low)
+    // GAP: +0x4D4..+0x4DB is HASHED — sim pause/hitstop timers
+    { kP2EntityOff + ENTITY_SUPERBG_MASK_HIGH_OFF, ENTITY_SUPERBG_MASK_HIGH_SIZE },    // F2 (high)
     { kP2EntityOff + ENTITY_HIT_REACTION_DISPLAY_MASK_OFF,
       ENTITY_HIT_REACTION_DISPLAY_MASK_SIZE },                                         // F7e
     { kP2EntityOff + ENTITY_RENDER_OUTPUT_BLOCK_OFF,
@@ -336,7 +340,18 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
     WriteMemory<uint32_t>(ADDR_EFFECT_INDEX, snapshot->effect_index);
 
     WriteMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER, snapshot->sim_frame);
-    WriteMemory<uint32_t>(ADDR_FRAME_COUNTER, snapshot->display_frame);
+    // ADDR_FRAME_COUNTER (0x81635C) is deliberately NOT restored. It is the
+    // OUTER-PASS counter (incremented once per main-loop pass, decomp:266427),
+    // not a simulation quantity, and it has zero simulation readers in the
+    // whole decomp. What does read it is presentation: every "critical"
+    // sidebar flash takes its alpha from `-6 - 25 * (*(game+4) % 11)`, an
+    // 11-step fade ramp. Restoring it ran that ramp BACKWARDS by the rollback
+    // depth on every correction, which vanilla can never do — the low-HP,
+    // guard-crush and MAX-meter flashes visibly stuttered under rollback.
+    // It stays captured (diagnostics/dumps read snapshot->display_frame) but
+    // the live counter is left to advance monotonically, as the renderer
+    // expects. Not to be confused with ADDR_FRAME_DISPLAY (0x816494), which IS
+    // sim-read and IS restored below (SAVESTATE_AUDIT F3).
     // F3: rewind Frame_Display with the sim so resim re-increments from the
     // restored value instead of drifting ahead by the rollback depth.
     WriteMemory<uint32_t>(ADDR_FRAME_DISPLAY, snapshot->frame_display);

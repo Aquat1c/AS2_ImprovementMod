@@ -793,6 +793,24 @@
 // unchanged.
 #define ENTITY_SUPERBG_MASK_OFF          0x04C4
 #define ENTITY_SUPERBG_MASK_SIZE         0x0278
+// 2026-08-18: the F2/F7g window swallowed SIMULATION bytes. entity+1236..1243
+// (+0x4D4..+0x4DB) holds the hitstop/pause countdowns and combo-scale bytes,
+// and the simulation branches on them — decomp:43968 (sub_424B80)
+//     if ( !*(_BYTE *)(pEntity + 1238) || *(_BYTE *)(pEntity + 1242) )
+// and decomp:111867 (sub_4BF8D0) reads +1238 again. The render function the
+// mask exists for (sub_4C47C0) never touches +0x4C4..+0x4DB at all.
+//
+// Masking them meant any divergence there was INVISIBLE to the desync hash —
+// the same "digest-masked is not the same as sim-free" trap that produced the
+// frame-58 desync, and a standing suspect for the B1/F8 round-end divergence.
+// The window is therefore split so these eight bytes are hashed again; the
+// render-churn parts either side stay masked.
+#define ENTITY_SUPERBG_MASK_LOW_OFF      0x04C4   // .. +0x4D3 (render churn)
+#define ENTITY_SUPERBG_MASK_LOW_SIZE     0x0010
+#define ENTITY_SIM_PAUSE_TIMERS_OFF      0x04D4   // .. +0x4DB  HASHED (sim)
+#define ENTITY_SIM_PAUSE_TIMERS_SIZE     0x0008
+#define ENTITY_SUPERBG_MASK_HIGH_OFF     0x04DC   // .. +0x73B (particle scratch)
+#define ENTITY_SUPERBG_MASK_HIGH_SIZE    0x0260
 
 // Character voice bookkeeping (SAVESTATE_AUDIT F4): 3 dwords per entity at
 // +107084 driven by Entity_UpdateAudio (sub_4C38F0) — [0] requested voice id
