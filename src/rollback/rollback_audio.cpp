@@ -537,6 +537,22 @@ inline size_t VoiceSlot(int handle) {
     return (size_t)((uint32_t)handle & 0x0FFFu);
 }
 
+// The canonical model may ONLY answer for the handle class the simulation
+// consumes. Audio_IsPlaying itself rejects everything else with -1:
+//     if (a1 < 0) return -1;
+//     if ((a1 & 0x78000000) != 0x10000000) return -1;
+//     if ((unsigned short)a1 >= 0x1000) return -1;
+// The audio library asks about its OWN handles too (sub_64D0B0 uses the
+// 0x18000000 class) and branches on that -1. Answering those from frame
+// arithmetic would hand back 0 where the game expects -1 and change BGM /
+// streaming behaviour, so they pass straight through to the device.
+inline bool IsSimVoiceHandle(int handle) {
+    if (handle < 0) return false;
+    if (((uint32_t)handle & 0x78000000u) != 0x10000000u) return false;
+    if (((uint32_t)handle & 0xFFFFu) >= 0x1000u) return false;
+    return true;
+}
+
 } // namespace
 
 void RollbackAudio_ResetVoiceModel() {
@@ -553,7 +569,7 @@ AudioPlayWrapper_t g_origAudioPlayWrapper = nullptr;
 
 int __cdecl Hook_Audio_Play_Wrapper(int handle) {
     if (!g_origAudioPlayWrapper) return 0;
-    if (RollbackSession_IsActive()) {
+    if (RollbackSession_IsActive() && IsSimVoiceHandle(handle)) {
         if (!s_voiceModelReady) VoiceModelReset();
         // Canonical start stamp. Replays re-stamp the same value, so this is
         // idempotent under rollback.
@@ -572,6 +588,12 @@ AudioIsPlaying_t g_origAudioIsPlaying = nullptr;
 int __cdecl Hook_Audio_IsPlaying(int handle) {
     if (!g_origAudioIsPlaying) return -1;
     if (!RollbackSession_IsActive()) {
+        return g_origAudioIsPlaying(handle);
+    }
+
+    // Not a simulation-consumed voice handle: the device owns the answer.
+    if (!IsSimVoiceHandle(handle)) {
+        ++s_voiceDeviceAnswers;
         return g_origAudioIsPlaying(handle);
     }
 
