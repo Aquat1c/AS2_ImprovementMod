@@ -201,6 +201,11 @@ struct AutoConnectConfig {
     bool     enabled;
     bool     valid;
     bool     isHost;
+    // role=spectator: attach to a running match as a spectator instead of
+    // hosting or joining. Needed to run the acceptance matrix with a spectator
+    // attached, which previously required driving the menu by hand.
+    bool     isSpectator;
+    char     spectateTarget[128];
     char     nickname[64];
     uint16_t listenPort;
     char     targetIp[96];
@@ -1962,6 +1967,10 @@ static void LoadAutoConnectConfig() {
             s_autoConnect.enabled = (atoi(val) != 0);
         } else if (_stricmp(key, "role") == 0) {
             s_autoConnect.isHost = (_stricmp(val, "host") == 0);
+            s_autoConnect.isSpectator = (_stricmp(val, "spectator") == 0);
+        } else if (_stricmp(key, "spectate_target") == 0 && val[0]) {
+            strncpy_s(s_autoConnect.spectateTarget,
+                      sizeof(s_autoConnect.spectateTarget), val, _TRUNCATE);
         } else if (_stricmp(key, "nickname") == 0 && val[0]) {
             strncpy_s(s_autoConnect.nickname, sizeof(s_autoConnect.nickname), val, _TRUNCATE);
         } else if (_stricmp(key, "port") == 0) {
@@ -2153,6 +2162,26 @@ static void HandleAutoConnect() {
 
     switch (s_autoConnectState) {
         case AutoConnectState::WaitingForMenu:
+            // Spectator role: no session of our own — attach to the host's
+            // spectator endpoint and then just watch.
+            if (s_autoConnect.isSpectator) {
+                if (mode == MODE_MENU && !ModeOwnership::IsPendingMenuRestore()) {
+                    const char* target = s_autoConnect.spectateTarget[0]
+                                             ? s_autoConnect.spectateTarget
+                                             : s_remoteEndpoint;
+                    LOG_NETPLAY(LOG_INFO,
+                        "[AutoConnect] Spectator attaching to %s", target);
+                    if (Net::SpectatorClient_StartConnect(target)) {
+                        AutoConnectTransition(AutoConnectState::WaitingForConnection,
+                                              "spectator connect started");
+                    } else if (s_autoConnectStateFrames > 600) {
+                        // Host may not be listening yet; retry rather than fail.
+                        AutoConnectTransition(AutoConnectState::WaitingForMenu,
+                                              "spectator connect retry");
+                    }
+                }
+                break;
+            }
             if (mode == MODE_MENU && !ModeOwnership::IsPendingMenuRestore() &&
                 snap.state == Net::SessionState::Idle) {
                 if (BeginAutoConnectSession()) {
@@ -2164,6 +2193,10 @@ static void HandleAutoConnect() {
             break;
 
         case AutoConnectState::WaitingForConnection:
+            if (s_autoConnect.isSpectator) {
+                // Spectator has no ready/charsel handshake; it simply follows.
+                break;
+            }
             if (snap.state == Net::SessionState::Connected && !snap.local_ready) {
                 // Auto-accept the match
                 Net::Session_SignalReady();
