@@ -1,72 +1,62 @@
 /**
- * Alice Senki 2 - Input Prediction Policy
+ * Alice Senki 2 - Input Prediction (re0.7 M4 resurrection, master plan §2.7.3-R)
  *
- * Centralized prediction for missing remote inputs during rollback.
- * First-pass strategy: repeat last confirmed remote input.
- * Falls back to neutral if no confirmed input exists.
+ * Hold-last-actual prediction for missing remote inputs. Resurrected from the
+ * pre-Gekko module as a pure, instantiable policy object for engine2.
  *
- * All prediction goes through this module so the policy is explicit
- * and can be swapped or extended later.
+ * The predictor itself is trivial by design (QOH99 §2.2): predict the last
+ * *actual* remote input. Earliest-mismatch tracking lives in the engine —
+ * the predictor only answers "what do we play when the wire is silent".
+ *
+ * Pure: no Win32, no game memory, no logging, no clock.
  */
 
 #pragma once
 
 #include <stdint.h>
 
+#include "net/frame_arithmetic.h"
+
 namespace Rollback {
 
-// ============================================================================
-// Prediction Strategy
-// ============================================================================
+class HoldLastPredictor {
+public:
+    void Reset(uint16_t neutral) {
+        neutral_ = neutral;
+        last_value_ = neutral;
+        has_actual_ = false;
+        last_frame_ = 0;
+        total_predictions_ = 0;
+    }
 
-enum class PredictionStrategy : uint8_t {
-    RepeatLast = 0,    // Repeat last confirmed remote input
-    Neutral,           // Always predict neutral (no buttons)
+    /// Feed a confirmed (actual) remote input. Only the newest frame wins;
+    /// out-of-order actuals for older frames do not regress the holding value.
+    void OnActual(uint32_t frame, uint16_t value) {
+        if (!has_actual_ || Net::frameAtOrAfter(frame, last_frame_)) {
+            has_actual_ = true;
+            last_frame_ = frame;
+            last_value_ = value;
+        }
+    }
+
+    /// Predict the remote input for a frame with no actual yet.
+    uint16_t Predict() {
+        ++total_predictions_;
+        return has_actual_ ? last_value_ : neutral_;
+    }
+
+    /// Non-counting peek (diagnostics).
+    uint16_t Held() const { return has_actual_ ? last_value_ : neutral_; }
+    bool     HasActual() const { return has_actual_; }
+    uint32_t LastActualFrame() const { return last_frame_; }
+    uint32_t TotalPredictions() const { return total_predictions_; }
+
+private:
+    uint16_t neutral_ = 0;
+    uint16_t last_value_ = 0;
+    uint32_t last_frame_ = 0;
+    uint32_t total_predictions_ = 0;
+    bool     has_actual_ = false;
 };
-
-// ============================================================================
-// Lifecycle
-// ============================================================================
-
-void Prediction_Init();
-void Prediction_Shutdown();
-
-/// Reset prediction state (call at session/match start).
-void Prediction_Reset();
-
-// ============================================================================
-// Configuration
-// ============================================================================
-
-/// Set the active prediction strategy.
-void Prediction_SetStrategy(PredictionStrategy strategy);
-
-/// Get the active prediction strategy.
-PredictionStrategy Prediction_GetStrategy();
-
-// ============================================================================
-// Prediction
-// ============================================================================
-
-/// Predict remote input for the given frame.
-/// Uses the configured strategy and internal state to produce a prediction.
-/// The caller is responsible for writing this to the input timeline.
-uint16_t Prediction_PredictRemote(int32_t frame);
-
-/// Notify the prediction module that a confirmed remote input has arrived.
-/// This updates the internal "last known" state used by RepeatLast strategy.
-void Prediction_OnRemoteConfirmed(int32_t frame, uint16_t input);
-
-// ============================================================================
-// Diagnostics
-// ============================================================================
-
-struct PredictionSnapshot {
-    PredictionStrategy strategy;
-    uint16_t           last_confirmed_input;  // Last known real remote input
-    int32_t            last_confirmed_frame;  // Frame of last confirmed remote
-};
-
-void Prediction_GetSnapshot(PredictionSnapshot* out);
 
 } // namespace Rollback

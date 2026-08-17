@@ -227,9 +227,17 @@ struct PeerIdentityPayload {
     uint8_t  _pad[3];
 };
 
+// Enriched at M4 to the §3.2 terminal shape (INV-20): every terminal is
+// self-describing on the wire — a coarse machine code (DisconnectReason,
+// session_types.h), a stable 32-bit hash of the typed reason name
+// (fnv1a32, machine-groupable across builds), and a bounded human string.
+// Fault terminals are sticky: session2 resends every 100 ms during the
+// goodbye window until the transport acks (reliable ch0) or the window ends.
 struct DisconnectPayload {
-    uint16_t reason_code;        // 0 = normal, 1 = timeout, 2 = version mismatch, 3 = error
-    char     message[64];        // Human-readable reason
+    uint8_t  code;               // Net::DisconnectReason (coarse class)
+    uint8_t  _pad;
+    uint32_t reason_id;          // fnv1a32 of the typed terminal reason name
+    char     human[96];          // Human-readable reason (null-terminated)
 };
 
 struct PingPayload {
@@ -813,6 +821,8 @@ static_assert(sizeof(PacketType) + sizeof(CharSelInputPayload) <= MAX_PACKET_SIZ
     "CharSelInputPayload must fit inside one transport packet");
 static_assert(sizeof(PeerIdentityPayload) == 84,
     "PeerIdentityPayload wire size must remain stable");
+static_assert(sizeof(DisconnectPayload) == 102,
+    "DisconnectPayload wire size must remain stable (M4 §3.2 terminal shape)");
 static_assert(sizeof(SyncAnnouncePayload) == 8,
     "SyncAnnouncePayload wire size must remain stable");
 static_assert(sizeof(SyncConfirmPayload) == 12,

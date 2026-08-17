@@ -31,16 +31,24 @@ namespace Rollback {
 typedef unsigned short (__cdecl *MatchHandler_t)(uint32_t* a1);
 static MatchHandler_t g_matchHandler = (MatchHandler_t)ADDR_MATCH_MODE;
 
-using StateSlot = GameSnapshot;
+// Direct-mapped tagged slot (re0.7 M4, plan §2.7.7): slot = frame % 64,
+// every slot tagged {epoch, frame, phase}; restores validate the tag
+// fail-closed so a stale-epoch slot can never be restored.
+struct StateSlot {
+    GameSnapshot snap;
+    uint32_t     epoch = 0;   // 0 = untagged/offline capture
+    uint32_t     phase = 0;
+    uint64_t     gameplay_hash = 0;
+};
 
 // ============================================================================
 // State History Ring Buffer
 // ============================================================================
 
 static StateSlot* s_slots         = nullptr;  // Heap-allocated (each slot is ~254KB)
-static int        s_writeIdx      = 0;
-static int        s_count         = 0;
 static bool       s_historyInit   = false;
+static uint32_t   s_tagEpoch      = 0;        // stamped onto captures
+static uint32_t   s_tagPhase      = 0;
 
 // ============================================================================
 // Resimulation State
@@ -74,10 +82,14 @@ static void WriteInputsForFrame(int32_t frame, int local_player) {
 // State History API
 // ============================================================================
 
+static int SlotIndexFor(int32_t frame) {
+    return (int)((uint32_t)frame % (uint32_t)STATE_HISTORY_CAPACITY);
+}
+
 void StateHistory_Init() {
     if (s_historyInit) return;
 
-    // Heap-allocate the ring buffer — each slot is ~254KB, total ~4MB
+    // Heap-allocate the ring buffer — each slot is ~254KB
     s_slots = new (std::nothrow) StateSlot[STATE_HISTORY_CAPACITY];
     if (!s_slots) {
         LOG_ERROR("[StateHistory] Failed to allocate %d slots (%zu bytes)",
@@ -86,8 +98,6 @@ void StateHistory_Init() {
     }
 
     memset(s_slots, 0, sizeof(StateSlot) * STATE_HISTORY_CAPACITY);
-    s_writeIdx = 0;
-    s_count = 0;
     s_historyInit = true;
 
     LOG_INFO("[StateHistory] Initialized (%d slots, %zu KB each, %zu KB total)",
@@ -107,109 +117,153 @@ void StateHistory_Shutdown() {
         s_slots = nullptr;
     }
     s_historyInit = false;
-    s_writeIdx = 0;
-    s_count = 0;
 }
 
 void StateHistory_Reset() {
     if (!s_historyInit || !s_slots) return;
     for (int i = 0; i < STATE_HISTORY_CAPACITY; i++) {
-        GameSnapshot_Clear(&s_slots[i]);
+        GameSnapshot_Clear(&s_slots[i].snap);
+        s_slots[i].epoch = 0;
+        s_slots[i].phase = 0;
+        s_slots[i].gameplay_hash = 0;
     }
-    s_writeIdx = 0;
-    s_count = 0;
     LOG_INFO("[StateHistory] Reset");
     NetplayLog_Write("STATE", -1, "State history reset");
 }
 
-bool StateHistory_CaptureFrame(int32_t frame) {
+void StateHistory_SetTagContext(uint32_t epoch, uint32_t phase) {
+    s_tagEpoch = epoch;
+    s_tagPhase = phase;
+    NetplayLog_Write("STATE", -1,
+        "State history tag context: epoch=%u phase=%u", epoch, phase);
+}
+
+static bool CaptureFrameInternal(int32_t frame, uint64_t* out_hash, bool want_hash) {
     if (!s_historyInit || !s_slots) return false;
 
-    StateSlot* slot = &s_slots[s_writeIdx];
-    if (!GameSnapshot_Capture(slot, frame)) {
+    StateSlot* slot = &s_slots[SlotIndexFor(frame)];
+    if (!GameSnapshot_Capture(&slot->snap, frame)) {
         return false;
     }
-
-    s_writeIdx = (s_writeIdx + 1) % STATE_HISTORY_CAPACITY;
-    if (s_count < STATE_HISTORY_CAPACITY) s_count++;
+    slot->epoch = s_tagEpoch;
+    slot->phase = s_tagPhase;
+    slot->gameplay_hash = want_hash ? GameSnapshot_HashGameplay(&slot->snap) : 0;
+    if (out_hash) *out_hash = slot->gameplay_hash;
 
     NetplayLog_Verbose("STATE", frame,
-        "Captured frame: checksum=0x%08X count=%d oldest=%d newest=%d",
-        slot->checksum,
-        s_count,
-        StateHistory_GetOldestFrame(),
-        StateHistory_GetNewestFrame());
+        "Captured frame: checksum=0x%08X epoch=%u slot=%d",
+        slot->snap.checksum,
+        slot->epoch,
+        SlotIndexFor(frame));
 
     return true;
+}
+
+bool StateHistory_CaptureFrame(int32_t frame) {
+    return CaptureFrameInternal(frame, nullptr, false);
+}
+
+bool StateHistory_CaptureFrameHashed(int32_t frame, uint64_t* out_gameplay_hash) {
+    return CaptureFrameInternal(frame, out_gameplay_hash, true);
 }
 
 bool StateHistory_LoadFrame(int32_t frame) {
     if (!s_historyInit || !s_slots) return false;
 
-    // Search for the requested frame in the ring buffer
-    for (int i = 0; i < s_count; i++) {
-        int idx = (s_writeIdx - 1 - i + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
-        if (s_slots[idx].valid && s_slots[idx].frame == frame) {
-            NetplayLog_Write("STATE", frame,
-                "Loading state: checksum=0x%08X slot=%d",
-                s_slots[idx].checksum,
-                idx);
-            return GameSnapshot_Restore(&s_slots[idx]);
-        }
+    StateSlot* slot = &s_slots[SlotIndexFor(frame)];
+    if (slot->snap.valid && slot->snap.frame == frame) {
+        NetplayLog_Write("STATE", frame,
+            "Loading state: checksum=0x%08X epoch=%u slot=%d",
+            slot->snap.checksum,
+            slot->epoch,
+            SlotIndexFor(frame));
+        return GameSnapshot_Restore(&slot->snap);
     }
 
     LOG_ERROR("[StateHistory] Frame %d not found in history (oldest=%d newest=%d count=%d)",
-        frame, StateHistory_GetOldestFrame(), StateHistory_GetNewestFrame(), s_count);
+        frame, StateHistory_GetOldestFrame(), StateHistory_GetNewestFrame(),
+        StateHistory_GetCount());
     return false;
+}
+
+bool StateHistory_LoadFrameTagged(int32_t frame, uint32_t epoch) {
+    if (!s_historyInit || !s_slots) return false;
+
+    StateSlot* slot = &s_slots[SlotIndexFor(frame)];
+    if (!slot->snap.valid || slot->snap.frame != frame || slot->epoch != epoch) {
+        // Tag mismatch = fail-closed: never restore a stale-epoch slot
+        // (§2.7.5).
+        LOG_ERROR("[StateHistory] Tagged restore refused: frame=%d want_epoch=%u "
+            "slot={valid=%d frame=%d epoch=%u}",
+            frame, epoch,
+            slot->snap.valid ? 1 : 0, slot->snap.frame, slot->epoch);
+        NetplayLog_Write("STATE", frame,
+            "Tagged restore REFUSED: want_epoch=%u slot_valid=%d slot_frame=%d slot_epoch=%u",
+            epoch, slot->snap.valid ? 1 : 0, slot->snap.frame, slot->epoch);
+        return false;
+    }
+    NetplayLog_Write("STATE", frame,
+        "Loading tagged state: checksum=0x%08X epoch=%u slot=%d",
+        slot->snap.checksum, slot->epoch, SlotIndexFor(frame));
+    return GameSnapshot_Restore(&slot->snap);
 }
 
 bool StateHistory_HasFrame(int32_t frame) {
     if (!s_historyInit || !s_slots) return false;
-    for (int i = 0; i < s_count; i++) {
-        int idx = (s_writeIdx - 1 - i + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
-        if (s_slots[idx].valid && s_slots[idx].frame == frame) {
-            return true;
-        }
-    }
-    return false;
+    const StateSlot* slot = &s_slots[SlotIndexFor(frame)];
+    return slot->snap.valid && slot->snap.frame == frame;
 }
 
 void StateHistory_DiscardFramesAfter(int32_t frame) {
     if (!s_historyInit || !s_slots) return;
 
-    while (s_count > 0) {
-        const int newestIdx = (s_writeIdx - 1 + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
-        if (!s_slots[newestIdx].valid || s_slots[newestIdx].frame <= frame) {
-            break;
+    for (int i = 0; i < STATE_HISTORY_CAPACITY; i++) {
+        if (s_slots[i].snap.valid && s_slots[i].snap.frame > frame) {
+            GameSnapshot_Clear(&s_slots[i].snap);
+            s_slots[i].epoch = 0;
+            s_slots[i].phase = 0;
+            s_slots[i].gameplay_hash = 0;
         }
-
-        GameSnapshot_Clear(&s_slots[newestIdx]);
-        s_writeIdx = newestIdx;
-        --s_count;
     }
 
     NetplayLog_Write("STATE", frame,
         "Discarded future states after frame %d: count=%d oldest=%d newest=%d",
         frame,
-        s_count,
+        StateHistory_GetCount(),
         StateHistory_GetOldestFrame(),
         StateHistory_GetNewestFrame());
 }
 
 int32_t StateHistory_GetOldestFrame() {
-    if (!s_historyInit || !s_slots || s_count == 0) return -1;
-    int idx = (s_writeIdx - s_count + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
-    return s_slots[idx].frame;
+    if (!s_historyInit || !s_slots) return -1;
+    int32_t oldest = -1;
+    for (int i = 0; i < STATE_HISTORY_CAPACITY; i++) {
+        if (s_slots[i].snap.valid &&
+            (oldest == -1 || s_slots[i].snap.frame < oldest)) {
+            oldest = s_slots[i].snap.frame;
+        }
+    }
+    return oldest;
 }
 
 int32_t StateHistory_GetNewestFrame() {
-    if (!s_historyInit || !s_slots || s_count == 0) return -1;
-    int idx = (s_writeIdx - 1 + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
-    return s_slots[idx].frame;
+    if (!s_historyInit || !s_slots) return -1;
+    int32_t newest = -1;
+    for (int i = 0; i < STATE_HISTORY_CAPACITY; i++) {
+        if (s_slots[i].snap.valid && s_slots[i].snap.frame > newest) {
+            newest = s_slots[i].snap.frame;
+        }
+    }
+    return newest;
 }
 
 int32_t StateHistory_GetCount() {
-    return s_count;
+    if (!s_historyInit || !s_slots) return 0;
+    int32_t count = 0;
+    for (int i = 0; i < STATE_HISTORY_CAPACITY; i++) {
+        if (s_slots[i].snap.valid) count++;
+    }
+    return count;
 }
 
 // ============================================================================
@@ -220,11 +274,10 @@ int32_t StateHistory_GetCount() {
 /// Returns -1 if no suitable frame exists.
 static int32_t FindBestRollbackFrame(int32_t target_frame) {
     int32_t best = -1;
-    for (int i = 0; i < s_count; i++) {
-        int idx = (s_writeIdx - 1 - i + STATE_HISTORY_CAPACITY) % STATE_HISTORY_CAPACITY;
-        if (s_slots[idx].valid && s_slots[idx].frame <= target_frame) {
-            if (best == -1 || s_slots[idx].frame > best) {
-                best = s_slots[idx].frame;
+    for (int i = 0; i < STATE_HISTORY_CAPACITY; i++) {
+        if (s_slots[i].snap.valid && s_slots[i].snap.frame <= target_frame) {
+            if (best == -1 || s_slots[i].snap.frame > best) {
+                best = s_slots[i].snap.frame;
             }
         }
     }
@@ -363,7 +416,7 @@ void Resim_GetSnapshot(ResimSnapshot* out) {
     out->last_rollback_frame = s_lastRollbackFrame;
     out->last_rollback_length = s_lastRollbackLength;
 
-    out->history_count = s_count;
+    out->history_count = StateHistory_GetCount();
     out->history_oldest_frame = StateHistory_GetOldestFrame();
     out->history_newest_frame = StateHistory_GetNewestFrame();
 }

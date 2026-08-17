@@ -1632,14 +1632,24 @@ static void OnPacketReceived(uintptr_t peerToken, uint8_t channelID,
             break;
 
         case PacketType::Disconnect: {
+            // M4 §3.2 terminal shape: {code u8, reason_id u32, human[96]}.
             const char* reason = "Remote disconnected";
+            uint8_t code = 0;
+            uint32_t reasonId = 0;
+            char humanBuf[sizeof(DisconnectPayload::human)];
             if (payloadLen >= sizeof(DisconnectPayload)) {
                 const DisconnectPayload* dp = static_cast<const DisconnectPayload*>(payload);
-                reason = dp->message;
+                memcpy(humanBuf, dp->human, sizeof(humanBuf));
+                humanBuf[sizeof(humanBuf) - 1] = '\0';
+                if (humanBuf[0]) reason = humanBuf;
+                code = dp->code;
+                reasonId = dp->reason_id;
             }
-            LOG_INFO("[Session] Received Disconnect: %s", reason);
+            LOG_INFO("[Session] Received Disconnect: %s (code=%u reason_id=0x%08X)",
+                     reason, code, reasonId);
             Rollback::NetplayLog_Write("SESSION", -1,
-                "Remote Disconnect received: %s", reason);
+                "Remote Disconnect received: code=%u reason_id=0x%08X human=%s",
+                code, reasonId, reason);
             if (s_activeSessionToken != 0) {
                 Transport2_RequestDisconnect(s_activeSessionToken, 0, true);
                 Transport2_RequestDestroyHost(s_activeSessionToken);
@@ -1990,13 +2000,40 @@ void Session2_Terminate(Session2TerminalReason reason, const char* detail) {
             break;
     }
 
+    const bool faultTerminal =
+        reason != Session2TerminalReason::UserCancel &&
+        reason != Session2TerminalReason::GameExit;
+
     if (peerReachable) {
+        // M4 §3.2 terminal shape (INV-20): coarse code + stable reason_id
+        // hash of the typed reason name + bounded human string.
         DisconnectPayload dp{};
-        dp.reason_code = static_cast<uint16_t>(disconnectData);
-        strncpy(dp.message, text, sizeof(dp.message) - 1);
-        dp.message[sizeof(dp.message) - 1] = '\0';
+        dp.code = static_cast<uint8_t>(disconnectData);
+        {
+            const char* name = Session2TerminalReasonName(reason);
+            uint32_t hash = 2166136261u;
+            for (const char* c = name; *c; ++c) {
+                hash ^= (uint8_t)*c;
+                hash *= 16777619u;
+            }
+            dp.reason_id = hash;
+        }
+        strncpy(dp.human, text, sizeof(dp.human) - 1);
+        dp.human[sizeof(dp.human) - 1] = '\0';
         QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect,
                          &dp, sizeof(dp), true, "terminate");
+        if (faultTerminal) {
+            // Sticky terminal (INV-20): resend every 100 ms across a bounded
+            // goodbye window while the worker still pumps, so the reliable
+            // channel gets real chances to deliver+ack before the host dies.
+            // (Full resend-until-acked persistence needs a session that
+            // outlives the terminal — tracked as an M5/M6 obligation.)
+            for (int i = 0; i < 4; ++i) {
+                Sleep(100);
+                QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect,
+                                 &dp, sizeof(dp), true, "terminate-resend");
+            }
+        }
         Transport2_RequestDisconnect(token, disconnectData, false);
     }
 

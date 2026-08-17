@@ -40,23 +40,37 @@ int32_t Resim_GetReplayLength();
 // State History (Ring Buffer of Savestates)
 // ============================================================================
 
-/// Maximum number of saved states in the ring buffer.
-/// Must be >= max rollback budget + max input delay + margin.
-/// 32 supports budget 7 + delay ~20 + safety margin.
-constexpr int STATE_HISTORY_CAPACITY = 32;
+/// Maximum number of saved states in the ring buffer (re0.7 M4, plan §2.7.7):
+/// 64 slots (R_max 15 + catch-up headroom + safety), direct-mapped
+/// slot = frame % 64.
+constexpr int STATE_HISTORY_CAPACITY = 64;
 
 /// Initialize the state history ring buffer.
 void StateHistory_Init();
 void StateHistory_Shutdown();
 void StateHistory_Reset();
 
+/// Set the identity tag stamped onto every subsequent capture (re0.7 M4,
+/// plan §2.7.7): every slot is tagged {epoch, frame, phase} and restores
+/// validate the tag fail-closed. Epoch 0 = untagged/offline (legacy callers:
+/// replay stepping, training, manual savestate baseline).
+void StateHistory_SetTagContext(uint32_t epoch, uint32_t phase);
+
 /// Capture the current game state and associate it with the given frame.
 /// Returns true on success.
 bool StateHistory_CaptureFrame(int32_t frame);
 
+/// Capture and also report the Block64 gameplay digest of the captured
+/// sim-affecting bytes (the SyncHash / confirm-pipeline `pre_state_hash`).
+bool StateHistory_CaptureFrameHashed(int32_t frame, uint64_t* out_gameplay_hash);
+
 /// Load a previously captured state for the given frame.
 /// Returns true on success, false if the frame isn't in history.
 bool StateHistory_LoadFrame(int32_t frame);
+
+/// Tag-validated restore (fail-closed): refuses a slot whose {epoch, frame}
+/// tag does not match. A stale-epoch slot can NEVER be restored (§2.7.5).
+bool StateHistory_LoadFrameTagged(int32_t frame, uint32_t epoch);
 
 /// Check if a specific frame is available in history.
 bool StateHistory_HasFrame(int32_t frame);

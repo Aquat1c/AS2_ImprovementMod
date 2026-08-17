@@ -38,8 +38,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Enable asynchronous exception handling for SEH (__try/__except)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHa")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /EHa")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHa /FS")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /EHa /FS")
 
 # ============================================================================
 # Options
@@ -47,6 +47,11 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /EHa")
 
 option(USE_VCPKG "Use vcpkg for dependencies" OFF)
 option(AS2_ENABLE_LEGACY_CUMULATIVE_PACKETS "Build the legacy cumulative packet experiment" OFF)
+# re0.7 M4 (plan §6): the GekkoNet backend stays the LIVE gameplay path until
+# the M6 cutover gate passes. ON  -> rollback_session.cpp (GekkoNet) + GekkoNet
+# lib/link. OFF -> rollback_session_engine2.cpp (custom engine2 adapter), no
+# GekkoNet anywhere in the build.
+option(AS2_WITH_GEKKO "Ship the GekkoNet rollback backend (until M6 cutover)" ON)
 option(AS2_ENABLE_NAT_TRAVERSAL "Enable NAT traversal backend integration" ON)
 option(AS2_ENABLE_UPNP_FALLBACK "Enable miniupnpc UPnP fallback mapping" ON)
 option(AS2_ENABLE_PCPNATPMP_FALLBACK "Enable libpcpnatpmp PCP/NAT-PMP fallback mapping" ON)
@@ -176,7 +181,7 @@ endif()
 # Pinned workspace dependency used for the gameplay rollback bridge.
 # ============================================================================ 
 
-if(EXISTS "${GEKKONET_DIR}/GekkoLib/CMakeLists.txt")
+if(AS2_WITH_GEKKO AND EXISTS "${GEKKONET_DIR}/GekkoLib/CMakeLists.txt")
     set(BUILD_DOCS OFF CACHE BOOL "Build GekkoNet docs" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build GekkoNet shared libraries" FORCE)
     set(NO_ASIO_BUILD OFF CACHE BOOL "Build GekkoNet without ASIO" FORCE)
@@ -191,8 +196,10 @@ if(EXISTS "${GEKKONET_DIR}/GekkoLib/CMakeLists.txt")
             ${CMAKE_CURRENT_SOURCE_DIR}/include
         )
     endif()
-else()
+elseif(AS2_WITH_GEKKO)
     message(WARNING "GekkoNet not found at ${GEKKONET_DIR}; gameplay bridge build will fail until it is added.")
+else()
+    message(STATUS "AS2_WITH_GEKKO=OFF: building the custom engine2 backend; GekkoNet excluded.")
 endif()
 
 # ============================================================================
@@ -301,9 +308,12 @@ set(DIAGNOSTICS_HEADERS
 )
 
 set(ROLLBACK_HEADERS
+    include/rollback/block_digest.h
     include/rollback/determinism_verify.h
+    include/rollback/engine2.h
     include/rollback/frame_lineage.h
     include/rollback/game_snapshot.h
+    include/rollback/lifecycle_window.h
     include/rollback/savestate.h
     include/rollback/input_timeline.h
     include/rollback/prediction.h
@@ -434,13 +444,13 @@ set(DIAGNOSTICS_SOURCES
 
 set(ROLLBACK_SOURCES
     src/rollback/determinism_verify.cpp
+    src/rollback/engine2.cpp
     src/rollback/frame_lineage.cpp
     src/rollback/game_snapshot.cpp
     src/rollback/savestate.cpp
     src/rollback/input_timeline.cpp
     src/rollback/prediction.cpp
     src/rollback/resimulation.cpp
-    src/rollback/rollback_session.cpp
     src/rollback/rollback_debug.cpp
     src/rollback/desync_dump.cpp
     src/rollback/netplay_log.cpp
@@ -451,6 +461,15 @@ set(ROLLBACK_SOURCES
     src/rollback/online_wiring.cpp
     src/rollback/rematch_cleanup.cpp
 )
+
+# re0.7 M4: the RollbackSession_* facade has two providers behind the same
+# unchanged header (plan §6 M4 "facade adapter"): the GekkoNet backend or the
+# engine2 adapter, selected by AS2_WITH_GEKKO.
+if(AS2_WITH_GEKKO)
+    list(APPEND ROLLBACK_SOURCES src/rollback/rollback_session.cpp)
+else()
+    list(APPEND ROLLBACK_SOURCES src/rollback/rollback_session_engine2.cpp)
+endif()
 
 set(NET_SOURCES
     src/net/baseline_sync.cpp
@@ -607,27 +626,54 @@ set_target_properties(async_log_tests PROPERTIES
 
 add_test(NAME async_log_tests COMMAND async_log_tests)
 
-add_executable(gekko_input_tests
-    tests/gekko_input_tests.cpp
-    lib/GekkoNet/GekkoLib/src/input.cpp
+if(AS2_WITH_GEKKO)
+    add_executable(gekko_input_tests
+        tests/gekko_input_tests.cpp
+        lib/GekkoNet/GekkoLib/src/input.cpp
+    )
+
+    target_include_directories(gekko_input_tests PRIVATE
+        include
+        lib/GekkoNet/GekkoLib/include
+    )
+
+    target_compile_definitions(gekko_input_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        _CRT_SECURE_NO_WARNINGS
+    )
+
+    set_target_properties(gekko_input_tests PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+
+    add_test(NAME gekko_input_tests COMMAND gekko_input_tests)
+endif()
+
+# re0.7 M4: engine2 core unit tests + deterministic socket-free soak harness
+# (plan §7.1 T-ENG-1..12, §7.2 model) + savestate-cost microbench (§7.5 #4).
+# Pure target: engine core + headers only, no Win32-linked mod TUs.
+add_executable(engine2_tests
+    tests/engine2_tests.cpp
+    src/rollback/engine2.cpp
 )
 
-target_include_directories(gekko_input_tests PRIVATE
+target_include_directories(engine2_tests PRIVATE
     include
-    lib/GekkoNet/GekkoLib/include
+    include/core
 )
 
-target_compile_definitions(gekko_input_tests PRIVATE
+target_compile_definitions(engine2_tests PRIVATE
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
 )
 
-set_target_properties(gekko_input_tests PROPERTIES
+set_target_properties(engine2_tests PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
 )
 
-add_test(NAME gekko_input_tests COMMAND gekko_input_tests)
+add_test(NAME engine2_tests COMMAND engine2_tests)
 
 add_executable(training_logic_tests
     tests/frame_advantage_classifier_tests.cpp
@@ -696,24 +742,34 @@ target_include_directories(as2_rollback PRIVATE
     ${MINIUPNPC_DIR}/include
     ${LIBJUICE_DIR}/include
     ${PCPNATPMP_DIR}/include
-    ${GEKKONET_DIR}/GekkoLib/include
 )
 
 target_compile_definitions(as2_rollback PRIVATE
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
-    GEKKONET_STATIC
     AS2_HAVE_LIBJUICE=${AS2_HAVE_LIBJUICE}
     AS2_HAVE_MINIUPNPC=${AS2_HAVE_MINIUPNPC}
     AS2_HAVE_PCPNATPMP=${AS2_HAVE_PCPNATPMP}
 )
 
+if(AS2_WITH_GEKKO)
+    target_include_directories(as2_rollback PRIVATE
+        ${GEKKONET_DIR}/GekkoLib/include
+    )
+    target_compile_definitions(as2_rollback PRIVATE
+        GEKKONET_STATIC
+        AS2_WITH_GEKKO=1
+    )
+endif()
+
 # Link libraries (MinHook built from source - true static, SDL3 requires DLL)
+if(AS2_WITH_GEKKO)
+    target_link_libraries(as2_rollback PRIVATE GekkoNet)
+endif()
 target_link_libraries(as2_rollback PRIVATE
     imgui
     minhook
     enet
-    GekkoNet
     ${SDL3_DIR}/lib/x86/SDL3.lib
     ws2_32.lib
     winhttp.lib

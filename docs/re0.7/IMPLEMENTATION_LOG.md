@@ -694,3 +694,275 @@ milestone must know. Plan references are to `RE07_MASTER_REBUILD_PLAN.md`.
    `GameplayPacketRouter_OnPacket`, `PacketType::Hello/HelloAck`,
    `HelloPayload/HelloAckPayload`, `enet_silence_ms` (spectator's own
    `Spectator::PacketType::Hello` namespace is unrelated and untouched).
+
+---
+
+## 2026-08-17 — M4 (engine2 offline bring-up; Gekko still ships)
+
+### M4-1: Resurrect + finish `input_timeline` + `prediction` (§2.7.3)
+
+- **Files:** `include/rollback/input_timeline.h` (rewritten),
+  `include/rollback/prediction.h` (rewritten),
+  `src/rollback/input_timeline.cpp` / `src/rollback/prediction.cpp` (reduced
+  to include-hygiene stub TUs).
+- **Done:** both modules resurrected as PURE, instantiable, header-only
+  classes (inventory confirmed both orphaned — zero includers — so the old
+  global C API had no consumer to preserve):
+  - `InputRing` — direct-mapped canonical u32 input ring (wrap-safe via
+    frame_arithmetic, INV-15), typed `Set` results
+    (`Stored/Occupied/Conflict/StaleSlot`) so the engine maps occupied-slot
+    writes to adopt / DuplicateIdentical / Conflict without the ring
+    guessing intent; slot immutability is the INV-18 substrate.
+  - `HoldLastPredictor` — hold-last-actual with newest-frame-wins updates;
+    earliest-mismatch tracking deliberately lives in the engine.
+- **Deviation:** header-only instead of .cpp-backed (the pure engine core
+  and the socket-free test target instantiate them without linking mod TUs);
+  the stub .cpp files stay listed in CMake so the layout is unchanged.
+
+### M4-2: `rollback/engine2` — the socket-free RollbackEngine core (§2.7)
+
+- **Files:** `include/rollback/engine2.h` (new), `src/rollback/engine2.cpp`
+  (new), `include/rollback/block_digest.h` (new — Block64 primitive, §2.7.7
+  hash mandate, shared by core/adapter/bench).
+- **Done:** full §2.7 spec as an instantiable `RollbackEngine` (zero
+  Win32/game/socket/clock/log includes; protocol.h structs only):
+  - §2.7.1 `EngineConfig` (validated at Arm; neutral 0xFFFF/out-of-mask
+    rejected); §2.7.2 canonical u32 counter + epoch mapping
+    (`RotateEpoch` strictly-increasing, origin remap, counter NEVER resets).
+  - §2.7.3 C/D/X/P/R/F: capture-once with adopt-on-repeat (INV-18); delay =
+    pure relabel (raise fills neutral future immediately; lower drains at a
+    fully-confirmed boundary, frame-counted 300-opportunity timeout reverts
+    — INV-16, no wall clock); typed ingest
+    Applied/DuplicateIdentical/Conflict/InvalidValue(0xFFFF or ~0x3FFF)/
+    TooFarFuture(+120)/Stale, with Conflict/Invalid as sticky fail-closed
+    terminals (INV-19); stalled producer bounded
+    `min(peerR+peerD+2, 30)` ahead of peer ack with the ≤32-suffix
+    structural assert (INV-24), fenceable; hold-last predict + earliest
+    mismatch (out-of-order actuals take the min); confirm = actual prefix +
+    committed replay, single immutable pop seam (predicted values can never
+    pop).
+  - §2.7.4 `NextAction()` in exactly the plan's order; the PredictionLimit
+    comparison is the ONLY reader of R_local in the engine (INV-1/INV-4,
+    marked in-source).
+  - §2.7.5 explicit transaction: `BeginRollback / NextReplayInputs /
+    CommitReplayFrame / FinishRollback / FinishRollbackAtBoundary /
+    FinishRollbackBeforeBoundary` (both truncation variants collapse the
+    speculative suffix to the replay cursor and invalidate its exec
+    records); capture inside the transaction = typed InternalInvariant
+    terminal.
+  - §2.7.7 SyncHash: cadence exactly every 30 confirmed frames, 128-record
+    local cadence ring, bounded (128) peer queue with
+    stale-ignore/future-queue/inconsistent-fatal epoch relations and
+    exact-across-all-fields compare → `ConfirmedDesync` terminal.
+  - §3.2 wire building: `BuildInputStream` (window anchored at
+    peer_ack_through+1, clamped to 32/first-frame, ack + PressureReport on
+    every packet), `IngestInputStream` (idempotent merge, monotonic ack
+    re-anchor, advisory capture), `FillPressureReport`.
+  - run_state.h classification per pass; per-engine `Stats`;
+    `FramesAheadSigned` telemetry (explicitly no decision consumer).
+- **Deviation:** internal invariant violations set a typed terminal instead
+  of asserting (a release game process must fail closed, not crash); the
+  unit tests pin the terminal. `HashVerify::InconsistentEpoch` doubles as
+  the queue-overflow return (both are the ProtocolViolation class; the
+  terminal code distinguishes them).
+
+### M4-3: Facade adapter behind unchanged `rollback_session.h`
+
+- **Files:** `src/rollback/rollback_session_engine2.cpp` (new),
+  `CMakeLists.txt` (`AS2_WITH_GEKKO` option).
+- **Done:** every symbol of the preserved facade implemented over the
+  engine2 core (§2.7.8 mapping table honored): two-phase dispatcher contract
+  (BeginFrame captures at the sim frontier + plans; ProcessNextEvent drains
+  — corrections first via StateHistory tagged restore + replay-Advance
+  events, then at most the visible advance), save→simulate→commit shape
+  (pre-tick `StateHistory_CaptureFrameHashed` supplies the confirm
+  pre-hash), InputStream egress (send-per-seal + 50 ms idle resend while
+  un-acked, session_id stamped, StressHooks egress drop query preserved),
+  `BufferGekkoPacket` reinterpreted as the v2 InputStreamPayload ingest
+  (wrong session_id inert per §3.1), SyncHash send/receive, and:
+  - **M2 obligations closed:** typed stalls call
+    `FrameScheduler_NotifyHold(cause, create_debt = cause==PredictionLimit)`
+    — engine2 is the first (and only) `LocalInputMissing` producer;
+    PressureReport ingest feeds `FrameScheduler_SubmitPeerDepthSample`.
+  - **M3 obligations closed:** engine terminals route through
+    `Session2_Terminate(ProtocolViolation | ConfirmedDesync)` (desync path
+    dumps evidence via `DesyncDump_TryDump` first — D-1); the UI abort stays
+    with input_override's existing single kill-path site (reads
+    `GetErrorReason`), so the kill-path allowlist is UNCHANGED.
+  - `IsSessionRunning` keeps the ProgressDeadline meaning;
+    `IsPeerInterrupted` is the supervisor passthrough;
+    `FramesAhead` = signed produced-frontier lead (telemetry only).
+- **Deviations:**
+  1. Adapter is a separate TU selected by CMake
+     (`AS2_WITH_GEKKO=ON` → rollback_session.cpp,
+     `OFF` → rollback_session_engine2.cpp) instead of `#if` inside the live
+     66 KB Gekko file — same flag semantics, zero risk to the shipping
+     path. GekkoNet subdirectory/link/include/`GEKKONET_STATIC` and the
+     `gekko_input_tests` target are all gated on the option; **default ON**
+     (Gekko is still the live gameplay path per the M4 exit gate).
+  2. Epoch authority is a local stub (epoch 1, no rotation caller) until
+     M5 match_setup; `SetProducerFenced` and the delay hotkeys have no
+     caller until M5/M6.
+  3. `RefreshLifecycleWindow` uses the conservative stand-in
+     (`match_exit_pending=false`, all non-(8,3) ticks exact) — the audited
+     minimal window needs the M6 director signal (see M4_AUDITS.md).
+  4. Stress ingest/prediction hook points (delivery delay, forced
+     mismatch) are not yet wired (egress drop is); rewire with the M6
+     dispatcher pass.
+  5. SyncHash rng/hp diagnostics are 0 (gameplay_hash authoritative);
+     side-channel lands with the M6 HUD/dump pass.
+
+### M4-4: StateHistory 64-slot tagging + FPU + savestate guard adapter
+
+- **Files:** `include/rollback/resimulation.h`,
+  `src/rollback/resimulation.cpp`, `include/rollback/game_snapshot.h`,
+  `src/rollback/game_snapshot.cpp`, `src/rollback/savestate.cpp`,
+  `src/net/netplay_palette_runtime.cpp`.
+- **Done:**
+  - `STATE_HISTORY_CAPACITY` 32 → 64; storage is direct-mapped
+    (`slot = frame % 64`) per §2.7.7; every slot tagged `{epoch, frame,
+    phase}` via `StateHistory_SetTagContext`; new
+    `StateHistory_LoadFrameTagged` refuses tag mismatches fail-closed
+    (stale-epoch slots can never be restored); new
+    `StateHistory_CaptureFrameHashed` returns the Block64 gameplay digest.
+    Legacy `CaptureFrame/LoadFrame/HasFrame/DiscardFramesAfter` keep their
+    signatures (replay reverse-stepping + training verified compatible:
+    HasFrame-before-Load patterns, dense frame sequences).
+  - `GameSnapshot` gains per-slot x87 CW + MXCSR capture/restore (same
+    fnstcw/fldcw/_mm_getcsr mechanism the Gekko CaptureState already used —
+    TrialNetplay: capture-and-restore, never assume 0x027F) and
+    `GameSnapshot_HashGameplay` (sim-affecting members only, INV-22).
+  - Guard adapter (inventory 3a): the redundant
+    `GameplayBridge_IsSessionActive` check removed from savestate.cpp (the
+    facade check was already present) and replaced with
+    `Rollback::RollbackSession_IsActive()` at the three
+    netplay_palette_runtime sites; both TUs no longer include
+    gameplay_bridge.h. (mod_main/online_wiring bridge uses are the doomed
+    set itself — untouched until the M6 deletion.)
+
+### M4-6 / M4-7: audits
+
+- **Files:** `docs/re0.7/M4_AUDITS.md` (new),
+  `include/rollback/lifecycle_window.h` (new), region-role comments in
+  `game_snapshot.h`.
+- **Done:** M4-6 per-region role table (SIM vs RENDER/TIMING/CONTROL) with
+  rationale; digest membership = main_state + rng/sim counters +
+  mode/substate/timers + input buffers + effect cursor; EXCLUDED:
+  display_frame (timing), pre_match_gap (render), FPU control words
+  (machine config), palettes (outside all regions by pipeline design).
+  M4-7 decomp audit with line citations: `Game_ChangeMode` (0x5D2EB0,
+  L266664-92) calls `Handle_ReleaseAll` — the only release path reachable
+  from gameplay, via the mode-8 exit router `sub_4CA210` (L118402+, mode 9
+  at L118430); zero release sites inside the match handler; round state is
+  pure match-region counters (`Match_UpdateRoundState` L107972+). Verdict:
+  round boundaries predict normally; the match-end handoff is the single
+  in-gameplay exact window. Pure predicate
+  `LifecycleWindow_IsExactInputNext` is the §2.7.6 engine predicate
+  (unit-pinned).
+
+### M4-8: tests + soak + microbench
+
+- **Files:** `tests/engine2_tests.cpp` (new), `CMakeLists.txt` (new target
+  `engine2_tests` + `add_test`).
+- **Done:** T-ENG-1..12 all implemented against the pure core (capture-once
+  adopt/immutability; delay raise/lower-drain/timeout-revert; hold-last +
+  earliest mismatch under out-of-order actuals + retained speculation;
+  transaction begin/commit/finish + boundary truncation + in-transaction
+  capture fail-closed; confirm ordering with pre-hash carry; full ingest
+  taxonomy; window math incl. 30-cap producer suffix, single-packet hole
+  refill, ack re-anchor, fully-acked degenerate window; producer bound +
+  fencing; INV-4 pin "exactly R speculative frames, never R+1, released by
+  one actual"; full-pipeline u32 wrap run at first_frame=0xFFFFFF00; epoch
+  rotation + stale/future/inconsistent hash relations + origin remap;
+  SyncHash 30-frame cadence + exact-all-fields compare + 128 queue bound)
+  plus the lifecycle-window predicate pins, the §7.2-model soak (two full
+  peers over a seeded lossy/jittery/reordering frame-clock link: 100k
+  frames, 3% loss, 1+[0..2]-frame jitter ≈ 40±15 ms RTT; asserts zero
+  terminals, hash chain clean, per-frame confirmed streams identical, both
+  confirm frontiers >90% of the run), and the §7.5#4 microbench (real
+  `sizeof(GameSnapshot)` volume: save/restore memcpy + Block64 p50/p99
+  printout; hard-fails only at 10x budget so CI cannot flake — the 1.5 ms
+  acceptance is judged on min-spec at M8).
+- **Deviations:** T-ENG-9's "no other code path reads R" link-time/grep half
+  is a review-gate item (single reader marked INV-4 in engine2.cpp), not an
+  executable test. The microbench measures byte-volume cost offline, not
+  in-game capture (game memory unavailable in a unit target); in-game
+  numbers come from the M8 STAT instrument.
+
+### Ride-along: DisconnectPayload §3.2 enrichment (M3 deviation closed)
+
+- **Files:** `include/net/protocol.h`, `src/net/session2.cpp`,
+  `docs/re0.7/API_FREEZE.md`.
+- **Done:** `DisconnectPayload` → `{code u8, reason_id u32, human[96]}`
+  (102 B pin); `Session2_Terminate` fills code from DisconnectReason,
+  reason_id = fnv1a32 of the typed `Session2TerminalReason` name, and for
+  fault terminals resends the packet every 100 ms across a bounded 400 ms
+  goodbye window before transport destroy; receiver logs/surfaces
+  code+reason_id+human. API_FREEZE §6 updated (wire break legal — v20 is
+  dev-only until M6).
+- **Deviation / M5-M6 obligation:** full sticky resend-UNTIL-ACKED needs a
+  session object that outlives the terminal (today teardown is synchronous);
+  the bounded resend window + ENet reliable-channel retransmission is the
+  M4 approximation. Revisit when session2 gains a terminal-lingering state
+  at the M5/M6 cutover.
+
+### Build-system summary (M4)
+
+- New CMake option `AS2_WITH_GEKKO` (default ON) selects
+  `rollback_session.cpp` + GekkoNet lib/link/include/`GEKKONET_STATIC` +
+  `gekko_input_tests` (ON) vs `rollback_session_engine2.cpp` with no
+  GekkoNet anywhere (OFF). GekkoNet vendored lib itself untouched.
+- `ROLLBACK_HEADERS` += `block_digest.h`, `engine2.h`,
+  `lifecycle_window.h`; `ROLLBACK_SOURCES` += `engine2.cpp`
+  (rollback_session*.cpp now appended conditionally).
+- New test target `engine2_tests` (tests/engine2_tests.cpp +
+  src/rollback/engine2.cpp; include dirs `include` + `include/core` for the
+  as2_constants chain under game_snapshot.h).
+- No kill-path allowlist changes (the engine2 adapter funnels through
+  `Session2_Terminate` + the existing input_override abort site only).
+
+### Obligations for next milestones
+
+- **M5 (match_setup):** take epoch authority into the adapter
+  (`RotateEpoch` + `StateHistory_SetTagContext` at GameplayStart commit;
+  the M4 stub pins epoch 1); retire the `BufferGekkoPacket` facade name
+  with the router-table cutover; fence the producer during frontend phases
+  (`SetProducerFenced` — currently caller-less); enforce session_id at the
+  router (adapter already drops mismatches at ingest).
+- **M6 (director/cutover):** wire `match_exit_pending` from
+  MatchLifecycle/exit-route state into `RefreshLifecycleWindow` (replace
+  the conservative stand-in); adapter-side mode-change bail during replay
+  (§2.8.6-d) once the dispatcher rewiring lands; delay hotkeys `-`/`=`;
+  SyncHash rng/hp diagnostics; stress delivery-delay/forced-mismatch
+  hooks; flip default `AS2_WITH_GEKKO=OFF` at the cutover gate and delete
+  the Gekko branch per plan M6; session2 terminal-lingering state for true
+  sticky Disconnect resend; input_override abort site burns down to the
+  typed-terminal flow.
+- **M8:** run the microbench equivalent in-game on min-spec (STAT
+  instrument) against the 1.5 ms p99 acceptance.
+
+### Compile risks to check first (M4 build session)
+
+1. `engine2.h` is included by two new TUs (`engine2.cpp`,
+   `engine2_tests.cpp`) and pulls `net/protocol.h` — first place a
+   namespace/packing slip surfaces. `InputStreamPayload`/`SyncHashPayload`
+   field names must match the M1 header exactly.
+2. `static_assert(sizeof(DisconnectPayload) == 102)` — hand-computed under
+   pack(1); if it fires, the compiler's number is the truth.
+3. `GameSnapshot` grew (fpu_cw/_pad_fpu/mxcsr) — savestate/replay slots
+   grow with it (heap-allocated everywhere; no wire/file format carries the
+   struct; replay coarse checkpoints are process-local).
+4. `__asm fnstcw/fldcw` in game_snapshot.cpp — x86-only MSVC inline asm,
+   same mechanism already living in rollback_session.cpp; needs
+   `<xmmintrin.h>` for `_mm_getcsr/_mm_setcsr` (added).
+5. StateHistory internals rewrote the slot layout (`StateSlot{snap, epoch,
+   phase, gameplay_hash}`) — grep-verified no external accessor of the old
+   fields; `memset` over the slot array is legal (all-POD struct).
+6. The `AS2_WITH_GEKKO=OFF` configuration compiles
+   `rollback_session_engine2.cpp` — a new ~700-line TU aggregating
+   session2/frame_scheduler/supervisor/delay_policy headers; build BOTH
+   configurations once (`-DAS2_WITH_GEKKO=OFF` is the engine2 CI config;
+   default ON is the shipping config).
+7. `engine2_tests` runs a 100k-frame soak + a memcpy-heavy microbench —
+   expect a few seconds of runtime; if CTest timeouts are tight, the soak
+   constant is `kFrames` in `SoakRun`.

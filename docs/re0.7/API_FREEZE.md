@@ -111,3 +111,7 @@ Defined, still unsent (M4+): `InputStreamPayload` + `PressureReport`,
 (+ `ResyncRequest` payload), `FrontendPhaseId`,
 `NetTransitionKind::EpochAlign` + payload fields, `phase_id` in the four
 frontend payloads.
+Changed at M4 (§3.2 terminal shape, INV-20): `DisconnectPayload` is now
+`{code u8, reason_id u32 (fnv1a32 of the typed reason name), human[96]}`
+(102 B pin); session2 fault terminals resend it at 100 ms across the bounded
+goodbye window. Wire break is legal (v20 is dev-only until M6).

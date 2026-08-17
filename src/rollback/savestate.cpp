@@ -31,7 +31,6 @@
 #include "training/frame_advantage.h"
 #include "training/input_macro.h"
 #include "training/practice_tools.h"
-#include "net/gameplay_bridge.h"
 #include "net/session_manager.h"
 #include "net/spectator_playback.h"
 #include "as2_constants.h"
@@ -317,10 +316,9 @@ static bool IsOnlineOwnedContext() {
         return true;
     }
 
-    if (Net::GameplayBridge_IsSessionActive()) {
-        return true;
-    }
-
+    // re0.7 M4 guard adapter (inventory §7 / plan M4 task 4): the engine
+    // facade is the session-active authority; gameplay_bridge is retired
+    // with the M6 cutover.
     if (Rollback::RollbackSession_IsActive()) {
         return true;
     }

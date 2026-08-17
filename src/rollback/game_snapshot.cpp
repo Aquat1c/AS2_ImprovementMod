@@ -1,11 +1,13 @@
 #include "rollback/game_snapshot.h"
 
 #include "patches/memory_utils.h"
+#include "rollback/block_digest.h"
 #include "rollback/determinism_verify.h"
 #include "ui/log_window.h"
 
 #include <string.h>
 #include <windows.h>
+#include <xmmintrin.h>
 
 namespace Rollback {
 
@@ -57,6 +59,19 @@ bool GameSnapshot_Capture(GameSnapshot* snapshot, int32_t frame) {
     snapshot->match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
     snapshot->rng_seed = DetVer_GetRngSeed();
     snapshot->effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
+
+    // FPU/MXCSR control words — captured per slot rather than assumed
+    // (plan §2.7.7; TrialNetplay pins 0x027F, AS2 captures-and-restores).
+    snapshot->fpu_cw = 0;
+    snapshot->mxcsr = 0;
+    __try {
+        unsigned short cw;
+        __asm { fnstcw cw }
+        snapshot->fpu_cw = cw;
+        snapshot->mxcsr = _mm_getcsr();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Non-fatal: zeros mean "do not restore".
+    }
 
     __try {
         memcpy(snapshot->main_state, (const void*)kMainStart, kMainSize);
@@ -126,12 +141,61 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
     WriteMemory<uint32_t>(ADDR_INPUT_READ_IDX, snapshot->input_read_idx);
     WriteMemory<uint32_t>(ADDR_INPUT_WRITE_IDX, snapshot->input_write_idx);
 
+    // Restore FPU/MXCSR control words captured with the slot.
+    __try {
+        if (snapshot->fpu_cw != 0) {
+            unsigned short cw = snapshot->fpu_cw;
+            __asm { fldcw cw }
+        }
+        if (snapshot->mxcsr != 0) {
+            _mm_setcsr(snapshot->mxcsr);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Non-fatal.
+    }
+
     __try {
         memset((void*)ADDR_MATCH_PER_FRAME_TEMP, 0, MATCH_PER_FRAME_TEMP_SIZE);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 
     return true;
+}
+
+uint64_t GameSnapshot_HashGameplay(const GameSnapshot* snapshot) {
+    if (!snapshot || !snapshot->valid) {
+        return 0;
+    }
+    // SIM-affecting membership only (INV-22, M4-6 audit): display_frame,
+    // pre_match_gap (render state), and the FPU control words are excluded.
+    uint64_t h = BLOCK64_SEED;
+    struct SimHeader {
+        uint32_t rng_seed;
+        uint32_t sim_frame;
+        uint32_t game_mode;
+        uint32_t substate;
+        uint32_t substate_timer;
+        uint32_t game_type;
+        uint32_t match_phase_timer;
+        uint32_t input_read_idx;
+        uint32_t input_write_idx;
+        uint32_t effect_index;
+    } header{};
+    header.rng_seed = snapshot->rng_seed;
+    header.sim_frame = snapshot->sim_frame;
+    header.game_mode = snapshot->game_mode;
+    header.substate = snapshot->substate;
+    header.substate_timer = snapshot->substate_timer;
+    header.game_type = snapshot->game_type;
+    header.match_phase_timer = snapshot->match_phase_timer;
+    header.input_read_idx = snapshot->input_read_idx;
+    header.input_write_idx = snapshot->input_write_idx;
+    header.effect_index = snapshot->effect_index;
+    h = Block64_Update(h, &header, sizeof(header));
+    h = Block64_Update(h, snapshot->main_state, sizeof(snapshot->main_state));
+    h = Block64_Update(h, snapshot->input_p1, sizeof(snapshot->input_p1));
+    h = Block64_Update(h, snapshot->input_p2, sizeof(snapshot->input_p2));
+    return h;
 }
 
 } // namespace Rollback

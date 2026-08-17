@@ -1,137 +1,111 @@
 /**
- * Alice Senki 2 - Input Timeline
+ * Alice Senki 2 - Input Timeline (re0.7 M4 resurrection, master plan §2.7.3)
  *
- * Frame-indexed input history for rollback gameplay.
- * Stores both local and remote input per frame, tracks confirmation
- * and prediction status.
+ * Canonical-frame input ring for the custom rollback engine (engine2).
+ * This is the pre-Gekko mod-owned input store, resurrected and finished for
+ * the §2.7 pipeline: wrap-safe u32 canonical frames (INV-15), capture-once
+ * slot immutability (INV-18), and typed set results so the engine can map
+ * an occupied-slot write to adopt / DuplicateIdentical / Conflict without
+ * this module guessing intent.
+ *
+ * Pure and instantiable: no Win32, no game memory, no logging, no clock.
+ * The engine owns one ring per side; the unit/soak harness owns its own.
  *
  * Input format: 16-bit bitmask matching the game's native format
- * (INPUT_UP/DOWN/LEFT/RIGHT/A/B/C/D/START/SELECT/L1/R1/L2/R2).
+ * (INPUT_UP..INPUT_R2, bits 0..13). 0xFFFF is the game's "no input yet"
+ * history marker and is unrepresentable as a stored value by contract
+ * (validated by the engine ingest, INV-19).
  *
- * The timeline is a fixed-size ring buffer. Frames older than the
- * buffer capacity are discarded. The buffer must be large enough
- * to hold MAX_ROLLBACK + input_delay + safety margin frames.
+ * Storage is direct-mapped (`frame % capacity`). Because every live window
+ * in the engine is tiny compared to the capacity (un-acked suffix <= 32,
+ * speculation <= 15, confirm lag bounded), a slot collision can only involve
+ * a frame at least `capacity` frames in the past — evicting it is always
+ * safe, and a write that finds a *newer* frame in its slot is by definition
+ * stale and refused.
  */
 
 #pragma once
 
 #include <stdint.h>
-#include <stdbool.h>
+
+#include <vector>
+
+#include "net/frame_arithmetic.h"
 
 namespace Rollback {
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// Maximum number of frames stored in the timeline ring buffer.
-/// Must exceed max rollback + delay + margin. 256 is generous.
-constexpr int TIMELINE_CAPACITY = 256;
 
 /// Neutral input (no buttons pressed).
 constexpr uint16_t INPUT_NEUTRAL = 0x0000;
 
-// ============================================================================
-// Per-Frame Input Entry
-// ============================================================================
+class InputRing {
+public:
+    enum class SetResult : uint8_t {
+        Stored,     // slot was empty — value sealed
+        Occupied,   // identical value already sealed (capture-once adopt path)
+        Conflict,   // DIFFERENT value already sealed (immutability violation)
+        StaleSlot,  // slot holds a newer frame — the write is ancient/stale
+    };
 
-struct FrameInput {
-    uint16_t local;               // Local player's input
-    uint16_t remote;              // Remote player's input (real or predicted)
-    bool     local_confirmed;     // Local input is committed
-    bool     remote_confirmed;    // Remote input is real (not predicted)
-    bool     remote_predicted;    // Remote input was filled by prediction
-    bool     prediction_wrong;    // Real remote arrived and differs from predicted
+    InputRing() = default;
+
+    /// (Re)arm the ring. Frames have no retention floor beyond the eviction
+    /// rule above; `capacity` should exceed every live window by orders of
+    /// magnitude (engine default 4096).
+    void Reset(uint32_t capacity, uint16_t neutral) {
+        neutral_ = neutral;
+        slots_.assign(capacity ? capacity : 1u, Slot{});
+    }
+
+    bool Armed() const { return !slots_.empty(); }
+    uint32_t Capacity() const { return (uint32_t)slots_.size(); }
+
+    bool Has(uint32_t frame) const {
+        if (slots_.empty()) return false;
+        const Slot& s = slots_[frame % slots_.size()];
+        return s.present && s.frame == frame;
+    }
+
+    /// Value at `frame`, or neutral when absent.
+    uint16_t Value(uint32_t frame) const {
+        if (slots_.empty()) return neutral_;
+        const Slot& s = slots_[frame % slots_.size()];
+        return (s.present && s.frame == frame) ? s.value : neutral_;
+    }
+
+    /// Seal `frame` with `value`. Assigned slots are immutable forever
+    /// (INV-18): a repeat write with the same value reports Occupied (the
+    /// caller adopts), a different value reports Conflict (the caller fails
+    /// closed, INV-19). A slot held by a newer frame refuses the write as
+    /// StaleSlot; a slot held by an older frame is evicted (>= capacity
+    /// frames in the past by construction).
+    SetResult Set(uint32_t frame, uint16_t value) {
+        if (slots_.empty()) return SetResult::StaleSlot;
+        Slot& s = slots_[frame % slots_.size()];
+        if (s.present) {
+            if (s.frame == frame) {
+                return (s.value == value) ? SetResult::Occupied
+                                          : SetResult::Conflict;
+            }
+            if (Net::frameAfter(s.frame, frame)) {
+                return SetResult::StaleSlot;
+            }
+            // Older frame: fell out of every live window — evict.
+        }
+        s.present = true;
+        s.frame = frame;
+        s.value = value;
+        return SetResult::Stored;
+    }
+
+private:
+    struct Slot {
+        uint32_t frame = 0;
+        uint16_t value = 0;
+        bool     present = false;
+    };
+
+    std::vector<Slot> slots_;
+    uint16_t neutral_ = INPUT_NEUTRAL;
 };
-
-// ============================================================================
-// Lifecycle
-// ============================================================================
-
-void InputTimeline_Init();
-void InputTimeline_Shutdown();
-
-/// Clear all history and reset to frame 0.
-void InputTimeline_Reset();
-
-/// Clear all history and prime the timeline so the next simulated frame is
-/// `start_frame`. Frames before `start_frame` are treated as already elapsed.
-void InputTimeline_BeginAtFrame(int32_t start_frame);
-
-// ============================================================================
-// Writing Input
-// ============================================================================
-
-/// Record the local player's input for the given frame.
-/// Called once per frame during forward simulation.
-void InputTimeline_SetLocalInput(int32_t frame, uint16_t input);
-
-/// Record real remote input for the given frame.
-/// If this frame was previously predicted, sets prediction_wrong if different.
-/// Returns true if this input contradicts a previous prediction (triggers rollback).
-bool InputTimeline_SetRemoteInput(int32_t frame, uint16_t input);
-
-/// Fill remote input for a frame using prediction (called when real input
-/// hasn't arrived yet). Marks the frame as predicted.
-void InputTimeline_PredictRemoteInput(int32_t frame, uint16_t predicted_input);
-
-// ============================================================================
-// Reading Input
-// ============================================================================
-
-/// Get the input entry for a specific frame.
-/// Returns nullptr if the frame is outside the buffer range.
-const FrameInput* InputTimeline_GetFrame(int32_t frame);
-
-/// Get the local input for a specific frame. Returns INPUT_NEUTRAL if unavailable.
-uint16_t InputTimeline_GetLocalInput(int32_t frame);
-
-/// Get the remote input for a specific frame (real or predicted).
-/// Returns INPUT_NEUTRAL if unavailable.
-uint16_t InputTimeline_GetRemoteInput(int32_t frame);
-
-/// Check if remote input is confirmed for a given frame.
-bool InputTimeline_IsRemoteConfirmed(int32_t frame);
-
-// ============================================================================
-// Timeline Queries
-// ============================================================================
-
-/// The earliest frame still in the buffer.
-int32_t InputTimeline_GetEarliestFrame();
-
-/// The latest frame that has local input.
-int32_t InputTimeline_GetLatestLocalFrame();
-
-/// The latest frame with confirmed remote input.
-int32_t InputTimeline_GetLatestConfirmedRemoteFrame();
-
-/// Find the first frame >= start_frame where remote was predicted and is
-/// now known to be wrong. Returns -1 if no mismatch found.
-int32_t InputTimeline_FindFirstMisprediction(int32_t start_frame);
-
-/// Clear prediction_wrong flags for frames in [from_frame, to_frame).
-/// Must be called after a successful resimulation so the same misprediction
-/// is not re-detected on subsequent frames.
-void InputTimeline_ClearMispredictions(int32_t from_frame, int32_t to_frame);
-
-/// Number of frames currently predicted (remote not yet confirmed).
-int32_t InputTimeline_GetPredictedFrameCount();
-
-// ============================================================================
-// Diagnostics
-// ============================================================================
-
-struct InputTimelineSnapshot {
-    int32_t earliest_frame;
-    int32_t latest_local_frame;
-    int32_t latest_confirmed_remote_frame;
-    int32_t predicted_frame_count;
-    int32_t total_predictions;       // Lifetime count
-    int32_t total_mispredictions;    // Lifetime count
-    int32_t total_correct_predictions;
-};
-
-void InputTimeline_GetSnapshot(InputTimelineSnapshot* out);
 
 } // namespace Rollback

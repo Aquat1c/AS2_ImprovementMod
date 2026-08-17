@@ -3,8 +3,8 @@
 #include "core/game_state.h"
 #include "net/netplay_palette_storage.h"
 #include "net/player_side_mapping.h"
-#include "net/gameplay_bridge.h"
 #include "net/match_lifecycle.h"
+#include "rollback/rollback_session.h"
 #include "patches/charsel_palette_select.h"
 #include "net/session_manager.h"
 #include "net/session_types.h"
@@ -609,7 +609,7 @@ static void MaybeReapplyGameplayOverrides() {
     }
 
     const bool introWindowActive =
-        !GameplayBridge_IsSessionActive() &&
+        !Rollback::RollbackSession_IsActive() &&
         GetGameMode() == MODE_MATCH &&
         MatchLifecycle_GetPhase() == MatchLifecyclePhase::IntroActive;
     if (!introWindowActive) {
@@ -634,7 +634,7 @@ static void ProcessMatchPaletteHotkeys() {
     const bool modifiersDown = AreRemotePaletteHotkeyModifiersDown();
 
     const bool allowHotkey = s_matchActive &&
-        GameplayBridge_IsSessionActive() &&
+        Rollback::RollbackSession_IsActive() &&
         GetGameMode() == MODE_MATCH &&
         !ModMenu_IsOpen();
 
@@ -655,7 +655,7 @@ static void ProcessMatchPaletteHotkeys() {
             vanillaReady ? 1 : 0,
             netplayReady ? 1 : 0,
             ModMenu_IsOpen() ? 1 : 0,
-            GameplayBridge_IsSessionActive() ? 1 : 0,
+            Rollback::RollbackSession_IsActive() ? 1 : 0,
             (unsigned)GetGameMode());
 
         if (allowHotkey && !modifiersDown && choiceAvailable) {
