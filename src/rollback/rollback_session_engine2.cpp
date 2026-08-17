@@ -22,6 +22,7 @@
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "rollback/game_snapshot.h"
+#include "rollback/block_digest.h"
 #include "net/connection_supervisor.h"
 #include "net/delay_policy.h"
 #include "net/frontend_input_sync.h"
@@ -167,11 +168,14 @@ uint32_t ComputeLiveChecksumInternal() {
         uint32_t effect_index;
     } parts{};
     __try {
-        parts.main_crc = CalcCRC32(
+        // Four-lane digest rather than the byte-at-a-time CRC32: this runs
+        // once per visible frame from RollbackDebug_FrameUpdate, and the CRC
+        // cost a full serial pass over the whole match region each time.
+        parts.main_crc = StateFingerprint32(
             (const void*)ADDR_MATCH_BASE,
             (ADDR_P2_ENTITY_BASE + ENTITY_SIZE) - ADDR_MATCH_BASE);
         parts.effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
-        return CalcCRC32(&parts, sizeof(parts));
+        return StateFingerprint32(&parts, sizeof(parts));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0xDEADDEAD;
     }

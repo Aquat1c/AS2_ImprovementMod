@@ -161,9 +161,12 @@ uint32_t SnapshotChecksum(const uint8_t* mainState, size_t mainSize, uint32_t ef
         uint32_t effect_index;
     } parts{};
 
-    parts.main_crc = CalcCRC32(mainState, mainSize);
+    // Four-lane digest, not the byte-at-a-time CRC32 this used to run: the
+    // CRC was a serial chain over the full 253 KB on EVERY capture — roughly
+    // 400 us, against ~18 us of actual simulation per replayed frame.
+    parts.main_crc = StateFingerprint32(mainState, mainSize);
     parts.effect_index = effectIndex;
-    return CalcCRC32(&parts, sizeof(parts));
+    return StateFingerprint32(&parts, sizeof(parts));
 }
 
 } // namespace

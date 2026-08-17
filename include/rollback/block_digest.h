@@ -124,4 +124,23 @@ inline uint64_t Block64(const void* data, size_t len,
     return Block64_Update(seed, data, len);
 }
 
+/// Fold a 64-bit digest to 32 bits (both halves contribute).
+inline uint32_t Block64_Fold32(uint64_t h) {
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+/// 32-bit state fingerprint for the per-frame paths that used to run a
+/// byte-at-a-time table CRC32 over the whole state. The CRC is a serial
+/// dependency chain — one byte, one table lookup, each step waiting on the
+/// last — which measured ~400 us per 253 KB pass and ran on EVERY snapshot
+/// capture and every visible frame. Same reason the digest above is four-lane;
+/// see qoh99's StateProofDigest.h, which hit and fixed the identical problem.
+///
+/// Not interchangeable with CalcCRC32 values: anything comparing fingerprints
+/// must produce them with the same function (both peers run the same build,
+/// enforced by the handshake's build hash).
+inline uint32_t StateFingerprint32(const void* data, size_t len) {
+    return Block64_Fold32(Block64(data, len));
+}
+
 } // namespace Rollback
