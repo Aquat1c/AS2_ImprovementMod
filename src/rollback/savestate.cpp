@@ -27,6 +27,7 @@
 #include "rollback/savestate.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/game_snapshot.h"
+#include "rollback/block_digest.h"
 #include "rollback/rollback_session.h"
 #include "training/frame_advantage.h"
 #include "training/input_macro.h"
@@ -156,7 +157,12 @@ static uint32_t ComputeMainChecksum() {
         parts.main_crc = Rollback::GameSnapshot_MainFingerprintSkippingExcluded(
             (const uint8_t*)ADDR_MATCH_BASE);
         parts.effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
-        return CalcCRC32(&parts, sizeof(parts));
+        // Must be the SAME combine SnapshotChecksum uses, or the comparison is
+        // between two different hash functions and can never match. That is
+        // what the "BASELINE RESTORED with CHECKSUM MISMATCH" error actually
+        // was: the capture side moved to the four-lane fingerprint while this
+        // live side still finished with CalcCRC32.
+        return Rollback::StateFingerprint32(&parts, sizeof(parts));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0xDEADDEAD;
     }

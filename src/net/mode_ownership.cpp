@@ -468,7 +468,11 @@ void SanitizeOwnedGameType(uint32_t mode, bool sessionActive, const char* reason
     uint32_t currentType = GetGameType();
     if (currentType != desiredType) {
         WriteU32(ADDR_GAME_TYPE, desiredType);
-        LOG_NETPLAY(LOG_WARNING,
+        // INFO, not WARNING: forcing VS_HUMAN when a netplay session owns the
+        // mode is this function's PURPOSE, and it fires on every session start.
+        // Logging routine, intended behaviour at warning level is how a healthy
+        // acceptance log ends up looking broken.
+        LOG_NETPLAY(LOG_INFO,
             "[ModeOwn] Sanitized game type %u -> %u (%s, mode=%u)",
             currentType, desiredType, reason ? reason : "?", mode);
     }
