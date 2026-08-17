@@ -11,6 +11,11 @@
 
 #include "core/game_state.h"
 #include "core/mod_main.h"
+#include "net/connection_supervisor.h"
+#include "net/delay_policy.h"
+#include "patches/frame_scheduler.h"
+#include "rollback/rollback_session.h"
+#include "rollback/run_state.h"
 #include "ui/mod_menu.h"
 #include "ui/netplay_hud_style.h"
 
@@ -415,7 +420,27 @@ void NetplayHud_Render() {
                             hud.p2_trail_length_px);
     }
 
-    char stats[80] = {};
+    // ── Progress-stall warning banner (M3 obligation, consumed at M6) ──
+    // 8 s of zero canonical-frame progress while the transport still pings:
+    // §2.4 progress deadline pre-warning before the 20 s teardown.
+    if (Net::ConnectionSupervisor_IsProgressStallWarned()) {
+        char warn[96] = {};
+        snprintf(warn, sizeof(warn),
+                 "Opponent's game stopped responding (%us)",
+                 Net::ConnectionSupervisor_GetProgressStallMs() / 1000u);
+        const ImVec2 wsz = ImGui::CalcTextSize(warn);
+        const float warnW = wsz.x + kStatsPadW * 2.0f;
+        const float warnH = wsz.y + kStatsPadH * 2.0f;
+        const float warnX = (W - warnW) * 0.5f;
+        const float warnY = H * 0.18f;
+        dl->AddRectFilled(ImVec2(warnX, warnY),
+                          ImVec2(warnX + warnW, warnY + warnH),
+                          IM_COL32(96, 24, 24, 200), kStatsRounding);
+        dl->AddText(ImVec2(warnX + kStatsPadW, warnY + kStatsPadH),
+                    IM_COL32(255, 200, 120, 255), warn);
+    }
+
+    char stats[160] = {};
     if (hud.show_connection_stats) {
         if (hud.ping_ms >= 0.0f) {
             snprintf(stats, sizeof(stats), "PING:%dms  D:%d  RB:%d",
@@ -423,6 +448,34 @@ void NetplayHud_Render() {
         } else {
             snprintf(stats, sizeof(stats), "PING:--  D:%d  RB:%d",
                      hud.delay_frames, hud.rollback_frames);
+        }
+
+        // Coverage badge (M6, INV-6): the delay-policy verdict is shown,
+        // never silently corrected. FullSpeed draws nothing.
+        const Net::CoverageClass cov =
+            Net::DelayPolicy_ClassifyLocalCoverage(nullptr, nullptr);
+        if (cov == Net::CoverageClass::Underbuffered ||
+            cov == Net::CoverageClass::Marginal) {
+            const size_t len = strlen(stats);
+            snprintf(stats + len, sizeof(stats) - len, "  [%s]",
+                     Net::CoverageClassName(cov));
+        }
+
+        // Hold-cause line (M6, §2.10 vocabulary replacing the NETCLASS/debt
+        // readouts): live run state + peer readouts from PressureReport.
+        if (Rollback::RollbackSession_IsActive()) {
+            FrameSchedulerSnapshot sched{};
+            FrameScheduler_GetSnapshot(&sched);
+            Rollback::RollbackSessionSnapshot rb{};
+            Rollback::RollbackSession_GetSnapshot(&rb);
+            if (sched.run_state != Rollback::RunState::Running ||
+                rb.peer_prediction_depth > 0) {
+                const size_t len = strlen(stats);
+                snprintf(stats + len, sizeof(stats) - len,
+                         "  %s  peer-depth:%u",
+                         Rollback::RunStateName(sched.run_state),
+                         rb.peer_prediction_depth);
+            }
         }
     } else if (hud.status_text[0]) {
         snprintf(stats, sizeof(stats), "%s", hud.status_text);

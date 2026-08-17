@@ -10,7 +10,6 @@
 #include "net/session_manager.h"
 #include "net/session_types.h"
 #include "net/mode_ownership.h"
-#include "net/netplay_menu_controller.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "rollback/netplay_log.h"
@@ -480,7 +479,12 @@ void MatchLifecycle_FrameUpdate() {
             s_phase != MatchLifecyclePhase::ReturningToMenu) {
             LOG_NETPLAY(LOG_WARNING, "[MatchLife] Session lost during %s",
                 MatchLifecyclePhaseName(s_phase));
-            NetMenu::HandleDisconnection("Session lost during match");
+            // M6 kill-path burn-down (INV-12): whoever killed the session
+            // already ran the typed Session2_Terminate funnel and its UI
+            // surface (supervisor Dead, engine terminal, user cancel). This
+            // guard only unwinds MATCH ownership — it is no longer a
+            // HandleDisconnection caller.
+            MatchLifecycle_OnDisconnect("Session lost during match");
             return;
         }
     }

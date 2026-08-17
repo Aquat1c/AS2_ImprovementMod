@@ -62,6 +62,13 @@ M0 additions (packet sinks used by `gameplay_packet_router`, replaced at M5 by
 packet_router→engine ingest — additions are allowed, removals are not):
 `OnlineWiring_HandleEngineDataPacket`, `OnlineWiring_HandleStartupBarrierPacket`.
 
+M6: provider is now `src/rollback/match_director.cpp` (online_wiring.cpp
+deleted; header/facade unchanged). Additive M6 API (INV-9 match-end ladder):
+`OnlineWiring_MatchEndLadderAllows(kind)` /
+`OnlineWiring_MatchEndLadderNotifyConsumed(kind)`.
+`OnlineWiringSnapshot` shape unchanged (`target/current_tick_scale` report
+the scheduler speed scale; `stall_threshold` reports 0 — retired knob).
+
 ## 4. `Rollback::RollbackSession_*` (include/rollback/rollback_session.h) — preserved facade
 
 - [ ] `RollbackSession_IsActive` / `IsSessionRunning` / `IsPeerInterrupted`
@@ -83,9 +90,17 @@ Done at M5: `RollbackSession_BufferGekkoPacket` renamed
 `RollbackSession_OnSyncHashPacket` added (engine2 ingest; Gekko no-op);
 `RollbackSessionSnapshot.gekko_*` field names renamed `link_*`.
 
+Done at M6 (additive, both adapters): `RollbackSession_SuspendBetweenMatches`
+(engine2: engine stays armed across the match boundary, next Begin under a
+higher epoch ROTATES; Gekko: alias to End) and
+`RollbackSession_SetMatchExitPending` (engine2 §2.7.6 exact-window signal;
+Gekko no-op). `RollbackSessionSnapshot` gains peer advisory readouts
+(`peer_produced_frontier`, `peer_prediction_depth`, `peer_run_state`,
+`peer_adv_delay`, `peer_adv_rollback` — zeros on Gekko).
+
 ## 5. Policy/lifecycle contracts consumed by the frontend — preserved
 
-- [ ] `DelayPolicy_*` per inventory §2.5 (incl. `OnRollbackApplied`/`IsRollbackSynced` fed by engine2). `DelayPolicy_GetStallThreshold` is retired WITH the rewritten input_override branch at M5 (its only consumer).
+- [ ] `DelayPolicy_*` per inventory §2.5 (incl. `OnRollbackApplied`/`IsRollbackSynced` fed by engine2). Done at M6: `DelayPolicy_GetStallThreshold`/`GetProtectionWindow` DELETED with the input_override rewrite (§2.8.7); snapshot fields report 0; additive `DelayPolicy_ClassifyLocalCoverage` (§2.9.1) + measurement re-fed from `net/time_probe` (new module, packets 77/78).
 - [ ] `SyncPolicy_*`, `MatchLifecycle_*` (full header), `NetplayPhaseRuntime_*`
 - [ ] `InputSyncHooks_SetLoadBarrierFreeze` / `SetTimesyncFreeze` / `IsModOwnedSync`
 - [ ] `TransitionBarrier_*` full surface; `PhaseTransitionProposal/Ack` routed by every dispatch owner

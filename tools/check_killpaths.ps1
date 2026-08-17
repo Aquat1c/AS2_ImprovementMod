@@ -36,9 +36,12 @@ $allow = @{
     # every recoverable path routes through RestartPregame on the live
     # connection (INV-12). Second site = session-already-lost UI guard.
     "src\net\match_setup.cpp"             = 2
-    # Legacy heuristic callers being burned down by M6 — DO NOT ADD, only remove:
-    "src\net\match_lifecycle.cpp"         = 1    # session-lost guard (M6 target)
-    "src\patches\input_override.cpp"      = 1    # AbortRollbackDispatcher (M6 target)
+    # M6 burn-down: match_lifecycle's session-lost guard no longer calls the
+    # UI funnel (it unwinds match ownership only) — entry removed.
+    # input_override: AbortRollbackDispatcher is now typed-first (routes any
+    # residual live session through Session2_Terminate(TransportFailed)
+    # BEFORE the UI funnel); the single UI call site remains for surfacing.
+    "src\patches\input_override.cpp"      = 1    # AbortRollbackDispatcher (typed-first, M6)
 }
 
 $pattern = "(NetMenu::)?(HandleDisconnection|OpenDisconnectError)\s*\("

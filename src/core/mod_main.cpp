@@ -51,7 +51,6 @@
 #include "net/sync_trace.h"
 #include "net/delay_policy.h"
 #include "net/game_settings_sync.h"
-#include "net/gameplay_bridge.h"
 #include "net/set_tracker.h"
 #include "net/player_side_mapping.h"
 #include "replay/replay_runtime.h"
@@ -557,9 +556,6 @@ static void DeferredInit() {
     LogInitStep("DelayPolicy_Init", "END");
 
     // Initialize gameplay bridge (checks GekkoNet availability for future use)
-    LogInitStep("GameplayBridge_Init", "BEGIN");
-    Net::GameplayBridge_Init();
-    LogInitStep("GameplayBridge_Init", "END");
 
     // Initialize rollback gameplay subsystems
     LogInitStep("RollbackSession_Init", "BEGIN");
@@ -715,8 +711,7 @@ __declspec(dllexport) void ModShutdown() {
         Rollback::RollbackSession_Shutdown();
         Net::DelayPolicy_Shutdown();
         Net::SyncPolicy_Shutdown();
-        Net::GameplayBridge_Shutdown();
-        Net::MatchLifecycle_Shutdown();
+            Net::MatchLifecycle_Shutdown();
         Net::PregameSync_Shutdown();
         NetMenu::Shutdown();
         ModeOwnership::Remove();
@@ -842,10 +837,9 @@ __declspec(dllexport) void ModOnFrame() {
     // Update online wiring (manages rollback session lifecycle)
     Rollback::OnlineWiring_FrameUpdate();
 
-    // Drive gameplay bridge per-frame (rollback session + delay policy consumption)
-    // The bridge is the single entry point for per-frame gameplay runtime.
-    if (Net::GameplayBridge_IsSessionActive()) {
-        Net::GameplayBridge_FrameUpdate();
+    // Per-frame gameplay diagnostics (M6: gameplay_bridge retired — the
+    // match director owns the session; the facade is the activity query).
+    if (Rollback::RollbackSession_IsActive()) {
         Rollback::RollbackDebug_FrameUpdate();
     }
     Net::SyncTrace_FrameUpdate();
@@ -1076,7 +1070,7 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     Net::MatchLifecycle_GetSnapshot(&lifeSnap);
 
     bool inMatch = lifeSnap.active && lifeSnap.match_owned;
-    bool rollbackActive = Net::GameplayBridge_IsSessionActive();
+    bool rollbackActive = Rollback::RollbackSession_IsActive();
     // Also show HUD during charsel/stagesel lockstep (pregame active but no
     // match lifecycle or rollback yet). This covers initial charsel and rematch
     // charsel where MatchLifecycle is Inactive and rollback hasn't started.

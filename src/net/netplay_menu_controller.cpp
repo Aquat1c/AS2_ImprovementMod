@@ -2748,9 +2748,19 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
     if (Net::PregameSync_Begin()) {
         LOG_NETPLAY(LOG_INFO,
             "[NetMenu] Auto-rematch pregame restart started on CharSel");
-        // Retire this boundary's barriers so the next match starts clean.
-        Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::WinScreenExit);
-        Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::PostMatchDecision);
+        // Retire this boundary's barriers so the next match starts clean —
+        // in ladder order (INV-9, M6), reporting each consume to the
+        // director's match-end ladder gate.
+        if (Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::WinScreenExit)) {
+            Rollback::OnlineWiring_MatchEndLadderNotifyConsumed(
+                Net::NetTransitionKind::WinScreenExit);
+        }
+        if (Rollback::OnlineWiring_MatchEndLadderAllows(
+                Net::NetTransitionKind::PostMatchDecision) &&
+            Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::PostMatchDecision)) {
+            Rollback::OnlineWiring_MatchEndLadderNotifyConsumed(
+                Net::NetTransitionKind::PostMatchDecision);
+        }
     } else {
         LOG_NETPLAY(LOG_WARNING,
             "[NetMenu] Auto-rematch pregame restart deferred (phase=%s lifecycle=%s)",

@@ -1,14 +1,25 @@
 /**
- * Alice Senki 2 - Online Rollback Wiring Implementation
+ * Alice Senki 2 - Match Director (re0.7 M6, plan §2.6)
  *
- * This is the integration glue that connects all subsystems:
- *   - Bootstrap → RollbackSession handoff
- *   - Engine-facing packet sinks (dispatch lives in net/packet_router)
- *   - Lifecycle phase → rollback start/stop/pause
- *   - Disconnect → safe teardown
- *   - Post-match → clean handoff
- *   - Full-path logging throughout
- *   - Stress hook integration
+ * Implements the PRESERVED `OnlineWiring_*` facade (inventory §2.3) as the
+ * match director. Replaces src/rollback/online_wiring.cpp at the M6 cutover.
+ *
+ * Responsibilities (§2.6, thin by design — ordering, not policy):
+ *   - Startup: GameplayStart commit → engine arm (first match of the
+ *     session) or ROTATE (rematch: RollbackSession_Begin under a higher
+ *     epoch rotates the armed engine — no engine teardown between matches,
+ *     the canonical frame counter never resets, INV-15/G2).
+ *   - Match end: suspend-between-matches (engine survives through the
+ *     winscreen / continue prompt); full RollbackSession_End only on the
+ *     director-ordered SESSION teardown (§2.6.4).
+ *   - INV-9 match-end ladder: WinScreenExit → PostMatchDecision →
+ *     EpochAlign commits are consumed strictly in order; a later-step commit
+ *     is held (the barrier keeps re-acking it) until the earlier step is
+ *     committed locally.
+ *   - match_exit_pending: derived from MatchLifecycle and mirrored into the
+ *     engine's exact-input window (§2.7.6, INV-25) — replaces the M4
+ *     conservative stand-in.
+ *   - fx/spectator/palette/lifecycle event fan-out in the fixed order.
  */
 
 #include "rollback/online_wiring.h"
@@ -21,7 +32,7 @@
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "patches/input_sync_hooks.h"
-#include "net/gameplay_bridge.h"
+#include "patches/frame_scheduler.h"
 #include "net/packet_router.h"
 #include "net/match_lifecycle.h"
 #include "net/set_tracker.h"
@@ -37,7 +48,6 @@
 #include "net/delay_policy.h"
 #include "net/locked_match_config.h"
 #include "net/enet_transport.h"
-#include "net/netplay_pacing.h"
 #include "net/churn_pause.h"
 #include "net/game_settings_sync.h"
 #include "net/player_side_mapping.h"
@@ -79,13 +89,11 @@ static uint32_t s_backgroundPollCount    = 0;
 static uint32_t s_backgroundPollFailures = 0;
 
 // Startup gameplay-entry barrier state (M5: rides TransitionBarrier kind
-// GameplayStart — the 4-way propose/ack primitive that was modeled on the
-// old GekkoReady exchange; GekkoReady itself is retired). Each peer proposes
-// on reaching the FIRST interactive post-intro boundary; the commit
-// (both proposed + acked) is the mutual release.
+// GameplayStart). Each peer proposes on reaching the FIRST interactive
+// post-intro boundary; the commit (both proposed + acked) is the release.
 static bool     s_startupBarrierEntered    = false;
-static bool     s_startupProposed          = false;  // local GameplayStart proposal sent
-static bool     s_startupReleased          = false;  // gameplay-entry barrier released
+static bool     s_startupProposed          = false;
+static bool     s_startupReleased          = false;
 static uint32_t s_startupBlockedLogCounter = 0;
 static uint32_t s_introHoldLogCounter      = 0;
 
@@ -97,17 +105,47 @@ static int      s_lastRollbackBudget     = -1;
 // Rollback start guard — prevent double-starting
 static bool     s_rollbackBeginPending   = false;
 
+// match_exit_pending mirror (M6, §2.7.6): last value pushed to the engine.
+static bool     s_matchExitPendingMirror = false;
+
+// ── INV-9 match-end ladder (M6, §4.4) ───────────────────────────────────────
+// Armed when a match ends; disarmed when the ladder completes (EpochAlign
+// consumed), on disconnect, or by the fail-open watchdog (a wedged gate must
+// degrade into the §4.6 recovery ladder, never wedge a session — INV-12).
+static bool     s_ladderArmed        = false;
+static bool     s_ladderWseConsumed  = false;
+static bool     s_ladderPmdConsumed  = false;
+static uint32_t s_ladderHeldTicks    = 0;
+static uint32_t s_ladderHeldLogCount = 0;
+constexpr uint32_t kLadderFailOpenTicks = 600;   // ≈10 s at 60 Hz
+
+static void ArmMatchEndLadder(const char* reason) {
+    if (s_ladderArmed) return;
+    s_ladderArmed = true;
+    s_ladderWseConsumed = false;
+    s_ladderPmdConsumed = false;
+    s_ladderHeldTicks = 0;
+    s_ladderHeldLogCount = 0;
+    NetplayLog_Write("LADDER", -1,
+        "Match-end ladder ARMED (%s): WinScreenExit -> PostMatchDecision -> EpochAlign",
+        reason ? reason : "?");
+}
+
+static void DisarmMatchEndLadder(const char* reason) {
+    if (!s_ladderArmed) return;
+    s_ladderArmed = false;
+    s_ladderHeldTicks = 0;
+    NetplayLog_Write("LADDER", -1,
+        "Match-end ladder disarmed (%s): wse=%d pmd=%d",
+        reason ? reason : "?",
+        s_ladderWseConsumed ? 1 : 0,
+        s_ladderPmdConsumed ? 1 : 0);
+}
+
 static bool IsInteractiveRollbackPhase() {
     return s_rollbackActive &&
            Net::NetplayPhaseRuntime_IsInteractivePacingPhase(
                Net::NetplayPhaseRuntime_GetPhase());
-}
-
-static int32_t GetCurrentGameAbsFrameForLogs() {
-    if (s_rollbackActive) {
-        return RollbackSession_GetCurrentGameAbsFrame();
-    }
-    return (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
 }
 
 static int32_t GetStartupLogFrame() {
@@ -156,8 +194,7 @@ static void ResetStartupBarrierState(const char* reason) {
     s_startupBlockedLogCounter = 0;
     s_introHoldLogCounter = 0;
     // Clear the barrier slot so a stale proposal from a previous match can
-    // never satisfy the next match's release (the old "ignore remote READY
-    // before interactive boundary" guard, structurally).
+    // never satisfy the next match's release.
     Net::TransitionBarrier_Clear(Net::NetTransitionKind::GameplayStart,
         reason ? reason : "startup barrier reset");
 }
@@ -184,19 +221,17 @@ static void LogGameplayPacketAnomaly(const char* reason,
 // ============================================================================
 
 void OnlineWiring_HandleEngineDataPacket(const void* payload, size_t payloadLen) {
-    // Engine internal protocol data (raw Gekko stream until the engine2
-    // cutover) — buffer for the rollback session to drain.
     if (payloadLen == 0 || !payload) {
         LogGameplayPacketAnomaly("Empty InputStream", Net::PacketType::InputStream, payloadLen, 1);
         return;
     }
 
     if (!s_rollbackActive) {
-        static uint32_t s_preLiveGekkoDrops = 0;
-        s_preLiveGekkoDrops++;
-        if (s_preLiveGekkoDrops <= 5 || (s_preLiveGekkoDrops % 120) == 0) {
+        static uint32_t s_preLiveStreamDrops = 0;
+        s_preLiveStreamDrops++;
+        if (s_preLiveStreamDrops <= 5 || (s_preLiveStreamDrops % 120) == 0) {
             NetplayLog_Write("STARTUP", GetStartupLogFrame(),
-                "Dropping pre-live InputStream while rollback session is not active: "
+                "Dropping pre-live/suspended InputStream while rollback dispatch is inactive: "
                 "len=%zu phase=%s",
                 payloadLen,
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
@@ -224,7 +259,7 @@ static bool PrepareBaselineForInteractiveRelease() {
     const Net::LockedMatchConfig* config = Net::PregameSync_GetLockedConfig();
     if (!config) {
         NetplayLog_Write("HANDOFF", -1, "ERROR: No locked config available for startup handoff");
-        LOG_ERROR("[OnlineWiring] No locked config for startup handoff");
+        LOG_ERROR("[MatchDirector] No locked config for startup handoff");
         return false;
     }
 
@@ -238,19 +273,14 @@ static bool PrepareBaselineForInteractiveRelease() {
     const int32_t preIntroGameAbsFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
 
     NetplayLog_Write("HANDOFF", preIntroGameAbsFrame,
-        "=== BOOTSTRAP -> INTRO HANDOFF ===");
+        "=== BOOTSTRAP -> INTRO HANDOFF === epoch=%u",
+        Net::PregameSync_GetCurrentEpoch());
     NetplayLog_Write("HANDOFF", preIntroGameAbsFrame,
         "Config hash=0x%08X baseline_crc=0x%08X bootstrap_frame_abs=%u gameplay_start_host_game_abs_frame=%d",
         s_configHash,
         s_baselineCRC,
         bootSnap.bootstrap_frame_abs,
         bootSnap.gameplay_start_host_game_abs_frame);
-    NetplayLog_Write("HANDOFF", preIntroGameAbsFrame,
-        "Load barrier sim: local=%d remote=%d | baseline sim: local=%d remote=%d",
-        bootSnap.local_load_sim_frame,
-        bootSnap.remote_load_sim_frame,
-        bootSnap.local_baseline_sim_frame,
-        bootSnap.remote_baseline_sim_frame);
 
     // Preserve hard startup alignment before deterministic intro runs.
     uint32_t preRestoreCRC = CalcCRC32(
@@ -276,11 +306,9 @@ static bool PrepareBaselineForInteractiveRelease() {
     } else {
         NetplayLog_Write("HANDOFF", preIntroGameAbsFrame,
             "WARNING: Baseline restore FAILED before intro handoff");
-        LOG_WARN("[OnlineWiring] Baseline restore failed before intro handoff");
+        LOG_WARN("[MatchDirector] Baseline restore failed before intro handoff");
     }
 
-    // M3: no callback handoff — packet_router routes startup READY/ACK and
-    // engine data here in every regime.
     ResetStartupBarrierState("interactive release armed");
     s_liveReleaseArmed = true;
 
@@ -293,31 +321,29 @@ static bool PrepareBaselineForInteractiveRelease() {
 static bool TryStartRollbackSession() {
     if (s_rollbackActive) return true;  // Already active
 
-    // Get locked config from pregame sync
     const Net::LockedMatchConfig* config = Net::PregameSync_GetLockedConfig();
     if (!config) {
         NetplayLog_Write("HANDOFF", -1, "ERROR: No locked config available for rollback start");
-        LOG_ERROR("[OnlineWiring] No locked config for rollback session start");
+        LOG_ERROR("[MatchDirector] No locked config for rollback session start");
         return false;
     }
 
-    // Get bootstrap handoff facts for baseline info
     Net::PregameBootstrapInfo bootSnap{};
     Net::PregameSync_GetBootstrapInfo(&bootSnap);
 
-    // Get delay policy values
     const int visibleDelay = Net::DelayPolicy_GetActiveDelay();
     const int effectiveDelay = Net::DelayPolicy_GetEffectiveLocalDelay();
     int rollbackBudget = Net::DelayPolicy_GetRollbackBudget();
-    const int protectionWindow = Net::DelayPolicy_GetProtectionWindow();
 
-    // Determine local/remote player via PlayerMapping module
     Net::SessionRole role = Net::Session_GetRole();
     bool isHost = (role == Net::SessionRole::Host);
     int localPlayer = Net::PlayerMapping_DeriveFromRole(config->host_side, isHost);
+
+    // Player mapping was owned by the retired gameplay_bridge; the director
+    // sets and verifies it directly now (M6, gameplay_bridge deleted).
+    Net::PlayerMapping_SetAssignment(localPlayer);
     int remotePlayer = Net::PlayerMapping_GetRemoteGameSlot();
 
-    // Build rollback session config
     RollbackSessionConfig rbConfig{};
     rbConfig.local_player = localPlayer;
     rbConfig.remote_player = remotePlayer;
@@ -328,16 +354,15 @@ static bool TryStartRollbackSession() {
     const int32_t interactiveFrame = (int32_t)ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
     rbConfig.frame_origin_abs = interactiveFrame;
 
-    // Config hash for logging
     s_configHash = Net::LockedMatchConfig_Hash(config);
     s_baselineCRC = rbConfig.baseline_checksum;
     s_handoffDelay = effectiveDelay;
     s_handoffBudget = rollbackBudget;
     s_frameOriginAbs = interactiveFrame;
 
-    // --- LOG BEFORE/AFTER for live release ---
     NetplayLog_Write("HANDOFF", interactiveFrame,
-        "=== INTERACTIVE RELEASE -> ROLLBACK START ===");
+        "=== INTERACTIVE RELEASE -> ROLLBACK START === epoch=%u",
+        Net::PregameSync_GetCurrentEpoch());
     NetplayLog_Write("HANDOFF", interactiveFrame,
         "Config: p1_char=%u p1_pal=%u p2_char=%u p2_pal=%u stage=%u rounds_raw=%u rounds_to_win=%d",
         config->p1_character, config->p1_palette,
@@ -357,34 +382,22 @@ static bool TryStartRollbackSession() {
         "Baseline CRC=0x%08X bootstrap_frame_abs=%d interactive_boundary_game_abs_frame=%d frame_origin_abs=%d rb_start_frame=0",
         s_baselineCRC, bootstrapFrame, interactiveFrame, rbConfig.frame_origin_abs);
     NetplayLog_Write("HANDOFF", interactiveFrame,
-        "Load barrier sim: local=%d remote=%d | baseline sim: local=%d remote=%d | start sim=%d",
-        bootSnap.local_load_sim_frame,
-        bootSnap.remote_load_sim_frame,
-        bootSnap.local_baseline_sim_frame,
-        bootSnap.remote_baseline_sim_frame,
-        bootSnap.gameplay_start_host_game_abs_frame);
-    NetplayLog_Write("HANDOFF", interactiveFrame,
-        "Frame origin delta from bootstrap baseline: %d frames",
-        rbConfig.frame_origin_abs - bootstrapFrame);
-    NetplayLog_Write("HANDOFF", interactiveFrame,
-        "Local delay visible=%d effective=%d rollback_budget=%d remote_visible=%d remote_effective=%d protection_window=%d stall_threshold=%d",
+        "Local delay visible=%d effective=%d rollback_budget=%d remote_visible=%d remote_effective=%d",
         visibleDelay,
         effectiveDelay,
         rollbackBudget,
         Net::DelayPolicy_GetRemoteAnnouncedDelay(),
-        Net::DelayPolicy_GetEffectiveRemoteDelay(),
-        protectionWindow,
-        Net::DelayPolicy_GetStallThreshold());
+        Net::DelayPolicy_GetEffectiveRemoteDelay());
     Net::DelayPolicy_LogDelayMap("rollback handoff");
 
-    // M3: no callback registration — packet_router is the permanent owner.
-
-    // Start rollback session through GameplayBridge
-    bool ok = Net::GameplayBridge_StartSession(rbConfig);
+    // Arm (first match) or rotate (rematch — the engine2 adapter rotates the
+    // armed engine when Begin arrives under a higher epoch, §2.6.5).
+    bool ok = RollbackSession_Begin(rbConfig);
     if (!ok) {
         NetplayLog_Write("HANDOFF", interactiveFrame,
-            "ERROR: GameplayBridge_StartSession FAILED");
-        LOG_ERROR("[OnlineWiring] GameplayBridge_StartSession failed");
+            "ERROR: RollbackSession_Begin FAILED");
+        LOG_ERROR("[MatchDirector] RollbackSession_Begin failed");
+        Net::PlayerMapping_Clear();
         return false;
     }
 
@@ -393,20 +406,18 @@ static bool TryStartRollbackSession() {
     s_gameplayActive = Net::NetplayPhaseRuntime_IsInteractivePacingPhase(
         Net::NetplayPhaseRuntime_GetPhase());
     s_liveReleaseArmed = false;
+    s_matchExitPendingMirror = false;
+    RollbackSession_SetMatchExitPending(false);
     // Clear any stale startup hold pulse now that rollback owns gameplay.
-    // If Gekko is still finishing its own pre-start sync, the dispatcher gate
-    // will re-arm a fresh one-frame runtime freeze as needed.
     InputSyncHooks_SetTimesyncFreeze(false);
 
-    // Mark delay as consumed by the live rollback session.
     Net::DelayPolicy_OnRollbackApplied(effectiveDelay);
 
-    // Reset per-match digest history/desync flags so warnings don't leak across
-    // rematch/new-session frame-number reuse windows.
+    // Reset per-match digest history/desync flags so warnings don't leak
+    // across rematch/new-session frame-number reuse windows.
     RollbackDebug_ResetSession();
     Net::SyncTrace_ResetSession("rollback start");
 
-    // Enable state digest for desync detection (authoritative, settled-frame compare).
     RollbackDebug_SetDigestEnabled(true);
     if (Net::SyncTrace_ShouldArmIntegrityOnRollback()) {
         Net::SyncTrace_SetIntegrityActive(true, "rollback start");
@@ -424,14 +435,13 @@ static bool TryStartRollbackSession() {
 
     NetplayLog_Write("HANDOFF", interactiveFrame,
         "=== ROLLBACK SESSION STARTED SUCCESSFULLY ===");
-    LOG_INFO("[OnlineWiring] Rollback session started: P%d vs P%d, visible_delay=%d effective_delay=%d budget=%d remote_delay=%d stall_threshold=%d baseline=0x%08X",
+    LOG_INFO("[MatchDirector] Rollback session started: P%d vs P%d, visible_delay=%d effective_delay=%d budget=%d remote_delay=%d baseline=0x%08X",
         localPlayer + 1,
         remotePlayer + 1,
         visibleDelay,
         effectiveDelay,
         rollbackBudget,
         Net::DelayPolicy_GetRemoteAnnouncedDelay(),
-        Net::DelayPolicy_GetStallThreshold(),
         s_baselineCRC);
 
     Net::SpectatorRuntime_OnRollbackStarted(rbConfig.frame_origin_abs);
@@ -440,7 +450,7 @@ static bool TryStartRollbackSession() {
 }
 
 // ============================================================================
-// Safe Teardown
+// Suspension / teardown
 // ============================================================================
 
 static bool ShouldPreservePaletteRuntimeForPostMatch(const char* reason) {
@@ -452,17 +462,22 @@ static bool ShouldPreservePaletteRuntimeForPostMatch(const char* reason) {
            strcmp(reason, "match end event") == 0;
 }
 
-static void StopRollbackSession(const char* reason) {
+// Match-boundary or session-end stop. `sessionTeardown=false` = the match
+// ended but the session lives on (winscreen → rematch): the engine2 backend
+// keeps its engine armed so the next Begin rotates the epoch (§2.6.3/§2.6.5).
+// `sessionTeardown=true` = director-ordered SESSION teardown → full engine
+// end (§2.6.4).
+static void StopRollbackSession(const char* reason, bool sessionTeardown) {
     if (!s_rollbackActive) return;
 
     int32_t frame = RollbackSession_GetCurrentFrame();
 
-    // Snapshot before teardown
     RollbackSessionSnapshot snap{};
     RollbackSession_GetSnapshot(&snap);
 
     NetplayLog_Write("TEARDOWN", frame,
-        "=== ROLLBACK SESSION ENDING ===");
+        "=== ROLLBACK SESSION %s ===",
+        sessionTeardown ? "ENDING (session teardown)" : "SUSPENDING (match boundary)");
     NetplayLog_Write("TEARDOWN", frame,
         "Reason: %s", reason ? reason : "unknown");
     NetplayLog_Write("TEARDOWN", frame,
@@ -475,7 +490,6 @@ static void StopRollbackSession(const char* reason) {
         "IO: sent=%d recv=%d",
         snap.local_inputs_sent, snap.remote_inputs_received);
 
-    // Check for desync before ending
     RollbackDebug_LogSessionSummary(reason ? reason : "rollback stop");
     if (RollbackDebug_IsDesyncDetected()) {
         int32_t desyncFrame = RollbackDebug_GetDesyncFrame();
@@ -483,9 +497,16 @@ static void StopRollbackSession(const char* reason) {
             "WARNING: Desync was detected at frame %d", desyncFrame);
     }
 
-    // End session through GameplayBridge
-    Net::GameplayBridge_EndSession();
-    Net::NetplayPacing_ResetSession(reason ? reason : "rollback stop");
+    RollbackSession_SetMatchExitPending(false);
+    s_matchExitPendingMirror = false;
+
+    if (sessionTeardown) {
+        RollbackSession_End();
+        Net::PlayerMapping_Clear();
+    } else {
+        RollbackSession_SuspendBetweenMatches(reason ? reason : "match boundary");
+    }
+    FrameScheduler_OnSessionReset(reason ? reason : "rollback stop");
     Net::ChurnPause_ResetSession(reason ? reason : "rollback stop");
     Net::SyncTrace_ResetSession(reason ? reason : "rollback stop");
     Net::SyncTrace_SetIntegrityActive(false, reason ? reason : "rollback stop");
@@ -507,8 +528,11 @@ static void StopRollbackSession(const char* reason) {
     }
 
     NetplayLog_Write("TEARDOWN", frame,
-        "=== ROLLBACK SESSION ENDED ===");
-    LOG_INFO("[OnlineWiring] Rollback session ended: %s", reason ? reason : "unknown");
+        "=== ROLLBACK SESSION %s ===",
+        sessionTeardown ? "ENDED" : "SUSPENDED");
+    LOG_INFO("[MatchDirector] Rollback session %s: %s",
+        sessionTeardown ? "ended" : "suspended",
+        reason ? reason : "unknown");
 }
 
 static bool DisconnectNeedsBoundaryCleanup() {
@@ -563,9 +587,8 @@ static void LogBudgetChange(int from, int to, const char* reason) {
 // Per-Frame Update
 // ============================================================================
 
-// Mid-session local input-delay hotkeys `-`/`=` (plan §9 Q3, shipped with
-// the first release; INV-23/B-7: a peer-local knob with no wire message —
-// changing it here has no interaction with the peer whatsoever).
+// Mid-session local input-delay hotkeys `-`/`=` (plan §9 Q3; INV-23/B-7:
+// peer-local knob, no wire message).
 static void UpdateDelayHotkeys() {
     if (!s_rollbackActive || !s_gameplayActive) {
         return;
@@ -593,7 +616,7 @@ static void UpdateDelayHotkeys() {
         NetplayLog_Write("DELAY", RollbackSession_GetCurrentFrame(),
             "Local delay hotkey applied: %d -> %d (peer-local, no wire message)",
             cur, target);
-        LOG_NETPLAY(LOG_INFO, "[OnlineWiring] Local input delay %d -> %d (hotkey)", cur, target);
+        LOG_NETPLAY(LOG_INFO, "[MatchDirector] Local input delay %d -> %d (hotkey)", cur, target);
     } else {
         NetplayLog_Write("DELAY", RollbackSession_GetCurrentFrame(),
             "Local delay hotkey deferred/refused by session: %d -> %d", cur, target);
@@ -628,6 +651,31 @@ static void CheckPolicyChanges() {
     s_lastRollbackBudget = curBudget;
 }
 
+// M6 (§2.7.6/INV-25): derive match_exit_pending from MatchLifecycle and
+// mirror it into the engine's exact-input window. The exit route can fire
+// from MatchEnd (Mode 8 Sub 5) — any tick that can execute the mode-8 exit
+// router (Game_ChangeMode → Handle_ReleaseAll) must be exact-input.
+static void UpdateMatchExitPendingMirror() {
+    if (!s_rollbackActive) {
+        return;
+    }
+    Net::MatchLifecycleSnapshot lifeSnap{};
+    Net::MatchLifecycle_GetSnapshot(&lifeSnap);
+    const bool exitPending =
+        lifeSnap.phase == Net::MatchLifecyclePhase::MatchEnd ||
+        lifeSnap.phase == Net::MatchLifecyclePhase::PostMatchRoute ||
+        lifeSnap.match_end_route != 0;
+    if (exitPending != s_matchExitPendingMirror) {
+        s_matchExitPendingMirror = exitPending;
+        RollbackSession_SetMatchExitPending(exitPending);
+        NetplayLog_Write("LIFE", RollbackSession_GetCurrentFrame(),
+            "match_exit_pending -> %d (phase=%s route=%u)",
+            exitPending ? 1 : 0,
+            Net::MatchLifecyclePhaseName(lifeSnap.phase),
+            lifeSnap.match_end_route);
+    }
+}
+
 static void CheckLifecyclePhase() {
     Net::MatchLifecyclePhase curPhase = Net::MatchLifecycle_GetPhase();
 
@@ -636,8 +684,6 @@ static void CheckLifecyclePhase() {
 
         // === Handle phase transitions ===
 
-        // Entering PlayableGameplay — usually means interactive control began.
-        // Rollback start is deferred to the mutual post-intro startup release.
         if (curPhase == Net::MatchLifecyclePhase::PlayableGameplay) {
             if (s_rollbackStarted) {
                 const bool resumed = (s_lastLifecyclePhase == Net::MatchLifecyclePhase::PauseActive ||
@@ -654,8 +700,6 @@ static void CheckLifecyclePhase() {
                 }
             } else {
                 if (!s_liveReleaseArmed) {
-                    // Defensive fallback: if handoff wiring was missed, still arm the
-                    // interactive startup barrier here so first-advance cannot race.
                     s_liveReleaseArmed = true;
                     ResetStartupBarrierState("lifecycle playable fallback");
                     NetplayLog_Write("STARTUP", GetStartupLogFrame(),
@@ -669,39 +713,39 @@ static void CheckLifecyclePhase() {
         // Leaving PlayableGameplay — handle based on where we're going
         if (s_lastLifecyclePhase == Net::MatchLifecyclePhase::PlayableGameplay) {
             if (curPhase == Net::MatchLifecyclePhase::PauseActive) {
-                // Pause — keep the session alive, but interactive pacing stops.
                 s_gameplayActive = false;
                 Net::PauseHandler_OnPauseEnter();
                 NetplayLog_Write("LIFE", RollbackSession_GetCurrentFrame(),
                     "Pause active — rollback session retained; interactive pacing paused");
             } else if (curPhase == Net::MatchLifecyclePhase::RoundTransition) {
-                // Round end transition — keep the same session running into the next round.
                 s_gameplayActive = false;
                 NetplayLog_Write("LIFE", RollbackSession_GetCurrentFrame(),
                     "Round transition — rollback session retained; non-interactive in-match phase continues");
             } else if (curPhase == Net::MatchLifecyclePhase::MatchEnd) {
-                // Match end — stop rollback safely
-                StopRollbackSession("match ended");
+                // Match end — suspend at the boundary; the SESSION (and on
+                // engine2 the engine itself) survives into the winscreen.
+                StopRollbackSession("match ended", /*sessionTeardown=*/false);
             } else if (curPhase == Net::MatchLifecyclePhase::DisconnectRecovery) {
-                StopRollbackSession("disconnect during gameplay");
+                StopRollbackSession("disconnect during gameplay", /*sessionTeardown=*/true);
             }
         }
 
         // Match end from any state
         if (curPhase == Net::MatchLifecyclePhase::MatchEnd &&
             s_lastLifecyclePhase != Net::MatchLifecyclePhase::MatchEnd) {
-            // Record match result for set tracking
             Net::MatchLifecycleSnapshot lifeSnap{};
             Net::MatchLifecycle_GetSnapshot(&lifeSnap);
             Net::SetTracker_RecordResult(lifeSnap.winner);
+            // Arm the INV-9 match-end ladder for this boundary.
+            ArmMatchEndLadder("match end");
         }
 
         if (curPhase == Net::MatchLifecyclePhase::MatchEnd && s_rollbackActive) {
-            StopRollbackSession("match ended (non-gameplay)");
+            StopRollbackSession("match ended (non-gameplay)", /*sessionTeardown=*/false);
         }
 
-        // Begin win-screen lockstep as soon as the match ends so both peers stay
-        // aligned through the Mode 8 -> Mode 9 transition and fade-in substates.
+        // Begin win-screen lockstep as soon as the match ends so both peers
+        // stay aligned through the Mode 8 -> Mode 9 transition.
         if (curPhase == Net::MatchLifecyclePhase::MatchEnd &&
             s_lastLifecyclePhase != Net::MatchLifecyclePhase::MatchEnd) {
             Net::WinScreenSync_Begin();
@@ -711,15 +755,15 @@ static void CheckLifecyclePhase() {
 
         // Disconnect from any state
         if (curPhase == Net::MatchLifecyclePhase::DisconnectRecovery && s_rollbackActive) {
-            StopRollbackSession("disconnect");
+            StopRollbackSession("disconnect", /*sessionTeardown=*/true);
         }
 
-        // Entering WinScreenActive — palette cleanup only (lockstep already armed at MatchEnd)
+        // Entering WinScreenActive — palette cleanup only
         if (curPhase == Net::MatchLifecyclePhase::WinScreenActive &&
             s_lastLifecyclePhase != Net::MatchLifecyclePhase::WinScreenActive) {
             Net::NetplayPaletteRuntime_OnWinScreenEnter();
             NetplayLog_Write("LIFE", -1,
-                "Win screen entered — rollback gameplay session detached, post-match lockstep active");
+                "Win screen entered — rollback gameplay suspended, post-match lockstep active");
         }
 
         // Leaving WinScreenActive — abort sync if still running
@@ -736,9 +780,8 @@ static void CheckLifecyclePhase() {
         // Inactive — full cleanup
         if (curPhase == Net::MatchLifecyclePhase::Inactive) {
             if (s_rollbackActive) {
-                StopRollbackSession("lifecycle inactive");
+                StopRollbackSession("lifecycle inactive", /*sessionTeardown=*/false);
             }
-            // Reset per-match state
             s_rollbackStarted = false;
             s_rollbackBeginPending = false;
             s_liveReleaseArmed = false;
@@ -752,9 +795,9 @@ static void CheckLifecyclePhase() {
             ResetStartupBarrierState("lifecycle inactive");
             NetplayLog_Write("LIFE", -1,
                 "Rollback cleanup complete: lifecycle inactive, frame_origin_abs reset");
-            // Do NOT reset SetTracker here — Inactive is reached on both rematch
-            // (charsel return) and real session end. The session-end reset is in
-            // OnlineWiring_OnDisconnect, which is the only correct reset point.
+            // Do NOT reset SetTracker here — Inactive is reached on both
+            // rematch (charsel return) and real session end; the session-end
+            // reset lives in OnlineWiring_OnDisconnect.
         }
 
         // MatchInit — potential round restart, re-enable gameplay flag
@@ -762,7 +805,6 @@ static void CheckLifecyclePhase() {
             if (s_lastLifecyclePhase == Net::MatchLifecyclePhase::RoundTransition) {
                 Net::NetplayPaletteRuntime_OnRoundRestart();
             }
-            // New round starting — rollback session stays alive
             NetplayLog_Write("LIFE", -1,
                 "New round init — same rollback session continues: frame_origin_abs=%d startup_released=%d pending_frame=%d",
                 s_frameOriginAbs,
@@ -770,16 +812,112 @@ static void CheckLifecyclePhase() {
                 RollbackSession_HasPendingFrame() ? 1 : 0);
         }
 
-        // IntroActive → will reach PlayableGameplay soon
         if (curPhase == Net::MatchLifecyclePhase::IntroActive) {
             NetplayLog_Write("LIFE", -1,
-                "Intro active — same rollback session continues: startup_barrier_active=%d pacing_active=0 pending_frame=%d release_armed=%d",
+                "Intro active — same rollback session continues: startup_barrier_active=%d pending_frame=%d release_armed=%d",
                 (!s_startupReleased && (s_liveReleaseArmed || s_rollbackActive)) ? 1 : 0,
                 RollbackSession_HasPendingFrame() ? 1 : 0,
                 s_liveReleaseArmed ? 1 : 0);
         }
 
         s_lastLifecyclePhase = curPhase;
+    }
+}
+
+// ============================================================================
+// INV-9 match-end ladder gate (M6, §4.4)
+// ============================================================================
+
+static bool LadderStepSatisfied(Net::NetTransitionKind kind, bool consumedFlag) {
+    return consumedFlag || Net::TransitionBarrier_IsCommitted(kind);
+}
+
+bool OnlineWiring_MatchEndLadderAllows(Net::NetTransitionKind kind) {
+    if (!s_ladderArmed) {
+        return true;   // no boundary pending (e.g. session-start EpochAlign)
+    }
+    switch (kind) {
+        case Net::NetTransitionKind::WinScreenExit:
+            return true;
+        case Net::NetTransitionKind::PostMatchDecision:
+            return LadderStepSatisfied(Net::NetTransitionKind::WinScreenExit,
+                                       s_ladderWseConsumed);
+        case Net::NetTransitionKind::EpochAlign: {
+            const bool ok =
+                LadderStepSatisfied(Net::NetTransitionKind::WinScreenExit,
+                                    s_ladderWseConsumed) &&
+                LadderStepSatisfied(Net::NetTransitionKind::PostMatchDecision,
+                                    s_ladderPmdConsumed);
+            if (!ok) {
+                s_ladderHeldLogCount++;
+                if (s_ladderHeldLogCount <= 5 || (s_ladderHeldLogCount % 120) == 0) {
+                    NetplayLog_Write("LADDER", -1,
+                        "EpochAlign commit HELD by match-end ladder: wse=%d/%d pmd=%d/%d held_ticks=%u",
+                        s_ladderWseConsumed ? 1 : 0,
+                        Net::TransitionBarrier_IsCommitted(Net::NetTransitionKind::WinScreenExit) ? 1 : 0,
+                        s_ladderPmdConsumed ? 1 : 0,
+                        Net::TransitionBarrier_IsCommitted(Net::NetTransitionKind::PostMatchDecision) ? 1 : 0,
+                        s_ladderHeldTicks);
+                }
+            }
+            return ok;
+        }
+        default:
+            return true;   // kinds outside the ladder are unaffected
+    }
+}
+
+void OnlineWiring_MatchEndLadderNotifyConsumed(Net::NetTransitionKind kind) {
+    if (!s_ladderArmed) {
+        return;
+    }
+    switch (kind) {
+        case Net::NetTransitionKind::WinScreenExit:
+            s_ladderWseConsumed = true;
+            break;
+        case Net::NetTransitionKind::PostMatchDecision:
+            s_ladderPmdConsumed = true;
+            break;
+        case Net::NetTransitionKind::EpochAlign: {
+            // Ladder complete: retire this boundary's earlier-step slots so
+            // stale commits can never satisfy the NEXT boundary. (F-7 note:
+            // a PostMatchDecision intent contradicting the lockstep-derived
+            // answer is logged at the consume sites; the protocol-violation
+            // terminal is deferred until the wire intents are unified —
+            // see IMPLEMENTATION_LOG M6.)
+            Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::WinScreenExit);
+            Net::TransitionBarrier_ConsumeCommit(Net::NetTransitionKind::PostMatchDecision);
+            Net::TransitionBarrier_Clear(Net::NetTransitionKind::WinScreenExit,
+                                         "match-end ladder complete");
+            Net::TransitionBarrier_Clear(Net::NetTransitionKind::PostMatchDecision,
+                                         "match-end ladder complete");
+            DisarmMatchEndLadder("ladder complete (EpochAlign consumed)");
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// Fail-open watchdog: a wedged ladder degrades into the §4.6 recovery ladder
+// instead of wedging the session (INV-12). Counted only while an EpochAlign
+// commit is actually being held.
+static void UpdateLadderWatchdog() {
+    if (!s_ladderArmed) {
+        return;
+    }
+    if (Net::TransitionBarrier_IsCommitted(Net::NetTransitionKind::EpochAlign) &&
+        !OnlineWiring_MatchEndLadderAllows(Net::NetTransitionKind::EpochAlign)) {
+        s_ladderHeldTicks++;
+        if (s_ladderHeldTicks >= kLadderFailOpenTicks) {
+            NetplayLog_Write("LADDER", -1,
+                "Match-end ladder FAIL-OPEN after %u held ticks (earlier steps never "
+                "committed) — releasing gate; recovery ladder owns convergence",
+                s_ladderHeldTicks);
+            DisarmMatchEndLadder("fail-open watchdog");
+        }
+    } else {
+        s_ladderHeldTicks = 0;
     }
 }
 
@@ -806,32 +944,35 @@ void OnlineWiring_Init() {
     s_lastLifecyclePhase = Net::MatchLifecyclePhase::Inactive;
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
+    s_matchExitPendingMirror = false;
+    s_ladderArmed = false;
+    s_ladderWseConsumed = false;
+    s_ladderPmdConsumed = false;
     ResetStartupBarrierState("init");
 
-    Net::NetplayPacing_Init();
     Net::ChurnPause_Init();
     StressHooks_Init();
     Net::SetTracker_Init();
     Net::WinScreenSync_Init();
     Net::PauseHandler_Init();
 
-    LOG_INFO("[OnlineWiring] Initialized");
-    NetplayLog_Write("WIRING", -1, "OnlineWiring initialized");
-    NetplayLog_Write("STARTUP", -1,
-        "Vendor/runtime patch path: using integration-layer startup barrier; "
-        "no GekkoNet internal FramesAhead override active");
+    LOG_INFO("[MatchDirector] Initialized");
+    NetplayLog_Write("WIRING", -1, "MatchDirector initialized (OnlineWiring facade)");
 }
 
 void OnlineWiring_Shutdown() {
     if (s_rollbackActive) {
-        StopRollbackSession("mod shutdown");
+        StopRollbackSession("mod shutdown", /*sessionTeardown=*/true);
+    } else {
+        // A suspended engine still holds resources — end it on shutdown.
+        RollbackSession_End();
     }
-    Net::NetplayPacing_Shutdown();
     Net::ChurnPause_Shutdown();
     s_liveReleaseArmed = false;
     s_rollbackBeginPending = false;
     s_frameOriginAbs = -1;
     ResetStartupBarrierState("shutdown");
+    DisarmMatchEndLadder("shutdown");
     Net::WinScreenSync_Shutdown();
     Net::PauseHandler_Shutdown();
     StressHooks_Shutdown();
@@ -849,27 +990,30 @@ void OnlineWiring_FrameUpdate() {
 
     s_gameplayActive = IsInteractiveRollbackPhase();
 
+    // M6: exact-input window signal for the engine (§2.7.6, INV-25).
+    UpdateMatchExitPendingMirror();
+
+    // INV-9 ladder fail-open watchdog.
+    UpdateLadderWatchdog();
+
     // Mid-session delay hotkeys (M5; peer-local, INV-23).
     UpdateDelayHotkeys();
 
-    // Keep Gekko session events/liveness flowing even when the input dispatcher
-    // is stalled in lockstep/startup holds. This remains game-thread-owned
-    // (no cross-thread Gekko mutation), but decouples poll cadence from the
-    // dispatcher's ability to advance simulation.
+    // Keep engine events/liveness flowing even when the input dispatcher is
+    // stalled in lockstep/startup holds.
     if (s_rollbackActive) {
         s_backgroundPollCount++;
         Net::ChurnPause_OnRollbackPoll(
             s_gameplayActive && s_rollbackActive,
             RollbackSession_GetCurrentFrame());
         const bool pollOk = RollbackSession_PollSession();
-        // Session death gating (M3): tear down only when Gekko reports the
-        // session broken (20s disconnect timeout fired) or the
-        // ConnectionSupervisor has reached its Dead verdict. A supervisor
-        // Interrupted state is a freeze-and-wait condition, never a teardown.
+        // Session death gating: tear down only when the session reports a
+        // terminal or the ConnectionSupervisor reached its Dead verdict.
+        // Interrupted is a freeze-and-wait condition, never a teardown.
         const bool supervisorDead = Net::ConnectionSupervisor_IsDead();
         if (!pollOk || supervisorDead) {
             s_backgroundPollFailures++;
-            NetplayLog_Write("GEKKO", RollbackSession_GetCurrentFrame(),
+            NetplayLog_Write("ENGINE", RollbackSession_GetCurrentFrame(),
                 "Background poll FAILED: count=%u failures=%u poll_ok=%d supervisor_dead=%d phase=%s",
                 s_backgroundPollCount,
                 s_backgroundPollFailures,
@@ -882,7 +1026,7 @@ void OnlineWiring_FrameUpdate() {
                     : "Rollback session poll failure");
             }
         } else if (s_backgroundPollCount <= 5 || (s_backgroundPollCount % 300) == 0) {
-            NetplayLog_Verbose("GEKKO", RollbackSession_GetCurrentFrame(),
+            NetplayLog_Verbose("ENGINE", RollbackSession_GetCurrentFrame(),
                 "Background poll ok: count=%u phase=%s gameplay=%d",
                 s_backgroundPollCount,
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
@@ -897,16 +1041,14 @@ void OnlineWiring_FrameUpdate() {
         curPhase != Net::MatchLifecyclePhase::PlayableGameplay) {
         const bool drained = RollbackSession_DrainPendingNonAdvanceEvents();
         if (!drained) {
-            NetplayLog_Write("GEKKO", RollbackSession_GetCurrentFrame(),
+            NetplayLog_Write("ENGINE", RollbackSession_GetCurrentFrame(),
                 "Pending rollback frame still requires dispatcher-owned advance: phase=%s",
                 Net::MatchLifecyclePhaseName(curPhase));
         }
     }
 
-    // Startup gameplay-entry barrier:
-    // - Deterministic intro runs in vanilla/passive mode.
-    // - Rollback-owned BeginFrame/Advance is held until BOTH peers report the
-    //   first post-intro interactive boundary and exchange READY+ACK.
+    // Startup gameplay-entry barrier: deterministic intro runs vanilla;
+    // rollback-owned advance is held until BOTH peers commit GameplayStart.
     if ((s_liveReleaseArmed || s_rollbackActive) && !s_startupReleased) {
         const bool sessionConnected = Net::Session_IsConnected();
         const Net::MatchRollbackPhase rollbackPhase = Net::NetplayPhaseRuntime_GetPhase();
@@ -926,8 +1068,7 @@ void OnlineWiring_FrameUpdate() {
             s_introHoldLogCounter++;
             if (s_introHoldLogCounter <= 5 || (s_introHoldLogCounter % 120) == 0) {
                 NetplayLog_Write("STARTUP", GetStartupLogFrame(),
-                    "Session connected but live advance still gated: intro not finished "
-                    "(phase=%s)",
+                    "Session connected but live advance still gated: intro not finished (phase=%s)",
                     Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
             }
         } else {
@@ -935,9 +1076,6 @@ void OnlineWiring_FrameUpdate() {
         }
 
         if (sessionConnected && inPlayableGameplay && !s_startupProposed) {
-            // TransitionBarrier GameplayStart (M5, replacing GekkoReady):
-            // propose once at the interactive boundary; the barrier owns
-            // resends (250 ms) and idempotent re-acks.
             Net::TransitionBarrier_Propose(
                 Net::NetTransitionKind::GameplayStart, 0,
                 Net::PregameSync_GetCurrentEpoch());
@@ -1006,13 +1144,8 @@ void OnlineWiring_FrameUpdate() {
         s_gameplayActive && s_rollbackActive,
         s_rollbackActive ? RollbackSession_GetCurrentFrame() : -1);
 
-    // Drive rollback subsystems only when gameplay is active
+    // Periodic RTT/stats logging (every 5 seconds = 300 frames)
     if (s_rollbackActive && s_gameplayActive) {
-        // GameplayBridge_FrameUpdate (rollback session + delay consumption)
-        // is called from mod_main.cpp after OnlineWiring_FrameUpdate.
-        // We only do auxiliary diagnostic work here.
-
-        // Periodic RTT/stats logging (every 5 seconds = 300 frames)
         int32_t frame = RollbackSession_GetCurrentFrame();
         if (frame > 0 && frame % 300 == 0) {
             Net::ConnectionStats stats{};
@@ -1024,21 +1157,27 @@ void OnlineWiring_FrameUpdate() {
             RollbackSessionSnapshot rbSnap{};
             RollbackSession_GetSnapshot(&rbSnap);
 
+            FrameSchedulerSnapshot schedSnap{};
+            FrameScheduler_GetSnapshot(&schedSnap);
+
             NetplayLog_Write("STATS", frame,
-                "RTT=%.1fms jitter=%.1fms loss=%u/%u visible_delay=%d effective_delay=%d budget=%d stall=%d",
+                "RTT=%.1fms jitter=%.1fms loss=%u/%u visible_delay=%d effective_delay=%d budget=%d slew_ppm=%d debt=%u",
                 rbSnap.link_avg_ping > 0.0f ? rbSnap.link_avg_ping : stats.rtt_ms,
                 rbSnap.link_jitter,
                 stats.packets_lost, stats.packets_sent,
                 dpSnap.active_delay,
                 dpSnap.effective_local_delay,
                 dpSnap.rollback_budget,
-                dpSnap.stall_threshold);
+                schedSnap.slew_ppm,
+                schedSnap.debt_frames);
 
             NetplayLog_Write("STATS", frame,
-                "Rollbacks=%d maxdepth=%d frames_ahead=%.1f",
+                "Rollbacks=%d maxdepth=%d frames_ahead=%.1f peer_depth=%u peer_produced=%u",
                 rbSnap.rollback_count,
                 rbSnap.max_rollback_distance,
-                rbSnap.frames_ahead);
+                rbSnap.frames_ahead,
+                rbSnap.peer_prediction_depth,
+                rbSnap.peer_produced_frontier);
         }
     }
 }
@@ -1071,8 +1210,9 @@ void OnlineWiring_OnGameplayPause(const char* reason) {
 }
 
 void OnlineWiring_OnMatchEnd() {
+    ArmMatchEndLadder("match end event");
     if (s_rollbackActive) {
-        StopRollbackSession("match end event");
+        StopRollbackSession("match end event", /*sessionTeardown=*/false);
     } else {
         s_liveReleaseArmed = false;
         s_rollbackBeginPending = false;
@@ -1110,7 +1250,11 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     const bool boundaryCleanupNeeded = DisconnectNeedsBoundaryCleanup();
 
     if (s_rollbackActive) {
-        StopRollbackSession(effectiveReason);
+        StopRollbackSession(effectiveReason, /*sessionTeardown=*/true);
+    } else {
+        // A suspended engine (between matches) still ends with the session.
+        RollbackSession_End();
+        Net::PlayerMapping_Clear();
     }
 
     if (boundaryCleanupNeeded) {
@@ -1156,7 +1300,9 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     s_lastLifecyclePhase = Net::MatchLifecyclePhase::Inactive;
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
-    Net::NetplayPacing_ResetSession("disconnect");
+    s_matchExitPendingMirror = false;
+    DisarmMatchEndLadder("disconnect");
+    FrameScheduler_OnSessionReset("disconnect");
     Net::ChurnPause_ResetSession(reason ? reason : "disconnect");
     Net::SyncTrace_ResetSession(reason ? reason : "disconnect");
     Net::SyncTrace_SetIntegrityActive(false, reason ? reason : "disconnect");
@@ -1170,7 +1316,6 @@ void OnlineWiring_OnDisconnect(const char* reason) {
     Net::SetTracker_Reset();
     ResetStartupBarrierState("disconnect");
 
-    // Log final state
     Net::ConnectionStats stats{};
     Net::Session_GetStats(&stats);
     NetplayLog_Write("DISCONNECT", -1,
@@ -1184,8 +1329,6 @@ void OnlineWiring_OnRematch() {
     NetplayLog_Write("POSTMATCH", -1,
         "=== REMATCH SELECTED — returning to CharSel ===");
     NetplayLog_Write("POSTMATCH", -1,
-        "Clearing rollback state for next match");
-    NetplayLog_Write("POSTMATCH", -1,
         "Pre-cleanup wiring state: started=%d active=%d gameplay=%d frame_origin_abs=%d baseline=0x%08X config=0x%08X recv=%d dispatched=%d",
         s_rollbackStarted ? 1 : 0,
         s_rollbackActive ? 1 : 0,
@@ -1198,7 +1341,12 @@ void OnlineWiring_OnRematch() {
 
     RematchCleanup_PrepareForNextMatch("post-match rematch");
 
-    // Full reset for next match
+    // Match-scoped reset for the next match. The engine itself stays armed
+    // (suspended) on the engine2 backend — the next GameplayStart commit
+    // rotates the epoch instead of re-arming (§2.6.5).
+    if (s_rollbackActive) {
+        StopRollbackSession("post-match rematch", /*sessionTeardown=*/false);
+    }
     s_rollbackStarted = false;
     s_rollbackActive = false;
     s_gameplayActive = false;
@@ -1215,7 +1363,8 @@ void OnlineWiring_OnRematch() {
     s_backgroundPollFailures = 0;
     s_lastActiveDelay = -1;
     s_lastRollbackBudget = -1;
-    Net::NetplayPacing_ResetSession("rematch");
+    s_matchExitPendingMirror = false;
+    FrameScheduler_OnSessionReset("rematch");
     Net::ChurnPause_ResetSession("rematch");
     Net::SyncTrace_ResetSession("rematch");
     Net::SyncTrace_SetIntegrityActive(false, "rematch");
@@ -1223,16 +1372,6 @@ void OnlineWiring_OnRematch() {
     Net::SpectatorRuntime_OnMatchEnd("rematch");
     Net::NetplayPaletteRuntime_OnMatchEnd("rematch");
 
-    NetplayLog_Write("POSTMATCH", -1,
-        "Post-cleanup wiring state: started=%d active=%d gameplay=%d frame_origin_abs=%d baseline=0x%08X config=0x%08X recv=%d dispatched=%d",
-        s_rollbackStarted ? 1 : 0,
-        s_rollbackActive ? 1 : 0,
-        s_gameplayActive ? 1 : 0,
-        s_frameOriginAbs,
-        s_baselineCRC,
-        s_configHash,
-        s_remoteInputsReceived,
-        s_packetsDispatched);
     NetplayLog_Write("POSTMATCH", -1,
         "New match reset complete after rematch selection");
 }
@@ -1243,6 +1382,9 @@ void OnlineWiring_OnReturnToSession() {
 
     RematchCleanup_PrepareForNextMatch("post-match return to session");
 
+    if (s_rollbackActive) {
+        StopRollbackSession("return to session", /*sessionTeardown=*/false);
+    }
     s_rollbackStarted = false;
     s_rollbackActive = false;
     s_gameplayActive = false;
@@ -1257,7 +1399,9 @@ void OnlineWiring_OnReturnToSession() {
     s_packetsDispatched = 0;
     s_backgroundPollCount = 0;
     s_backgroundPollFailures = 0;
-    Net::NetplayPacing_ResetSession("return to session");
+    s_matchExitPendingMirror = false;
+    DisarmMatchEndLadder("return to session");
+    FrameScheduler_OnSessionReset("return to session");
     Net::ChurnPause_ResetSession("return to session");
     Net::SyncTrace_ResetSession("return to session");
     Net::SyncTrace_SetIntegrityActive(false, "return to session");
@@ -1297,8 +1441,8 @@ bool OnlineWiring_IsGameplayEntryAdvanceBlocked() {
 
 void OnlineWiring_GetSnapshot(OnlineWiringSnapshot* out) {
     if (!out) return;
-    Net::NetplayPacingSnapshot pacingSnap{};
-    Net::NetplayPacing_GetSnapshot(&pacingSnap);
+    FrameSchedulerSnapshot schedSnap{};
+    FrameScheduler_GetSnapshot(&schedSnap);
     const Net::MatchRollbackPhase rollbackPhase = Net::NetplayPhaseRuntime_GetPhase();
     const bool sessionRunning = s_rollbackActive && RollbackSession_IsSessionRunning();
     const bool startupBarrierArmed = !s_startupReleased && (s_liveReleaseArmed || s_rollbackActive);
@@ -1313,15 +1457,17 @@ void OnlineWiring_GetSnapshot(OnlineWiringSnapshot* out) {
     out->startup_barrier_released = s_startupReleased;
     out->lockstep_owner_active = Net::NetplayPhaseRuntime_IsLockstepPhase(rollbackPhase);
     out->phase = rollbackPhase;
-    out->target_tick_scale = pacingSnap.target_scale;
-    out->current_tick_scale = pacingSnap.current_scale;
+    // INV-5: there is no tick-scale actuator anymore; report the scheduler's
+    // effective speed in both fields (consumers show them as-is).
+    out->target_tick_scale = schedSnap.speed_scale;
+    out->current_tick_scale = schedSnap.speed_scale;
     out->frame_origin_abs = s_frameOriginAbs;
     out->baseline_crc = s_baselineCRC;
     out->config_hash = s_configHash;
     out->handoff_delay = s_handoffDelay;
     out->handoff_budget = s_handoffBudget;
     out->remote_announced_delay = Net::DelayPolicy_GetRemoteAnnouncedDelay();
-    out->stall_threshold = Net::DelayPolicy_GetStallThreshold();
+    out->stall_threshold = 0;   // retired knob (§2.8.7); field kept for shape
     out->remote_inputs_received = s_remoteInputsReceived;
     out->packets_dispatched = s_packetsDispatched;
 }

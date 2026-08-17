@@ -27,6 +27,13 @@ void WinScreenSync_Shutdown();
 /// Begin win screen sync.  Called when entering Mode 9.
 void WinScreenSync_Begin();
 
+/// Same-epoch lockstep restart (M6, §4.6 ladder step 2 for the winscreen
+/// stream): stop + re-begin the winscreen input phase under the UNCHANGED
+/// epoch after a committed EpochAlign(first_phase=WinScreen) re-run. Unlike
+/// Abort this proposes NO WinScreenExit and both sides restart their frame
+/// index space identically. The continue prompt re-runs from scratch.
+void WinScreenSync_RestartLockstep(const char* reason);
+
 /// Abort / reset.  Called on disconnect or unexpected mode change.
 void WinScreenSync_Abort();
 

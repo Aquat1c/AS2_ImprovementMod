@@ -73,6 +73,20 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config);
 /// End the current session. Destroys GekkoNet session and cleans up.
 void RollbackSession_End();
 
+/// Match-boundary suspension (M6, §2.6.3): the match ended but the SESSION
+/// lives on (winscreen → continue prompt → rematch). Dispatch/queries behave
+/// as inactive, but the engine2 backend keeps its engine armed so the next
+/// `RollbackSession_Begin` under a higher epoch ROTATES (canonical frame
+/// counter continues, INV-15) instead of re-arming. The Gekko adapter maps
+/// this to a full `RollbackSession_End` (per-match engine lifetime).
+void RollbackSession_SuspendBetweenMatches(const char* reason);
+
+/// Mirror of the director-derived match-exit signal (M6, §2.7.6/INV-25):
+/// true while the mode-8 exit router is armed (match result resolved), so
+/// the engine's exact-input window covers the irreversible handoff tick(s).
+/// No-op on the Gekko adapter.
+void RollbackSession_SetMatchExitPending(bool pending);
+
 /// Is a rollback session currently active?
 bool RollbackSession_IsActive();
 
@@ -237,6 +251,15 @@ struct RollbackSessionSnapshot {
     // backend's own RTT estimate — time_probe from M6 on the engine2 path)
     float    link_avg_ping;
     float    link_jitter;
+
+    // Peer advisory readouts from the freshest PressureReport (M6 HUD;
+    // engine2 only — zeros on the Gekko adapter). INV-23: advisory display
+    // data, never applied locally.
+    uint32_t peer_produced_frontier;   // one past newest frame the peer sealed
+    uint8_t  peer_prediction_depth;
+    uint8_t  peer_run_state;           // Rollback::RunState byte
+    uint8_t  peer_adv_delay;
+    uint8_t  peer_adv_rollback;
 };
 
 void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out);

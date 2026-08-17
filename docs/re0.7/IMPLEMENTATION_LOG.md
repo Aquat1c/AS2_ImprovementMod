@@ -1282,3 +1282,259 @@ milestone must know. Plan references are to `RE07_MASTER_REBUILD_PLAN.md`.
 7. MSVC unused-variable warnings possible in match_setup
    (`s_loadBarrierSent`, `s_remoteCapabilities` are write-mostly — same as
    the deleted TUs).
+
+---
+
+## 2026-08-17 — M6 (match_director + engine2 CUTOVER; ships with M5)
+
+**Cutover state: `AS2_WITH_GEKKO` default flipped to OFF — engine2 is the
+live gameplay path.** The Gekko configuration remains the legacy/fallback
+config (§8.3): it must keep COMPILING (both configs chased through every M6
+edit) but is no longer default; `lib/GekkoNet` untouched. Deviation from the
+plan-M6 letter ("Remove GekkoNet: lib, flag, branch"): the flag/branch/lib
+survive as the fallback build until M8 field acceptance — deleting them
+before the cutover gate has actually RUN (builds are forbidden in this
+session) would destroy the §8.3 partial-fallback option.
+
+### M6-1: `src/rollback/match_director.cpp` — online_wiring.cpp DELETED
+
+- **Files:** `src/rollback/match_director.cpp` (new, ~1130 lines),
+  `src/rollback/online_wiring.cpp` (DELETED), `include/rollback/online_wiring.h`
+  (facade preserved; additive ladder API), `CMakeLists.txt`.
+- **Done:** all 13 `OnlineWiring_*` facade functions re-implemented as the
+  §2.6 director. Changes vs the ported wiring:
+  - **Engine survival (§2.6.3/.5, G2):** match end now calls
+    `RollbackSession_SuspendBetweenMatches` (new facade fn) instead of
+    `RollbackSession_End`; full End happens ONLY on director-ordered session
+    teardown (disconnect/shutdown). `StopRollbackSession(reason, sessionTeardown)`
+    is the single ordered stop.
+  - **INV-9 ladder:** `OnlineWiring_MatchEndLadderAllows/NotifyConsumed`
+    (additive facade): armed at MatchEnd; EpochAlign consumption refused
+    (held; barrier keeps re-acking) until WinScreenExit AND PostMatchDecision
+    are committed/consumed locally; ladder completion retires the earlier
+    slots (stale-commit leak across boundaries closed). Fail-open watchdog:
+    600 held ticks (~10 s) releases the gate into the §4.6 recovery ladder
+    (INV-12 — the gate itself must never wedge a session).
+  - **match_exit_pending (M4 obligation closed):** derived per frame from
+    MatchLifecycle (phase MatchEnd/PostMatchRoute or nonzero exit-route
+    byte) and mirrored via `RollbackSession_SetMatchExitPending`.
+  - gameplay_bridge is DELETED (inventory §11): the director sets/verifies
+    PlayerMapping and calls `RollbackSession_Begin` directly.
+    `frame_lineage` deleted too (trivial mapping inlined in the Gekko
+    adapter). mod_main's bridge init/frame/shutdown/HUD uses replaced with
+    facade queries.
+  - netplay_pacing calls replaced: FrameScheduler_OnSessionReset at session
+    resets; snapshot tick scales report `FrameScheduler_GetSpeedScale()`;
+    `stall_threshold` snapshot field pinned 0.
+- **Deviation (F-7):** the PostMatchDecision-vs-lockstep contradiction
+  TERMINAL is NOT enabled — today's wire intents are inconsistent by design
+  (continue_flow's decline proposes ReturnToSession while the charsel
+  auto-rematch path proposes Rematch for the same "any NO" route), so a
+  strict compare would kill healthy sessions. Ladder ordering is enforced;
+  the intent unification + terminal is an M7 obligation.
+
+### M6-2: dispatcher rewired onto engine2 typed stalls; netplay_pacing DELETED
+
+- **Files:** `src/patches/input_override.cpp`, `src/net/netplay_pacing.cpp`
+  + `include/net/netplay_pacing.h` (DELETED), `include/net/delay_policy.h`,
+  `src/net/delay_policy.cpp`, `src/rollback/rollback_session.cpp` (log trims),
+  `tools/check_killpaths.ps1`, `src/net/match_lifecycle.cpp`.
+- **Done:**
+  - The dead `#if 0` Gekko frames-ahead throttle block (~690 lines) deleted.
+  - Netplay branch (§2.8.3): BeginFrame → ProcessNextEvent loop preserved;
+    the ONLY pre-BeginFrame hold left is ChurnPause (ExternalSuspension).
+    A pass whose event stream contains no Advance is an N=0 engine hold:
+    freeze pulse + vanilla timeout clears + Session_Update/PollSession pump
+    (typed HoldCause was already reported by the adapter from NextAction).
+    Catch-up headroom now uses `predicted_frames_outstanding` (the legacy
+    `prediction_debt` is 0 on engine2 by INV-1).
+  - `DelayPolicy_GetStallThreshold`/`GetProtectionWindow` deleted (§2.8.7);
+    snapshot fields report 0 (menu UI shows nothing at 0); DELAYMAP log
+    keeps its columns as diagnostics.
+  - `GetTimesyncDebugInfo` re-fed from FrameScheduler snapshot + telemetry.
+  - **Kill-path burn-down:** AbortRollbackDispatcher routes any residual
+    live session through `Session2_Terminate(TransportFailed)` BEFORE the UI
+    funnel; match_lifecycle's session-lost guard no longer calls
+    HandleDisconnection (unwinds match ownership via its own OnDisconnect);
+    allowlist updated (match_lifecycle entry removed).
+  - **Frontend-phase STAT producer (M2/M5 note closed):** charsel lockstep
+    wait + winscreen lockstep wait now report
+    `FrameScheduler_NotifyHold(LifecycleBoundary, false)`.
+
+### M6-3: engine2 adapter obligations closed (rotation, exact window, stress, diagnostics)
+
+- **Files:** `src/rollback/rollback_session_engine2.cpp`,
+  `include/rollback/rollback_session.h` (additive: SuspendBetweenMatches,
+  SetMatchExitPending, snapshot peer_* advisory fields),
+  `include/rollback/engine2.h` + `src/rollback/engine2.cpp` (PredictionTap).
+- **Done:**
+  - **Cross-match RotateEpoch (M5 obligation closed):** a suspended armed
+    engine rotating under a higher epoch continues the canonical counter
+    (INV-15); rotation executes §2.6.5: StateHistory_Reset +
+    SetTagContext(new epoch) + DesyncDump_Reset + delay re-request +
+    per-boundary adapter state clear. Falls back to full re-arm when R or
+    the player slot changed, the epoch did not increase, or the engine
+    faulted. game-abs mapping is now epoch-relative
+    (`rb - RbEpochOrigin()`), so fx/HUD abs frames stay per-match.
+  - **§2.8.6(d) replay mode-bail:** a committed replay tick that left
+    mode-8/sub-3 truncates via `FinishRollbackAtBoundary` instead of
+    replaying the stale speculative suffix.
+  - **SyncHash rng/hp diagnostics:** `DetVer_GetRngSeed` + P1/P2 HP words
+    captured pre-tick into the confirm seam / SyncHash payloads.
+  - **Stress ingest hooks:** delivery-delay queue (16-slot, frame-released)
+    ahead of `IngestInputStream`; forced mismatch via a new engine
+    `PredictionTap` (corrupts PREDICTIONS through
+    `StressHooks_MaybeCorruptPrediction`, never actuals — INV-19 intact);
+    tap refreshed per PollSession so the mod-menu toggle works live.
+  - Link stats (`link_avg_ping/link_jitter`) and telemetry now fed from
+    time_probe (p50 RTT / p95-p50 jitter, ms display of µs source).
+- **Gekko adapter:** `SuspendBetweenMatches` = alias to End (per-match
+  engine lifetime); `SetMatchExitPending` = no-op; snapshot peer_* fields
+  memset-zero.
+
+### M6-4: time_probe + frontend-delay latch + DelayPolicy re-feed + coverage
+
+- **Files:** `include/net/time_probe.h` + `src/net/time_probe.cpp` (new),
+  `src/net/packet_router.cpp` (routes 77/78), `src/net/session2.cpp`
+  (4 Hz drive from Session_Update while Connected/Ready; reset in
+  ResetState), `src/net/frontend_input_sync.cpp`, `src/net/delay_policy.cpp`,
+  `include/net/delay_policy.h`.
+- **Done:** §2.9.3 verbatim: QPC µs stamps, dwell subtraction,
+  generation gate, 32-sample rolling window, 4x-median local-stall
+  rejection; latched frontend delay (ceil(oneway)+1, +2 at >=6 frames,
+  1/0.15 s rise, 1/0.30 s decay, >=12-sample warmup) consumed by
+  `ComputeDelayProposalDetails` (ms-derived value stays the pre-window
+  fallback — harness behavior unchanged). DelayPolicy_FrameUpdate prefers
+  the probe (QOH99 lesson 7); `DelayPolicy_ClassifyLocalCoverage` implements
+  the §2.9.1 directional math (FullSpeed/Marginal/Underbuffered,
+  margin = max(2, oneway/3)).
+- **Deviation:** oneway→frames conversion uses the fixed 16667 µs proper_60
+  period (compat_58 differs by 2% — negligible for a delay estimate; noted
+  for the M8 review).
+
+### M6-5: winscreen same-epoch Realign (M5 deviation 3 closed)
+
+- **Files:** `src/net/match_setup.cpp`, `src/net/winscreen_sync.cpp`,
+  `include/net/winscreen_sync.h`.
+- **Done:** a Realign escalation latched while the winscreen stream owns the
+  exchange (pregame Idle/GameplayHandoff, mode 9) re-runs EpochAlign for the
+  CURRENT epoch with `first_phase=WinScreen`; the peer echoes on seeing the
+  proposal; commit → both sides `WinScreenSync_RestartLockstep` (new: stop +
+  re-begin the input phase under the unchanged epoch, NO WinScreenExit
+  proposal, frame index space restarts identically on both sides; the
+  continue prompt re-runs from scratch via the existing
+  `ContinueFlow_Reset` in Begin). 5 s commit timeout falls back to the
+  fresh-epoch pregame restart. The same-epoch re-run is deliberately EXEMPT
+  from the INV-9 ladder (the ladder gates the NEXT epoch's alignment).
+
+### M6-6: sticky Disconnect resend-until-acked (M3/M4 deviation closed)
+
+- **Files:** `src/net/session2.cpp`, `include/net/transport2.h`,
+  `src/net/transport2.cpp`.
+- **Done:** new `Transport2Stats.peer_reliable_in_transit` (worker stamps
+  ENet `peer->reliableDataInTransit` per service pass). Fault terminals now
+  linger up to 2 s, resending the reasoned Disconnect every 100 ms and
+  exiting EARLY once the reliable queue drains (acked) or the peer object
+  detaches. UserCancel/GameExit keep their existing bounded goodbyes.
+
+### M6-7: HUD + diagnostics surface
+
+- **Files:** `src/ui/netplay_hud.cpp`, `src/patches/input_override.cpp`
+  (GetTimesyncDebugInfo), `src/core/mod_main.cpp`.
+- **Done:** progress-stall banner ("Opponent's game stopped responding
+  (Ns)", from `ConnectionSupervisor_IsProgressStallWarned/GetProgressStallMs`
+  — M3 obligation closed); coverage badge ([Underbuffered]/[Marginal],
+  INV-6 — FullSpeed draws nothing); hold-cause line (run_state name +
+  peer prediction depth from PressureReport) replacing the NETCLASS/debt
+  vocabulary. Disconnect UI already surfaces `Session2TerminalReasonName`
+  via Session2's error text (verified — no extra wiring needed).
+
+### M6-8: EpochAlign unit coverage (M5 gate deviation closed)
+
+- **Files:** `tests/transition_barrier_tests.cpp` (new), `CMakeLists.txt`
+  (new target `transition_barrier_tests` linking the real module with
+  stubbed transport/logging), `tests/frontend_sync_tests.cpp` (+1
+  Session_SendPacket stub; target gains `src/net/time_probe.cpp`).
+- **Done:** T-TB-1..7 pin plain commit, the INV-10 {epoch, first_phase}
+  commit rule + mismatch refusal + higher-epoch re-proposal, echo-verbatim
+  acks (INV-13), idempotent re-ack + stale-ack rejection, Clear semantics
+  (stale remote proposal can never re-commit), consume-once, and the
+  barrier half of T-LADDER (all 6 arrival orders of the 3 match-end kinds
+  commit). The director's consume-ORDER gate is not linkable standalone
+  (game-memory TU) — exercised in-game via the LADDER log lines.
+
+### Build-system summary (M6)
+
+- `AS2_WITH_GEKKO` default ON → **OFF** (cutover). ON must still configure/
+  compile (fallback config; GekkoNet subdir/link only in that config).
+- Deleted files: `src/rollback/online_wiring.cpp`, `src/net/netplay_pacing.cpp`,
+  `include/net/netplay_pacing.h`, `src/net/gameplay_bridge.cpp`,
+  `include/net/gameplay_bridge.h`, `src/rollback/frame_lineage.cpp`,
+  `include/rollback/frame_lineage.h`.
+- Added: `src/rollback/match_director.cpp` (ROLLBACK_SOURCES),
+  `src/net/time_probe.cpp` + `include/net/time_probe.h` (NET lists),
+  `tests/transition_barrier_tests.cpp` (+target/add_test).
+- frontend_sync_tests source list: +`src/net/time_probe.cpp`.
+
+### Deferred (with reasons) → M7/M8 obligations
+
+- **GekkoNet full removal** (flag, Gekko adapter TU, vendored lib): only
+  after the cutover gate (§7 suite + LE-1) actually PASSES on a build —
+  M8 exit review item. Until then AS2_WITH_GEKKO=ON is the §8.3 fallback.
+- **F-7 contradiction terminal:** unify PostMatchDecision wire intents
+  (continue_flow decline vs auto-rematch propose different intents today),
+  then enable the fail-closed compare in the director ladder (M7).
+- **PeerIdentity round/timing folding into config exchange** (M3 note):
+  wire churn with no functional gain this milestone — reconsider at M7
+  alongside the spectator re-hookup packet review.
+- **Load/GO onto TransitionBarrier consolidation** (M5-1 deviation 1):
+  the director consumes the shipping packet flows fine; consolidation
+  remains optional (M7+, only if a director-driven reload lands for the
+  baseline retry path).
+- **Baseline retry with a real asset reload** (M5-1 deviation 2): still a
+  recapture-only retry; a mode-rewinding reload needs new director
+  machinery (M7 candidate).
+- **Frontend-phase per-phase STAT rollup:** the M6 producer labels the
+  dispatcher wait sites (LifecycleBoundary); a phase-aware per-phase
+  breakdown remains open (M7, low priority).
+- **M8:** in-game STAT acceptance runs (§7.5) incl. the 1.5 ms savestate
+  p99 on min-spec; LE-1 replication; rematch soak 100 cycles now exercising
+  RotateEpoch (assert: epoch strictly increasing AND canonical counter
+  monotonic across the whole session log); compat_58 oneway-frames review.
+
+### Compile risks to check first (M6 build session)
+
+1. **Both configs must build:** `-DAS2_WITH_GEKKO=OFF` (new default) and
+   `-DAS2_WITH_GEKKO=ON` (fallback). The ON config compiles
+   rollback_session.cpp with the two new facade fns appended near
+   `RollbackSession_IsActive` — first place a namespace slip surfaces.
+2. `match_director.cpp` is a new ~1130-line TU with online_wiring's include
+   set minus gameplay_bridge/netplay_pacing plus frame_scheduler.h — check
+   for now-unused includes (determinism_verify, resimulation) warnings and
+   the `Net::PlayerMapping_*` signatures.
+3. `rollback_session_engine2.cpp`: two `__try` blocks landed in functions
+   with C++ locals — MSVC C2712 fires if any local needs unwinding in the
+   same function (ReadSyncHashDiagnostics and the replay mode-bail block in
+   ProcessNextEvent are POD-only by construction; if C2712 appears, hoist
+   the `__try` into a helper).
+4. `time_probe.cpp` under WIN32_LEAN_AND_MEAN in the frontend_sync_tests
+   target (no winsock dependency — pure QPC/GetTickCount); the tests' new
+   `Session_SendPacket` stub must match the header signature exactly
+   (uint8_t, PacketType, const void*, size_t, bool).
+5. `transition_barrier_tests` stubs only 4 LogWindow functions — if
+   LOG_NETPLAY expands to more than LogWindow_LogCat on this toolchain,
+   add the missing stubs (frontend_sync_tests has the full list to copy).
+6. `netplay_hud.cpp` now includes frame_scheduler.h/run_state.h — RunState
+   is `Rollback::RunState`; check for LogLevel/LOG_* macro collisions with
+   imgui headers in that TU.
+7. Grep-verified zero remaining references at edit time:
+   `NetplayPacing_*`, `GameplayBridge_*`, `FrameLineage_*`,
+   `DelayPolicy_GetStallThreshold`, `DelayPolicy_GetProtectionWindow`
+   (comments only). `OnlineWiringSnapshot.stall_threshold` and
+   `DelayPolicySnapshot.stall_threshold/protection_window` fields survive
+   (report 0) for rollback_debug/menu_ui shape stability.
+8. The engine2 rotation path calls `StateHistory_SetTagContext` with
+   MODE_MATCH from core/as2_constants.h — already in the include set.
+9. `s_engine.SetPeerAdvisory` remains caller-less (IngestInputStream applies
+   the advisory internally) — MSVC may warn on the unused decl only, no
+   action needed.

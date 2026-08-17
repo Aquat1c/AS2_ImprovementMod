@@ -32,7 +32,9 @@
 #include "net/protocol.h"
 #include "net/session_manager.h"
 #include "net/session2.h"
+#include "net/time_probe.h"
 #include "patches/frame_scheduler.h"
+#include "rollback/determinism_verify.h"
 #include "patches/memory_utils.h"
 #include "rollback/desync_dump.h"
 #include "rollback/engine2.h"
@@ -61,15 +63,33 @@ RollbackEngine s_engine;
 
 bool     s_initialized = false;
 bool     s_active = false;
+bool     s_suspended = false;   // M6: match-boundary suspension — the engine
+                                // stays armed; the next Begin under a higher
+                                // epoch ROTATES instead of re-arming (§2.6.5)
+bool     s_matchExitPending = false;  // M6: director-derived §2.7.6 signal
 int      s_localPlayer = 0;
 int      s_remotePlayer = 1;
 uint32_t s_baselineChecksum = 0;
 int32_t  s_frameOriginAbs = 0;
 uint32_t s_epoch = 1;           // adopted from match_setup at Begin (M5);
-                                // cross-match RotateEpoch lands with the M6
-                                // director (engine survives the match end)
+                                // rotated across matches by Begin (M6)
 char     s_sessionError[160] = "";
 bool     s_terminalReported = false;
+
+// M6 stress ingest: bounded delivery-delay queue for InputStream payloads
+// (StressHooks_SetInputDeliveryDelay — held packets are released once the
+// sim frontier has advanced past their release frame).
+struct DelayedStreamPacket {
+    Net::InputStreamPayload payload;
+    int32_t release_rb_frame;
+    bool    valid;
+};
+constexpr size_t kDelayedStreamMax = 16;
+DelayedStreamPacket s_delayedStream[kDelayedStreamMax] = {};
+
+// Forward decls (defined with the ingest section below).
+void IngestInputStreamNow(const Net::InputStreamPayload& p);
+void DrainDelayedStreamQueue();
 
 // Two-phase pass plan.
 enum class PassStep : uint8_t {
@@ -96,6 +116,13 @@ uint32_t s_remoteInputsRecv = 0;
 
 int32_t RbFrame(uint32_t canonical) {
     return (int32_t)(canonical - s_engine.FirstFrame());
+}
+
+// rb frame at which the CURRENT epoch began (0 until the first cross-match
+// rotation). game_abs mapping is epoch-relative (§2.7.2): the canonical
+// counter spans all matches, the game's own counter resets per match.
+int32_t RbEpochOrigin() {
+    return (int32_t)(s_engine.EpochFrameOrigin() - s_engine.FirstFrame());
 }
 
 uint32_t ComputeLiveChecksumInternal() {
@@ -216,13 +243,26 @@ void RefreshLifecycleWindow() {
         s_engine.SetLifecycleExactNext(true);  // fail safe
         return;
     }
-    // match_exit_pending: the match region's exit route is armed the moment
-    // the win screen handoff resolves. Until the M6 director wires the
-    // MatchLifecycle-driven signal, the conservative M4 stand-in is
-    // "any tick outside plain mode-8/substate-3 gameplay".
-    const bool exit_pending = false;
+    // match_exit_pending (M6): director-derived from MatchLifecycle (phase
+    // MatchEnd/PostMatchRoute or a non-zero vanilla exit-route byte) and
+    // mirrored via RollbackSession_SetMatchExitPending — replaces the M4
+    // conservative stand-in.
     s_engine.SetLifecycleExactNext(
-        LifecycleWindow_IsExactInputNext(mode, substate, exit_pending));
+        LifecycleWindow_IsExactInputNext(mode, substate, s_matchExitPending));
+}
+
+// SyncHash diagnostics (M6, §2.7.7): rng/hp ride the confirm seam as
+// diagnostics; gameplay_hash stays authoritative either way.
+void ReadSyncHashDiagnostics(uint32_t* rng, uint16_t* hp0, uint16_t* hp1) {
+    __try {
+        *rng = DetVer_GetRngSeed();
+        *hp0 = (uint16_t)ReadMemory<int16_t>(ADDR_P1_HP_DIRECT);
+        *hp1 = (uint16_t)ReadMemory<int16_t>(ADDR_P2_HP_DIRECT);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *rng = 0;
+        *hp0 = 0;
+        *hp1 = 0;
+    }
 }
 
 // Capture the pre-tick snapshot for `frame` and return its gameplay digest
@@ -232,12 +272,7 @@ bool SavePreTick(uint32_t frame, uint64_t* hash,
     if (!StateHistory_CaptureFrameHashed(RbFrame(frame), hash)) {
         return false;
     }
-    // rng/hp SyncHash diagnostics: the snapshot holds the authoritative
-    // rng_seed already; the diagnostic side-channel wires up with the M6
-    // HUD/dump pass. gameplay_hash stays authoritative either way (§2.7.7).
-    *rng = 0;
-    *hp0 = 0;
-    *hp1 = 0;
+    ReadSyncHashDiagnostics(rng, hp0, hp1);
     return true;
 }
 
@@ -259,10 +294,85 @@ void RollbackSession_Shutdown() {
     s_initialized = false;
 }
 
+// Stress prediction tap (M6): installed while stress hooks are enabled so
+// forced mismatches corrupt PREDICTIONS (a genuine mispredict → rollback),
+// never actuals (INV-19).
+static uint16_t StressPredictionTap(uint16_t predicted) {
+    return StressHooks_MaybeCorruptPrediction(predicted);
+}
+
 bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     if (!s_initialized) return false;
     if (s_active) {
         RollbackSession_End();
+    }
+
+    // ── M6 cross-match epoch rotation (§2.6.5, INV-15/G2) ──────────────────
+    // A suspended (match-boundary) engine under an unchanged session rotates
+    // to the new epoch: the canonical frame counter and input streams
+    // CONTINUE; only state identity and the game-frame origin change.
+    // Fall back to a full re-arm when anything the immutable EngineConfig
+    // carries has changed (R, player slot) or the engine faulted.
+    if (s_engine.Armed() && s_suspended &&
+        s_engine.Terminal() == EngineTerminal::None) {
+        uint32_t newEpoch = Net::PregameSync_GetCurrentEpoch();
+        if (newEpoch == 0) {
+            newEpoch = s_epoch + 1;
+        }
+        const bool configCompatible =
+            (uint8_t)(config.local_player & 1) == (uint8_t)(s_localPlayer & 1) &&
+            (uint8_t)(config.rollback_budget < 1 ? 1
+                : config.rollback_budget > 15 ? 15 : config.rollback_budget)
+                == s_engine.MaxRollback();
+        if (newEpoch > s_epoch && configCompatible) {
+            if (s_engine.RotateEpoch(newEpoch, s_engine.SimFrontier())) {
+                s_epoch = newEpoch;
+                s_baselineChecksum = config.baseline_checksum;
+                s_frameOriginAbs = config.frame_origin_abs;
+                s_sessionError[0] = '\0';
+                s_terminalReported = false;
+                s_passStep = PassStep::Idle;
+                s_rollingBack = false;
+                s_lastStreamSendMs = GetTickCount();
+                memset(s_delayedStream, 0, sizeof(s_delayedStream));
+
+                // Epoch rotation execution (§2.6.5): invalidate every
+                // savestate slot and re-tag under the new epoch — the AS2
+                // analog of reregisterFrameData().
+                StateHistory_Reset();
+                StateHistory_SetTagContext(s_epoch, /*phase=*/(uint32_t)MODE_MATCH);
+                DesyncDump_Reset();
+
+                // Delay may have changed between matches (peer-local knob).
+                const int delay = config.initial_delay < 0 ? 0
+                    : config.initial_delay > 15 ? 15 : config.initial_delay;
+                if ((uint8_t)delay != s_engine.ActiveDelay()) {
+                    s_engine.RequestInputDelay((uint8_t)delay);
+                }
+
+                s_engine.SetPredictionTap(
+                    StressHooks_IsEnabled() ? &StressPredictionTap : nullptr);
+
+                s_active = true;
+                s_suspended = false;
+                NetplayLog_Write("ROLLBACK", RbFrame(s_engine.SimFrontier()),
+                    "engine2 EPOCH ROTATION: epoch=%u origin_canonical=%u "
+                    "origin_abs=%d delay=%d budget=%u (engine survived the match boundary)",
+                    s_epoch, s_engine.SimFrontier(), s_frameOriginAbs,
+                    delay, s_engine.MaxRollback());
+                return true;
+            }
+            NetplayLog_Write("ROLLBACK", RbFrame(s_engine.SimFrontier()),
+                "engine2 RotateEpoch refused (%s) — falling back to full re-arm",
+                s_engine.TerminalDetail());
+        } else {
+            NetplayLog_Write("ROLLBACK", RbFrame(s_engine.SimFrontier()),
+                "engine2 rotation not applicable (epoch %u -> %u compatible=%d) — full re-arm",
+                s_epoch, newEpoch, configCompatible ? 1 : 0);
+        }
+        // Not rotatable: disarm and fall through to the fresh-arm path.
+        s_engine.Disarm();
+        s_suspended = false;
     }
 
     EngineConfig ec{};
@@ -300,12 +410,17 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     s_localInputsSent = 0;
     s_remoteInputsRecv = 0;
     s_lastStreamSendMs = GetTickCount();
+    memset(s_delayedStream, 0, sizeof(s_delayedStream));
 
     StateHistory_Reset();
     StateHistory_SetTagContext(s_epoch, /*phase=*/(uint32_t)MODE_MATCH);
     DesyncDump_Reset();
 
+    s_engine.SetPredictionTap(
+        StressHooks_IsEnabled() ? &StressPredictionTap : nullptr);
+
     s_active = true;
+    s_suspended = false;
     NetplayLog_Write("ROLLBACK", 0,
         "engine2 session begin: local=P%d delay=%d budget=%d origin_abs=%d epoch=%u",
         s_localPlayer + 1, ec.input_delay, ec.max_rollback, s_frameOriginAbs, s_epoch);
@@ -313,15 +428,52 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
 }
 
 void RollbackSession_End() {
-    if (!s_active) return;
+    if (!s_active && !s_suspended) return;
+    const int32_t frame = RbFrame(s_engine.SimFrontier());
     s_active = false;
+    s_suspended = false;
+    s_matchExitPending = false;
     s_passStep = PassStep::Idle;
     s_rollingBack = false;
+    memset(s_delayedStream, 0, sizeof(s_delayedStream));
+    s_engine.SetPredictionTap(nullptr);
     s_engine.Disarm();
     StateHistory_SetTagContext(0, 0);
-    NetplayLog_Write("ROLLBACK", RbFrame(s_engine.SimFrontier()),
+    NetplayLog_Write("ROLLBACK", frame,
         "engine2 session end: confirmed=%d rollbacks=%u",
         RbFrame(s_engine.ConfirmedFrontier()), s_engine.GetStats().rollbacks);
+}
+
+void RollbackSession_SuspendBetweenMatches(const char* reason) {
+    // M6 (§2.6.3): the match ended but the SESSION lives on. Dispatch and
+    // queries go inactive; the engine stays ARMED so the next Begin under a
+    // higher epoch rotates (INV-15: the canonical counter never resets).
+    if (!s_active) return;
+    if (s_engine.Terminal() != EngineTerminal::None) {
+        // A faulted engine has nothing worth preserving.
+        RollbackSession_End();
+        return;
+    }
+    s_active = false;
+    s_suspended = true;
+    s_matchExitPending = false;
+    s_passStep = PassStep::Idle;
+    s_rollingBack = false;
+    memset(s_delayedStream, 0, sizeof(s_delayedStream));
+    // The frontend lockstep owns the winscreen stream — fence the producer
+    // for the whole suspension (§2.7.3-P).
+    s_engine.SetProducerFenced(true);
+    NetplayLog_Write("ROLLBACK", RbFrame(s_engine.SimFrontier()),
+        "engine2 suspended at match boundary (%s): canonical=%u confirmed=%d "
+        "epoch=%u — engine stays armed for rotation",
+        reason ? reason : "?",
+        s_engine.SimFrontier(),
+        RbFrame(s_engine.ConfirmedFrontier()),
+        s_epoch);
+}
+
+void RollbackSession_SetMatchExitPending(bool pending) {
+    s_matchExitPending = pending;
 }
 
 bool RollbackSession_IsActive() {
@@ -355,6 +507,11 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
 
 bool RollbackSession_PollSession() {
     if (!s_active) return false;
+    // Stress hooks can be toggled live from the mod menu — keep the
+    // prediction tap and delayed-queue state coherent (M6).
+    s_engine.SetPredictionTap(
+        StressHooks_IsEnabled() ? &StressPredictionTap : nullptr);
+    DrainDelayedStreamQueue();
     // Producer fence (§2.7.3-P, M5 obligation closed): the stalled-producer
     // must not feed the gameplay stream while a frontend lockstep phase owns
     // the input exchange or the pregame machine is mid-barrier — those
@@ -383,6 +540,36 @@ EventResult RollbackSession_ProcessNextEvent() {
 
     // Continue an open rollback transaction: emit the next replay frame.
     if (s_engine.InRollback()) {
+        // §2.8.6(d) mode-change bail (M6): if the last committed replay tick
+        // crossed a native mode/substate boundary earlier than the
+        // speculative timeline did, truncate the frontier at the cursor
+        // instead of replaying a stale speculative suffix.
+        {
+            uint32_t mode = 0, substate = 0;
+            bool readOk = true;
+            __try {
+                mode = ReadMemory<uint32_t>(ADDR_GAME_MODE);
+                substate = ReadMemory<uint32_t>(ADDR_SUB_STATE);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                readOk = false;
+            }
+            if (readOk &&
+                (mode != (uint32_t)LIFECYCLE_MODE_MATCH ||
+                 substate != (uint32_t)LIFECYCLE_SUBSTATE_FIGHT)) {
+                NetplayLog_Write("ROLLBACK", RbFrame(s_engine.SimFrontier()),
+                    "engine2 replay crossed a native boundary (mode=%u sub=%u) — "
+                    "truncating at replay cursor (§2.8.6-d)",
+                    mode, substate);
+                if (!s_engine.FinishRollbackAtBoundary()) {
+                    ReportEngineTerminal();
+                    return EventResult::Error;
+                }
+                Net::DelayPolicy_OnRollbackApplied(s_engine.ActiveDelay());
+                s_rollingBack = false;
+                DrainConfirmSeam();
+                return EventResult::Done;
+            }
+        }
         uint32_t frame = 0;
         uint16_t inputs[2] = {0, 0};
         if (s_engine.NextReplayInputs(&frame, inputs)) {
@@ -502,6 +689,36 @@ void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2) {
 // Packet ingestion
 // ============================================================================
 
+namespace {
+
+void IngestInputStreamNow(const Net::InputStreamPayload& p) {
+    const int32_t localDepth = (int32_t)s_engine.SpeculativeFrames();
+    if (!s_engine.IngestInputStream(p)) {
+        ReportEngineTerminal();
+        return;
+    }
+    ++s_remoteInputsRecv;
+
+    // M2 obligation: feed the §2.8.4 pace-slew input from PressureReport.
+    FrameScheduler_SubmitPeerDepthSample((int32_t)p.pressure.prediction_depth,
+                                         localDepth);
+}
+
+// M6 stress ingest: release queued delivery-delayed packets whose release
+// frame has been reached (called from PollSession/BeginFrame drains).
+void DrainDelayedStreamQueue() {
+    const int32_t now = RbFrame(s_engine.SimFrontier());
+    for (size_t i = 0; i < kDelayedStreamMax; ++i) {
+        if (s_delayedStream[i].valid &&
+            now >= s_delayedStream[i].release_rb_frame) {
+            s_delayedStream[i].valid = false;
+            IngestInputStreamNow(s_delayedStream[i].payload);
+        }
+    }
+}
+
+} // namespace
+
 void RollbackSession_OnInputStreamPacket(const void* data, size_t len) {
     // v2 ingest (§3.2 InputStreamPayload) — the M5 routing-table entry point.
     if (!s_active || !data) return;
@@ -519,16 +736,30 @@ void RollbackSession_OnInputStreamPacket(const void* data, size_t len) {
         return;  // §3.1: wrong session_id is structurally inert
     }
 
-    const int32_t localDepth = (int32_t)s_engine.SpeculativeFrames();
-    if (!s_engine.IngestInputStream(p)) {
-        ReportEngineTerminal();
+    // M6 stress ingest hook (§2.7.8): delivery-delay holds the whole packet
+    // for N frames before the engine sees it (test methodology preserved).
+    const int deliveryDelay = StressHooks_IsEnabled()
+        ? StressHooks_GetInputDeliveryDelay() : 0;
+    if (deliveryDelay > 0) {
+        for (size_t i = 0; i < kDelayedStreamMax; ++i) {
+            if (!s_delayedStream[i].valid) {
+                s_delayedStream[i].payload = p;
+                s_delayedStream[i].release_rb_frame =
+                    RbFrame(s_engine.SimFrontier()) + deliveryDelay;
+                s_delayedStream[i].valid = true;
+                return;
+            }
+        }
+        // Queue full: deliver the oldest immediately, hold this one in its
+        // slot — the redundant window makes ordering irrelevant.
+        IngestInputStreamNow(s_delayedStream[0].payload);
+        s_delayedStream[0].payload = p;
+        s_delayedStream[0].release_rb_frame =
+            RbFrame(s_engine.SimFrontier()) + deliveryDelay;
         return;
     }
-    ++s_remoteInputsRecv;
 
-    // M2 obligation: feed the §2.8.4 pace-slew input from PressureReport.
-    FrameScheduler_SubmitPeerDepthSample((int32_t)p.pressure.prediction_depth,
-                                         localDepth);
+    IngestInputStreamNow(p);
 }
 
 void RollbackSession_OnSyncHashPacket(const void* data, size_t len) {
@@ -566,11 +797,11 @@ int32_t RollbackSession_GetFrameOriginAbs() {
 }
 
 int32_t RollbackSession_GetCurrentGameAbsFrame() {
-    return s_frameOriginAbs + RbFrame(s_engine.SimFrontier());
+    return s_frameOriginAbs + (RbFrame(s_engine.SimFrontier()) - RbEpochOrigin());
 }
 
 int32_t RollbackSession_RbFrameToGameAbs(int32_t rb_frame) {
-    return s_frameOriginAbs + rb_frame;
+    return s_frameOriginAbs + (rb_frame - RbEpochOrigin());
 }
 
 bool RollbackSession_IsRollingBack() {
@@ -650,7 +881,11 @@ void RollbackSession_GetTimesyncTelemetry(RollbackTimesyncTelemetry* out) {
     out->max_rollback_distance = (int32_t)st.max_rollback_depth;
     out->predicted_frames_outstanding = (int32_t)s_engine.SpeculativeFrames();
     out->frames_ahead = (float)s_engine.FramesAheadSigned();
-    // Link stats come from time_probe at M6; zeros until then.
+    // Link stats from time_probe (M6, §2.9.3 — µs source, ms display).
+    if (Net::TimeProbe_HasMeasurement()) {
+        out->link_avg_ping = (float)Net::TimeProbe_GetRttP50Us() / 1000.0f;
+        out->link_jitter = (float)Net::TimeProbe_GetJitterP95Us() / 1000.0f;
+    }
 }
 
 // ============================================================================
@@ -706,9 +941,21 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->local_inputs_sent = (int32_t)s_localInputsSent;
     out->remote_inputs_received = (int32_t)s_remoteInputsRecv;
 
-    // Link stats arrive with time_probe (M6); zeros until then.
-    out->link_avg_ping = 0.0f;
-    out->link_jitter = 0.0f;
+    // Link stats from time_probe (M6, §2.9.3).
+    if (Net::TimeProbe_HasMeasurement()) {
+        out->link_avg_ping = (float)Net::TimeProbe_GetRttP50Us() / 1000.0f;
+        out->link_jitter = (float)Net::TimeProbe_GetJitterP95Us() / 1000.0f;
+    } else {
+        out->link_avg_ping = 0.0f;
+        out->link_jitter = 0.0f;
+    }
+
+    // Peer advisory readouts for the M6 HUD (INV-23: display only).
+    out->peer_produced_frontier = s_engine.PeerProducedFrontier();
+    out->peer_prediction_depth = s_engine.PeerPredictionDepth();
+    out->peer_run_state = 0;
+    out->peer_adv_delay = s_engine.PeerAdvisoryDelay();
+    out->peer_adv_rollback = s_engine.PeerAdvisoryRollback();
 }
 
 uint32_t RollbackSession_ComputeLiveStateChecksum() {

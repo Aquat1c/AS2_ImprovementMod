@@ -221,6 +221,16 @@ public:
     /// mirrors it here; tests drive the flag directly.
     void SetLifecycleExactNext(bool exact) { lifecycle_exact_next_ = exact; }
 
+    // ── Test-only prediction tap (M6 stress hooks) ──────────────────────────
+
+    /// Installed by the adapter when stress hooks are enabled (null in
+    /// production): every predicted remote value passes through the tap, so
+    /// the harness can force a genuine mispredict → rollback without ever
+    /// touching actual inputs (INV-19 stays intact). The engine masks the
+    /// result to ENGINE_INPUT_VALID_MASK.
+    using PredictionTap = uint16_t (*)(uint16_t predicted);
+    void SetPredictionTap(PredictionTap tap) { prediction_tap_ = tap; }
+
     // ── Per-opportunity decision (§2.7.4, INV-1/INV-4) ──────────────────────
 
     /// Evaluated once per scheduler pass (and between batch iterations):
@@ -412,6 +422,7 @@ private:
 
     bool     lifecycle_exact_next_ = false;
     bool     producer_fenced_ = false;
+    PredictionTap prediction_tap_ = nullptr;
 
     // Peer advisory (PressureReport; INV-23: never applied locally).
     uint8_t  peer_adv_delay_ = 0;

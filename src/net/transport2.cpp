@@ -180,6 +180,7 @@ static void UpdateStats(bool hostActive, ENetPeer* peer) {
         s_stats.rtt_variance_ms = (float)peer->roundTripTimeVariance;
         s_stats.packets_sent = peer->packetsSent;
         s_stats.packets_lost = peer->packetsLost;
+        s_stats.peer_reliable_in_transit = peer->reliableDataInTransit;
 
         // ENet-protocol liveness: lastReceiveTime advances on ANY inbound
         // command (acks of our pings included), in host serviceTime units.
@@ -212,6 +213,7 @@ static void UpdateStats(bool hostActive, ENetPeer* peer) {
         s_stats.rtt_variance_ms = 0.0f;
         s_stats.packets_sent = 0;
         s_stats.packets_lost = 0;
+        s_stats.peer_reliable_in_transit = 0;
         if (s_anyInboundSeen && s_lastProtocolInboundTickMs != 0) {
             // Peer object gone but silence keeps growing from the last
             // genuine inbound — a detached peer must not look "fresh".

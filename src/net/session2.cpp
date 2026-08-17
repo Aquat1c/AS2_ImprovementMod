@@ -27,6 +27,7 @@
 #include "net/session2.h"
 #include "net/connection_supervisor.h"
 #include "net/transition_barrier.h"
+#include "net/time_probe.h"
 #include "net/transport2.h"
 #include "net/nat_traversal.h"
 #include "net/game_settings_sync.h"
@@ -286,6 +287,7 @@ static void ResetState() {
     s_pacingClockTerminalFired = false;
     ResetHandshakeState();
     Nat_ClearRemoteHint();
+    TimeProbe_ResetSession("session reset");
 }
 
 static bool ReadEntireFile(const char* path, std::vector<uint8_t>* outBytes) {
@@ -2023,16 +2025,27 @@ void Session2_Terminate(Session2TerminalReason reason, const char* detail) {
         QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect,
                          &dp, sizeof(dp), true, "terminate");
         if (faultTerminal) {
-            // Sticky terminal (INV-20): resend every 100 ms across a bounded
-            // goodbye window while the worker still pumps, so the reliable
-            // channel gets real chances to deliver+ack before the host dies.
-            // (Full resend-until-acked persistence needs a session that
-            // outlives the terminal — tracked as an M5/M6 obligation.)
-            for (int i = 0; i < 4; ++i) {
+            // Sticky terminal (INV-20, M6): resend every 100 ms UNTIL the
+            // transport reports the reliable goodbye acked (ENet-level
+            // reliableDataInTransit drained), bounded by a 2 s hard cap so a
+            // dead peer cannot wedge teardown. The worker keeps pumping the
+            // host during the linger; this closes the M4 fixed-window
+            // approximation.
+            bool acked = false;
+            for (int i = 0; i < 20; ++i) {
                 Sleep(100);
+                Transport2Stats linger{};
+                Transport2_GetStats(&linger);
+                if (!linger.peer_connected ||
+                    (i >= 1 && linger.peer_reliable_in_transit == 0)) {
+                    acked = true;
+                    break;
+                }
                 QueueTypedPacket(CHANNEL_CONTROL, PacketType::Disconnect,
                                  &dp, sizeof(dp), true, "terminate-resend");
             }
+            Rollback::NetplayLog_Write("SESSION", -1,
+                "Sticky Disconnect linger done: acked=%d", acked ? 1 : 0);
         }
         Transport2_RequestDisconnect(token, disconnectData, false);
     }
@@ -2472,6 +2485,9 @@ void Session_Update() {
 
     if (s_state == SessionState::Connected || s_state == SessionState::Ready) {
         SendPeerIdentity();
+        // time_probe cadence (M6, §2.9.3): 4 Hz µs RTT probe while a peer
+        // exists — feeds the frontend-delay latch and the coverage math.
+        TimeProbe_FrameUpdate();
     }
     if (s_state == SessionState::Connected) {
         SendNatInfo();

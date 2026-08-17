@@ -1,16 +1,19 @@
 /**
- * Alice Senki 2 - Online Rollback Wiring
+ * Alice Senki 2 - Match Director (re0.7 M6, plan §2.6)
  *
- * Connects the bootstrap/lifecycle layer to the rollback gameplay core.
- * This is the integration glue — NOT a new architecture — just wiring:
+ * The match director behind the PRESERVED `OnlineWiring_*` facade
+ * (inventory §2.3 — all 13 functions keep their signatures; implementation
+ * lives in src/rollback/match_director.cpp since M6, online_wiring.cpp is
+ * deleted). Thin by design; owns ordering, not policy:
  *
- *   1. Bootstrap completion → RollbackSession_Begin
+ *   1. GameplayStart commit → engine arm (first match) / RotateEpoch
+ *      (rematch — the engine survives match boundaries, §2.6.5)
  *   2. InputStream packets → RollbackSession_OnInputStreamPacket
- *   3. Lifecycle transitions → RollbackSession_End / state safety
- *   4. Disconnect/failure → safe teardown 
- *   5. Post-match/rematch → clean handoff
- *   6. Full-path logging throughout
- *   7. Live diagnostics + stress hook integration
+ *   3. Lifecycle transitions → suspend-between-matches / director teardown
+ *   4. INV-9 match-end ladder gate: WinScreenExit → PostMatchDecision →
+ *      EpochAlign consume strictly in order (held + re-acked, never skipped)
+ *   5. match_exit_pending → engine exact-input window (§2.7.6, INV-25)
+ *   6. Disconnect → the single ordered teardown fan-out (§2.6.4)
  */
 
 #pragma once
@@ -18,6 +21,7 @@
 #include <stdint.h>
 
 #include "net/netplay_phase_runtime.h"
+#include "net/protocol.h"
 
 namespace Rollback {
 
@@ -80,6 +84,23 @@ void OnlineWiring_OnReturnToSession();
 /// rollback session when active. (The startup gameplay-entry barrier rides
 /// TransitionBarrier kind GameplayStart since M5 — GekkoReady is retired.)
 void OnlineWiring_HandleEngineDataPacket(const void* payload, size_t payloadLen);
+
+// ============================================================================
+// Match-end barrier ladder (M6, INV-9 / §4.4)
+// ============================================================================
+
+/// Strict ladder gate: consuming a later-step commit is refused until the
+/// earlier steps have committed/consumed locally. Kinds outside the ladder
+/// (or an unarmed ladder — e.g. session-start EpochAlign) always pass.
+/// The barrier primitive keeps re-acking a held commit, so refusal = held,
+/// never skipped (the exact inversion that killed the field session).
+bool OnlineWiring_MatchEndLadderAllows(Net::NetTransitionKind kind);
+
+/// The consumer of a ladder-step commit reports it so later steps unlock.
+/// EpochAlign consumption completes the ladder (leftover WinScreenExit /
+/// PostMatchDecision slots are retired so they can never satisfy the next
+/// boundary).
+void OnlineWiring_MatchEndLadderNotifyConsumed(Net::NetTransitionKind kind);
 
 // ============================================================================
 // Diagnostics

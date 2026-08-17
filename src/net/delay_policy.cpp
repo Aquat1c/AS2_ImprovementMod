@@ -14,6 +14,7 @@
 #include "net/delay_policy.h"
 
 #include "net/session_manager.h"
+#include "net/time_probe.h"
 #include "rollback/rollback_session.h"
 #include "rollback/netplay_log.h"
 
@@ -232,6 +233,18 @@ void DelayPolicy_Shutdown() {
 
 void DelayPolicy_FrameUpdate() {
     if (!s_initialized) {
+        return;
+    }
+
+    // M6 re-feed (§2.9.1/2.9.3): the µs time_probe estimator is the primary
+    // measurement source once it has a window — transport/lobby ms values
+    // are the fallback only (QOH99 lesson 7).
+    if (TimeProbe_HasMeasurement()) {
+        const float p50_ms = (float)TimeProbe_GetRttP50Us() / 1000.0f;
+        const float p95_ms = (float)TimeProbe_GetRttP95Us() / 1000.0f;
+        const float jitter_ms = (float)TimeProbe_GetJitterP95Us() / 1000.0f;
+        DelayPolicy_UpdateNetworkMeasurement(p50_ms, jitter_ms,
+                                             p95_ms, p95_ms, jitter_ms);
         return;
     }
 
@@ -468,13 +481,38 @@ int DelayPolicy_GetRemoteAnnouncedMaxRollback() {
     return s_remoteAnnouncedMaxRb;
 }
 
-int DelayPolicy_GetProtectionWindow() {
-    return s_connectionProtectionWindow;
+CoverageClass DelayPolicy_ClassifyLocalCoverage(float* out_oneway_frames,
+                                                int* out_required) {
+    // oneway p95 in frames: probe-first (§2.9.1: never from ms transport
+    // stats when the probe window exists).
+    float oneway = 0.0f;
+    if (TimeProbe_HasMeasurement()) {
+        oneway = TimeProbe_GetOneWayFramesP95(16667u);
+    } else if (s_measurementValid) {
+        oneway = s_oneWayFrames;
+    } else {
+        if (out_oneway_frames) *out_oneway_frames = 0.0f;
+        if (out_required) *out_required = 0;
+        return CoverageClass::Unknown;
+    }
+
+    const int onewayCeil = (int)ceilf(oneway);
+    const int margin = (std::max)(2, onewayCeil / 3);
+    const int required = onewayCeil + margin;
+    // coverage(peer->us) = D_peer + R_local: your rollback protects you,
+    // the peer's delay protects you too (INV-23).
+    const int coverage = s_resolvedVisibleRemoteDelay + s_rollbackBudget;
+
+    if (out_oneway_frames) *out_oneway_frames = oneway;
+    if (out_required) *out_required = required;
+    if (coverage > required) return CoverageClass::FullSpeed;
+    if (coverage == required) return CoverageClass::Marginal;
+    return CoverageClass::Underbuffered;
 }
 
-int DelayPolicy_GetStallThreshold() {
-    return s_stallThreshold;
-}
+// (M6: the public GetProtectionWindow/GetStallThreshold getters are retired
+// with the netplay_pacing controller, §2.8.7. The internal derived values
+// survive only as log diagnostics; DELAYMAP keeps its columns.)
 
 bool DelayPolicy_IsRollbackSynced() {
     return s_rollbackSynced;
@@ -525,7 +563,7 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
     out->resolved_visible_remote_delay = s_resolvedVisibleRemoteDelay;
     out->effective_local_delay = s_effectiveLocalDelay;
     out->effective_remote_delay = s_effectiveRemoteDelay;
-    out->protection_window = s_connectionProtectionWindow;
+    out->protection_window = 0;   // retired knob (M6, §2.8.7)
     out->rollback_budget = s_rollbackBudget;
     out->rollback_tolerance = s_rollbackToleranceK;
     out->gameplay_delay_mode = s_gameplayDelayMode;
@@ -533,7 +571,7 @@ void DelayPolicy_GetSnapshot(DelayPolicySnapshot* out) {
     out->recommended_max_rollback = s_recommendedMaxRollback;
     out->remote_announced_delay = s_remoteAnnouncedDelay;
     out->remote_announced_max_rollback = s_remoteAnnouncedMaxRb;
-    out->stall_threshold = s_stallThreshold;
+    out->stall_threshold = 0;     // retired knob (M6, §2.8.7)
     out->measured_avg_ping_ms = s_avgPingMs;
     out->measured_rtt_variance_ms = s_lastVarianceMs;
     out->measured_rtt_p90_ms = s_rttP90Ms;

@@ -7,7 +7,7 @@
 #include "log_window.h"
 #include "net/churn_pause.h"
 #include "net/netplay_menu_controller.h"
-#include "net/netplay_pacing.h"
+#include "net/session2.h"
 #include "net/netplay_phase_runtime.h"
 #include "net/session_manager.h"
 #include "net/connection_supervisor.h"
@@ -219,8 +219,6 @@ bool InputOverride_AreSystemKeyWorkaroundsEnabled() {
 // Per-session startup tracking — reset when a new rollback session begins.
 // Must be declared before AbortRollbackDispatcher which references it.
 static bool s_rollbackSessionWasActive = false;
-static bool s_hardHoldWatchdogActive = false;
-static int s_hardHoldWatchdogFrames = 0;
 
 static int AbortRollbackDispatcher(const char* fallbackReason) {
     const char* sessionErr = Rollback::RollbackSession_GetErrorReason();
@@ -254,6 +252,16 @@ static int AbortRollbackDispatcher(const char* fallbackReason) {
         sessionState != Net::SessionState::Idle &&
         sessionState != Net::SessionState::Failed &&
         sessionState != Net::SessionState::Disconnecting;
+    if (sessionNeedsTeardown) {
+        // M6 typed-terminal flow: an engine terminal has already run
+        // Session2_Terminate from the adapter, and a supervisor Dead already
+        // terminated from the supervisor — both leave the session
+        // Failed/Idle and skip this branch. Anything still alive here is a
+        // residual local session fault: route it through the same typed
+        // funnel BEFORE the UI so the peer gets a reasoned Disconnect
+        // (INV-20) instead of a bare transport drop.
+        Net::Session2_Terminate(Net::Session2TerminalReason::TransportFailed, reason);
+    }
     if (sessionNeedsTeardown ||
         Net::MatchLifecycle_GetPhase() != Net::MatchLifecyclePhase::DisconnectRecovery) {
         NetMenu::HandleDisconnection(reason);
@@ -2064,6 +2072,9 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         // Lockstep gate: only advance when both inputs are available
         if (!Net::CharSelSync_HasInputsForCurrentFrame()) {
             s_dispatchWaitCount++;
+            // Frontend-phase STAT hold producer (M6, closes the M2/M5 note):
+            // a frontend lockstep wait is a labeled 0-sim lifecycle pass.
+            FrameScheduler_NotifyHold(Rollback::HoldCause::LifecycleBoundary, false);
             Rollback::NetplayLog_Write("INPUT", -1,
                 "Step 3a: Waiting for remote input (wait#%u)", s_dispatchWaitCount);
             Rollback::NetplayLog_Flush();
@@ -2307,708 +2318,30 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         InputSyncHooks_SetTimesyncFreeze(false);
     }
 
-    // ── GekkoNet rollback session ───────────────────────────────────
-    // Two-phase event processing: BeginFrame once, then ProcessNextEvent
-    // until all events are consumed. Each AdvanceEvent = one game frame.
-#if 0
+// (The 0.6 GekkoNet frames-ahead throttle block was deleted at the M6
+// cutover: engine2 owns holds via typed NextAction stalls; the scheduler
+// owns the clock. See RE07_MASTER_REBUILD_PLAN.md sections 2.7.4/2.8.)
     if (Rollback::RollbackSession_IsActive()) {
-        // GekkoNet frames_ahead semantics:
-        //   positive => local is AHEAD (prediction pressure increasing)
-        //   negative => local is BEHIND (local can catch up)
-        static int s_catchupCooldown = 0;
-        static int s_aheadThrottleCooldown = 0;
-        static bool s_doDoubleTick = false;
-        static bool s_doAheadThrottleHold = false;
-        static bool s_loggedTimesyncEnabled = false;
-        static bool s_liveTimesyncWasEnabled = false;
-        static bool s_timesyncCatchupArmed = false;
-        static bool s_lastDispatcherCallAdvanced = false;
-        static bool s_lastAdvanceWasRollback = false;
-        static uint32_t s_postReleaseNormalAdvanceCount = 0;
-        static DWORD s_liveTimesyncEnabledAtMs = 0;
-        static bool s_loggedFirstBeginAfterRelease = false;
-        static bool s_loggedFirstAdvanceAfterRelease = false;
-        static bool s_startupBiasActive = false;
-        static float s_startupBias = 0.0f;
-        static int32_t s_lastCatchupDecisionFrame = -1000000;
-        static int32_t s_lastAheadDecisionFrame = -1000000;
-        static int32_t s_lastPacingDecisionFrame = -1000000;
-        static bool s_aheadThrottleActive = false;
-        static uint32_t s_aheadOverEnterCount = 0;
-        static uint32_t s_aheadUnderExitCount = 0;
-        static uint32_t s_behindPressureCount = 0;
-        static uint32_t s_startupGateLogCount = 0;
-        static uint32_t s_timesyncAheadPressureLogCount = 0;
-        static uint32_t s_timesyncSettleSuppressedLogCount = 0;
-        static uint32_t s_catchupRollbackSuppressedLogCount = 0;
-        static uint32_t s_catchupCooldownSuppressedLogCount = 0;
-        static uint32_t s_aheadThrottleSuppressedLogCount = 0;
+        // ── engine2 netplay branch (M6 rewiring, plan §2.8.3 / §6 M6) ───
+        // Two-phase contract preserved: BeginFrame(localInput) captures +
+        // plans; ProcessNextEvent drains (corrections first, then at most
+        // one visible advance per call). Holds are ENGINE-typed now: a pass
+        // whose ProcessNextEvent stream contains no Advance is an N=0 hold
+        // pass — the adapter already reported the typed HoldCause to the
+        // scheduler from NextAction (INV-2 closed cause enum; the legacy
+        // netplay_pacing controller is deleted, §2.8.7).
+        static bool s_passSawAdvance = false;
 
-        // Detect new session: reset per-session state
-        if (!s_rollbackSessionWasActive) {
-            s_rollbackSessionWasActive = true;
-            s_loggedTimesyncEnabled = false;
-            s_liveTimesyncWasEnabled = false;
-            s_timesyncCatchupArmed = false;
-            s_catchupCooldown = 0;
-            s_aheadThrottleCooldown = 0;
-            s_doDoubleTick = false;
-            s_doAheadThrottleHold = false;
-            s_lastDispatcherCallAdvanced = false;
-            s_lastAdvanceWasRollback = false;
-            s_postReleaseNormalAdvanceCount = 0;
-            s_liveTimesyncEnabledAtMs = 0;
-            s_loggedFirstBeginAfterRelease = false;
-            s_loggedFirstAdvanceAfterRelease = false;
-            s_startupBiasActive = false;
-            s_startupBias = 0.0f;
-            s_lastCatchupDecisionFrame = -1000000;
-            s_lastAheadDecisionFrame = -1000000;
-            s_lastPacingDecisionFrame = -1000000;
-            s_aheadThrottleActive = false;
-            s_aheadOverEnterCount = 0;
-            s_aheadUnderExitCount = 0;
-            s_behindPressureCount = 0;
-            s_startupGateLogCount = 0;
-            s_timesyncAheadPressureLogCount = 0;
-            s_timesyncSettleSuppressedLogCount = 0;
-            s_catchupRollbackSuppressedLogCount = 0;
-            s_catchupCooldownSuppressedLogCount = 0;
-            s_aheadThrottleSuppressedLogCount = 0;
-            // Clear any stale global freeze state from prior sessions. Runtime
-            // drift control below is dispatcher-local and does not use hard
-            // frame suppression hooks.
-            InputSyncHooks_SetTimesyncFreeze(false);
-            Rollback::NetplayLog_Write("TIMESYNC", -1,
-                "Session started: timesync=startup phase=%s "
-                "semantics=framesAhead>0 local_ahead, framesAhead<0 local_behind",
-                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
-        }
-
-        // Gameplay-entry barrier: hold local BeginFrame until OnlineWiring
-        // confirms the mutual startup release at the interactive boundary.
-        // Packet/session pumping must continue while held.
-        if (Rollback::OnlineWiring_IsGameplayEntryAdvanceBlocked()) {
-            s_lastDispatcherCallAdvanced = false;
-            s_startupGateLogCount++;
-            if (s_startupGateLogCount <= 5 || (s_startupGateLogCount % 120) == 0) {
-                Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
-                    "Session running but gameplay advance GATED at interactive boundary "
-                    "(release/session pending): phase=%s session_running=%d",
-                    Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
-                    Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
-            }
-            Net::Session_Update();
-            {
-                // Abort only on true session death: Gekko-side broken (20s
-                // disconnect fired) or supervisor Dead. Interrupted = hold.
-                const bool pollOk = Rollback::RollbackSession_PollSession();
-                if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
-                    return AbortRollbackDispatcher("Peer disconnected during startup barrier");
-                }
-            }
-            return -1;
-        }
-        s_startupGateLogCount = 0;
-
-        float framesAhead = Rollback::RollbackSession_FramesAhead();
-        const float freezeEnter = GetTimesyncFreezeEnterThreshold();
-        const int rollbackBudget = Rollback::RollbackSession_GetRollbackBudget();
-
-        // Timesync drift control belongs only to live gameplay after the
-        // startup release barrier has completed.
-        const bool inPlayableGameplay = IsInPlayableMatchGameplay();
-        const bool startupReleased = Rollback::OnlineWiring_IsStartupReleased();
-        const bool liveGameplayTimesync = inPlayableGameplay && startupReleased;
-        const int32_t timesyncFrame = Rollback::RollbackSession_GetCurrentFrame();
-        const DWORD nowMs = GetTickCount();
-
-        constexpr DWORD TIMESYNC_SETTLE_MS = 180;
-        constexpr uint32_t TIMESYNC_SETTLE_NORMAL_ADVANCES = 2;
-        constexpr float STARTUP_BIAS_CAPTURE_THRESHOLD = 1.25f;
-        constexpr float STARTUP_BIAS_DECAY_PER_NORMAL_ADV = 0.15f;
-        constexpr float AHEAD_THROTTLE_EXIT_HYSTERESIS = 0.75f;
-        constexpr uint32_t AHEAD_THROTTLE_ENTER_FRAMES = 3;
-        constexpr uint32_t AHEAD_THROTTLE_EXIT_FRAMES = 5;
-        constexpr uint32_t CATCHUP_CONFIRM_FRAMES = 2;
-
-        if (liveGameplayTimesync && !s_liveTimesyncWasEnabled) {
-            s_liveTimesyncWasEnabled = true;
-            s_liveTimesyncEnabledAtMs = nowMs;
-            s_postReleaseNormalAdvanceCount = 0;
-            s_timesyncCatchupArmed = false;
-            s_catchupCooldown = 0;
-            s_aheadThrottleCooldown = 0;
-            s_doDoubleTick = false;
-            s_doAheadThrottleHold = false;
-            s_lastCatchupDecisionFrame = -1000000;
-            s_lastAheadDecisionFrame = -1000000;
-            s_lastPacingDecisionFrame = -1000000;
-            s_aheadThrottleActive = false;
-            s_aheadOverEnterCount = 0;
-            s_aheadUnderExitCount = 0;
-            s_behindPressureCount = 0;
-            s_timesyncSettleSuppressedLogCount = 0;
-            s_catchupRollbackSuppressedLogCount = 0;
-            s_catchupCooldownSuppressedLogCount = 0;
-            s_aheadThrottleSuppressedLogCount = 0;
-
-            if (std::fabs(framesAhead) >= STARTUP_BIAS_CAPTURE_THRESHOLD) {
-                s_startupBiasActive = true;
-                s_startupBias = framesAhead;
-                Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                    "Startup bias capture ACTIVE at live enable: raw=%.2f bias=%.2f threshold=%.2f",
-                    framesAhead, s_startupBias, STARTUP_BIAS_CAPTURE_THRESHOLD);
-            } else {
-                s_startupBiasActive = false;
-                s_startupBias = 0.0f;
-                Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                    "Startup bias capture SKIPPED at live enable: raw=%.2f threshold=%.2f",
-                    framesAhead, STARTUP_BIAS_CAPTURE_THRESHOLD);
-            }
-        } else if (!liveGameplayTimesync && s_liveTimesyncWasEnabled) {
-            s_liveTimesyncWasEnabled = false;
-            s_timesyncCatchupArmed = false;
-            s_doDoubleTick = false;
-            s_doAheadThrottleHold = false;
-            s_aheadThrottleActive = false;
-            s_aheadOverEnterCount = 0;
-            s_aheadUnderExitCount = 0;
-            Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                "Gameplay timesync DISABLED: phase=%s startupReleased=%d",
-                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
-                startupReleased ? 1 : 0);
-        }
-
-        float effectiveFramesAhead = framesAhead;
-        if (s_startupBiasActive) {
-            effectiveFramesAhead -= s_startupBias;
-        }
-        const float aheadThresholdEnter = (std::max)(1.25f, freezeEnter * 0.6f);
-
-        if (!s_loggedTimesyncEnabled && liveGameplayTimesync) {
-            s_loggedTimesyncEnabled = true;
-            Rollback::NetplayLog_Write("TIMESYNC", -1,
-                "Gameplay timesync ENABLED (PlayableGameplay + startup released): "
-                "raw=%.2f effective=%.2f bias=%.2f bias_active=%d ahead_enter=%.2f budget=%d",
-                framesAhead, effectiveFramesAhead, s_startupBias,
-                s_startupBiasActive ? 1 : 0, aheadThresholdEnter, rollbackBudget);
-        }
-
-        if (liveGameplayTimesync) {
-            const bool settleElapsed =
-                s_liveTimesyncEnabledAtMs != 0 &&
-                (nowMs - s_liveTimesyncEnabledAtMs) >= TIMESYNC_SETTLE_MS;
-            const bool settleNormalAdvance =
-                s_postReleaseNormalAdvanceCount >= TIMESYNC_SETTLE_NORMAL_ADVANCES;
-
-            if (!s_timesyncCatchupArmed) {
-                if (settleElapsed && settleNormalAdvance) {
-                    s_timesyncCatchupArmed = true;
-                    Rollback::NetplayLog_Write("TIMESYNC", -1,
-                        "Gameplay timesync CATCH-UP armed after settle window: "
-                        "elapsed_ms=%lu normal_advances=%u raw=%.2f effective=%.2f",
-                        (unsigned long)(nowMs - s_liveTimesyncEnabledAtMs),
-                        s_postReleaseNormalAdvanceCount,
-                        framesAhead,
-                        effectiveFramesAhead);
-                } else {
-                    s_timesyncSettleSuppressedLogCount++;
-                    if (s_timesyncSettleSuppressedLogCount <= 5 ||
-                        (s_timesyncSettleSuppressedLogCount % 120) == 0) {
-                        Rollback::NetplayLog_Write("TIMESYNC", -1,
-                            "Gameplay timesync catch-up SUPPRESSED by settle window: "
-                            "elapsed_ms=%lu/%lu normal_advances=%u/%u raw=%.2f effective=%.2f",
-                            (unsigned long)(nowMs - s_liveTimesyncEnabledAtMs),
-                            (unsigned long)TIMESYNC_SETTLE_MS,
-                            s_postReleaseNormalAdvanceCount,
-                            TIMESYNC_SETTLE_NORMAL_ADVANCES,
-                            framesAhead,
-                            effectiveFramesAhead);
-                    }
-                }
-            }
-
-            // Use a lower ahead-entry threshold than the legacy freezeEnter so
-            // ahead-side correction can actually engage in live windows.
-            const float aheadEnter = aheadThresholdEnter;
-            const float aheadExit = (std::max)(0.5f, aheadEnter - AHEAD_THROTTLE_EXIT_HYSTERESIS);
-
-            if (effectiveFramesAhead >= aheadEnter) {
-                s_timesyncAheadPressureLogCount++;
-                if (s_timesyncAheadPressureLogCount <= 5 ||
-                    (s_timesyncAheadPressureLogCount % 120) == 0) {
-                    Rollback::NetplayLog_Write("TIMESYNC", -1,
-                        "Local ahead pressure observed: effective=%.2f raw=%.2f "
-                        "bias=%.2f enter=%.2f exit=%.2f budget=%d",
-                        effectiveFramesAhead, framesAhead, s_startupBias,
-                        aheadEnter, aheadExit, rollbackBudget);
-                }
-            } else {
-                s_timesyncAheadPressureLogCount = 0;
-            }
-
-            if (!s_aheadThrottleActive) {
-                if (effectiveFramesAhead >= aheadEnter) {
-                    s_aheadOverEnterCount++;
-                    if (s_aheadOverEnterCount >= AHEAD_THROTTLE_ENTER_FRAMES) {
-                        s_aheadThrottleActive = true;
-                        s_aheadOverEnterCount = 0;
-                        s_aheadUnderExitCount = 0;
-                        Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                            "Ahead-side SOFT THROTTLE ENTER: raw=%.2f effective=%.2f "
-                            "enter=%.2f exit=%.2f",
-                            framesAhead, effectiveFramesAhead, aheadEnter, aheadExit);
-                    }
-                } else {
-                    s_aheadOverEnterCount = 0;
-                }
-            } else {
-                if (effectiveFramesAhead <= aheadExit) {
-                    s_aheadUnderExitCount++;
-                    if (s_aheadUnderExitCount >= AHEAD_THROTTLE_EXIT_FRAMES) {
-                        s_aheadThrottleActive = false;
-                        s_doAheadThrottleHold = false;
-                        s_aheadUnderExitCount = 0;
-                        Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                            "Ahead-side SOFT THROTTLE EXIT: raw=%.2f effective=%.2f exit=%.2f",
-                            framesAhead, effectiveFramesAhead, aheadExit);
-                    }
-                } else {
-                    s_aheadUnderExitCount = 0;
-                }
-            }
-        } else {
-            s_timesyncAheadPressureLogCount = 0;
-            s_timesyncSettleSuppressedLogCount = 0;
-            s_timesyncCatchupArmed = false;
-            s_postReleaseNormalAdvanceCount = 0;
-            s_doDoubleTick = false;
-            s_doAheadThrottleHold = false;
-            s_aheadThrottleActive = false;
-            s_aheadOverEnterCount = 0;
-            s_aheadUnderExitCount = 0;
-            s_behindPressureCount = 0;
-            s_lastPacingDecisionFrame = -1000000;
-            s_catchupRollbackSuppressedLogCount = 0;
-            s_catchupCooldownSuppressedLogCount = 0;
-            s_aheadThrottleSuppressedLogCount = 0;
-            if (inPlayableGameplay && !startupReleased) {
-                Rollback::NetplayLog_Write("TIMESYNC", -1,
-                    "Gameplay timesync SUPPRESSED by startup barrier: phase=%s "
-                    "released=%d",
-                    Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
-            }
-        }
-
-        if (s_catchupCooldown > 0) {
-            s_catchupCooldown--;
-        }
-        if (s_aheadThrottleCooldown > 0) {
-            s_aheadThrottleCooldown--;
-        }
-
-        const bool rollingBackNow = Rollback::RollbackSession_IsRollingBack();
-        const bool catchupBehind = effectiveFramesAhead <= -1.0f;
-        const bool stableNormalAdvance = s_lastDispatcherCallAdvanced && !s_lastAdvanceWasRollback;
-        if (liveGameplayTimesync && s_timesyncCatchupArmed && catchupBehind && stableNormalAdvance && !rollingBackNow) {
-            if (s_behindPressureCount < 255u) {
-                s_behindPressureCount++;
-            }
-        } else if (!catchupBehind) {
-            s_behindPressureCount = 0;
-        }
-
-        // If the local peer is behind, schedule an extra tick to catch up.
-        // Only applies during live gameplay — not during startup/intro where
-        // GekkoNet drives deterministic progression on its own.
-        if (liveGameplayTimesync &&
-            s_timesyncCatchupArmed &&
-            stableNormalAdvance &&
-            catchupBehind &&
-            !s_doDoubleTick) {
-            const bool blockedByRollback = rollingBackNow || s_lastAdvanceWasRollback;
-            const bool blockedByCooldown = s_catchupCooldown > 0;
-            const bool blockedByDecisionWindow = timesyncFrame == s_lastCatchupDecisionFrame;
-            const bool blockedByPacingWindow = timesyncFrame == s_lastPacingDecisionFrame;
-            const bool blockedByConfirm = s_behindPressureCount < CATCHUP_CONFIRM_FRAMES;
-
-            if (!blockedByRollback &&
-                !blockedByCooldown &&
-                !blockedByDecisionWindow &&
-                !blockedByPacingWindow &&
-                !blockedByConfirm) {
-                const float framesBehind = -effectiveFramesAhead;
-                const uint32_t pressureCount = s_behindPressureCount;
-                s_doDoubleTick = true;
-                s_catchupCooldown = GetCatchupCooldown(framesBehind);
-                s_lastCatchupDecisionFrame = timesyncFrame;
-                s_lastPacingDecisionFrame = timesyncFrame;
-                s_behindPressureCount = 0;
-                Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                    "Scheduling catch-up tick: behind=%.2f raw=%.2f effective=%.2f "
-                    "bias=%.2f cooldown=%d rb=%d pressure=%u",
-                    framesBehind,
-                    framesAhead,
-                    effectiveFramesAhead,
-                    s_startupBias,
-                    s_catchupCooldown,
-                    rollingBackNow ? 1 : 0,
-                    pressureCount);
-            } else if (blockedByRollback) {
-                s_catchupRollbackSuppressedLogCount++;
-                if (s_catchupRollbackSuppressedLogCount <= 5 ||
-                    (s_catchupRollbackSuppressedLogCount % 120) == 0) {
-                    Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                        "Catch-up SUPPRESSED: rollback active (rolling_back=%d last_advance_rb=%d) "
-                        "raw=%.2f effective=%.2f",
-                        rollingBackNow ? 1 : 0,
-                        s_lastAdvanceWasRollback ? 1 : 0,
-                        framesAhead,
-                        effectiveFramesAhead);
-                }
-            } else if (blockedByCooldown) {
-                s_catchupCooldownSuppressedLogCount++;
-                if (s_catchupCooldownSuppressedLogCount <= 5 ||
-                    (s_catchupCooldownSuppressedLogCount % 120) == 0) {
-                    Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                        "Catch-up SUPPRESSED: cooldown active (%d) raw=%.2f effective=%.2f",
-                        s_catchupCooldown,
-                        framesAhead,
-                        effectiveFramesAhead);
-                }
-            } else if (blockedByConfirm) {
-                Rollback::NetplayLog_Verbose("TIMESYNC", timesyncFrame,
-                    "Catch-up waiting for confirm streak: pressure=%u/%u raw=%.2f effective=%.2f",
-                    s_behindPressureCount,
-                    CATCHUP_CONFIRM_FRAMES,
-                    framesAhead,
-                    effectiveFramesAhead);
-            } else if (blockedByPacingWindow || blockedByDecisionWindow) {
-                Rollback::NetplayLog_Verbose("TIMESYNC", timesyncFrame,
-                    "Catch-up skipped by pacing arbitration: pacing_window=%d decision_window=%d "
-                    "raw=%.2f effective=%.2f",
-                    blockedByPacingWindow ? 1 : 0,
-                    blockedByDecisionWindow ? 1 : 0,
-                    framesAhead,
-                    effectiveFramesAhead);
-            }
-        }
-
-        // Local-ahead correction: apply bounded, hysteretic, soft pacing hold.
-        // This is intentionally a light throttle, not a hard freeze.
-        if (liveGameplayTimesync &&
-            s_aheadThrottleActive &&
-            stableNormalAdvance &&
-            !s_doDoubleTick &&
-            !s_doAheadThrottleHold &&
-            effectiveFramesAhead >= aheadThresholdEnter) {
-            const bool blockedByRollback = rollingBackNow || s_lastAdvanceWasRollback;
-            const bool blockedByCooldown = s_aheadThrottleCooldown > 0;
-            const bool blockedByDecisionWindow = timesyncFrame == s_lastAheadDecisionFrame;
-            const bool blockedByPacingWindow = timesyncFrame == s_lastPacingDecisionFrame;
-
-            if (!blockedByRollback &&
-                !blockedByCooldown &&
-                !blockedByDecisionWindow &&
-                !blockedByPacingWindow) {
-                s_doAheadThrottleHold = true;
-                s_aheadThrottleCooldown = GetAheadThrottleCooldown(effectiveFramesAhead);
-                s_lastAheadDecisionFrame = timesyncFrame;
-                s_lastPacingDecisionFrame = timesyncFrame;
-                Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                    "Ahead-side SOFT THROTTLE scheduled: raw=%.2f effective=%.2f "
-                    "cooldown=%d rb=%d",
-                    framesAhead,
-                    effectiveFramesAhead,
-                    s_aheadThrottleCooldown,
-                    rollingBackNow ? 1 : 0);
-            } else {
-                s_aheadThrottleSuppressedLogCount++;
-                if (s_aheadThrottleSuppressedLogCount <= 5 ||
-                    (s_aheadThrottleSuppressedLogCount % 120) == 0) {
-                    Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                        "Ahead-side SOFT THROTTLE suppressed: rollback=%d last_rb=%d cooldown=%d "
-                        "pacing_window=%d decision_window=%d",
-                        rollingBackNow ? 1 : 0,
-                        s_lastAdvanceWasRollback ? 1 : 0,
-                        s_aheadThrottleCooldown,
-                        blockedByPacingWindow ? 1 : 0,
-                        blockedByDecisionWindow ? 1 : 0);
-                }
-            }
-        }
-
-        // State: track whether we've started this frame's event batch
-        static bool s_gekkoFrameStarted = false;
-
-        if (!s_gekkoFrameStarted) {
-            if (s_doAheadThrottleHold) {
-                s_doAheadThrottleHold = false;
-                s_lastDispatcherCallAdvanced = false;
-                Rollback::NetplayLog_Write("TIMESYNC", timesyncFrame,
-                    "Ahead-side SOFT THROTTLE EXECUTED: skipping one local advance window "
-                    "raw=%.2f effective=%.2f bias=%.2f cooldown=%d",
-                    framesAhead,
-                    effectiveFramesAhead,
-                    s_startupBias,
-                    s_aheadThrottleCooldown);
-                Net::Session_Update();
-                {
-                    const bool pollOk = Rollback::RollbackSession_PollSession();
-                    if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
-                        return AbortRollbackDispatcher("Peer disconnected during ahead-side throttle hold");
-                    }
-                }
-                return -1;
-            }
-
-            // Phase 1: Collect local input and feed to GekkoNet
-            InputSystem_Update();
-            uint16_t localInput = Net::PlayerMapping_ReadLocalInput();
-
-            if (!s_loggedFirstBeginAfterRelease &&
-                Rollback::OnlineWiring_IsStartupReleased() &&
-                inPlayableGameplay) {
-                s_loggedFirstBeginAfterRelease = true;
-                Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
-                    "First BeginFrame allowed after startup release");
-            }
-
-            const char* timesyncMode = "startup";
-            if (liveGameplayTimesync) {
-                if (s_doAheadThrottleHold) {
-                    timesyncMode = "live-ahead-throttle";
-                } else {
-                    timesyncMode = s_timesyncCatchupArmed ? "live" : "release-handoff";
-                }
-            } else if (inPlayableGameplay && !startupReleased) {
-                timesyncMode = "startup-gated";
-            }
-
-            Rollback::NetplayLog_Write("INPUT", -1,
-                "Dispatcher: starting new frame, local_input=0x%04X "
-                "framesAhead(raw=%.2f effective=%.2f bias=%.2f) phase=%s tsync=%s",
-                localInput, framesAhead, effectiveFramesAhead, s_startupBias,
-                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
-                timesyncMode);
-
-            Rollback::RollbackSession_BeginFrame(localInput);
-            s_gekkoFrameStarted = true;
-        }
-
-        // Phase 2: Process next GekkoNet event
-        Rollback::EventResult result = Rollback::RollbackSession_ProcessNextEvent();
-
-        if (result == Rollback::EventResult::Error) {
-            s_gekkoFrameStarted = false;
-            s_lastDispatcherCallAdvanced = false;
-            return AbortRollbackDispatcher("Rollback session failed");
-        }
-
-        if (result == Rollback::EventResult::Advance) {
-            // GekkoNet wants one frame advanced (normal or rollback).
-            // Inputs already set via InputSystem_SetNetplayInput by HandleAdvanceEvent.
-            // Write to outputInputs for the game's dispatcher contract.
-            uint16_t p1 = 0, p2 = 0;
-            Rollback::RollbackSession_GetAdvanceInputs(&p1, &p2);
-            outputInputs[0] = (__int16)p1;
-            outputInputs[1] = (__int16)p2;
-
-            // Write inputs to history buffers (game's match handler reads from these)
-            volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
-            const uint32_t writeIdx = (uint32_t)*pFrameWrite;
-            if (writeIdx < INPUT_HISTORY_MAX) {
-                *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p1;
-                *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (writeIdx * sizeof(uint16_t))) = p2;
-            }
-            *pFrameWrite = (int32_t)(writeIdx + 1);
-
-            Rollback::NetplayLog_Write("INPUT", -1,
-                "Dispatcher: Advance → P1=0x%04X P2=0x%04X writeIdx=%u->%u rb=%d",
-                p1, p2, writeIdx, writeIdx + 1, Rollback::RollbackSession_IsRollingBack() ? 1 : 0);
-
-            s_lastDispatcherCallAdvanced = true;
-            const bool advanceWasRollback = Rollback::RollbackSession_IsRollingBack();
-            s_lastAdvanceWasRollback = advanceWasRollback;
-            if (!startupReleased) {
-                Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
-                    "ERROR: Advance produced before mutual post-intro startup release");
-            }
-            if (startupReleased && inPlayableGameplay && !advanceWasRollback) {
-                s_postReleaseNormalAdvanceCount++;
-                if (!s_loggedFirstAdvanceAfterRelease) {
-                    s_loggedFirstAdvanceAfterRelease = true;
-                    Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
-                        "First post-release NORMAL Advance observed");
-                }
-            } else if (startupReleased && inPlayableGameplay && advanceWasRollback) {
-                Rollback::NetplayLog_Write("TIMESYNC", Rollback::RollbackSession_GetCurrentFrame(),
-                    "Advance during rollback observed post-release (catch-up remains blocked): "
-                    "raw=%.2f effective=%.2f",
-                    framesAhead,
-                    effectiveFramesAhead);
-            }
-
-            if (liveGameplayTimesync && !advanceWasRollback && s_startupBiasActive) {
-                const float prevBias = s_startupBias;
-                if (s_startupBias > 0.0f) {
-                    s_startupBias = (std::max)(0.0f, s_startupBias - STARTUP_BIAS_DECAY_PER_NORMAL_ADV);
-                } else if (s_startupBias < 0.0f) {
-                    s_startupBias = (std::min)(0.0f, s_startupBias + STARTUP_BIAS_DECAY_PER_NORMAL_ADV);
-                }
-
-                if (prevBias != s_startupBias &&
-                    (s_postReleaseNormalAdvanceCount <= 5 ||
-                     (s_postReleaseNormalAdvanceCount % 120) == 0)) {
-                    Rollback::NetplayLog_Write("TIMESYNC", Rollback::RollbackSession_GetCurrentFrame(),
-                        "Startup bias decay: prev=%.2f next=%.2f raw=%.2f effective=%.2f normal_adv=%u",
-                        prevBias,
-                        s_startupBias,
-                        framesAhead,
-                        framesAhead - s_startupBias,
-                        s_postReleaseNormalAdvanceCount);
-                }
-
-                const float postDecayEffective = framesAhead - s_startupBias;
-                if (std::fabs(s_startupBias) < 0.25f || std::fabs(postDecayEffective) < 0.35f) {
-                    s_startupBiasActive = false;
-                    Rollback::NetplayLog_Write("TIMESYNC", Rollback::RollbackSession_GetCurrentFrame(),
-                        "Startup bias neutralization COMPLETE: residual_bias=%.2f raw=%.2f effective=%.2f",
-                        s_startupBias,
-                        framesAhead,
-                        postDecayEffective);
-                    s_startupBias = 0.0f;
-                }
-            }
-
-            return 0;  // Game's loop runs one full tick (InputProcess + matchHandler)
-        } else {
-            // No more events (Done) — frame batch complete
-            s_gekkoFrameStarted = false;
-            s_lastDispatcherCallAdvanced = false;
-
-            // Double-tick: if scheduled, start another BeginFrame cycle
-            // so the game runs a second full tick through the match handler
-            if (s_doDoubleTick) {
-                s_doDoubleTick = false;
-
-                InputSystem_Update();
-                uint16_t localInput2 = Net::PlayerMapping_ReadLocalInput();
-
-                Rollback::NetplayLog_Write("TIMESYNC", -1,
-                    "Catch-up tick: starting second BeginFrame, local_input=0x%04X", localInput2);
-
-                Rollback::RollbackSession_BeginFrame(localInput2);
-                s_gekkoFrameStarted = true;
-
-                // Continue processing — the game's while loop will call us
-                // again for each Advance event from GekkoNet
-                Rollback::EventResult result2 = Rollback::RollbackSession_ProcessNextEvent();
-                if (result2 == Rollback::EventResult::Error) {
-                    s_gekkoFrameStarted = false;
-                    s_lastDispatcherCallAdvanced = false;
-                    return AbortRollbackDispatcher("Rollback session failed during double-tick");
-                }
-
-                if (result2 == Rollback::EventResult::Advance) {
-                    uint16_t p1 = 0, p2 = 0;
-                    Rollback::RollbackSession_GetAdvanceInputs(&p1, &p2);
-                    outputInputs[0] = (__int16)p1;
-                    outputInputs[1] = (__int16)p2;
-
-                    volatile int32_t* pFrameWrite2 = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
-                    const uint32_t writeIdx2 = (uint32_t)*pFrameWrite2;
-                    if (writeIdx2 < INPUT_HISTORY_MAX) {
-                        *reinterpret_cast<volatile uint16_t*>(ADDR_P1_INPUT_HISTORY + (writeIdx2 * sizeof(uint16_t))) = p1;
-                        *reinterpret_cast<volatile uint16_t*>(ADDR_P2_INPUT_HISTORY + (writeIdx2 * sizeof(uint16_t))) = p2;
-                    }
-                    *pFrameWrite2 = (int32_t)(writeIdx2 + 1);
-
-                    Rollback::NetplayLog_Write("TIMESYNC", -1,
-                        "Catch-up Advance → P1=0x%04X P2=0x%04X writeIdx=%u->%u rb=%d",
-                        p1, p2, writeIdx2, writeIdx2 + 1,
-                        Rollback::RollbackSession_IsRollingBack() ? 1 : 0);
-
-                    s_lastDispatcherCallAdvanced = true;
-                    const bool advanceWasRollback2 = Rollback::RollbackSession_IsRollingBack();
-                    s_lastAdvanceWasRollback = advanceWasRollback2;
-                    if (!startupReleased) {
-                        Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
-                            "ERROR: Catch-up Advance produced before mutual post-intro startup release");
-                    }
-                    if (startupReleased && inPlayableGameplay && !advanceWasRollback2) {
-                        s_postReleaseNormalAdvanceCount++;
-                        if (!s_loggedFirstAdvanceAfterRelease) {
-                            s_loggedFirstAdvanceAfterRelease = true;
-                            Rollback::NetplayLog_Write("STARTUP", Rollback::RollbackSession_GetCurrentFrame(),
-                                "First post-release NORMAL Advance observed");
-                        }
-                    } else if (startupReleased && inPlayableGameplay && advanceWasRollback2) {
-                        Rollback::NetplayLog_Write("TIMESYNC", Rollback::RollbackSession_GetCurrentFrame(),
-                            "Catch-up Advance ran during rollback (no additional catch-up scheduling): "
-                            "raw=%.2f effective=%.2f",
-                            framesAhead,
-                            effectiveFramesAhead);
-                    }
-
-                    if (liveGameplayTimesync && !advanceWasRollback2 && s_startupBiasActive) {
-                        const float prevBias = s_startupBias;
-                        if (s_startupBias > 0.0f) {
-                            s_startupBias = (std::max)(0.0f, s_startupBias - STARTUP_BIAS_DECAY_PER_NORMAL_ADV);
-                        } else if (s_startupBias < 0.0f) {
-                            s_startupBias = (std::min)(0.0f, s_startupBias + STARTUP_BIAS_DECAY_PER_NORMAL_ADV);
-                        }
-
-                        const float postDecayEffective2 = framesAhead - s_startupBias;
-                        if (prevBias != s_startupBias &&
-                            (s_postReleaseNormalAdvanceCount <= 5 ||
-                             (s_postReleaseNormalAdvanceCount % 120) == 0)) {
-                            Rollback::NetplayLog_Write("TIMESYNC", Rollback::RollbackSession_GetCurrentFrame(),
-                                "Startup bias decay (catch-up advance path): prev=%.2f next=%.2f raw=%.2f effective=%.2f",
-                                prevBias,
-                                s_startupBias,
-                                framesAhead,
-                                postDecayEffective2);
-                        }
-
-                        if (std::fabs(s_startupBias) < 0.25f || std::fabs(postDecayEffective2) < 0.35f) {
-                            s_startupBiasActive = false;
-                            Rollback::NetplayLog_Write("TIMESYNC", Rollback::RollbackSession_GetCurrentFrame(),
-                                "Startup bias neutralization COMPLETE: residual_bias=%.2f raw=%.2f effective=%.2f",
-                                s_startupBias,
-                                framesAhead,
-                                postDecayEffective2);
-                            s_startupBias = 0.0f;
-                        }
-                    }
-
-                    return 0;  // Game processes this tick normally
-                }
-                // If Done immediately (no advance needed), fall through
-                s_gekkoFrameStarted = false;
-                s_lastDispatcherCallAdvanced = false;
-            }
-
-            Rollback::NetplayLog_Write("INPUT", -1,
-                "Dispatcher: Done, breaking dispatcher loop");
-
-            return -1;  // Break game's dispatcher loop
-        }
-    }
-
-#endif
-    if (Rollback::RollbackSession_IsActive()) {
         if (!s_rollbackSessionWasActive) {
             s_rollbackSessionWasActive = true;
             s_rollbackFrameStarted = false;
+            s_passSawAdvance = false;
             s_loggedFirstBeginAfterRelease = false;
             s_loggedFirstAdvanceAfterRelease = false;
             s_startupGateLogCount = 0;
-            Net::NetplayPacing_ResetSession("dispatcher session start");
             InputSyncHooks_SetTimesyncFreeze(false);
             Rollback::NetplayLog_Write("TIMESYNC", -1,
-                "Session started: controller=tick-slew phase=%s",
+                "Session started: controller=engine-typed-stalls phase=%s",
                 Net::MatchRollbackPhaseName(Net::NetplayPhaseRuntime_GetPhase()));
         }
 
@@ -3019,6 +2352,9 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 s_rollbackFrameStarted ? 1 : 0,
                 sessionFramePending ? 1 : 0,
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
+            if (!s_rollbackFrameStarted && sessionFramePending) {
+                s_passSawAdvance = false;
+            }
             s_rollbackFrameStarted = sessionFramePending;
         }
 
@@ -3026,7 +2362,6 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         const bool inPlayableGameplay =
             Net::NetplayPhaseRuntime_IsInteractivePacingPhase(rollbackPhase);
         const bool startupReleased = Rollback::OnlineWiring_IsStartupReleased();
-        const bool liveGameplayPacing = startupReleased && inPlayableGameplay;
 
         if (Rollback::OnlineWiring_IsGameplayEntryAdvanceBlocked()) {
             s_startupGateLogCount++;
@@ -3041,10 +2376,8 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             FrameScheduler_NotifyHold(Rollback::HoldCause::LifecycleBoundary, false);
             Net::Session_Update();
             {
-                // Abort only on true session death: Gekko-side broken (20s
-                // disconnect fired) or supervisor Dead verdict. While the
-                // supervisor merely reports Interrupted this stays in the
-                // existing freeze-hold (TSYNC pulse) and keeps pumping.
+                // Abort only on true session death: engine terminal or
+                // supervisor Dead verdict. Interrupted = freeze-and-wait.
                 const bool pollOk = Rollback::RollbackSession_PollSession();
                 if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
                     InputSyncHooks_SetTimesyncFreeze(false);
@@ -3055,119 +2388,28 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             return -1;
         }
         s_startupGateLogCount = 0;
-        InputSyncHooks_SetTimesyncFreeze(false);
 
         if (!s_rollbackFrameStarted) {
             Rollback::RollbackTimesyncTelemetry preTelemetry{};
             Rollback::RollbackSession_GetTimesyncTelemetry(&preTelemetry);
-
-            const int stallThreshold = Net::DelayPolicy_GetStallThreshold();
             const int32_t currentFrame = preTelemetry.rb_frame_current;
 
-            const Net::NetplayPacingAction pacingAction = Net::NetplayPacing_BeginFrame(
-                preTelemetry,
-                rollbackPhase,
-                startupReleased,
-                stallThreshold);
-            if (pacingAction != Net::NetplayPacingAction::None) {
-                // M2 semanticHold shim (exit-gate contract): legacy pacing
-                // holds consume their pacing slot at the normal deadline and
-                // create NO CadenceDebt (the peer froze too; nothing to
-                // repay). Typed cause for the §2.10 STAT buckets: device
-                // churn is external, everything else the legacy controller
-                // decides is network-attributed (PredictionLimit).
-                const bool churnHold = Net::ChurnPause_ShouldForceHold(
-                    preTelemetry, rollbackPhase, startupReleased);
-                FrameScheduler_NotifyHold(
-                    churnHold ? Rollback::HoldCause::ExternalSuspension
-                              : Rollback::HoldCause::PredictionLimit,
-                    /*create_debt=*/false);
-                Net::NetplayPacing_OnHoldSample(
-                    preTelemetry,
-                    rollbackPhase,
-                    startupReleased,
-                    pacingAction);
-                Net::NetplayPacingSnapshot pacingSnap{};
-                Net::NetplayPacing_GetSnapshot(&pacingSnap);
-                const int holdCount =
-                    pacingAction == Net::NetplayPacingAction::SoftHold
-                        ? pacingSnap.soft_hold_count
-                        : (pacingAction == Net::NetplayPacingAction::HardHold
-                            ? pacingSnap.hard_hold_count
-                            : pacingSnap.stall_frame_count);
-                const int holdThreshold =
-                    pacingAction == Net::NetplayPacingAction::SoftHold
-                        ? pacingSnap.soft_threshold
-                        : (pacingAction == Net::NetplayPacingAction::HardHold
-                            ? pacingSnap.hard_threshold
-                            : pacingSnap.stall_threshold);
-
-                if (pacingAction == Net::NetplayPacingAction::HardHold) {
-                    if (!s_hardHoldWatchdogActive) {
-                        s_hardHoldWatchdogActive = true;
-                        s_hardHoldWatchdogFrames = 0;
-                        Rollback::NetplayLog_Verbose(
-                            "WATCHDOG", currentFrame,
-                            "hard_hold ENTER: rb=%d remote_rb=%d gap=%d debt=%d budget=%d threshold=%d session_running=%d",
-                            currentFrame,
-                            preTelemetry.rb_frame_last_remote_received,
-                            pacingSnap.raw_remote_gap,
-                            pacingSnap.prediction_debt,
-                            preTelemetry.rollback_budget,
-                            holdThreshold,
-                            Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
-                    }
-                    s_hardHoldWatchdogFrames++;
-                    if (s_hardHoldWatchdogFrames <= 3 || (s_hardHoldWatchdogFrames % 60) == 0) {
-                        Rollback::NetplayLog_Verbose(
-                            "WATCHDOG", currentFrame,
-                            "hard_hold active: frames=%d rb=%d remote_rb=%d gap=%d debt=%d budget=%d session_running=%d",
-                            s_hardHoldWatchdogFrames,
-                            currentFrame,
-                            preTelemetry.rb_frame_last_remote_received,
-                            pacingSnap.raw_remote_gap,
-                            pacingSnap.prediction_debt,
-                            preTelemetry.rollback_budget,
-                            Rollback::RollbackSession_IsSessionRunning() ? 1 : 0);
-                    }
-                } else if (s_hardHoldWatchdogActive) {
-                    Rollback::NetplayLog_Verbose(
-                        "WATCHDOG", currentFrame,
-                        "hard_hold EXIT: action=%s held_frames=%d rb=%d remote_rb=%d",
-                        Net::NetplayPacingActionName(pacingAction),
-                        s_hardHoldWatchdogFrames,
-                        currentFrame,
-                        preTelemetry.rb_frame_last_remote_received);
-                    s_hardHoldWatchdogActive = false;
-                    s_hardHoldWatchdogFrames = 0;
-                }
-
-                if (holdCount <= 5 || (holdCount % 120) == 0) {
-                    Rollback::NetplayLog_Write(
-                        "STALL", currentFrame,
-                        "Holding gameplay: rb_current=%d rb_remote=%d action=%s raw_gap=%d debt=%d remote_eff=%d threshold=%d phase=%s count=%d class=%s pressure=%.2f",
-                        currentFrame,
-                        preTelemetry.rb_frame_last_remote_received,
-                        Net::NetplayPacingActionName(pacingAction),
-                        pacingSnap.raw_remote_gap,
-                        pacingSnap.prediction_debt,
-                        pacingSnap.effective_remote_delay,
-                        holdThreshold,
-                        Net::MatchRollbackPhaseName(rollbackPhase),
-                        holdCount,
-                        Net::NetQualityName(pacingSnap.quality),
-                        pacingSnap.pressure);
-                }
+            // Device-churn mutual pause (KEEP module): the ONLY remaining
+            // pre-BeginFrame hold after the M6 controller deletion. Every
+            // network condition is the engine typed stall below.
+            if (Net::ChurnPause_ShouldForceHold(preTelemetry, rollbackPhase, startupReleased)) {
+                FrameScheduler_NotifyHold(Rollback::HoldCause::ExternalSuspension,
+                                          /*create_debt=*/false);
+                Rollback::NetplayLog_Verbose("STALL", currentFrame,
+                    "Churn-pause hold: rb_current=%d phase=%s",
+                    currentFrame, Net::MatchRollbackPhaseName(rollbackPhase));
                 InputSyncHooks_SetTimesyncFreeze(true);
                 Net::Session_Update();
                 {
-                    // Interrupted peers freeze here (stall-hold already keeps
-                    // the game paused); only Gekko-broken (20s) or supervisor
-                    // Dead aborts the dispatcher.
                     const bool pollOk = Rollback::RollbackSession_PollSession();
                     if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
                         InputSyncHooks_SetTimesyncFreeze(false);
-                        return AbortRollbackDispatcher("Peer disconnected during stall hold");
+                        return AbortRollbackDispatcher("Peer disconnected during churn hold");
                     }
                 }
                 ResetVanillaTimeoutCounters();
@@ -3185,36 +2427,26 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             }
 
             Rollback::NetplayLog_Verbose("INPUT", currentFrame,
-                "Dispatcher frame start: local_input=0x%04X phase=%s stall_threshold=%d",
+                "Dispatcher frame start: local_input=0x%04X phase=%s",
                 localInput,
-                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()),
-                stallThreshold);
+                Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
 
             Rollback::RollbackSession_BeginFrame(localInput);
+            s_rollbackFrameStarted = true;
+            s_passSawAdvance = false;
 
             Rollback::RollbackTimesyncTelemetry postTelemetry{};
             Rollback::RollbackSession_GetTimesyncTelemetry(&postTelemetry);
-            Net::NetplayPacing_OnSessionSample(
-                postTelemetry,
-                rollbackPhase,
-                startupReleased,
-                Rollback::RollbackSession_IsSessionRunning());
-            s_rollbackFrameStarted = true;
-
-            Net::NetplayPacingSnapshot pacingSnap{};
-            Net::NetplayPacing_GetSnapshot(&pacingSnap);
-
             Rollback::NetplayLog_Verbose("TIMESYNC", postTelemetry.rb_frame_current,
-                "UpdateSession complete: rb_current=%d game_abs=%d origin_abs=%d frames_ahead=%.2f adjust_ms=%.2f tick_target=%.3f tick_current=%.3f remote_rb=%d confirmed_rb=%d ping=%.1f jitter=%.1f phase=%s",
+                "BeginFrame complete: rb_current=%d game_abs=%d origin_abs=%d frames_ahead=%.2f "
+                "remote_rb=%d confirmed_rb=%d depth=%d ping=%.1f jitter=%.1f phase=%s",
                 postTelemetry.rb_frame_current,
                 postTelemetry.game_abs_frame_current,
                 postTelemetry.frame_origin_abs,
                 postTelemetry.frames_ahead,
-                pacingSnap.filtered_adjust_ms,
-                pacingSnap.target_scale,
-                pacingSnap.current_scale,
                 postTelemetry.rb_frame_last_remote_received,
                 postTelemetry.rb_frame_last_confirmed,
+                postTelemetry.predicted_frames_outstanding,
                 postTelemetry.link_avg_ping,
                 postTelemetry.link_jitter,
                 Net::MatchRollbackPhaseName(rollbackPhase));
@@ -3232,6 +2464,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             uint16_t p2 = 0;
             Rollback::RollbackSession_GetAdvanceInputs(&p1, &p2);
             CommitRollbackAdvance(outputInputs, p1, p2);
+            s_passSawAdvance = true;
 
             const bool hadRollback = Rollback::RollbackSession_IsRollingBack();
             Rollback::NetplayLog_Write("INPUT", Rollback::RollbackSession_GetCurrentFrame(),
@@ -3247,7 +2480,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     "First post-release NORMAL Advance observed");
             }
 
-            // Count canonical sim progress for the scheduler's STAT line.
+            // Count canonical sim progress for the scheduler STAT line.
             // Rollback-replay advances re-run already-counted frames.
             if (!hadRollback) {
                 FrameScheduler_NotifySimFrame();
@@ -3257,19 +2490,19 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             return 0;
         }
 
-        // ── Hidden catch-up (§2.8.3, N = 1 + k) ─────────────────────────
-        // Generalization of the 0.6 double-tick machinery: while the
-        // CadenceDebt ledger owes hidden frames, run extra BeginFrame cycles
-        // inside this same pass (bounded by kMaxCatchupExtraPerPass, the
-        // depth headroom R − depth − 1, and the 6000 µs wall budget — all
-        // enforced in FrameScheduler_TryTakeCatchupFrame). The ledger has no
-        // debt producer on the Gekko path (legacy holds are semanticHolds),
-        // so k stays 0 until engine2 creates PredictionLimit debt at M4+.
+        // ── Done ────────────────────────────────────────────────────────
+        // Hidden catch-up (§2.8.3, N = 1 + k): while the CadenceDebt ledger
+        // owes hidden frames, run extra BeginFrame cycles inside this same
+        // pass (bounded by kMaxCatchupExtraPerPass, depth headroom
+        // R − depth − 1, and the 6000 µs wall budget — all enforced in
+        // FrameScheduler_TryTakeCatchupFrame). engine2 PredictionLimit
+        // stalls are the debt producer (create_debt=true in the adapter).
         {
             Rollback::RollbackTimesyncTelemetry catchupTelemetry{};
             Rollback::RollbackSession_GetTimesyncTelemetry(&catchupTelemetry);
             const int32_t depthHeadroom =
-                catchupTelemetry.rollback_budget - catchupTelemetry.prediction_debt - 1;
+                catchupTelemetry.rollback_budget -
+                catchupTelemetry.predicted_frames_outstanding - 1;
             if (FrameScheduler_TryTakeCatchupFrame(depthHeadroom)) {
                 // Hidden frames must consume a FRESH device sample (DECOMP
                 // §6.2: duplicating locally while the remote consumes real
@@ -3295,6 +2528,7 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                     uint16_t cp2 = 0;
                     Rollback::RollbackSession_GetAdvanceInputs(&cp1, &cp2);
                     CommitRollbackAdvance(outputInputs, cp1, cp2);
+                    s_passSawAdvance = true;
                     FrameScheduler_NotifyCatchupFrame();
                     ResetVanillaTimeoutCounters();
                     return 0;  // one more full game tick in this pass
@@ -3305,10 +2539,45 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         }
 
         s_rollbackFrameStarted = false;
+
+        if (!s_passSawAdvance) {
+            // N=0 hold pass: the engine stalled (typed HoldCause already
+            // reported to the scheduler by the adapter NextAction path).
+            // DECOMP §6.1 hold contract: −1 AND AdvanceFrame-suppression
+            // pulse AND vanilla timeout clears — plus keep the network
+            // pumping so the stall can release (INV-24 producer runs inside
+            // PollSession).
+            InputSyncHooks_SetTimesyncFreeze(true);
+            Net::Session_Update();
+            {
+                const bool pollOk = Rollback::RollbackSession_PollSession();
+                if (!pollOk || Net::ConnectionSupervisor_IsDead()) {
+                    InputSyncHooks_SetTimesyncFreeze(false);
+                    return AbortRollbackDispatcher("Peer disconnected during engine stall");
+                }
+            }
+            static uint32_t s_engineStallLogCount = 0;
+            s_engineStallLogCount++;
+            if (s_engineStallLogCount <= 5 || (s_engineStallLogCount % 120) == 0) {
+                Rollback::RollbackTimesyncTelemetry stallTelemetry{};
+                Rollback::RollbackSession_GetTimesyncTelemetry(&stallTelemetry);
+                Rollback::NetplayLog_Write("STALL", stallTelemetry.rb_frame_current,
+                    "Engine hold pass: rb_current=%d rb_remote=%d depth=%d budget=%d phase=%s count=%u",
+                    stallTelemetry.rb_frame_current,
+                    stallTelemetry.rb_frame_last_remote_received,
+                    stallTelemetry.predicted_frames_outstanding,
+                    stallTelemetry.rollback_budget,
+                    Net::MatchRollbackPhaseName(rollbackPhase),
+                    s_engineStallLogCount);
+            }
+        } else {
+            InputSyncHooks_SetTimesyncFreeze(false);
+        }
         ResetVanillaTimeoutCounters();
 
-        Rollback::NetplayLog_Write("INPUT", Rollback::RollbackSession_GetCurrentFrame(),
-            "Dispatcher: Done, breaking dispatcher loop");
+        Rollback::NetplayLog_Verbose("INPUT", Rollback::RollbackSession_GetCurrentFrame(),
+            "Dispatcher: Done, breaking dispatcher loop (advanced=%d)",
+            s_passSawAdvance ? 1 : 0);
 
         return -1;
     }
@@ -3326,7 +2595,6 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
     s_loggedFirstBeginAfterRelease = false;
     s_loggedFirstAdvanceAfterRelease = false;
     s_startupGateLogCount = 0;
-    Net::NetplayPacing_NotifyLocalMode();
     InputSyncHooks_SetTimesyncFreeze(false);
     const int result = g_origInputDispatcher(outputInputs);
     if (result == 0 && Replay::ReplayRuntime_IsReplayMatchActive()) {
@@ -3769,6 +3037,8 @@ int __cdecl Hook_InputProcess(int gameState) {
             s_winscreenFrameJustP1 = 0;
             s_winscreenFrameJustP2 = 0;
             s_winscreenWaitCount++;
+            // Frontend-phase STAT hold producer (M6): winscreen lockstep wait.
+            FrameScheduler_NotifyHold(Rollback::HoldCause::LifecycleBoundary, false);
             if (s_winscreenWaitCount <= 5 || (s_winscreenWaitCount % 120) == 0) {
                 Rollback::NetplayLog_Write("WINLOCK", -1,
                     "InputProcess waiting for remote frame: wait#%u consume=%u remote_latest=%u mode=%u sub=%u",
@@ -4205,13 +3475,19 @@ void GetTimesyncDebugInfo(TimesyncDebugInfo* out) {
         return;
     }
 
-    Net::NetplayPacingSnapshot pacingSnap{};
-    Net::NetplayPacing_GetSnapshot(&pacingSnap);
-    out->frames_ahead = pacingSnap.frames_ahead;
-    out->rate_adjust_ms = pacingSnap.filtered_adjust_ms;
+    // M6: the netplay_pacing controller is deleted (§2.8.7) — timesync debug
+    // readouts come from the scheduler snapshot + engine telemetry instead.
+    FrameSchedulerSnapshot schedSnap{};
+    FrameScheduler_GetSnapshot(&schedSnap);
+    Rollback::RollbackTimesyncTelemetry telemetry{};
+    Rollback::RollbackSession_GetTimesyncTelemetry(&telemetry);
+    out->frames_ahead = telemetry.frames_ahead;
+    out->rate_adjust_ms = schedSnap.period_adjust_us / 1000.0f;
     out->stall_frame_count =
-        pacingSnap.stall_frame_count + pacingSnap.soft_hold_count + pacingSnap.hard_hold_count;
-    out->stalled = pacingSnap.stall_active ||
-                   pacingSnap.soft_hold_active ||
-                   pacingSnap.hard_hold_active;
+        (int)(schedSnap.holds_prediction + schedSnap.holds_lifecycle +
+              schedSnap.holds_local_input + schedSnap.holds_external);
+    out->stalled = schedSnap.run_state == Rollback::RunState::PredictionPressure ||
+                   schedSnap.run_state == Rollback::RunState::ExactLifecycleBarrier ||
+                   schedSnap.run_state == Rollback::RunState::ExternalSuspension ||
+                   schedSnap.run_state == Rollback::RunState::EmergencyHold;
 }

@@ -20,6 +20,7 @@
 #include "net/pregame_sync.h"
 #include "net/session2.h"
 #include "net/sync_trace.h"
+#include "net/time_probe.h"
 #include "net/transition_barrier.h"
 #include "net/winscreen_sync.h"
 #include "core/as2_constants.h"
@@ -128,6 +129,15 @@ void PacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadL
             Rollback::RollbackSession_OnSyncHashPacket(payload, payloadLen);
             break;
         }
+
+        // --- time_probe µs RTT estimator (M6, §2.9.3) ---
+        case PacketType::TimeProbe:
+            TimeProbe_OnProbe(payload, payloadLen);
+            break;
+
+        case PacketType::TimeProbeAck:
+            TimeProbe_OnProbeAck(payload, payloadLen);
+            break;
 
         // --- Frontend starvation interrogation (INV-11) ---
         case PacketType::ResyncRequest: {

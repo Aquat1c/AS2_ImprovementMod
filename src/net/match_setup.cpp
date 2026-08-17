@@ -1436,7 +1436,14 @@ static void UpdateSyncConfirmed() {
                     "EpochAlign committed but native mode-9 exit pending (sub=%u) — holding commit consumption",
                     GetSubstate());
             }
+        } else if (!Rollback::OnlineWiring_MatchEndLadderAllows(
+                       NetTransitionKind::EpochAlign)) {
+            // INV-9 (M6): the match-end ladder refuses this commit until
+            // WinScreenExit and PostMatchDecision committed locally. The
+            // barrier keeps re-acking the held proposal; nothing is skipped.
         } else if (TransitionBarrier_ConsumeCommit(NetTransitionKind::EpochAlign)) {
+            Rollback::OnlineWiring_MatchEndLadderNotifyConsumed(
+                NetTransitionKind::EpochAlign);
             ExecuteEpochAlignCommit();
             return;
         }
@@ -1920,8 +1927,90 @@ static void RestartPregame(const char* reason) {
     }
 }
 
-// Winscreen-context escalation (pregame Idle/GameplayHandoff): the ladder
-// still applies — a Restart routes both peers to charsel under a fresh epoch.
+// ── Winscreen same-epoch realign (M6, closes M5 deviation 3) ────────────────
+// A Realign escalation latched while the winscreen stream owns the exchange
+// (pregame Idle/GameplayHandoff, native mode 9) re-runs EpochAlign for the
+// CURRENT epoch with first_phase=WinScreen; on commit both sides restart the
+// winscreen lockstep under the unchanged epoch (§4.6 step 2). Timeout falls
+// back to the fresh-epoch pregame restart (never a teardown, INV-12).
+// Note: this same-epoch re-run is deliberately exempt from the director's
+// INV-9 match-end ladder — the ladder gates the NEXT epoch's alignment.
+static bool  s_winRealignActive = false;
+static DWORD s_winRealignStartTick = 0;
+constexpr DWORD kWinRealignTimeoutMs = 5000;
+
+static bool WinRealignContextValid() {
+    return (s_phase == PregamePhase::Idle ||
+            s_phase == PregamePhase::GameplayHandoff) &&
+           GetGameMode() == MODE_WINSCREEN;
+}
+
+static void StartWinScreenRealign(const char* reason) {
+    Rollback::NetplayLog_Write("PREGAME", -1,
+        "WinScreen EpochAlign re-run START: epoch=%u reason=%s",
+        s_epoch, reason ? reason : "?");
+    FrontendInputSync_ClearRecoveryRequest();
+    TransitionBarrier_Clear(NetTransitionKind::EpochAlign, "winscreen realign");
+    TransitionBarrier_ProposeEpochAlign(
+        s_epoch, (uint8_t)FrontendPhaseId::WinScreen,
+        (uint8_t)GetGameMode(), s_sessionId);
+    s_winRealignActive = true;
+    s_winRealignStartTick = GetTickCount();
+}
+
+static void UpdateWinScreenRealign() {
+    // Peer-initiated re-run: echo a remote EpochAlign(WinScreen) proposal for
+    // the current epoch so the commit can form (both-or-neither, INV-10).
+    if (!s_winRealignActive && WinRealignContextValid()) {
+        uint32_t remoteEpoch = 0;
+        uint8_t remoteFirst = 0;
+        uint8_t remoteMode = 0;
+        if (TransitionBarrier_RemoteProposed(NetTransitionKind::EpochAlign) &&
+            TransitionBarrier_GetRemoteEpochAlign(&remoteEpoch, &remoteFirst, &remoteMode) &&
+            remoteEpoch == s_epoch &&
+            remoteFirst == (uint8_t)FrontendPhaseId::WinScreen) {
+            Rollback::NetplayLog_Write("PREGAME", -1,
+                "WinScreen EpochAlign re-run adopted from peer: epoch=%u", s_epoch);
+            TransitionBarrier_ProposeEpochAlign(
+                s_epoch, (uint8_t)FrontendPhaseId::WinScreen,
+                (uint8_t)GetGameMode(), s_sessionId);
+            s_winRealignActive = true;
+            s_winRealignStartTick = GetTickCount();
+        }
+    }
+
+    if (!s_winRealignActive) {
+        return;
+    }
+
+    if (!WinRealignContextValid()) {
+        // The winscreen ended underneath the re-run (exit route fired) — the
+        // normal ladder owns convergence from here.
+        s_winRealignActive = false;
+        TransitionBarrier_Clear(NetTransitionKind::EpochAlign, "winscreen realign aborted");
+        return;
+    }
+
+    if (TransitionBarrier_IsCommitted(NetTransitionKind::EpochAlign) &&
+        TransitionBarrier_ConsumeCommit(NetTransitionKind::EpochAlign)) {
+        s_winRealignActive = false;
+        Rollback::NetplayLog_Write("PREGAME", -1,
+            "WinScreen EpochAlign re-run COMMITTED: epoch=%u — restarting winscreen lockstep",
+            s_epoch);
+        WinScreenSync_RestartLockstep("winscreen epoch realign");
+        return;
+    }
+
+    if ((DWORD)(GetTickCount() - s_winRealignStartTick) >= kWinRealignTimeoutMs) {
+        s_winRealignActive = false;
+        TransitionBarrier_Clear(NetTransitionKind::EpochAlign, "winscreen realign timeout");
+        RestartPregame("winscreen realign timeout");
+    }
+}
+
+// Winscreen-context escalation (pregame Idle/GameplayHandoff): a Realign on
+// the winscreen stream re-runs EpochAlign under the SAME epoch (M6); charsel
+// phases realign in place; everything else restarts under a fresh epoch.
 static void HandleResyncEscalation(FrontendResyncEscalation esc) {
     if (esc == FrontendResyncEscalation::None) {
         return;
@@ -1935,8 +2024,12 @@ static void HandleResyncEscalation(FrontendResyncEscalation esc) {
         RealignCurrentEpoch("interrogation identity mismatch");
         return;
     }
-    // Everything else (Restart, or Realign outside the charsel phases, e.g.
-    // the winscreen stream): pregame restart under a fresh epoch.
+    if (esc == FrontendResyncEscalation::Realign && WinRealignContextValid()) {
+        StartWinScreenRealign("interrogation identity mismatch (winscreen stream)");
+        return;
+    }
+    // Everything else (Restart, or Realign with no owning context): pregame
+    // restart under a fresh epoch.
     RestartPregame(esc == FrontendResyncEscalation::Restart
         ? "interrogation exhausted"
         : "interrogation identity mismatch (non-charsel phase)");
@@ -2015,6 +2108,10 @@ void PregameSync_FrameUpdate() {
     // The INV-11 ladder escalation can latch in any regime (the winscreen
     // stream interrogates while pregame is idle) — consume it first.
     HandleResyncEscalation(FrontendInputSync_ConsumeResyncEscalation());
+
+    // Winscreen same-epoch realign driver (M6): runs in Idle/GameplayHandoff
+    // where the winscreen stream lives.
+    UpdateWinScreenRealign();
 
     if (s_phase == PregamePhase::Idle || s_phase == PregamePhase::GameplayHandoff) return;
 

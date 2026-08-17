@@ -163,8 +163,36 @@ int  DelayPolicy_GetEffectiveLocalDelay();
 int  DelayPolicy_GetEffectiveRemoteDelay();
 int  DelayPolicy_GetRemoteAnnouncedDelay();
 int  DelayPolicy_GetRemoteAnnouncedMaxRollback();
-int  DelayPolicy_GetProtectionWindow();
-int  DelayPolicy_GetStallThreshold();
+// (M6: DelayPolicy_GetProtectionWindow / DelayPolicy_GetStallThreshold are
+// retired with the netplay_pacing controller, §2.8.7 — no decision may read
+// a stall/protection knob; the snapshot fields report 0.)
+
+// ============================================================================
+// Coverage classification (M6, §2.9.1 / INV-6)
+// ============================================================================
+
+enum class CoverageClass : uint8_t {
+    Unknown = 0,      // no measurement yet
+    FullSpeed,        // coverage >  required
+    Marginal,         // coverage == required
+    Underbuffered,    // coverage <  required
+};
+
+inline const char* CoverageClassName(CoverageClass c) {
+    switch (c) {
+        case CoverageClass::FullSpeed:     return "FullSpeed";
+        case CoverageClass::Marginal:      return "Marginal";
+        case CoverageClass::Underbuffered: return "Underbuffered";
+        default:                           return "Unknown";
+    }
+}
+
+/// Directional coverage of the LOCAL side (peer→us): D_peer + R_local vs
+/// required = oneway_frames + max(2, oneway_frames/3), oneway from the
+/// time_probe p95 (§2.9.1). Advisory/HUD only — nothing clamps or corrects
+/// (INV-6). `out_oneway_frames`/`out_required` optional.
+CoverageClass DelayPolicy_ClassifyLocalCoverage(float* out_oneway_frames,
+                                                int* out_required);
 
 bool DelayPolicy_IsRollbackSynced();
 void DelayPolicy_OnRollbackApplied(int delay_value);

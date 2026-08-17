@@ -47,11 +47,12 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /EHa /FS")
 
 option(USE_VCPKG "Use vcpkg for dependencies" OFF)
 option(AS2_ENABLE_LEGACY_CUMULATIVE_PACKETS "Build the legacy cumulative packet experiment" OFF)
-# re0.7 M4 (plan §6): the GekkoNet backend stays the LIVE gameplay path until
-# the M6 cutover gate passes. ON  -> rollback_session.cpp (GekkoNet) + GekkoNet
-# lib/link. OFF -> rollback_session_engine2.cpp (custom engine2 adapter), no
-# GekkoNet anywhere in the build.
-option(AS2_WITH_GEKKO "Ship the GekkoNet rollback backend (until M6 cutover)" ON)
+# re0.7 M6 CUTOVER (plan §6 M6): engine2 is the LIVE gameplay path — the
+# default is OFF. ON is the legacy/fallback configuration only (§8.3 partial
+# fallback): rollback_session.cpp (GekkoNet) + GekkoNet lib/link. It must
+# keep COMPILING until the M8 field acceptance retires it for good; the
+# vendored lib/GekkoNet tree stays untouched either way.
+option(AS2_WITH_GEKKO "Legacy GekkoNet rollback backend (fallback config; default engine2)" OFF)
 option(AS2_ENABLE_NAT_TRAVERSAL "Enable NAT traversal backend integration" ON)
 option(AS2_ENABLE_UPNP_FALLBACK "Enable miniupnpc UPnP fallback mapping" ON)
 option(AS2_ENABLE_PCPNATPMP_FALLBACK "Enable libpcpnatpmp PCP/NAT-PMP fallback mapping" ON)
@@ -311,7 +312,6 @@ set(ROLLBACK_HEADERS
     include/rollback/block_digest.h
     include/rollback/determinism_verify.h
     include/rollback/engine2.h
-    include/rollback/frame_lineage.h
     include/rollback/game_snapshot.h
     include/rollback/lifecycle_window.h
     include/rollback/savestate.h
@@ -351,7 +351,7 @@ set(NET_HEADERS
     include/net/spectator_playback.h
     include/net/netplay_palette_runtime.h
     include/net/netplay_palette_storage.h
-    include/net/netplay_pacing.h
+    include/net/time_probe.h
     include/net/netplay_phase_runtime.h
     include/net/game_settings_sync.h
     include/net/nat_traversal.h
@@ -371,7 +371,6 @@ set(NET_HEADERS
     include/net/player_side_mapping.h
     include/net/barrier_protocol.h
     include/net/sync_trace.h
-    include/net/gameplay_bridge.h
 )
 
 set(TESTING_HEADERS
@@ -444,7 +443,6 @@ set(DIAGNOSTICS_SOURCES
 set(ROLLBACK_SOURCES
     src/rollback/determinism_verify.cpp
     src/rollback/engine2.cpp
-    src/rollback/frame_lineage.cpp
     src/rollback/game_snapshot.cpp
     src/rollback/savestate.cpp
     src/rollback/input_timeline.cpp
@@ -457,7 +455,7 @@ set(ROLLBACK_SOURCES
     src/rollback/rollback_combo_fx.cpp
     src/rollback/rollback_status_fx.cpp
     src/rollback/stress_hooks.cpp
-    src/rollback/online_wiring.cpp
+    src/rollback/match_director.cpp
     src/rollback/rematch_cleanup.cpp
 )
 
@@ -487,7 +485,7 @@ set(NET_SOURCES
     src/net/spectator_playback.cpp
     src/net/netplay_palette_runtime.cpp
     src/net/netplay_palette_storage.cpp
-    src/net/netplay_pacing.cpp
+    src/net/time_probe.cpp
     src/net/churn_pause.cpp
     src/net/netplay_phase_runtime.cpp
     src/net/game_settings_sync.cpp
@@ -508,7 +506,6 @@ set(NET_SOURCES
     src/net/player_side_mapping.cpp
     src/net/barrier_protocol.cpp
     src/net/sync_trace.cpp
-    src/net/gameplay_bridge.cpp
     src/net/set_tracker.cpp
 )
 
@@ -542,6 +539,7 @@ add_executable(frontend_sync_tests
     src/net/frontend_input_sync.cpp
     src/net/winscreen_sync.cpp
     src/net/delay_policy.cpp
+    src/net/time_probe.cpp
     src/net/stagesel_sync.cpp
     src/net/stage_watchdog_tracker.cpp
 )
@@ -647,6 +645,30 @@ if(AS2_WITH_GEKKO)
 
     add_test(NAME gekko_input_tests COMMAND gekko_input_tests)
 endif()
+
+# re0.7 M6: TransitionBarrier unit target (EpochAlign commit rule, Clear
+# semantics, echo-verbatim acks, ladder-kind arrival orders) — closes the M5
+# gate deviation. Links the real module with stubbed transport/logging.
+add_executable(transition_barrier_tests
+    tests/transition_barrier_tests.cpp
+    src/net/transition_barrier.cpp
+)
+
+target_include_directories(transition_barrier_tests PRIVATE
+    include
+)
+
+target_compile_definitions(transition_barrier_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(transition_barrier_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME transition_barrier_tests COMMAND transition_barrier_tests)
 
 # re0.7 M4: engine2 core unit tests + deterministic socket-free soak harness
 # (plan §7.1 T-ENG-1..12, §7.2 model) + savestate-cost microbench (§7.5 #4).

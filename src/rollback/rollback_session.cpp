@@ -10,7 +10,6 @@
  */
 
 #include "rollback/rollback_session.h"
-#include "rollback/frame_lineage.h"
 #include "rollback/resimulation.h"
 #include "rollback/determinism_verify.h"
 #include "rollback/netplay_log.h"
@@ -339,7 +338,8 @@ static DWORD AdvanceWaitElapsedMs(DWORD now) {
 }
 
 static int32_t RbFrameToGameAbsFrame(int32_t rbFrame) {
-    return FrameLineage_GameAbsFromRb(s_frameOriginAbs, rbFrame);
+    // frame_lineage retired at M6: game_abs = origin + rb (trivial mapping).
+    return s_frameOriginAbs + rbFrame;
 }
 
 // Gekko's bootstrap checkpoint is saved at rb_frame=-1, but at the first
@@ -347,7 +347,8 @@ static int32_t RbFrameToGameAbsFrame(int32_t rbFrame) {
 // for that bootstrap state and for Advance(0). Do not shift the whole
 // save/load domain by +1; only normalize the bootstrap checkpoint.
 static int32_t RbCheckpointFrameToGameAbsFrame(int32_t rbFrame) {
-    return FrameLineage_GameAbsFromCheckpoint(s_frameOriginAbs, rbFrame);
+    // Bootstrap checkpoint (rb=-1) reports the same abs frame as Advance(0).
+    return s_frameOriginAbs + (rbFrame < 0 ? 0 : rbFrame);
 }
 
 static int32_t CurrentGameAbsFrame() {
@@ -1150,28 +1151,23 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     const char* localRole = (s_localPlayer == 0) ? "P1" : "P2";
     const int visibleDelay = Net::DelayPolicy_GetActiveDelay();
     const int effectiveDelay = Net::DelayPolicy_GetEffectiveLocalDelay();
-    const int protectionWindow = Net::DelayPolicy_GetProtectionWindow();
-    LOG_INFO("[RollbackSession] BEGIN: local=%s(h%d) visible_delay=%u effective_delay=%u max_rollback=%u protection_window=%u stall_threshold=%u frame_origin_abs=%d rb_start=0 state_size=%u",
+    LOG_INFO("[RollbackSession] BEGIN: local=%s(h%d) visible_delay=%u effective_delay=%u max_rollback=%u frame_origin_abs=%d rb_start=0 state_size=%u",
         localRole,
         s_localHandle,
         (unsigned)visibleDelay,
         (unsigned)effectiveDelay,
         (unsigned)config.rollback_budget,
-        (unsigned)protectionWindow,
-        (unsigned)Net::DelayPolicy_GetStallThreshold(),
         s_frameOriginAbs,
         (unsigned)sizeof(GekkoState));
 
     NetplayLog_Write("GEKKO", 0,
-        "BEGIN: rb_start=0 frame_origin_abs=%d local=P%d(h%d) remote=P%d(h%d) visible_delay=%d effective_delay=%d rollback_budget=%d protection_window=%d stall_threshold=%d state_kb=%zu baseline=0x%08X",
+        "BEGIN: rb_start=0 frame_origin_abs=%d local=P%d(h%d) remote=P%d(h%d) visible_delay=%d effective_delay=%d rollback_budget=%d state_kb=%zu baseline=0x%08X",
         s_frameOriginAbs,
         s_localPlayer + 1, s_localHandle,
         s_remotePlayer + 1, s_remoteHandle,
         visibleDelay,
         effectiveDelay,
         config.rollback_budget,
-        protectionWindow,
-        Net::DelayPolicy_GetStallThreshold(),
         sizeof(GekkoState) / 1024, config.baseline_checksum);
 
     NetplayLog_Write("GEKKO", 0,
@@ -1258,6 +1254,20 @@ void RollbackSession_End() {
 
     LOG_INFO("[RollbackSession] END: rb_frame=%d game_abs_frame=%d rollbacks=%d max_depth=%d",
         finalRbFrame, finalGameAbsFrame, s_totalRollbacks, s_maxRollbackDepth);
+}
+
+void RollbackSession_SuspendBetweenMatches(const char* reason) {
+    // Gekko engine lifetime is per-match: a boundary suspension IS an end.
+    NetplayLog_Write("GEKKO", s_active ? s_currentRbFrame : -1,
+        "SuspendBetweenMatches -> End (Gekko per-match lifetime): %s",
+        reason ? reason : "?");
+    RollbackSession_End();
+}
+
+void RollbackSession_SetMatchExitPending(bool pending) {
+    // No-op: GekkoNet owns its own lifecycle timing; the exact-input window
+    // mirror is an engine2 concept (§2.7.6).
+    (void)pending;
 }
 
 bool RollbackSession_IsActive() {

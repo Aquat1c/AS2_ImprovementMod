@@ -238,6 +238,24 @@ void WinScreenSync_Begin() {
         FrontendInputSync_GetFrontendDelay());
 }
 
+void WinScreenSync_RestartLockstep(const char* reason) {
+    if (!s_initialized) {
+        return;
+    }
+    Rollback::NetplayLog_Write(
+        "WINLOCK", -1,
+        "Restart lockstep under SAME epoch (%s): was_active=%d consume=%u",
+        reason ? reason : "?",
+        s_active ? 1 : 0,
+        FrontendInputSync_GetConsumeFrame());
+    if (s_active) {
+        FrontendInputSync_StopWinScreenInputPhase("winscreen realign restart");
+        FrontendInputSync_ClearPhaseBarrier();
+    }
+    ResetState();
+    WinScreenSync_Begin();
+}
+
 void WinScreenSync_Abort() {
     if (!s_active && !s_handoffPending) {
         return;

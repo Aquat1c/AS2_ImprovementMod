@@ -81,6 +81,10 @@ struct Transport2Stats {
     // liveness anchor (first worker poll after StartHost/StartJoin) once
     // anything was ever received; 0xFFFFFFFF = nothing ever received.
     uint32_t protocol_silence_ms;
+    // Bytes of reliable data still awaiting ENet-level acknowledgement on
+    // the active peer (M6: lets the sticky Disconnect terminal linger until
+    // the goodbye is actually acked instead of guessing with a fixed window).
+    uint32_t peer_reliable_in_transit;
 };
 
 bool Transport2_Init();

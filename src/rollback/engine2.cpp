@@ -84,7 +84,15 @@ uint16_t RollbackEngine::RemoteValueOrPredict(uint32_t frame, bool* predicted) {
         return remote_.Value(frame);
     }
     if (predicted) *predicted = true;
-    return predictor_.Held();
+    uint16_t value = predictor_.Held();
+    // Test-only prediction tap (M6 stress hook, §2.7.8 "StressHooks_* query
+    // points"): lets the harness corrupt a prediction to force a genuine
+    // mismatch/rollback without touching actuals (which would be a Conflict
+    // terminal, INV-19). Null in production unless stress hooks install it.
+    if (prediction_tap_) {
+        value = prediction_tap_(value) & ENGINE_INPUT_VALID_MASK;
+    }
+    return value;
 }
 
 // ============================================================================

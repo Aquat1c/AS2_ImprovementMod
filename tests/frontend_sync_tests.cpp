@@ -734,6 +734,12 @@ bool Session_IsConnected() {
     return g_sessionConnected;
 }
 
+// time_probe.cpp (linked since M6 for delay_policy's probe re-feed) sends
+// its probes through the raw session send — swallow them here.
+bool Session_SendPacket(uint8_t, PacketType, const void*, size_t, bool) {
+    return true;
+}
+
 SessionRole Session_GetRole() {
     return g_sessionRole;
 }

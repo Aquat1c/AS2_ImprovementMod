@@ -2,6 +2,7 @@
 
 #include "net/barrier_protocol.h"
 #include "net/delay_policy.h"
+#include "net/time_probe.h"
 #include "net/winscreen_sync.h"
 #include "core/game_state.h"
 #if !defined(AS2_FRONTEND_SYNC_TESTING)
@@ -198,6 +199,17 @@ static FrontendDelayProposalDetails ComputeDelayProposalDetails() {
         details.base_delay = details.configured_floor;
     }
     details.recommended_delay = ClampFrontendDelay(details.base_delay);
+    // M6 (§2.9.3): once the µs time_probe window exists, the LATCHED curve
+    // is authoritative — frontend_delay = ceil(oneway p95) + 1 (+2 once
+    // oneway >= 6 frames), floored at the configured delay, ramped max
+    // 1 frame per 0.15 s up / 0.30 s down. The ms-derived value above stays
+    // the pre-window fallback.
+    if (TimeProbe_HasMeasurement()) {
+        const int latched = TimeProbe_GetLatchedFrontendDelay(
+            (int)details.configured_floor, (int)details.recommended_delay);
+        details.recommended_delay = ClampFrontendDelay((uint16_t)latched);
+        details.one_way_frames = TimeProbe_GetOneWayFramesP95(16667u);
+    }
     return details;
 }
 
