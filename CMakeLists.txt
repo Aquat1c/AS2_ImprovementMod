@@ -448,6 +448,7 @@ set(NET_SOURCES
     src/net/frontend_input_sync.cpp
     src/net/packet_router.cpp
     src/net/transport2.cpp
+    src/net/link_emulator.cpp
     src/net/session2.cpp
     src/net/spectator_protocol.cpp
     src/net/spectator_manager.cpp
@@ -545,6 +546,32 @@ set_target_properties(frame_arithmetic_tests PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
 )
+
+# ---------------------------------------------------------------------------
+# link_emulator_tests — the emulator that makes high-RTT claims testable must
+# itself be trustworthy (ordering, honest latency, reliable-safe loss).
+# ---------------------------------------------------------------------------
+add_executable(link_emulator_tests
+    tests/link_emulator_tests.cpp
+    src/net/link_emulator.cpp
+)
+
+target_include_directories(link_emulator_tests PRIVATE
+    include
+)
+
+target_compile_definitions(link_emulator_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+    AS2_LINK_EMULATOR_TESTING
+)
+
+set_target_properties(link_emulator_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME link_emulator_tests COMMAND link_emulator_tests)
 
 add_test(NAME frame_arithmetic_tests COMMAND frame_arithmetic_tests)
 

@@ -41,6 +41,8 @@
 #include "net/enet_transport.h"
 #include "net/session_manager.h"
 #include "net/connection_supervisor.h"
+#include "net/link_emulator.h"
+#include "net/time_probe.h"
 #include "net/continue_flow.h"
 #include "net/transition_barrier.h"
 #include "net/mode_ownership.h"
@@ -503,6 +505,24 @@ static void DeferredInit() {
     LogInitStep("ConnectionSupervisor_Init", "BEGIN");
     Net::ConnectionSupervisor_Init();
     LogInitStep("ConnectionSupervisor_Init", "END");
+
+    // TimeProbe is the delay policy's PRIMARY latency source (percentiles and
+    // jitter; delay_policy falls back to ENet's coarse average without it).
+    // It was never initialised, so s_initialized stayed false, FrameUpdate
+    // returned immediately, and no probe was ever sent — every session in the
+    // project's history reported rtt_p90=0, rtt_p95=0, jitter95=0 and ran the
+    // delay policy on the fallback path.
+    LogInitStep("TimeProbe_Init", "BEGIN");
+    Net::TimeProbe_Init();
+    LogInitStep("TimeProbe_Init", "END");
+
+    // Test link emulation: armed from as2_stress.cfg before any session can
+    // start, so the very first handshake already experiences the emulated
+    // latency (a link that only appears once gameplay begins would leave the
+    // pregame/frontend paths untested at high RTT).
+    LogInitStep("LinkEmulator_LoadConfig", "BEGIN");
+    Net::LinkEmulator_LoadConfig();
+    LogInitStep("LinkEmulator_LoadConfig", "END");
     LogInitStep("TransitionBarrier_Init", "BEGIN");
     Net::TransitionBarrier_Init();
     LogInitStep("TransitionBarrier_Init", "END");
@@ -1182,7 +1202,20 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
     out->p2_vertical_position = localHud.vertical_position;
 
     // --- Ping: from session stats ---
-    out->ping_ms = sessionSnap.stats.rtt_ms;
+    // Show the SAME latency the netcode reacts to. The HUD used to read
+    // ENet's internal round-trip estimate, which is measured a layer below
+    // the delay policy's TimeProbe measurement — the two can disagree, and
+    // when they do the player is reading a number nothing else uses. The
+    // policy's measurement is the one that sets delay and prediction depth,
+    // so it is the one worth showing; ENet's remains the fallback for the
+    // window before TimeProbe has enough samples.
+    {
+        Net::DelayPolicySnapshot pingSnap{};
+        Net::DelayPolicy_GetSnapshot(&pingSnap);
+        out->ping_ms = pingSnap.measurement_valid
+                           ? pingSnap.measured_avg_ping_ms
+                           : sessionSnap.stats.rtt_ms;
+    }
 
     // --- Delay and rollback: from rollback session if active ---
     if (rollbackActive) {

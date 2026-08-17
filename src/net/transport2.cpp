@@ -11,6 +11,7 @@
 #include <enet/enet.h>
 
 #include "net/transport2.h"
+#include "net/link_emulator.h"
 #include "net/enet_transport.h"
 #include "net/session_types.h"
 #include "rollback/netplay_log.h"
@@ -437,6 +438,30 @@ static void WorkerThreadMain() {
             }
         }
 
+        // Release link-emulated packets whose delay has elapsed. Runs before
+        // servicing so a due packet is never held an extra iteration.
+        if (LinkEmulator_IsActive()) {
+            const uint32_t nowMs = GetTickCount();
+            Transport2Event due{};
+            while (LinkEmulator_PopDue(&due, sizeof(due), nowMs)) {
+                PushTransportEvent(due);
+            }
+            // Engagement evidence, once a second. An emulator that armed but
+            // never saw a packet would otherwise look identical to one that
+            // is shaping the link — which is exactly how a "high RTT" run
+            // gets reported as passing without ever being high RTT.
+            static DWORD s_lastEmuLogMs = 0;
+            if (s_lastEmuLogMs == 0 || (DWORD)(nowMs - s_lastEmuLogMs) >= 1000) {
+                s_lastEmuLogMs = nowMs;
+                LinkEmulatorStats st{};
+                LinkEmulator_GetStats(&st);
+                Rollback::NetplayLog_Write("LINKEMU", -1,
+                    "held=%u peak=%u delayed=%u released=%u dropped=%u overflow=%u",
+                    st.queued, st.peak_queued, st.total_delayed,
+                    st.total_released, st.total_dropped, st.overflow_forced);
+            }
+        }
+
         ENetEvent ev{};
         while (!s_stopRequested.load() && Transport_Service(0, &ev) > 0) {
             switch (ev.type) {
@@ -502,7 +527,20 @@ static void WorkerThreadMain() {
                     if (out.packet_len > 0 && ev.packet->data) {
                         memcpy(out.packet_data, ev.packet->data, out.packet_len);
                     }
-                    PushTransportEvent(out);
+
+                    // Test link emulation (off unless as2_stress.cfg arms it).
+                    // Everything inbound goes through here — session, pregame,
+                    // frontend lockstep, gameplay, SyncHash, TimeProbe — so a
+                    // simulated link is the same link for every subsystem, and
+                    // TimeProbe measures it exactly as it measures a real one.
+                    if (LinkEmulator_IsActive()) {
+                        const bool reliable =
+                            (ev.packet->flags & ENET_PACKET_FLAG_RELIABLE) != 0;
+                        LinkEmulator_Submit(&out, sizeof(out), reliable,
+                                            out.transport_tick_ms);
+                    } else {
+                        PushTransportEvent(out);
+                    }
 
                     enet_packet_destroy(ev.packet);
                     break;
