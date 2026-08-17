@@ -696,6 +696,8 @@ void RollbackDebug_RenderImGui(bool* p_open) {
                     fr.transactions_per_sec, fr.achieved_min, fr.achieved_max,
                     fr.real_corrections_per_sec, fr.truncated_per_sec);
             }
+            // The independent number: game steps actually executed.
+            ImGui::Text("Game re-simulated: %u ticks/s", fr.replay_ticks_per_sec);
             // The actual verdict: replayed frames that failed to reproduce.
             if (fr.replay_verifications > 0) {
                 const bool clean = fr.replay_mismatches == 0;

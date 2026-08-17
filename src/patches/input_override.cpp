@@ -2520,6 +2520,13 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
             s_passSawAdvance = true;
 
             const bool hadRollback = Rollback::RollbackSession_IsRollingBack();
+            // Independent witness: this is the real tick site — returning 0
+            // below hands the game one full simulation step. Counted here so
+            // the trace can compare "frames the engine says it replayed"
+            // against "times the game was actually stepped".
+            if (hadRollback) {
+                Rollback::RollbackSession_NoteReplayTickExecuted();
+            }
             // Verbose since 2026-08-17: at forced deep-rollback depth 30 this
             // line fires ~1900x/s (each replay tick is an Advance) — the
             // FORCED per-second line + rollback-begin depth lines carry the

@@ -464,8 +464,15 @@ void NetplayHud_Render() {
         // has repeatedly (and correctly) refused to take the logs' word for it.
         // FORCE:N present == every frame is executing a depth-N restore+replay.
         if (const int forced = Rollback::StressHooks_GetForcedRollbackDepth()) {
+            // Report the last FORCED transaction's depth, not the last
+            // transaction's: genuine depth-1 mispredictions interleave with
+            // the forced ones ~30x/s, so a blended figure reads as a 1 and
+            // makes per-frame depth-30 forcing look like it never ran.
+            Rollback::ForcedRollbackLiveStats fr{};
+            Rollback::RollbackSession_GetForcedStats(&fr);
             const size_t len = strlen(stats);
-            snprintf(stats + len, sizeof(stats) - len, "  FORCE:%d", forced);
+            snprintf(stats + len, sizeof(stats) - len, "  FORCE:%u/%d @%uHz",
+                     fr.last_forced_depth, forced, fr.transactions_per_sec);
         }
 
         // Coverage badge (M6, INV-6): the delay-policy verdict is shown,

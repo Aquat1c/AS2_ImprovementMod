@@ -381,6 +381,10 @@ void RollbackEngine::MarkMismatch(uint32_t frame) {
     if (!pending_mismatch_valid_ || frameBefore(frame, pending_mismatch_)) {
         pending_mismatch_ = frame;
         pending_mismatch_valid_ = true;
+        // A genuine correction always wins the earliest-frame rule, so it
+        // also takes ownership of the pending transaction's provenance: the
+        // next BeginRollback is a REAL rollback, not a synthesized one.
+        pending_mismatch_forced_ = false;
     }
 }
 
@@ -528,6 +532,7 @@ EngineAction RollbackEngine::NextAction() {
             forced_rollback_done_valid_ = true;
             pending_mismatch_ = sim_frontier_ - depth;
             pending_mismatch_valid_ = true;
+            pending_mismatch_forced_ = true;
             ++stats_.forced_transactions;  // unambiguous live evidence
             action.kind = EngineActionKind::Rollback;
             action.frame = pending_mismatch_;
@@ -629,6 +634,15 @@ bool RollbackEngine::CommitAdvance(uint32_t frame, uint64_t pre_state_hash,
 // Rollback transaction (§2.7.5)
 // ============================================================================
 
+bool RollbackEngine::PeekExecPreHash(uint32_t frame, uint64_t* out) const {
+    const ExecRecord& rec = exec_[frame % exec_.size()];
+    if (!rec.valid || !rec.committed || rec.frame != frame || rec.epoch != epoch_) {
+        return false;
+    }
+    if (out) *out = rec.pre_hash;
+    return true;
+}
+
 bool RollbackEngine::BeginRollback(uint32_t from) {
     if (!armed_ || terminal_ != EngineTerminal::None) return false;
     if (in_rollback_ || !pending_mismatch_valid_ || from != pending_mismatch_ ||
@@ -650,6 +664,18 @@ bool RollbackEngine::BeginRollback(uint32_t from) {
     ++stats_.rollbacks;
     stats_.last_rollback_from = from;
     stats_.last_rollback_length = depth;
+    // Provenance matters to every readout: a forced depth-30 transaction and
+    // a genuine depth-1 misprediction are BOTH rollbacks, and reporting them
+    // through one "last rollback depth" is what made per-frame depth-30
+    // forcing look like it was never happening.
+    stats_.last_rollback_forced = pending_mismatch_forced_;
+    if (pending_mismatch_forced_) {
+        stats_.last_forced_rollback_length = depth;
+    } else {
+        ++stats_.real_rollbacks;
+        stats_.last_real_rollback_length = depth;
+    }
+    pending_mismatch_forced_ = false;
     if (depth > stats_.max_rollback_depth) stats_.max_rollback_depth = depth;
     return true;
 }
@@ -695,12 +721,21 @@ bool RollbackEngine::CommitReplayFrame(uint32_t frame, uint64_t pre_state_hash,
     // Only compares when the replay consumed exactly what the original
     // execution did: a real correction legitimately changes the state, and a
     // record from another epoch describes different state identity entirely.
+    last_replay_verify_ = ReplayVerify{};
+    last_replay_verify_.frame = frame;
+    last_replay_verify_.actual = pre_state_hash;
+    last_replay_verify_.inputs[0] = replay_pending_inputs_[0];
+    last_replay_verify_.inputs[1] = replay_pending_inputs_[1];
+    last_replay_verify_.remote_predicted = replay_pending_predicted_;
     if (rec->valid && rec->committed && rec->frame == frame &&
         rec->epoch == epoch_ &&
         rec->inputs[0] == replay_pending_inputs_[0] &&
         rec->inputs[1] == replay_pending_inputs_[1]) {
+        last_replay_verify_.checked = true;
+        last_replay_verify_.expected = rec->pre_hash;
+        last_replay_verify_.match = (rec->pre_hash == pre_state_hash);
         ++stats_.replay_verifications;
-        if (rec->pre_hash != pre_state_hash) {
+        if (!last_replay_verify_.match) {
             ++stats_.replay_mismatches;
             stats_.last_replay_mismatch_frame = frame;
             stats_.last_replay_expect_hash = rec->pre_hash;

@@ -155,6 +155,12 @@ int32_t RollbackSession_RbFrameToGameAbs(int32_t rb_frame);
 /// Whether the current advance event is a rollback resimulation frame.
 bool RollbackSession_IsRollingBack();
 
+/// Called by the dispatcher immediately before it steps the game for a
+/// rollback-replay advance. This is the ONE tick count the engine does not
+/// produce itself, so it is what distinguishes "the engine replayed 30
+/// frames" from "the game was actually simulated 30 times".
+void RollbackSession_NoteReplayTickExecuted();
+
 /// Whether the session has completed its initial sync and is producing game events.
 bool RollbackSession_IsSessionRunning();
 
@@ -282,6 +288,14 @@ struct ForcedRollbackLiveStats {
     // save/restore, caught locally at the exact frame.
     uint32_t    replay_verifications;
     uint32_t    replay_mismatches;
+    // Game steps actually executed for replays in the last second, counted at
+    // the dispatcher's tick site rather than by the engine.
+    uint32_t    replay_ticks_per_sec;
+    // Depth of the last transaction of each kind, kept apart on purpose: a
+    // depth-1 misprediction lands between forced transactions, and a single
+    // blended "last depth" reports the 1.
+    uint32_t    last_forced_depth;
+    uint32_t    last_real_depth;
     const char* gate_reason;
     const char* config_source;     // as2_stress.cfg path, or nullptr
 };

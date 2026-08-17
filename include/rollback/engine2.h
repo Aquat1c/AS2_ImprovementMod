@@ -353,6 +353,14 @@ public:
     struct Stats {
         uint32_t rollbacks = 0;
         uint32_t forced_transactions = 0;  // SetForcedRollback-synthesized
+        uint32_t real_rollbacks = 0;       // genuine prediction corrections
+        // Depth of the last transaction OF EACH KIND. Reporting one blended
+        // "last rollback depth" is what hid per-frame depth-30 forcing: a
+        // depth-1 misprediction lands between forced transactions and every
+        // readout showed the 1.
+        bool     last_rollback_forced = false;
+        uint32_t last_forced_rollback_length = 0;
+        uint32_t last_real_rollback_length = 0;
         uint32_t max_rollback_depth = 0;
         uint32_t last_rollback_from = 0;
         uint32_t last_rollback_length = 0;
@@ -378,6 +386,25 @@ public:
         uint64_t last_replay_actual_hash = 0;
     };
     const Stats& GetStats() const { return stats_; }
+
+    /// Outcome of the most recent CommitReplayFrame verification, for the
+    /// forensic trace: what the frame produced the FIRST time versus what the
+    /// replay just produced, and whether the comparison was even possible.
+    struct ReplayVerify {
+        bool     checked = false;   // false = inputs differed / other epoch
+        bool     match = false;
+        uint32_t frame = 0;
+        uint64_t expected = 0;      // pre-state hash of the original execution
+        uint64_t actual = 0;        // pre-state hash of the replay
+        uint16_t inputs[2] = {0, 0};
+        bool     remote_predicted = false;
+    };
+    const ReplayVerify& LastReplayVerify() const { return last_replay_verify_; }
+
+    /// Recorded pre-state hash for an executed frame, if the ring still holds
+    /// it in this epoch. Read-only; used by the trace to show what a replay is
+    /// expected to reproduce BEFORE it runs.
+    bool PeekExecPreHash(uint32_t frame, uint64_t* out) const;
 
 private:
     struct ExecRecord {
@@ -500,6 +527,8 @@ private:
 
     RunState last_run_state_ = RunState::Running;
     Stats stats_{};
+    ReplayVerify last_replay_verify_{};
+    bool pending_mismatch_forced_ = false;
 };
 
 } // namespace Rollback

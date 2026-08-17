@@ -21,6 +21,7 @@
 
 #include "core/game_state.h"
 #include "core/as2_constants.h"
+#include "rollback/game_snapshot.h"
 #include "net/connection_supervisor.h"
 #include "net/delay_policy.h"
 #include "net/frontend_input_sync.h"
@@ -405,6 +406,76 @@ static bool     s_forcedFightWindowValid = false;
 // completed one-second window of executed transactions.
 static ForcedRollbackLiveStats s_forcedLive = {};
 
+// ── Forced-rollback forensic trace ─────────────────────────────────────────
+// Every number above is the ENGINE describing itself. That is exactly what a
+// broken forcing path would also report, so the trace below is built only
+// from things the engine does not own: values read straight out of live game
+// memory before and after the restore (did the GAME rewind?), a wall clock
+// around the transaction (did work actually happen?), and the two hashes the
+// verification compares (is the replay reproducing the original?).
+//
+// One full transaction is traced per second — enough to read, cheap enough
+// not to move the frame budget (the 253 KB/frame CRC lesson).
+struct ForcedTrace {
+    bool     armed = false;          // this transaction is the one being traced
+    uint32_t from = 0;
+    uint32_t until = 0;
+    uint32_t depth = 0;
+    uint32_t replayed = 0;
+    uint32_t verified = 0;
+    uint32_t mismatched = 0;
+    uint32_t unverifiable = 0;
+    LARGE_INTEGER start_qpc = {};
+    // Live game-memory witnesses, sampled either side of the restore.
+    uint32_t game_frame_before = 0;
+    uint32_t game_frame_after = 0;
+    int32_t  p1x_before = 0;
+    int32_t  p1x_after = 0;
+    uint16_t hp0_before = 0;
+    uint16_t hp0_after = 0;
+    uint64_t live_hash_before = 0;   // hash of live memory before the restore
+    uint64_t live_hash_after = 0;    // ... and after: MUST differ on a rewind
+    uint64_t expect_frontier_hash = 0;
+};
+static ForcedTrace s_trace = {};
+static DWORD s_traceLastMs = 0;
+
+// Independent game-tick witness: incremented by the DISPATCHER at the actual
+// tick site (input_override), not by the engine. If the engine claims 30
+// replay frames and this says 0, the ticks never ran.
+static uint32_t s_replayTicksExecuted = 0;
+static uint32_t s_replayTicksWindow = 0;
+
+// Live game-memory sample, read defensively (the game can be mid-teardown).
+struct GameWitness {
+    uint32_t sim_frame = 0;
+    int32_t  p1_x = 0;
+    uint16_t hp0 = 0;
+    uint16_t hp1 = 0;
+};
+static GameWitness ReadGameWitness() {
+    GameWitness w{};
+    __try {
+        w.sim_frame = ReadMemory<uint32_t>(ADDR_FRAME_SIMULATION);
+        // Entity +184 is the sub-pixel X the renderer divides by 10
+        // (sub_4C6B60). Any live sim word would do; this one moves visibly
+        // every frame during combat, which makes the rewind readable.
+        w.p1_x = (int32_t)ReadMemory<int16_t>((uint32_t)ADDR_P1_ENTITY_BASE + 184);
+        uint32_t rng = 0;
+        ReadSyncHashDiagnostics(&rng, &w.hp0, &w.hp1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return w;
+}
+
+static double QpcMicros(const LARGE_INTEGER& start) {
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    if (freq.QuadPart == 0) return 0.0;
+    return (double)(now.QuadPart - start.QuadPart) * 1e6 / (double)freq.QuadPart;
+}
+
 // Stress hook application (M6 tap + post-M8 forced-rollback depth): kept in
 // one place so every arm/rotate/poll site applies the identical mapping.
 static void ApplyStressHooks(RollbackEngine& engine) {
@@ -458,6 +529,8 @@ static void ApplyStressHooks(RollbackEngine& engine) {
         }
     }
     s_forcedLive.effective_depth_now = forced;
+    s_forcedLive.last_forced_depth = engine.GetStats().last_forced_rollback_length;
+    s_forcedLive.last_real_depth = engine.GetStats().last_real_rollback_length;
     engine.SetForcedRollback(forced);
 }
 
@@ -777,9 +850,35 @@ EventResult RollbackSession_ProcessNextEvent() {
                 LOG_ERROR("[RollbackSession/engine2] replay pre-save failed at %u", frame);
                 return EventResult::Error;
             }
+            const bool traceThisFrame = s_trace.armed;
+            uint64_t expectBefore = 0;
+            const bool haveExpect =
+                traceThisFrame && s_engine.PeekExecPreHash(frame, &expectBefore);
             if (!s_engine.CommitReplayFrame(frame, hash, rng, hp0, hp1)) {
                 ReportEngineTerminal();
                 return EventResult::Error;
+            }
+            if (traceThisFrame) {
+                const auto& v = s_engine.LastReplayVerify();
+                ++s_trace.replayed;
+                if (v.checked) {
+                    ++s_trace.verified;
+                    if (!v.match) ++s_trace.mismatched;
+                } else {
+                    ++s_trace.unverifiable;
+                }
+                const GameWitness w = ReadGameWitness();
+                NetplayLog_Write("FORCEDTRACE", RbFrame(frame),
+                    "  replay %2u/%u f%u in=(P1 0x%04X,P2 0x%04X)%s "
+                    "pre_hash=0x%016llX expect=0x%016llX %s | game sim_frame=%u p1_x=%d hp=%u/%u",
+                    s_trace.replayed, s_trace.depth, frame,
+                    v.inputs[0], v.inputs[1],
+                    v.remote_predicted ? " PREDICTED" : "",
+                    (unsigned long long)v.actual,
+                    (unsigned long long)(haveExpect ? expectBefore : v.expected),
+                    v.checked ? (v.match ? "MATCH" : "*** MISMATCH ***")
+                              : "(no baseline: inputs differ or new frame)",
+                    w.sim_frame, w.p1_x, w.hp0, w.hp1);
             }
             s_advP1 = inputs[0];
             s_advP2 = inputs[1];
@@ -805,6 +904,40 @@ EventResult RollbackSession_ProcessNextEvent() {
                 ReportEngineTerminal();
                 return EventResult::Error;
             }
+
+            // Arm the forensic trace for at most one transaction per second.
+            {
+                const DWORD nowMs = GetTickCount();
+                // Trace FORCED transactions only. Sampling "whatever rolled
+                // back first this second" kept landing on a depth-1
+                // misprediction and made the trace itself misleading.
+                const bool wantTrace =
+                    StressHooks_IsEnabled() &&
+                    StressHooks_GetForcedRollbackDepth() > 0 &&
+                    s_engine.GetStats().last_rollback_forced &&
+                    (s_traceLastMs == 0 || (DWORD)(nowMs - s_traceLastMs) >= 1000);
+                s_trace = ForcedTrace{};
+                if (wantTrace) {
+                    s_traceLastMs = nowMs;
+                    s_trace.armed = true;
+                    s_trace.from = action.frame;
+                    s_trace.until = action.replay_until;
+                    s_trace.depth = s_engine.GetStats().last_rollback_length;
+                    QueryPerformanceCounter(&s_trace.start_qpc);
+                    s_replayTicksExecuted = 0;
+                    // Witness the LIVE game state before the restore touches
+                    // it, plus a hash of live memory. If the restore is a
+                    // no-op these are identical after it, and no amount of
+                    // engine bookkeeping can hide that.
+                    const GameWitness before = ReadGameWitness();
+                    s_trace.game_frame_before = before.sim_frame;
+                    s_trace.p1x_before = before.p1_x;
+                    s_trace.hp0_before = before.hp0;
+                    GameSnapshot_HashGameplayLive(&s_trace.live_hash_before);
+                    s_engine.PeekExecPreHash(action.frame, &s_trace.expect_frontier_hash);
+                }
+            }
+
             // Tag-validated restore (fail-closed, §2.7.5).
             if (!StateHistory_LoadFrameTagged(RbFrame(action.frame), s_epoch)) {
                 snprintf(s_sessionError, sizeof(s_sessionError),
@@ -818,6 +951,37 @@ EventResult RollbackSession_ProcessNextEvent() {
                 "engine2 rollback begin: from=%d until=%d depth=%u",
                 RbFrame(action.frame), RbFrame(action.replay_until),
                 s_engine.GetStats().last_rollback_length);
+
+            if (s_trace.armed) {
+                const GameWitness after = ReadGameWitness();
+                s_trace.game_frame_after = after.sim_frame;
+                s_trace.p1x_after = after.p1_x;
+                s_trace.hp0_after = after.hp0;
+                GameSnapshot_HashGameplayLive(&s_trace.live_hash_after);
+                const bool rewound =
+                    s_trace.live_hash_before != s_trace.live_hash_after;
+                NetplayLog_Write("FORCEDTRACE", RbFrame(action.frame),
+                    "=== FORCED TX: restore f%d, replay to f%d, depth=%u ===",
+                    RbFrame(action.frame), RbFrame(action.replay_until),
+                    s_trace.depth);
+                NetplayLog_Write("FORCEDTRACE", RbFrame(action.frame),
+                    "  RESTORE %s: live_hash 0x%016llX -> 0x%016llX | "
+                    "game sim_frame %u -> %u | p1_x %d -> %d | p1_hp %u -> %u | "
+                    "slot_expect_hash=0x%016llX",
+                    rewound ? "REWOUND THE GAME" : "*** NO-OP: LIVE STATE UNCHANGED ***",
+                    (unsigned long long)s_trace.live_hash_before,
+                    (unsigned long long)s_trace.live_hash_after,
+                    s_trace.game_frame_before, s_trace.game_frame_after,
+                    s_trace.p1x_before, s_trace.p1x_after,
+                    s_trace.hp0_before, s_trace.hp0_after,
+                    (unsigned long long)s_trace.expect_frontier_hash);
+                if (!rewound) {
+                    LOG_NETPLAY(LOG_WARNING,
+                        "[Forced] Restore did not change live game state at frame %d — "
+                        "the rollback is not rewinding anything",
+                        RbFrame(action.frame));
+                }
+            }
             // First replay frame is emitted by the next call in this loop.
             return RollbackSession_ProcessNextEvent();
         }
@@ -919,10 +1083,42 @@ void DrainDelayedStreamQueue() {
 
 // Forced-deep-rollback per-second visibility line (declared above).
 void NoteRollbackTransactionDone(bool truncated) {
+    if (s_trace.armed) {
+        const double us = QpcMicros(s_trace.start_qpc);
+        const GameWitness end = ReadGameWitness();
+        // game_ticks is counted by the DISPATCHER at the real tick site, so
+        // it is the one number here the engine cannot inflate: it says how
+        // many times the game was actually stepped during this transaction.
+        NetplayLog_Write("FORCEDTRACE", RbFrame(s_engine.SimFrontier()),
+            "=== TX END%s: depth=%u replayed=%u verified=%u mismatched=%u "
+            "unverifiable=%u | game_ticks_executed=%u | %.0f us "
+            "(%.1f us/frame) | frontier now f%d sim_frame=%u p1_x=%d ===",
+            truncated ? " (TRUNCATED AT BOUNDARY)" : "",
+            s_trace.depth, s_trace.replayed, s_trace.verified,
+            s_trace.mismatched, s_trace.unverifiable, s_replayTicksExecuted,
+            us, s_trace.replayed ? us / (double)s_trace.replayed : 0.0,
+            RbFrame(s_engine.SimFrontier()), end.sim_frame, end.p1_x);
+        if (s_replayTicksExecuted < s_trace.replayed) {
+            LOG_NETPLAY(LOG_WARNING,
+                "[Forced] Engine replayed %u frames but the dispatcher only stepped "
+                "the game %u times — the replay is not re-simulating",
+                s_trace.replayed, s_replayTicksExecuted);
+        }
+        s_trace.armed = false;
+    }
     const int cfgDepth = StressHooks_IsEnabled()
         ? StressHooks_GetForcedRollbackDepth() : 0;
     if (cfgDepth <= 0) return;
-    const uint32_t depth = s_engine.GetStats().last_rollback_length;
+    const auto& estats = s_engine.GetStats();
+    if (!estats.last_rollback_forced) {
+        // A genuine misprediction correction. It is a real rollback and it
+        // belongs in real_corrections, but folding its depth into the
+        // achieved-depth range is what made per-frame depth-30 forcing read
+        // as "achieved_min=1" and put a 1 on the HUD between forced
+        // transactions.
+        return;
+    }
+    const uint32_t depth = estats.last_forced_rollback_length;
     if (s_forcedStatTx == 0) {
         s_forcedStatDepthMin = depth;
         s_forcedStatDepthMax = depth;
@@ -947,11 +1143,16 @@ void NoteRollbackTransactionDone(bool truncated) {
         // path); real prediction corrections are reported separately.
         const auto& est = s_engine.GetStats();
         NetplayLog_Write("FORCED", RbFrame(s_engine.ConfirmedFrontier()),
-            "forced_rb: transactions=%u/s depth=%d achieved_min=%u max=%u "
-            "real_corrections=%u truncated=%u replay_verified=%u replay_bad=%u",
-            forcedTx, cfgDepth, s_forcedStatDepthMin,
-            s_forcedStatDepthMax, realTx, s_forcedStatTruncated,
-            est.replay_verifications, est.replay_mismatches);
+            "forced_rb: transactions=%u/s depth=%d effective=%d achieved_min=%u max=%u "
+            "game_ticks_replayed=%u/s real_corrections=%u truncated=%u "
+            "replay_verified=%u replay_bad=%u [%s]",
+            forcedTx, cfgDepth, s_forcedLive.effective_depth_now,
+            s_forcedStatDepthMin, s_forcedStatDepthMax, s_replayTicksWindow,
+            realTx, s_forcedStatTruncated,
+            est.replay_verifications, est.replay_mismatches,
+            s_forcedLive.gate_reason ? s_forcedLive.gate_reason : "?");
+        s_forcedLive.replay_ticks_per_sec = s_replayTicksWindow;
+        s_replayTicksWindow = 0;
         if (est.replay_mismatches != s_forcedLive.replay_mismatches) {
             // Local nondeterminism: the same frame, replayed from a restored
             // snapshot with identical inputs, produced a different state.
@@ -981,6 +1182,11 @@ void NoteRollbackTransactionDone(bool truncated) {
 }
 
 } // namespace
+
+void RollbackSession_NoteReplayTickExecuted() {
+    ++s_replayTicksExecuted;
+    ++s_replayTicksWindow;
+}
 
 void RollbackSession_GetForcedStats(ForcedRollbackLiveStats* out) {
     if (!out) return;
