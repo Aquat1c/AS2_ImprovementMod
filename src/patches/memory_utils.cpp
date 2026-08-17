@@ -82,14 +82,34 @@ bool WriteMemoryBlockSafe(void* dst, const void* src, size_t size) {
     }
 }
 
+// Table-driven CRC-32 (reflected, poly 0xEDB88320) — byte-for-byte identical
+// results to the old bitwise loop, ~8x faster (2026-08-17 PERF: the bitwise
+// version was the top CPU consumer in live-run profiles — 253 KB region CRCs
+// are computed at dump/baseline seams and were being ground through 8
+// shift-iterations per byte). Table init races are benign: every thread
+// writes identical values.
+static uint32_t s_crcTable[256];
+static volatile long s_crcTableReady = 0;
+
+static void InitCrcTable() {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++) {
+            c = (c >> 1) ^ (0xEDB88320u & (uint32_t)-(int32_t)(c & 1));
+        }
+        s_crcTable[i] = c;
+    }
+    s_crcTableReady = 1;
+}
+
 uint32_t CalcCRC32(const void* data, size_t size) {
+    if (!s_crcTableReady) {
+        InitCrcTable();
+    }
     uint32_t crc = 0xFFFFFFFF;
     const uint8_t* ptr = (const uint8_t*)data;
     for (size_t i = 0; i < size; i++) {
-        crc ^= ptr[i];
-        for (int j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-        }
+        crc = (crc >> 8) ^ s_crcTable[(crc ^ ptr[i]) & 0xFF];
     }
     return ~crc;
 }

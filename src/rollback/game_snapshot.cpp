@@ -52,12 +52,43 @@ constexpr MaskRange kMainDigestMasks[] = {
     // blocks = sound ids 4-7). Captured+restored as before (restore's
     // explicit clear = vanilla pass-top semantics); digest-masked only.
     { (size_t)MATCH_PER_FRAME_TEMP_OFFSET, (size_t)MATCH_PER_FRAME_TEMP_SIZE },        // F7c
-    { kP1EntityOff + ENTITY_OFF_RENDER_TINT_STATE, ENTITY_RENDER_TINT_MASK_SIZE },     // F5
-    { kP1EntityOff + ENTITY_OFF_SUPERBG_STATE,     ENTITY_SUPERBG_SCRATCH_MASK_SIZE }, // F2
+    // F7e (2026-08-17, first combat-load run 19-17-3x): the fine-diag ring
+    // caught two transient per-side windows in the entities the moment real
+    // combat inputs started flowing — the render flash/tint block (F5
+    // widened to +0x1B4..+0x1BF: flash flag + pad + tint dwords, render-
+    // phase draw bookkeeping) and the 4-byte hit-reaction DISPLAY block
+    // (+0x7C4..+0x7C7: combo-pop shown/anim/life/keep — HUD-cadence;
+    // rollback_combo_fx owns their rollback correctness and
+    // netplay_hud_vanilla rewrites +0x7C5 around render). Both flickered
+    // (diverged at single captures, re-agreed next frame) with rng/hp/
+    // inputs identical throughout — display sampling noise, no sim reader
+    // (INV-22 read-back in vivo). Captured+restored unchanged.
+    // F7f: +0x1A4 / +0x7F0 / +0x7F8 — per-PASS-cadence render counters
+    // inside the entities (byte-exact FINEENT evidence, run 19-25-3x:
+    // cross-side offset == pass-count delta on consecutive frames). Same
+    // class as the F7d sim_frame exclusion; captured/restored unchanged.
+    { kP1EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF,
+      ENTITY_RENDER_ANIM_TIMER_MASK_SIZE },                                            // F7f
+    { kP1EntityOff + ENTITY_RENDER_FLASH_TINT_MASK_OFF,
+      ENTITY_RENDER_FLASH_TINT_MASK_SIZE },                                            // F5+F7e
+    { kP1EntityOff + ENTITY_SUPERBG_MASK_OFF,      ENTITY_SUPERBG_MASK_SIZE },         // F2+F7g
+    { kP1EntityOff + ENTITY_HIT_REACTION_DISPLAY_MASK_OFF,
+      ENTITY_HIT_REACTION_DISPLAY_MASK_SIZE },                                         // F7e
+    { kP1EntityOff + ENTITY_RENDER_OUTPUT_BLOCK_OFF,
+      ENTITY_RENDER_OUTPUT_BLOCK_SIZE },                                               // F7f render output
     { kP1EntityOff + ENTITY_OFF_VOICE_BOOKKEEPING, ENTITY_VOICE_BOOKKEEPING_SIZE },    // F4
-    { kP2EntityOff + ENTITY_OFF_RENDER_TINT_STATE, ENTITY_RENDER_TINT_MASK_SIZE },     // F5
-    { kP2EntityOff + ENTITY_OFF_SUPERBG_STATE,     ENTITY_SUPERBG_SCRATCH_MASK_SIZE }, // F2
+    { kP1EntityOff + ENTITY_VOICE_TAIL_MASK_OFF,   ENTITY_VOICE_TAIL_MASK_SIZE },       // F7h
+    { kP2EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF,
+      ENTITY_RENDER_ANIM_TIMER_MASK_SIZE },                                            // F7f
+    { kP2EntityOff + ENTITY_RENDER_FLASH_TINT_MASK_OFF,
+      ENTITY_RENDER_FLASH_TINT_MASK_SIZE },                                            // F5+F7e
+    { kP2EntityOff + ENTITY_SUPERBG_MASK_OFF,      ENTITY_SUPERBG_MASK_SIZE },         // F2+F7g
+    { kP2EntityOff + ENTITY_HIT_REACTION_DISPLAY_MASK_OFF,
+      ENTITY_HIT_REACTION_DISPLAY_MASK_SIZE },                                         // F7e
+    { kP2EntityOff + ENTITY_RENDER_OUTPUT_BLOCK_OFF,
+      ENTITY_RENDER_OUTPUT_BLOCK_SIZE },                                               // F7f render output
     { kP2EntityOff + ENTITY_OFF_VOICE_BOOKKEEPING, ENTITY_VOICE_BOOKKEEPING_SIZE },    // F4
+    { kP2EntityOff + ENTITY_VOICE_TAIL_MASK_OFF,   ENTITY_VOICE_TAIL_MASK_SIZE },       // F7h
 };
 constexpr size_t kMainDigestMaskCount =
     sizeof(kMainDigestMasks) / sizeof(kMainDigestMasks[0]);
@@ -298,28 +329,39 @@ uint64_t GameSnapshot_HashGameplay(const GameSnapshot* snapshot) {
     // control words are excluded; main_state is folded through the F2/F4/F5
     // digest masks; frame_display (F3) and the AI-learning statics (F1) are
     // hashed.
+    //
+    // F7d (2026-08-17, run 18-23-1x): sim_frame / input_read_idx — BOTH
+    // aliases of 0x816490 `Frame_Simulation` — are EXCLUDED. The counter is
+    // incremented once per OUTER PASS by Frame_AdvanceSimulation (0x562760,
+    // called after the sim while-loop, unconditionally for game_type != 3;
+    // DECOMP_TIMING_STUDY §1.2), while pre-tick hashing runs at SIM cadence:
+    // during multi-tick catch-up passes the capture lands mid-pass and the
+    // sampled value skews ±1..2 per side by pass-boundary alignment. The
+    // fine-diag ring proved 22 confirmed frames of live skew with every
+    // other hashed byte (all 4043 main windows, raw context image, all
+    // other header scalars) byte-identical — no sim reader in mod netplay
+    // (vanilla readers: Input_TryGetNextFrame gating, replaced by the
+    // dispatcher; HUD lag indicator, render-only). Captured+restored as
+    // before; digest-masked only. Hash-membership change — cross-build
+    // incompatible (constraint 3).
     uint64_t h = BLOCK64_SEED;
     struct SimHeader {
         uint32_t rng_seed;
-        uint32_t sim_frame;
         uint32_t game_mode;
         uint32_t substate;
         uint32_t substate_timer;
         uint32_t game_type;
         uint32_t match_phase_timer;
-        uint32_t input_read_idx;
         uint32_t input_write_idx;
         uint32_t effect_index;
         uint32_t frame_display;
     } header{};
     header.rng_seed = snapshot->rng_seed;
-    header.sim_frame = snapshot->sim_frame;
     header.game_mode = snapshot->game_mode;
     header.substate = snapshot->substate;
     header.substate_timer = snapshot->substate_timer;
     header.game_type = snapshot->game_type;
     header.match_phase_timer = snapshot->match_phase_timer;
-    header.input_read_idx = snapshot->input_read_idx;
     header.input_write_idx = snapshot->input_write_idx;
     header.effect_index = snapshot->effect_index;
     header.frame_display = snapshot->frame_display;
@@ -340,16 +382,15 @@ bool GameSnapshot_HashGameplayLive(uint64_t* outHash) {
     // MUST mirror GameSnapshot_HashGameplay exactly: same SimHeader field
     // order, same region order, same digest-mask segmentation, same Block64
     // chaining — a captured snapshot of this instant hashes to the identical
-    // value (M7 verification seam).
+    // value (M7 verification seam). F7d: sim_frame/input_read_idx (0x816490,
+    // pass-cadence Frame_Simulation) excluded — see GameSnapshot_HashGameplay.
     struct SimHeader {
         uint32_t rng_seed;
-        uint32_t sim_frame;
         uint32_t game_mode;
         uint32_t substate;
         uint32_t substate_timer;
         uint32_t game_type;
         uint32_t match_phase_timer;
-        uint32_t input_read_idx;
         uint32_t input_write_idx;
         uint32_t effect_index;
         uint32_t frame_display;
@@ -358,13 +399,11 @@ bool GameSnapshot_HashGameplayLive(uint64_t* outHash) {
     uint64_t h = BLOCK64_SEED;
     __try {
         header.rng_seed = DetVer_GetRngSeed();
-        header.sim_frame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
         header.game_mode = ReadMemory<uint32_t>(ADDR_GAME_MODE);
         header.substate = ReadMemory<uint32_t>(ADDR_SUB_STATE);
         header.substate_timer = ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER);
         header.game_type = ReadMemory<uint32_t>(ADDR_GAME_TYPE);
         header.match_phase_timer = ReadMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER);
-        header.input_read_idx = ReadMemory<uint32_t>(ADDR_INPUT_READ_IDX);
         header.input_write_idx = ReadMemory<uint32_t>(ADDR_INPUT_WRITE_IDX);
         header.effect_index = ReadMemory<uint32_t>(ADDR_EFFECT_INDEX);
         header.frame_display = ReadMemory<uint32_t>(ADDR_FRAME_DISPLAY);

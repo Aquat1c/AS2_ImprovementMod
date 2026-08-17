@@ -40,6 +40,10 @@ struct TracePair {
     bool has_local;
     bool has_remote;
     bool compared;
+    bool defer_logged;   // F7d diag fix: DEFER rows are written once per
+                         // pair, not once per RetryDeferredCompares poll
+                         // (the retry loop runs every frame and was writing
+                         // tens of thousands of duplicate DEFER rows).
     SyncTracePayload local;
     SyncTracePayload remote;
 };
@@ -57,7 +61,12 @@ static bool IsCompareActive() {
 }
 
 static bool ShouldWriteCsv() {
-    return s_enabled;
+    // F7d diagnostics fix: integrity mode (AS2_SYNC_TRACE_INTEGRITY=1
+    // without AS2_SYNC_TRACE=1) used to compare but never write rows — the
+    // synctrace CSVs shipped with headers only. Integrity-mode rows are
+    // sparse (every kIntegrityTraceInterval confirmed frames), so writing
+    // them is cheap and makes the compare results inspectable post-run.
+    return s_enabled || s_integrityMode;
 }
 
 static bool EnvFlagEnabled(const char* name) {
@@ -326,21 +335,38 @@ static void ComparePair(TracePair* pair) {
     if (domain == SyncTraceDomain::GameplayRollback) {
         if ((local.flags & SYNC_TRACE_FLAG_ROLLING_BACK) != 0 ||
             (remote.flags & SYNC_TRACE_FLAG_ROLLING_BACK) != 0) {
-            AppendCompareCsv("DEFER", local, remote, "rolling_back");
+            if (!pair->defer_logged) {
+                pair->defer_logged = true;
+                AppendCompareCsv("DEFER", local, remote, "rolling_back");
+            }
             pair->compared = false;
             return;
         }
 
         if ((local.flags & SYNC_TRACE_FLAG_VALID_STATE_CRC) == 0 ||
             (remote.flags & SYNC_TRACE_FLAG_VALID_STATE_CRC) == 0) {
-            AppendCompareCsv("DEFER", local, remote, "missing_state_crc");
+            if (!pair->defer_logged) {
+                pair->defer_logged = true;
+                AppendCompareCsv("DEFER", local, remote, "missing_state_crc");
+            }
             pair->compared = false;
             return;
         }
 
-        const int32_t remoteConfirmedRb = (int32_t)remote.remote_ack_frame;
-        if (!Rollback::RollbackDebug_IsRbFrameReadyToCompare(local.rb_frame, remoteConfirmedRb)) {
-            AppendCompareCsv("DEFER", local, remote, "gameplay_not_settled");
+        // F7d diag fix: the remote payload's remote_ack_frame is FROZEN at
+        // its emit instant (a trace for frame N is emitted while the
+        // remote's confirmed frontier is still ~N-2), so capping the settle
+        // check with it made `frame <= remoteSettled` false FOREVER — every
+        // gameplay pair deferred permanently, the deferred set grew by one
+        // pair per cadence interval, and the per-frame retry loop ground
+        // the whole process down (see engine2 adapter PERF note). The LIVE
+        // local estimate inside IsRbFrameReadyToCompare is the correct
+        // settle authority; pass -1 to skip the stale cap.
+        if (!Rollback::RollbackDebug_IsRbFrameReadyToCompare(local.rb_frame, -1)) {
+            if (!pair->defer_logged) {
+                pair->defer_logged = true;
+                AppendCompareCsv("DEFER", local, remote, "gameplay_not_settled");
+            }
             pair->compared = false;
             return;
         }
@@ -397,6 +423,7 @@ static void StoreLocalTrace(const SyncTracePayload& p) {
     pair->local = p;
     pair->has_local = true;
     pair->compared = false;
+    pair->defer_logged = false;   // fresh data -> one fresh DEFER allowed
     ComparePair(pair);
 }
 
@@ -405,6 +432,7 @@ static void StoreRemoteTrace(const SyncTracePayload& p) {
     pair->remote = p;
     pair->has_remote = true;
     pair->compared = false;
+    pair->defer_logged = false;   // fresh data -> one fresh DEFER allowed
     ComparePair(pair);
 }
 

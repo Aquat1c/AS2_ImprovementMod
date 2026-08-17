@@ -682,7 +682,10 @@ void RollbackDebug_RenderImGui(bool* p_open) {
         // Checksums
         ImGui::Separator();
         ImGui::Text("Baseline CRC:     0x%08X", snap.baseline_checksum);
-        ImGui::Text("Current CRC:      0x%08X", snap.current_checksum);
+        // Live CRC computed only while this debug window is open (GetSnapshot
+        // no longer hides the 253 KB CRC pass — engine2 adapter PERF note).
+        ImGui::Text("Current CRC:      0x%08X",
+                    RollbackSession_ComputeLiveStateChecksum());
 
         // Desync
         RollbackDebugSnapshot dbg;

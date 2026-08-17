@@ -280,20 +280,26 @@ uint16_t AutoConnectHarness_RunFightingAI(bool isHost, uint32_t matchFrame) {
 
     // Pick a new action when current one finishes
     if (s_ai.remaining <= 0) {
+        // 2026-08-17 combat-load rebalance: live pairs spent whole matches
+        // barely trading 1000 hp — too much retreat/block and not enough
+        // forward pressure, so desync coverage of hit/effect/super state was
+        // thin. Weights now favor Approach + Poke + Combo (attack buttons
+        // land every 2-6 frames while engaged); retreat/block reduced to
+        // spice. Per-side determinism unchanged (role-seeded LCG).
         uint32_t r = aiRand() % 100;
-        if      (r < 15) { s_ai.action = s_ai.Approach;    s_ai.remaining = 20 + (aiRand() % 30); }
-        else if (r < 25) { s_ai.action = s_ai.Retreat;     s_ai.remaining = 15 + (aiRand() % 20); }
-        else if (r < 35) { s_ai.action = s_ai.DashForward; s_ai.remaining = 10; }
-        else if (r < 42) { s_ai.action = s_ai.DashBack;    s_ai.remaining = 10; }
-        else if (r < 52) { s_ai.action = s_ai.Jump;        s_ai.remaining = 6; }
-        else if (r < 58) { s_ai.action = s_ai.AirAttack;   s_ai.remaining = 20; }
-        else if (r < 68) { s_ai.action = s_ai.Poke;        s_ai.remaining = 8 + (aiRand() % 10); }
-        else if (r < 76) { s_ai.action = s_ai.Combo;       s_ai.remaining = 24; }
-        else if (r < 82) { s_ai.action = s_ai.QCF;         s_ai.remaining = 8; }
-        else if (r < 87) { s_ai.action = s_ai.DP;          s_ai.remaining = 8; }
-        else if (r < 91) { s_ai.action = s_ai.HCF;         s_ai.remaining = 12; }
-        else if (r < 95) { s_ai.action = s_ai.Throw;       s_ai.remaining = 6; }
-        else if (r < 98) { s_ai.action = s_ai.Block;       s_ai.remaining = 20 + (aiRand() % 30); }
+        if      (r < 22) { s_ai.action = s_ai.Approach;    s_ai.remaining = 20 + (aiRand() % 30); }
+        else if (r < 27) { s_ai.action = s_ai.Retreat;     s_ai.remaining = 10 + (aiRand() % 10); }
+        else if (r < 37) { s_ai.action = s_ai.DashForward; s_ai.remaining = 10; }
+        else if (r < 40) { s_ai.action = s_ai.DashBack;    s_ai.remaining = 10; }
+        else if (r < 47) { s_ai.action = s_ai.Jump;        s_ai.remaining = 6; }
+        else if (r < 55) { s_ai.action = s_ai.AirAttack;   s_ai.remaining = 20; }
+        else if (r < 70) { s_ai.action = s_ai.Poke;        s_ai.remaining = 8 + (aiRand() % 10); }
+        else if (r < 82) { s_ai.action = s_ai.Combo;       s_ai.remaining = 24; }
+        else if (r < 88) { s_ai.action = s_ai.QCF;         s_ai.remaining = 8; }
+        else if (r < 93) { s_ai.action = s_ai.DP;          s_ai.remaining = 8; }
+        else if (r < 96) { s_ai.action = s_ai.HCF;         s_ai.remaining = 12; }
+        else if (r < 98) { s_ai.action = s_ai.Throw;       s_ai.remaining = 6; }
+        else if (r < 99) { s_ai.action = s_ai.Block;       s_ai.remaining = 20 + (aiRand() % 30); }
         else              { s_ai.action = s_ai.Wakeup;      s_ai.remaining = 10; }
         s_ai.step = 0;
     }

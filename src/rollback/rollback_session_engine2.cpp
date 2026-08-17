@@ -36,6 +36,7 @@
 #include "patches/memory_utils.h"
 #include "rollback/desync_diag.h"
 #include "rollback/desync_dump.h"
+#include "rollback/desync_fine_diag.h"
 #include "rollback/engine2.h"
 #include "rollback/lifecycle_window.h"
 #include "rollback/netplay_log.h"
@@ -335,6 +336,10 @@ bool SavePreTick(uint32_t frame, uint64_t* hash,
         return false;
     }
     ReadSyncHashDiagnostics(rng, hp0, hp1);
+    // F7d localization ring: per-window CRCs + raw context image at the SAME
+    // instant as the hashed capture (replays re-record, so the surviving
+    // entry always reflects the confirmed capture of the frame).
+    FineDiag_RecordPreTick(frame);
     return true;
 }
 
@@ -414,6 +419,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
                 StateHistory_SetTagContext(s_epoch, /*phase=*/(uint32_t)MODE_MATCH);
                 DesyncDump_Reset();
                 s_diagRing.Reset();
+                FineDiag_Reset();
 
                 // Delay may have changed between matches (peer-local knob).
                 const int delay = config.initial_delay < 0 ? 0
@@ -487,6 +493,7 @@ bool RollbackSession_Begin(const RollbackSessionConfig& config) {
     StateHistory_SetTagContext(s_epoch, /*phase=*/(uint32_t)MODE_MATCH);
     DesyncDump_Reset();
     s_diagRing.Reset();
+    FineDiag_Reset();
 
     ApplyStressHooks(s_engine);
 
@@ -580,7 +587,22 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
     // Capture-once keyed to the sim frontier (§2.7.3-C): repeats during a
     // stall adopt; the sealed word schedules at source + D_local.
     if (!s_engine.InRollback()) {
-        s_engine.CaptureLocalInput(s_engine.SimFrontier(), localInput);
+        const bool sealed =
+            s_engine.CaptureLocalInput(s_engine.SimFrontier(), localInput);
+        // TEMP DIAG (input-eater hunt): nonzero local samples that get
+        // ADOPTED instead of sealed are being replaced by whatever the
+        // producer sealed earlier — name the path.
+        if (localInput != 0) {
+            static uint32_t s_bfLog = 0;
+            ++s_bfLog;
+            if (s_bfLog <= 30 || (s_bfLog % 300) == 0) {
+                NetplayLog_Write("INPUTDIAG", RbFrame(s_engine.SimFrontier()),
+                    "BeginFrame nonzero local=0x%04X sealed=%d frontier=%u "
+                    "fenced=%d",
+                    localInput, sealed ? 1 : 0, s_engine.SimFrontier(),
+                    s_engine.ProducerFenced() ? 1 : 0);
+            }
+        }
     }
     SendInputStreamIfDue(/*force=*/true);
     s_passStep = PassStep::Idle;  // plan is derived lazily in ProcessNextEvent
@@ -605,6 +627,17 @@ bool RollbackSession_PollSession() {
     // Producer while stalled (INV-24): one seal per frame period; the
     // scheduler paces the caller, so one call per pass is the cadence.
     if (s_engine.ProduceLocalInputAhead(s_lastLocalSample)) {
+        // TEMP DIAG (input-eater hunt): how often does the producer seal,
+        // and with what sample?
+        {
+            static uint32_t s_prodLog = 0;
+            ++s_prodLog;
+            if (s_prodLog <= 30 || (s_prodLog % 600) == 0) {
+                NetplayLog_Write("INPUTDIAG", RbFrame(s_engine.SimFrontier()),
+                    "Producer seal #%u sample=0x%04X frontier=%u",
+                    s_prodLog, s_lastLocalSample, s_engine.SimFrontier());
+            }
+        }
         SendInputStreamIfDue(/*force=*/true);
     } else {
         SendInputStreamIfDue(/*force=*/false);
@@ -1014,7 +1047,17 @@ void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out) {
     out->rollback_budget = (int32_t)s_engine.MaxRollback();
 
     out->baseline_checksum = s_baselineChecksum;
-    out->current_checksum = ComputeLiveChecksumInternal();
+    // PERF (2026-08-17 live-run finding): GetSnapshot used to compute
+    // ComputeLiveChecksumInternal() here — a full 253 KB CRC pass hidden in
+    // a counters getter. RollbackDebug_IsRbFrameReadyToCompare calls this
+    // per DEFERRED synctrace pair per frame; with integrity tracing armed
+    // the deferred set grew by one pair per 60 confirmed frames and the
+    // per-frame cost grew ~22 µs/frame until the pair ran at 9 sim fps
+    // (profiled: 50% CalcCRC32, 50% lock wait). Diagnostic consumers that
+    // genuinely need the live CRC call
+    // RollbackSession_ComputeLiveStateChecksum() explicitly at their own
+    // (dump-time / debug-window) cadence.
+    out->current_checksum = 0;
 
     out->total_predictions = (int32_t)st.predictions_used;
     out->total_mispredictions = (int32_t)st.mispredictions;

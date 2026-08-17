@@ -1452,6 +1452,24 @@ static void CommitRollbackAdvance(__int16* outputInputs, uint16_t p1, uint16_t p
         outputInputs[1] = (__int16)p2;
     }
 
+    // ── F7i (2026-08-17 round-boundary desync, runs 19-42/19-49) ────────────
+    // Frame_Simulation (0x816490) is a PASS-cadence counter (vanilla ++ in
+    // Frame_AdvanceSimulation once per outer pass), so its value skews
+    // per-side under catch-up. F7d digest-masked it after proving no
+    // MID-ROUND sim reader — but the fine-diag ring then caught the ROUND
+    // TIME-OVER check consuming it: at f3985 the sides' entire state was
+    // byte-identical (all 4043 fine windows) with sim=3340 vs 3342, and the
+    // side 2 passes ahead flipped substate 3->2 (round end) two confirmed
+    // frames early. The counter IS sim-read at that seam, so it must be
+    // DETERMINISTIC: mirror it from Frame_Display (0x816494 — ticks once
+    // per SIM frame on the canonical timeline, F3, hashed) at TICK cadence,
+    // BEFORE the game logic of this tick runs (a pass-cadence mirror in
+    // Hook_AdvanceFrame is not enough — the 2nd tick of a catch-up pass
+    // would still read a stale value). Runs on straight AND replay
+    // advances; restore + re-mirror keeps rollbacks consistent.
+    *reinterpret_cast<volatile int32_t*>(ADDR_FRAME_SIMULATION) =
+        *reinterpret_cast<volatile int32_t*>(ADDR_FRAME_DISPLAY);
+
     volatile int32_t* pFrameWrite = reinterpret_cast<volatile int32_t*>(ADDR_INPUT_WRITE_IDX);
     const uint32_t writeIdx = (uint32_t)*pFrameWrite;
     if (writeIdx < INPUT_HISTORY_MAX) {
@@ -2352,17 +2370,29 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
                 Net::MatchRollbackPhaseName(Net::NetplayPhaseRuntime_GetPhase()));
         }
 
+        // ── THE INPUT EATER (found 2026-08-17, live pair 19-04-3x) ─────────
+        // This block used to assign `s_rollbackFrameStarted =
+        // sessionFramePending` in BOTH directions. HasPendingFrame() is true
+        // on virtually every healthy pass (speculative depth < budget), so
+        // the false→true assignment CLAIMED the frame as already begun and
+        // the real BeginFrame(localInput) block below never ran: the engine
+        // never received a fresh local sample on the healthy path. Local
+        // canonical inputs came exclusively from the INV-24 producer's
+        // stale `s_lastLocalSample`, which only refreshed during
+        // PredictionLimit stalls (HasPendingFrame()==false) — near-never on
+        // loopback. Observed: 18k+ confirmed frames with P1=P2=0x0000 while
+        // the harness AI (and any human) held live buttons; entities frozen
+        // all match; ImGui showed presses that never reached the game.
+        // The sync is now ONE-directional: it may only CLEAR a stale
+        // "started" flag when the session has nothing pending (the drift it
+        // was built to heal); it must never pre-claim a frame it never began.
         const bool sessionFramePending = Rollback::RollbackSession_HasPendingFrame();
-        if (s_rollbackFrameStarted != sessionFramePending) {
+        if (s_rollbackFrameStarted && !sessionFramePending) {
             Rollback::NetplayLog_Write("INPUT", Rollback::RollbackSession_GetCurrentFrame(),
-                "Dispatcher/session frame-start sync: local=%d session=%d phase=%s",
-                s_rollbackFrameStarted ? 1 : 0,
-                sessionFramePending ? 1 : 0,
+                "Dispatcher/session frame-start sync: clearing stale started flag "
+                "(session has no pending frame) phase=%s",
                 Net::MatchLifecyclePhaseName(Net::MatchLifecycle_GetPhase()));
-            if (!s_rollbackFrameStarted && sessionFramePending) {
-                s_passSawAdvance = false;
-            }
-            s_rollbackFrameStarted = sessionFramePending;
+            s_rollbackFrameStarted = false;
         }
 
         const Net::MatchRollbackPhase rollbackPhase = Net::NetplayPhaseRuntime_GetPhase();

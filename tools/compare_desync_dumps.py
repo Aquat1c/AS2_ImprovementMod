@@ -26,6 +26,71 @@ Exit codes: 0 = compared cleanly, 1 = usage/parse error.
 import re
 import sys
 
+# ── F7d fine-grained localization (FINE* lines, desync_fine_diag.cpp) ───────
+MAIN_BASE = 0x76C5F8
+FINE_REGIONS = [
+    ("match_header",  0x76C5F8, 0x76C608),
+    ("match_context", 0x76C608, 0x76E328),
+    ("effect_array",  0x76E328, 0x76FC28),
+    ("summon_array",  0x76FC28, 0x776668),
+    ("p1_entity",     0x776668, 0x790F74),
+    ("p2_entity",     0x790F74, 0x7AB880),
+]
+# main_state digest-mask table (kMainDigestMasks) -> fold segments. Each
+# segment's Block64 starts fresh block alignment at the segment start, so
+# "low/high half" of an 8-byte block is relative to the segment.
+P1_OFF = 0x776668 - MAIN_BASE
+P2_OFF = 0x790F74 - MAIN_BASE
+_MASKS = [
+    (0x700, 0x44),                    # F7c per_frame_temp
+    (P1_OFF + 0x01B8, 8),             # F5
+    (P1_OFF + 0x04DC, 0x260),         # F2
+    (P1_OFF + 0x1A24C, 12),           # F4
+    (P2_OFF + 0x01B8, 8),             # F5
+    (P2_OFF + 0x04DC, 0x260),         # F2
+    (P2_OFF + 0x1A24C, 12),           # F4
+]
+MAIN_SIZE = 0x7AB880 - MAIN_BASE
+
+
+def fold_segments():
+    segs = []
+    pos = 0
+    for off, size in _MASKS:
+        segs.append((pos, off))
+        pos = off + size
+    segs.append((pos, MAIN_SIZE))
+    return segs
+
+
+SEGS = fold_segments()
+
+
+def annotate_main_offset(off):
+    """Region+offset name, digest membership, and block-half for a
+    main_state offset."""
+    addr = MAIN_BASE + off
+    name = "?"
+    for n, lo, hi in FINE_REGIONS:
+        if lo <= addr < hi:
+            name = "%s+0x%x" % (n, addr - lo)
+            break
+    for lo, hi in SEGS:
+        if lo <= off < hi:
+            half = "low" if ((off - lo) % 8) < 4 else "HIGH"
+            return name, "hashed", half
+    return name, "MASKED", "-"
+
+
+FINEHDR_RE = re.compile(
+    r"^FINEHDR frame=(\d+) (.*?)\s*$")
+FINEWIN_RE = re.compile(
+    r"^FINEWIN frame=(\d+) n=(\d+) crcs=([0-9a-f,]+)\s*$")
+FINERAW_RE = re.compile(
+    r"^FINERAW frame=(\d+) n=(\d+) hex=([0-9a-f]+)\s*$")
+FINEENT_RE = re.compile(
+    r"^FINEENT frame=(\d+) spans=(\S+) p1=([0-9a-f]+) p2=([0-9a-f]+)\s*$")
+
 RING_RE = re.compile(
     r"^RING frame=(\d+) epoch=(\d+) hash=([0-9a-fA-F]+) rng=([0-9a-fA-F]+) "
     r"hp0=(\d+) hp1=(\d+) p1=0x([0-9a-fA-F]+) p2=0x([0-9a-fA-F]+)\s*$")
@@ -47,9 +112,32 @@ def parse_dump(path):
         "evidence": None,
         "ring": {},        # canonical frame -> entry dict
         "regions": {},     # name -> (addr, size, crc)
+        "finehdr": {},     # frame -> {field: value-string}
+        "finewin": {},     # frame -> [crc, ...]
+        "fineraw": {},     # frame -> bytes
+        "fineent": {},     # frame -> (spans, p1 bytes, p2 bytes)
     }
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
+            m = FINEHDR_RE.match(line)
+            if m:
+                frame = int(m.group(1))
+                dump["finehdr"][frame] = dict(
+                    kv.split("=", 1) for kv in m.group(2).split())
+                continue
+            m = FINEWIN_RE.match(line)
+            if m:
+                dump["finewin"][int(m.group(1))] = m.group(3).split(",")
+                continue
+            m = FINERAW_RE.match(line)
+            if m:
+                dump["fineraw"][int(m.group(1))] = bytes.fromhex(m.group(3))
+                continue
+            m = FINEENT_RE.match(line)
+            if m:
+                dump["fineent"][int(m.group(1))] = (
+                    m.group(2), bytes.fromhex(m.group(3)), bytes.fromhex(m.group(4)))
+                continue
             m = DIAG_RE.match(line)
             if m:
                 dump["source"] = m.group(1)
@@ -97,6 +185,93 @@ FIELDS = ("hash", "rng", "hp0", "hp1", "p1", "p2")
 
 def divergent_fields(ea, eb):
     return [f for f in FIELDS if ea[f] != eb[f]]
+
+
+def runs(indices):
+    """Group a sorted int list into (start, end_inclusive) runs."""
+    out = []
+    for i in indices:
+        if out and i == out[-1][1] + 1:
+            out[-1][1] = i
+        else:
+            out.append([i, i])
+    return out
+
+
+def fine_diff(a, b, frame, raw_context=2):
+    """Byte/window-level localization at `frame` from the FINE* records."""
+    ha, hb = a["finehdr"].get(frame), b["finehdr"].get(frame)
+    if ha and hb:
+        div = [k for k in ha if k in hb and ha[k] != hb[k]]
+        if div:
+            print("  FINEHDR divergent fields at f%d:" % frame)
+            for k in div:
+                print("    %-8s A=%s B=%s" % (k, ha[k], hb[k]))
+        else:
+            print("  FINEHDR: all header scalars EQUAL at f%d "
+                  "(rng/sim/mode/sub/subt/gtype/mpt/ridx/widx/effidx/fdisp"
+                  "/ai/p1t/p2t)" % frame)
+    else:
+        print("  no FINEHDR pair for f%d" % frame)
+
+    wa, wb = a["finewin"].get(frame), b["finewin"].get(frame)
+    if wa and wb and len(wa) == len(wb):
+        bad = [i for i in range(len(wa)) if wa[i] != wb[i]]
+        print("  FINEWIN divergent 64B windows at f%d: %d of %d"
+              % (frame, len(bad), len(wa)))
+        for i in bad[:40]:
+            off = i * 64
+            name, memb, _ = annotate_main_offset(off)
+            print("    win %4d main+0x%05x addr=0x%08x [%s] (%s) A=%s B=%s"
+                  % (i, off, MAIN_BASE + off, name, memb, wa[i], wb[i]))
+        if len(bad) > 40:
+            print("    ... %d more" % (len(bad) - 40))
+    else:
+        print("  no FINEWIN pair for f%d" % frame)
+
+    ea_, eb_ = a["fineent"].get(frame), b["fineent"].get(frame)
+    if ea_ and eb_:
+        spans = []
+        for part in ea_[0].split(","):
+            off, size = part.split(":")
+            spans.append((int(off, 16), int(size, 16)))
+        def ent_off(concat):
+            pos = 0
+            for off, size in spans:
+                if concat < pos + size:
+                    return off + (concat - pos)
+                pos += size
+            return -1
+        for pi, plabel in ((1, "p1"), (2, "p2")):
+            da, db = ea_[pi], eb_[pi]
+            bad = [i for i in range(min(len(da), len(db))) if da[i] != db[i]]
+            if bad:
+                print("  FINEENT %s divergent bytes at f%d:" % (plabel, frame))
+                for lo, hi in runs(bad)[:10]:
+                    print("    %s_entity+0x%x..0x%x A=%s B=%s"
+                          % (plabel, ent_off(lo), ent_off(hi),
+                             da[lo:hi + 1].hex(), db[lo:hi + 1].hex()))
+
+    ra, rb = a["fineraw"].get(frame), b["fineraw"].get(frame)
+    if ra and rb and len(ra) == len(rb):
+        bad = [i for i in range(len(ra)) if ra[i] != rb[i]]
+        print("  FINERAW divergent bytes at f%d (raw image = "
+              "header+context+effect_array): %d bytes" % (frame, len(bad)))
+        for lo, hi in runs(bad)[:32]:
+            name, memb, half = annotate_main_offset(lo)
+            av = ra[lo:hi + 1].hex()
+            bv = rb[lo:hi + 1].hex()
+            print("    main+0x%05x..0x%05x addr=0x%08x [%s] (%s, block-%s) "
+                  "A=%s B=%s"
+                  % (lo, hi, MAIN_BASE + lo, name, memb, half,
+                     av[:64], bv[:64]))
+        if len(runs(bad)) > 32:
+            print("    ... %d more runs" % (len(runs(bad)) - 32))
+        if not bad:
+            print("    (raw image equal -> divergence is beyond "
+                  "effect_array: summons or entities)")
+    else:
+        print("  no FINERAW pair for f%d" % frame)
 
 
 def fmt_entry(e):
@@ -159,6 +334,20 @@ def main(argv):
                       % (mark, f, ea["p1"], ea["p2"], eb["p1"], eb["p2"],
                          "   !INPUTS DIFFER (canonical stream broke!)"
                          if in_mismatch else ""))
+            # ── F7d fine-grained localization at the divergence onset ───────
+            if a["finewin"] or a["fineraw"]:
+                print()
+                print("fine-grained localization (confirm-seam records):")
+                prev = [f for f in common if f < frame]
+                if prev:
+                    print(" last AGREEING frame f%d:" % prev[-1])
+                    fine_diff(a, b, prev[-1])
+                print(" first DIVERGENT frame f%d:" % frame)
+                fine_diff(a, b, frame)
+                later = [f for f in common if f > frame][:2]
+                for f2 in later:
+                    print(" following frame f%d:" % f2)
+                    fine_diff(a, b, f2)
 
     # ── evidence lines (the failing SyncHash pair as each side saw it) ──────
     print()

@@ -593,7 +593,7 @@ as F2/F4/F5 (pass-cadence state, audio-only, no sim reader). Capture and
 restore are unchanged (restore's explicit clear = vanilla pass-top
 semantics). Digest-membership change — constraint 3 applies.
 
-### F7d — OPEN: one more per-side volatile window in the hashed membership (attempt-3 run 18-03-4x)
+### F7d — FIXED (2026-08-17, runs 18-23-1x/18-33-2x): the SimHeader hashed a PASS-cadence counter — twice
 
 With F7+F7b+F7c deployed, attempt 3 reached f649 confirmed frames clean
 and then hit the SAME fingerprint again: `rollbacks=0 on BOTH sides`
@@ -609,26 +609,188 @@ What the fingerprint proves:
 - Low-32 equality ⇒ every divergent byte sits at offset 4..7 of an
   8-byte block relative to its fold-segment start (Block64 prime is
   2^32+0x1b3; the low half of the state never sees a block's high half).
-- Header scalars that appear in LOW halves (rng, match_phase_timer,
-  input_read_idx=0x816490, input_write_idx, frame_display) are therefore
-  PROVEN equal — which also rules out sim_frame (same address as
-  read_idx). Remaining header high-half candidates: substate, game_type
-  (static), effect_index (0x76C5E8 — sole writer Effect_Enqueue looks
-  sim-cadence, but sub_4AB0F0, the render-phase effect-queue draw, is
-  still the audit's un-disassembled TODO). Otherwise: an odd-dword-
-  aligned window inside match_context (weather/camera/HUD sub-blocks).
+- Header scalars that appear in LOW halves are therefore PROVEN equal.
+  CORRECTION (found while closing F7d): the original half-assignment
+  here was wrong. The hashed SimHeader struct laid out as {rng, sim,
+  mode, sub, subt, gtype, mpt, ridx, widx, effidx, fdisp} puts
+  sim_frame(+4), substate(+12), game_type(+20), input_read_idx(+28) and
+  effect_index(+36) in HIGH halves; the low-32-proven-equal set is {rng,
+  game_mode, substate_timer, match_phase_timer, input_write_idx,
+  frame_display}. sim_frame/input_read_idx were therefore NOT ruled out
+  — and they were the culprit.
 
-Next-step diagnostics (not yet run):
-1. Extend DesyncDump to persist the raw SimHeader + per-64-byte-window
-   CRCs of match_context AT THE CONFIRM SEAM for the ring frames (the
-   current region CRCs are detection-instant live memory — post-
-   divergence, useless for localization).
-2. Set AS2_SYNC_TRACE=1 (not just _INTEGRITY) so the synctrace CSVs get
-   rows — integrity mode alone compares but does not write CSV.
-3. One-off disassembly of sub_4AB0F0 (constraint TODO #2) to close the
-   effect_index question.
+**Root cause (proven byte-level by the new fine-diag ring, run
+18-23-1x, desync f1769 / onset f1747):** 0x816490 `Frame_Simulation` —
+captured into the snapshot TWICE, as `sim_frame` and as
+`input_read_idx` (same address) — is a PASS-cadence counter, not a
+sim-tick counter. Disassembly of `Frame_AdvanceSimulation` (0x562760,
+verified against the exe) shows a plain `inc dword [816490h]` for
+game_type != 3, and per DECOMP_TIMING_STUDY §1.2 the function is called
+exactly once per OUTER Game_Update pass, AFTER the sim while-loop.
+Pre-tick hashing runs at SIM cadence: during multi-tick catch-up passes
+(constant on the loaded two-instance box) the second tick's capture
+lands mid-pass, sampling a value whose "passes completed so far" count
+is per-side by pass-boundary alignment. The fine-diag ring recorded the
+onset exactly: at f1746 both sides held sim=ridx=widx=fdisp=1771; at
+f1747 side A read sim/ridx=1772 vs side B 1771 (B's capture landed
+mid-pass), the skew grew to 2 at f1755, and for 22 confirmed frames
+EVERY OTHER HASHED BYTE — all 4043 64-byte main-state windows, the raw
+header+context+effect_array image, ai_learn, both input-span tails, and
+all other header scalars (fdisp/widx included, ticking 1:1 with the
+canonical frame on both sides) — stayed byte-identical. That is the
+INV-22 read-back proof in vivo: 0x816490 has no sim reader in mod
+netplay (vanilla readers are Input_TryGetNextFrame's pack gating —
+replaced by the mod dispatcher — and the render-only HUD lag readout at
+0x4B92xx/0x4BE6xx).
 
-Verified progression across the three 2026-08-17 live attempts:
-f29 (attempt 1, pre-F7b) → f780 (attempt 2, F7b) → f649-with-zero-
-rollbacks (attempt 3, F7c): each mask removed a confirmed volatile
-window; at least one remains.
+**Fix (F2/F4/F5/F7b/F7c precedent):** `sim_frame` and `input_read_idx`
+removed from the hashed SimHeader in `GameSnapshot_HashGameplay` +
+`GameSnapshot_HashGameplayLive` (game_snapshot.cpp). Capture/restore
+UNCHANGED — rollback still reproduces the pass-local value. Digest
+membership change — cross-build incompatible (constraint 3).
+
+**sub_4AB0F0 disassembled (constraint TODO #2 closed):** the ~75 KB
+render-phase effect-queue draw (0x4AB0F0..0x4BD543, 249-type jump table
+at 0x4BD544/0x4BD758, 133 handlers, three nested tables) iterates the
+200 32-byte effect_array entries per render pass. Of its 21,082
+instructions, the ONLY sim-region stores are two dwords in the
+type-44 handler (0x4AD553): entry+0xC/+0x10 — screen-space coordinate
+scratch recomputed from entry data + scroll each render pass. It never
+writes effect_index, match_context, or any other global (all other
+calls are draw prims 0x5D2F80/0x5D3030/0x5D3060/… and the debug text
+printf 0x629A20). effect_index is therefore clean, as suspected.
+Residual note: type-44 entry+0xC/+0x10 are render-cadence writes into
+HASHED effect_array bytes (in-segment block halves: +0xC low, +0x10
+high) — a THEORETICAL F7d-class window that has never appeared in a
+live divergence (fine-diag raw effect_array images stayed byte-equal
+through every observed desync window). Left hashed until evidence says
+otherwise; the fine-diag ring will name it byte-exactly if it ever
+fires.
+
+**Diagnostics added while closing this (all landed 2026-08-17):**
+
+1. `desync_fine_diag.cpp` — confirm-seam ring (64 frames): raw
+   SimHeader scalars, per-64-byte-window digests over ALL of main_state
+   (4043 windows), raw header+context+effect_array image (0x3630 B),
+   ai_learn + input-tail digests; recorded in SavePreTick at the same
+   instant as the hashed capture, dumped as machine `FINE*` lines in
+   both sides' desync dumps; `compare_desync_dumps.py` diffs them and
+   names divergent windows/bytes with region names, digest membership,
+   and block-half annotation. This is what turned F7d from fingerprint
+   inference into a two-line diff.
+2. Synctrace CSV: integrity mode (AS2_SYNC_TRACE_INTEGRITY=1 alone) now
+   writes rows (`ShouldWriteCsv` includes integrity mode); DEFER rows
+   are logged once per pair instead of once per retry poll.
+3. PERF (the "environmental" 35-37 sim_fps was NOT environmental):
+   profiling the degraded pair showed 50% CalcCRC32 / 50% lock wait,
+   growing ~22 µs/frame — `RollbackSession_GetSnapshot` hid a 253 KB
+   bitwise CRC (`ComputeLiveChecksumInternal`) and
+   `RollbackDebug_IsRbFrameReadyToCompare` called it per DEFERRED
+   synctrace pair per frame, while `ComparePair` capped the settle check
+   with the remote payload's emit-time ack (≈N-2 < N forever) so pairs
+   NEVER settled and the deferred set grew one pair per 60 frames.
+   Fixed: GetSnapshot no longer computes the live CRC (explicit
+   `RollbackSession_ComputeLiveStateChecksum()` for dump/debug-window
+   consumers), the stale ack cap is gone, and CalcCRC32 is table-driven
+   (~8x). Sessions now hold 60.0 sim fps for their whole duration.
+
+### F7e — first REAL-combat desync (run 19-17-3x, f689): entity display windows
+
+Context caveat for all F7a-F7d evidence: an input-dispatcher bug (the
+"frame-start sync" block pre-claiming frames so BeginFrame never sampled
+local input — IMPLEMENTATION_LOG, same day) meant every earlier live run
+was fought between IDLE characters. Once fixed, the first combat-loaded
+run desynced at f689 and the fine-diag ring named the divergence in one
+diff: transient, self-healing (flickering) divergence confined to two
+64-byte p2_entity windows — +0x184 (render flash flag +0x1B4, the
+unmasked byte ahead of the F5 tint mask) and +0x7C4 (hit-reaction
+DISPLAY block: combo-pop shown/anim/life/keep, HUD-cadence;
+rollback_combo_fx owns their rollback correctness, netplay_hud_vanilla
+rewrites +0x7C5 around render). rng/hp/inputs identical throughout and
+the windows re-agreed the next frame — display sampling noise (INV-22
+read-back in vivo).
+
+**Fix**: F5 mask widened to +0x1B4..+0x1BF
+(`ENTITY_RENDER_FLASH_TINT_MASK_*`) and a new 4-byte mask
++0x7C4..+0x7C7 (`ENTITY_HIT_REACTION_DISPLAY_MASK_*`), both entities.
+Capture/restore unchanged; digest-membership change (constraint 3).
+The fine-diag ring now also raw-captures entity spans [+0x180,+0x1C4)
+and [+0x7A0,+0x800) per frame (`FINEENT` lines) so any residual byte in
+these neighborhoods is named exactly without a new build.
+
+### F7f — second combat desync (run 19-25-3x, f509): three per-PASS entity counters, byte-exact
+
+The FINEENT raw spans added with F7e named the next one in single bytes:
+`p?_entity+0x1A4`, `+0x7F0`, `+0x7F8` — counters whose cross-side offset
+EQUALED the sides' pass-count delta (A sim=435/B=436 → each counter
+exactly +1 apart, on both observed frames), i.e. they advance once per
+outer pass (render phase) while pre-tick hashing samples them at sim
+cadence — the F7d mechanism inside the entities. (+0x1BC RENDER_TINT_TIMER
+showed the same pattern and was already masked by F7e.) Decomp context:
+the +0x1A4 neighborhood (+420/421/422/424) is written by the sim's
+hit-processing routine when a hit lands (hit-reaction display context)
+and then aged at render cadence; +0x7F0/+0x7F8 sit in the render-effect
+timer block. Masked as `ENTITY_RENDER_ANIM_TIMER_MASK_*` /
+`ENTITY_RENDER_FX_TIMER1/2_MASK_*` (4 bytes each, both entities);
+capture/restore unchanged; constraint 3 applies.
+
+### F7g — third combat desync (run 19-32-0x, f3059, supers active): the F2 superbg mask started 24 bytes late
+
+At f3059 (2537+ confirmed combat frames, hp 3751/100, super inputs
+active) the fine ring showed the F2-masked superbg scratch churning
+per-side as designed (masked windows +0x504..+0x644 divergent with NO
+hash effect — the mask doing its job), while the hash-divergent bytes
+were bounded to `p2_entity+0x4C4..+0x4DB` — the 24 bytes immediately
+BEFORE the F2 mask (the preceding window +0x484..+0x4C3 stayed equal).
+The superbg particle struct begins at +0x4C4, not +0x4DC. F2 mask
+widened to +0x4C4..+0x73B (`ENTITY_SUPERBG_MASK_*`, 632 B); FINEENT
+gained the [+0x4C0,+0x4E0) span. Also confirmed in the same dump: the
+F7e/F7f masks held (masked display bytes diverged at +0x1A4/+0x7F8 with
+hash still agreeing until the +0x4C4 range fired).
+
+### F7h — voice tail block; F7i — Frame_Simulation IS sim-read at ROUND TIME-OVER (the true F7d ending)
+
+F7h (run 19-42-5x f3299): static per-side divergence at
+`p1_entity+0x1A650..+0x1A68F` the moment a KO-announcer voice trigger
+fired — another audio-event-gated tail block, 0x404 past the F4 mask
+(F4 class; masked as `ENTITY_VOICE_TAIL_MASK_*`). Same investigation
+also disassembled `Match_UpdateScoreStats` (0x55BCD0, full 0x718-byte
+body): ALL its writes land in the 0x8E9650..0x8E9E5E stats/persistence
+range — outside every captured/hashed region — so the F6 hook's
+rollback-skip asymmetry CANNOT desync the hash (F6 exonerated).
+
+**F7i — the round-boundary desync (runs 19-42/19-49, byte-perfect
+catch):** at f3985 the sides' ENTIRE hashed+masked state was
+byte-identical (all 4043 fine windows, raw images, FINEENT spans) with
+ONLY sim=3340 vs 3342 differing — and the side 2 passes ahead flipped
+substate 3→2 (round TIME OVER at ~59 s) two confirmed frames early,
+then 58 windows diverged as one side ran the round reset.
+Frame_Simulation IS consumed by the sim at exactly one seam — the round
+time-over check — so F7d's mask alone hid the symptom mid-round but
+could not fix the boundary. Fix: while the mod owns netplay gameplay
+the counter is mirrored from `Frame_Display` (0x816494, tick-cadence,
+canonical, hashed) at TICK cadence in `CommitRollbackAdvance` (before
+the tick's game logic; a pass-cadence mirror would leave the 2nd tick
+of a catch-up pass stale) plus a pass-end safety mirror in
+`Hook_AdvanceFrame`. The F7d digest exclusion stays (the alias is now
+redundant with fdisp). Deterministic by construction; capture/restore
+unchanged.
+
+**Final verdict (run 19-53-3x): SOAK-PASS on BOTH sides** — 3 full
+matches, multiple round transitions, 2 rematch boundaries (epoch
+1→2→3, both fastpath — the any-NO charsel route did not trigger this
+run and remains to be re-exercised), 18,927 canonical confirmed frames
+of real combat, ZERO desyncs, zero dumps. Analyzer: all sync/incident
+criteria PASS; remaining FAILs are pacing follow-ups (sim rate ran at
+the catch-up cap ≈72 fps after the first rematch boundary — scheduler
+rebase issue, both sides in lockstep; 54 lifecycle holds at match
+boundaries; present p99 spikes at transitions).
+
+Verified progression across the 2026-08-17 live attempts:
+f29 (pre-F7b) → f780 (F7b) → f649 zero-rollbacks (F7c) → f1747-onset
+(diagnosed byte-exactly, F7d fix) → then under REAL combat (input
+dispatcher fixed the same day): f689 (F7e display masks) → f509
+byte-exact (F7f pass-cadence entity counters) → f2249 (+0x7FC
+companion byte, F7f block widened) → f3059 (F7g superbg head) →
+f3959 (flash/tint struct tail) → f3299/f3989 (F7h + F7i round
+boundary) → **SOAK-PASS, zero desyncs**.

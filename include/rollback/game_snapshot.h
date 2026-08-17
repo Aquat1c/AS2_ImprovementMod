@@ -34,14 +34,21 @@ struct GameSnapshot {
     uint32_t checksum;        // legacy CRC32 (main+effect_index) — diagnostics
     uint32_t rng_seed;        // SIM — MSVC LCG state (TLS _getptd()+0x14)
 
-    uint32_t sim_frame;       // SIM — 0x816490 sim/input-read counter
+    // PASS-CADENCE (F7d, EXCLUDED from digest): 0x816490 `Frame_Simulation`
+    // — ++ once per OUTER PASS by Frame_AdvanceSimulation (0x562760, after
+    // the sim while-loop), NOT per sim tick. Mid-pass pre-tick captures
+    // during multi-tick catch-up passes sample it with per-side skew.
+    // Captured+restored (rollback reproduces the local value); no sim
+    // reader in mod netplay (dispatcher replaces Input_TryGetNextFrame).
+    uint32_t sim_frame;
     uint32_t display_frame;   // TIMING — 0x81635C RENDER-LOOP counter (EXCLUDED)
     uint32_t game_mode;       // SIM — mode handler dispatch
     uint32_t substate;        // SIM — sub-state within mode
     uint32_t substate_timer;  // SIM
     uint32_t game_type;       // SIM (session-constant, config-locked)
     uint32_t match_phase_timer; // SIM — intro lock countdown
-    uint32_t input_read_idx;  // SIM (aliases sim_frame at 0x816490)
+    uint32_t input_read_idx;  // PASS-CADENCE alias of sim_frame (same address
+                              // 0x816490) — EXCLUDED from digest (F7d)
     uint32_t input_write_idx; // SIM
     uint32_t effect_index;    // SIM — Effect_Enqueue write cursor
     // SIM — 0x816494 `Frame_Display` (ADDR_FRAME_DISPLAY): ++ once per SIM
@@ -88,9 +95,11 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot);
 
 /// Block64 digest over the SIM-affecting members only (INV-22): palettes are
 /// render-only by pipeline design and live outside these regions entirely;
-/// display_frame (0x81635C), the pre-match render gap, and the FPU control
-/// words are excluded per the M4-6 audit, and the three per-entity digest
-/// masks (F2/F4/F5, see struct comment) are skipped inside main_state.
+/// display_frame (0x81635C), the pre-match render gap, the FPU control
+/// words, and the pass-cadence sim_frame/input_read_idx pair (0x816490,
+/// F7d) are excluded per the M4-6 audit + SAVESTATE_AUDIT §9, and the
+/// digest masks (F2/F4/F5/F7c, see struct comment) are skipped inside
+/// main_state.
 /// This is the `gameplay_hash` fed to the SyncHash exchange and the confirm
 /// pipeline.
 uint64_t GameSnapshot_HashGameplay(const GameSnapshot* snapshot);

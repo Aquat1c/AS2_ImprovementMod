@@ -696,6 +696,22 @@
 #define ENTITY_OFF_HIT_REACTION_ANIM_TIMER 0x07C5
 #define ENTITY_OFF_HIT_REACTION_LIFE_TIMER 0x07C6
 #define ENTITY_OFF_HIT_REACTION_KEEP_FLAG  0x07C7
+// F7h (run 19-42-5x f3299): a STATIC persistent divergence appeared at
+// p1_entity+0x1A650..+0x1A68F the moment P2 hit 50 hp (KO announcer
+// voice trigger) — 0x404 past the F4 voice-bookkeeping mask, i.e. another
+// audio-event-gated block in the entity tail (F4 class: wall-clock audio
+// timing is per-side). Masked as a 64-byte window; FINEENT covers
+// [+0x1A640,+0x1A6C0) for byte evidence if a neighbor fires.
+#define ENTITY_VOICE_TAIL_MASK_OFF   0x1A650
+#define ENTITY_VOICE_TAIL_MASK_SIZE  0x40
+
+// F7e: the four hit-reaction DISPLAY bytes above are HUD/render-cadence
+// bookkeeping (combo-pop animation; the mod's rollback_combo_fx owns their
+// rollback correctness and netplay_hud_vanilla smooths +0x7C5 around
+// render). The fine-diag ring caught them as transient per-side hash noise
+// under real combat — digest-masked (captured/restored unchanged).
+#define ENTITY_HIT_REACTION_DISPLAY_MASK_OFF  0x07C4
+#define ENTITY_HIT_REACTION_DISPLAY_MASK_SIZE 4
 #define ENTITY_OFF_ATTACHED_FX_SLOTS       0x07F0
 #define ENTITY_ATTACHED_FX_SLOTS_SIZE      0x0028
 #define ENTITY_RENDER_OVERLAY_FIELDS_SIZE  0x0019
@@ -709,6 +725,41 @@
 #define ENTITY_OFF_RENDER_FLASH_FLAG     0x01B4  // +436, BYTE, extra flash/afterimage draw flag
 #define ENTITY_OFF_RENDER_TINT_STATE     0x01B8  // +440, DWORD, 1 disables extra tint pass in sub_4C6B60
 #define ENTITY_OFF_RENDER_TINT_TIMER     0x01BC  // +444, DWORD
+// F7e (2026-08-17 combat-load run 19-17-3x): the F5 digest mask is widened to
+// start at the flash flag — +0x1B4..+0x1BF (flash byte + pad + tint dwords).
+// The fine-diag ring caught transient per-side divergence in the 64B window
+// covering +0x1B4 the moment real combat inputs started flowing; the flash
+// flag is render-phase draw bookkeeping (render_guard/practice both treat it
+// as neutral-render state).
+// F7g follow-up (run 19-35-2x f3959, single-flicker at f3901): the only
+// unexplained hashed divergence was p1_entity+0x1C4..+0x1CF — the tail of
+// the same render flash/tint bookkeeping struct. Mask extended to
+// +0x1B4..+0x1CF (28 B).
+#define ENTITY_RENDER_FLASH_TINT_MASK_OFF  0x01B4
+#define ENTITY_RENDER_FLASH_TINT_MASK_SIZE 0x1C
+// F7f (2026-08-17 combat run 19-25-3x, byte-exact via FINEENT): three more
+// per-PASS-cadence entity counters — +0x1A4 (render anim/overlay timer
+// neighborhood) and +0x7F0/+0x7F8 (timer-block render effect counters).
+// Their cross-side offset tracked the sides' pass-count delta exactly
+// (A sim=435/B=436 -> counters exactly +1 apart, both frames), i.e. they
+// increment once per outer pass (render phase) and pre-tick hashing
+// samples them at sim cadence — the F7d class inside the entities.
+// Run 19-47-2x f1469 byte evidence: the block is the hit-popup DISPLAY
+// context (decomp hit-processing writes +0x1A4(b)/+0x1A5(b)/+0x1A6(w)/
+// +0x1A8(w); HUD expiry FF-fills all six bytes at its own cadence — B
+// showed ff-fill one frame before A). Mask widened to 8 bytes.
+#define ENTITY_RENDER_ANIM_TIMER_MASK_OFF   0x01A4
+#define ENTITY_RENDER_ANIM_TIMER_MASK_SIZE  8
+// F7f follow-up (run 19-29-2x f2249): +0x7FC diverged next — the companion
+// state byte written when the +0x7F8 timer wraps. Then run 19-38-2x f3929
+// diverged at +0x800..+0x803 (the next dwords of the same region). The
+// whole +0x7F0..+0x833 range is the entity's RENDER OUTPUT block — fx
+// timers, then the sprite/overlay fields (+0x818 main sprite, +0x81C
+// group, +0x820.. overlay x/y/blend/alpha) that render_guard itself
+// classifies as render state and REWRITES on rollback corrections at its
+// own cadence. Masked wholesale; captured/restored unchanged.
+#define ENTITY_RENDER_OUTPUT_BLOCK_OFF      0x07F0
+#define ENTITY_RENDER_OUTPUT_BLOCK_SIZE     0x44
 // +440/+444 are advanced/terminated by the RENDER-phase player renderer
 // (sub_4C6B60, once per render frame) but live inside the hashed main_state
 // region → digest-MASKED (captured/restored, never hashed). SAVESTATE_AUDIT F5.
@@ -723,6 +774,14 @@
 // boundary so the last mutated field (+1850) is fully covered.
 #define ENTITY_OFF_SUPERBG_STATE         0x04DC  // +1244, DWORD — dispatch state (sim-set)
 #define ENTITY_SUPERBG_SCRATCH_MASK_SIZE 0x0260  // 608 B: +1244 .. +1851 inclusive
+// F7g (2026-08-17 combat run 19-32-0x, f3059): with supers active the fine
+// ring pinned per-side churn to +0x4C4..+0x4DB — the 24 bytes immediately
+// BEFORE the F2 mask (window +0x484..+0x4C3 stayed equal, bounding it).
+// The superbg particle struct evidently begins at +0x4C4, not +0x4DC; the
+// F2 digest mask now starts there (+0x4C4..+0x73B, 632 B). Capture/restore
+// unchanged.
+#define ENTITY_SUPERBG_MASK_OFF          0x04C4
+#define ENTITY_SUPERBG_MASK_SIZE         0x0278
 
 // Character voice bookkeeping (SAVESTATE_AUDIT F4): 3 dwords per entity at
 // +107084 driven by Entity_UpdateAudio (sub_4C38F0) — [0] requested voice id

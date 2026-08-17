@@ -220,6 +220,26 @@ static int __cdecl Hook_AdvanceFrame() {
         return 0;
     }
     int result = g_origAdvanceFrame ? g_origAdvanceFrame() : 0;
+
+    // ── F7i (2026-08-17 round-boundary desync, runs 19-42/19-49) ────────────
+    // Frame_Simulation (0x816490) increments once per OUTER PASS (this
+    // function's vanilla body), so under per-side catch-up its value skews
+    // between peers. F7d proved no MID-ROUND sim reader and digest-masked
+    // it — but the fine-diag ring then caught the ROUND TIME-OVER check
+    // consuming it: at f3985 both sides' entire 253 KB state was
+    // byte-identical (all 4043 windows) with sim=3340 vs 3342, and the side
+    // 2 passes ahead flipped substate 3->2 (round end) two confirmed frames
+    // early. The counter IS sim-relevant at exactly that seam, so it must
+    // be DETERMINISTIC, not masked: while the mod owns netplay gameplay,
+    // mirror it from Frame_Display (0x816494), which ticks once per SIM
+    // frame on the canonical timeline (F3) and is already hashed.
+    // Capture/restore are unchanged (both counters ride the snapshot); the
+    // F7d digest exclusion stays (the alias is now redundant with fdisp).
+    if (Rollback::RollbackSession_IsActive() && GetGameMode() == MODE_MATCH) {
+        *reinterpret_cast<volatile int32_t*>(ADDR_FRAME_SIMULATION) =
+            *reinterpret_cast<volatile int32_t*>(ADDR_FRAME_DISPLAY);
+    }
+
     PracticeTools_OnFrameAdvanced();
     return result;
 }

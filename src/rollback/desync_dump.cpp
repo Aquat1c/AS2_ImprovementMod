@@ -7,6 +7,7 @@
  */
 
 #include "rollback/desync_dump.h"
+#include "rollback/desync_fine_diag.h"
 #include "rollback/rollback_debug.h"
 #include "rollback/rollback_session.h"
 #include "rollback/determinism_verify.h"
@@ -302,7 +303,10 @@ void DesyncDump_WriteFullDump(FILE* f, const DesyncDumpParams& params) {
     fprintf(f, "  mispredictions:     %d\n", snap.total_mispredictions);
     fprintf(f, "  active_delay:       %d\n", snap.active_delay);
     fprintf(f, "  rollback_budget:    %d\n", snap.rollback_budget);
-    fprintf(f, "  current_checksum:   0x%08X\n", snap.current_checksum);
+    // Computed explicitly at dump time (GetSnapshot no longer hides the
+    // 253 KB CRC pass — see rollback_session_engine2.cpp PERF note).
+    fprintf(f, "  current_checksum:   0x%08X\n",
+            RollbackSession_ComputeLiveStateChecksum());
 
     // ====== GLOBAL GAME STATE ======
     fprintf(f, "\n--- Global Game State ---\n");
@@ -577,6 +581,9 @@ bool DesyncDump_TryDumpWithDiagnostics(int32_t frame,
         fprintf(f, "RINGCOUNT n=0\n");
     }
     DesyncDump_WriteRegionCRCsMachine(f);
+    // F7d fine-grained localization: confirm-seam per-window CRCs + raw
+    // context images for the ring frames (comparator: FINE* lines).
+    FineDiag_WriteDump(f);
     fprintf(f, "\n");
 
     // ====== FULL HUMAN-READABLE DUMP ======
