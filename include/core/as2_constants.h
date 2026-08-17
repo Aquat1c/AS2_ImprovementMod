@@ -92,6 +92,13 @@
 #define ADDR_MATCH_HUD_RENDER     (GAME_BASE + 0x0C05B0) // sub_4C05B0 — match HUD (nickname bars)
 #define ADDR_NAME_BAR_TEXTURE     0x816038               // dword_816038 — gradient bar texture
 #define ADDR_SE_PLAY            (GAME_BASE + 0x0C3C00)  // sub_4C3C00 — SE_Play (actual sound effect trigger)
+// Audio_IsPlaying (0x62C840): queries LIVE DirectSound buffer state. The
+// simulation branches on it — Entity_UpdateAudio only plays a voice and
+// updates the captured voice bookkeeping when it returns false — so truth and
+// replay ticks, which run at different real times, can take DIFFERENT
+// branches. Hooked for record/replay (rollback_audio), the qoh99 hkSoundStatus
+// pattern; masking the resulting bytes only hid the divergence.
+#define ADDR_AUDIO_IS_PLAYING   0x62C840
 #define ADDR_MATCH_SCORE_STATS  (GAME_BASE + 0x15BCD0)  // sub_55BCD0 — Match_UpdateScoreStats: cumulative
                                                         // score/rank/continuation `+=` globals OUTSIDE the snapshot
                                                         // regions, called on the round-end commit tick. Hooked so a

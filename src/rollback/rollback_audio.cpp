@@ -463,6 +463,93 @@ void RollbackAudio_OnEngineBatchEnd(int32_t rb_frame, int32_t game_abs_frame) {
     }
 }
 
+// ── Audio_IsPlaying record/replay (qoh99 hkSoundStatus model) ─────────────
+// The simulation branches on live DirectSound buffer state: Entity_UpdateAudio
+// only plays a voice and updates the CAPTURED voice bookkeeping when
+// Audio_IsPlaying returns false. Truth and replay ticks run at different real
+// times, so the device can answer differently and the two take different
+// branches — state that then differs from what the snapshot says it should be.
+// Digest-masking those bytes hid the divergence; it never removed it.
+//
+// So: record the device's answers in call order on the truth tick, and hand
+// the SAME answers back during replay ticks. The replay then reproduces the
+// truth tick's branches exactly, which is the whole contract of a rollback.
+namespace {
+
+constexpr size_t kAudioStatusRingFrames = 64;   // >= max rollback depth + slack
+constexpr size_t kAudioStatusCallsPerFrame = 32;
+
+struct AudioStatusFrame {
+    int32_t  rb_frame = -1;
+    uint16_t count = 0;
+    int      results[kAudioStatusCallsPerFrame] = {};
+};
+
+AudioStatusFrame s_statusRing[kAudioStatusRingFrames];
+uint16_t         s_statusReplayCursor = 0;
+int32_t          s_statusReplayFrame = -1;
+uint32_t         s_statusRecorded = 0;
+uint32_t         s_statusReplayed = 0;
+uint32_t         s_statusOverflow = 0;
+uint32_t         s_statusMisses = 0;
+
+AudioStatusFrame& StatusSlot(int32_t rb_frame) {
+    return s_statusRing[(size_t)((uint32_t)rb_frame % kAudioStatusRingFrames)];
+}
+
+} // namespace
+
+AudioIsPlaying_t g_origAudioIsPlaying = nullptr;
+
+int __cdecl Hook_Audio_IsPlaying(int handle) {
+    if (!g_origAudioIsPlaying) return -1;
+    if (!RollbackSession_IsActive()) {
+        return g_origAudioIsPlaying(handle);
+    }
+
+    const int32_t frame = RollbackSession_GetCurrentFrame();
+
+    if (RollbackSession_IsRollingBack()) {
+        AudioStatusFrame& slot = StatusSlot(frame);
+        if (s_statusReplayFrame != frame) {
+            s_statusReplayFrame = frame;
+            s_statusReplayCursor = 0;
+        }
+        if (slot.rb_frame == frame && s_statusReplayCursor < slot.count) {
+            ++s_statusReplayed;
+            return slot.results[s_statusReplayCursor++];
+        }
+        // No recording for this call: the replay asked more times than the
+        // truth tick did. Fall through to the device rather than inventing a
+        // value, and count it — a nonzero miss rate means the record window is
+        // too small or the branch genuinely diverged.
+        ++s_statusMisses;
+        return g_origAudioIsPlaying(handle);
+    }
+
+    const int result = g_origAudioIsPlaying(handle);
+    AudioStatusFrame& slot = StatusSlot(frame);
+    if (slot.rb_frame != frame) {
+        slot.rb_frame = frame;
+        slot.count = 0;
+    }
+    if (slot.count < kAudioStatusCallsPerFrame) {
+        slot.results[slot.count++] = result;
+        ++s_statusRecorded;
+    } else {
+        ++s_statusOverflow;
+    }
+    return result;
+}
+
+void RollbackAudio_GetStatusStats(uint32_t* recorded, uint32_t* replayed,
+                                  uint32_t* misses, uint32_t* overflow) {
+    if (recorded) *recorded = s_statusRecorded;
+    if (replayed) *replayed = s_statusReplayed;
+    if (misses)   *misses = s_statusMisses;
+    if (overflow) *overflow = s_statusOverflow;
+}
+
 char __cdecl Hook_SE_Play(int sound_id) {
     if (s_insideOriginalSEPlay) {
         return g_origSEPlay ? g_origSEPlay(sound_id) : 0;

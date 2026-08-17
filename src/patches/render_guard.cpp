@@ -8,6 +8,13 @@
 
 #include <stdint.h>
 
+#include "rollback/rollback_session.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 namespace RenderGuard {
 
 MatchRenderPlayers_t g_origMatchRenderPlayers = nullptr;
@@ -243,6 +250,28 @@ bool SanitizeMatch(int match) {
 int __cdecl Hook_MatchRenderPlayers(int match, char timerBit) {
     if (!g_origMatchRenderPlayers) {
         return 0;
+    }
+
+    // Is the vanilla player renderer being driven during rollback REPLAY
+    // ticks? EfzRevival/qoh99 both suppress render work during replay; if we
+    // do not, a depth-30 transaction issues 30 sets of draws that composite
+    // into the single presented buffer — which is what several combo digits
+    // on screen at once would look like. Measure before assuming.
+    {
+        static uint32_t s_replayCalls = 0;
+        static uint32_t s_liveCalls = 0;
+        static DWORD s_lastMs = 0;
+        if (Rollback::RollbackSession_IsRollingBack()) ++s_replayCalls; else ++s_liveCalls;
+        const DWORD now = GetTickCount();
+        if (s_lastMs == 0) s_lastMs = now;
+        if ((DWORD)(now - s_lastMs) >= 1000) {
+            s_lastMs = now;
+            Rollback::NetplayLog_Write("RENDERGUARD", -1,
+                "render calls/s: during_replay=%u live=%u",
+                s_replayCalls, s_liveCalls);
+            s_replayCalls = 0;
+            s_liveCalls = 0;
+        }
     }
 
     __try {

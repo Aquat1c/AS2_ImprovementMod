@@ -199,6 +199,21 @@ bool InstallHooks() {
         LOG_INFO("Hooked sub_4C3C00 (SE_Play - rollback-aware audio journal)");
     }
 
+    // Audio_IsPlaying: the simulation branches on live DirectSound state
+    // (Entity_UpdateAudio plays a voice and updates CAPTURED bookkeeping only
+    // when it returns false). Recorded on truth ticks and replayed during
+    // rollback so both take the same branch — qoh99's hkSoundStatus pattern.
+    LOG_INFO("ADDR_AUDIO_IS_PLAYING = 0x%08X (Audio_IsPlaying)", ADDR_AUDIO_IS_PLAYING);
+    status = MH_CreateHook(
+            reinterpret_cast<void*>(ADDR_AUDIO_IS_PLAYING),
+            reinterpret_cast<void*>(&Rollback::Hook_Audio_IsPlaying),
+            reinterpret_cast<void**>(&Rollback::g_origAudioIsPlaying));
+    if (status != MH_OK) {
+        LOG_WARN("Failed to hook Audio_IsPlaying! Status: %d (audio status not replayed)", status);
+    } else {
+        LOG_INFO("Hooked Audio_IsPlaying (record/replay for rollback determinism)");
+    }
+
     LOG_INFO("ADDR_EFFECT_SPAWN = 0x%08X (sub_4A92C0 Effect_Enqueue)", ADDR_EFFECT_SPAWN);
     status = MH_CreateHook(
             reinterpret_cast<void*>(ADDR_EFFECT_SPAWN),

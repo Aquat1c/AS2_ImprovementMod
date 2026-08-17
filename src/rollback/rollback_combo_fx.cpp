@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 namespace Rollback {
 namespace {
 
@@ -313,6 +318,22 @@ void RollbackComboFx_OnEngineBatchEnd(int32_t rb_frame, int32_t game_abs_frame) 
         s_setParams2Count);
 }
 
+// Once-per-second value snapshot. The TIMER_DECAY lines recorded only THAT a
+// change happened, never the values, so they could not answer the question
+// they existed for (does the combo/HIT display stall under rollback?).
+static void LogComboStatePeriodic(const ComboSnapshot& p1, const ComboSnapshot& p2) {
+    static DWORD s_lastMs = 0;
+    const DWORD now = GetTickCount();
+    if (s_lastMs != 0 && (DWORD)(now - s_lastMs) < 1000) return;
+    s_lastMs = now;
+    NetplayLog_Write("COMBOFX", s_currentRbFrame,
+        "STATE rb=%d rolling=%d | P1 combo=%u shown=%u anim=%u life=%u keep=%u "
+        "| P2 combo=%u shown=%u anim=%u life=%u keep=%u",
+        s_currentRbFrame, s_currentRollingBack ? 1 : 0,
+        p1.display_combo, p1.shown_flag, p1.anim_timer, p1.life_timer, p1.keep_flag,
+        p2.display_combo, p2.shown_flag, p2.anim_timer, p2.life_timer, p2.keep_flag);
+}
+
 int __cdecl Hook_Match_UpdateComboTimers(int match) {
     if (!g_origMatchUpdateComboTimers) {
         return 0;
@@ -329,11 +350,21 @@ int __cdecl Hook_Match_UpdateComboTimers(int match) {
     const ComboSnapshot p1After = CaptureEntity(ADDR_P1_ENTITY_BASE);
     const ComboSnapshot p2After = CaptureEntity(ADDR_P2_ENTITY_BASE);
 
+    // Only sample outside replays: a replay tick's values are mid-transaction
+    // and would misrepresent what the player is actually looking at.
+    if (!s_currentRollingBack) {
+        LogComboStatePeriodic(p1After, p2After);
+    }
+
     if (PresentationStateChanged(p1Before, p1After) ||
         PresentationStateChanged(p2Before, p2After)) {
         ++s_timerChangeCount;
-        const bool important = s_currentRollingBack ||
-                               ImportantPresentationStateChanged(p1Before, p1After) ||
+        // Rollback replays are the COMMON case, not the notable one: at
+        // per-frame depth-30 forcing this hook runs ~1800x/s, and promoting
+        // every replay tick to a full write produced 70,008 log lines in a
+        // two-minute run. Same class of self-inflicted cost as the synctrace
+        // CRC that once cost 25 fps. Importance is now about what CHANGED.
+        const bool important = ImportantPresentationStateChanged(p1Before, p1After) ||
                                ImportantPresentationStateChanged(p2Before, p2After);
         if (important) {
             NetplayLog_Write("COMBOFX", s_currentRbFrame,
