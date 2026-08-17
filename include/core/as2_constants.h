@@ -380,6 +380,15 @@
 #define ADDR_GAME_WNDPROC_CUSTOM_PROC_PTR 0x9DB668
 #define ADDR_GAME_WNDPROC_MSG_CALLBACK    0x9E5CB8
 #define ADDR_GAME_WNDPROC                 (GAME_BASE + 0x233490)  // sub_633490 DXLib wndproc
+// sub_63a110: DXLib per-frame windowed-size enforcer. Compares the client rect
+// against the engine's expected size and MoveWindow/sub_634bc0's it back on any
+// mismatch. In retail this whole function is skipped because the vanilla
+// msg-hook helper arms ADDR_GAME_WNDPROC_CUSTOM_HANDLER (0x9DB660) = 1 at
+// startup; the shell-hotkey layer forces that gate to 0, which re-arms this
+// enforcer and makes every user edge-drag resize snap back to 640x480 (the
+// wndproc invokes it on WM_SIZE for every wParam except SIZE_MAXIMIZED, which
+// is why only maximize survived). See ShellHotkeyPatch_Install.
+#define ADDR_GAME_WINDOW_SIZE_ENFORCER    (GAME_BASE + 0x23A110)  // sub_63a110
 #define ADDR_GAME_CURSOR_REQUEST_STATE    0x9DB6D0  // g_nCursorRequestState
 #define ADDR_GAME_CURSOR_CURRENT_SHOWN    0x9DB6D4  // g_bCursorCurrentState
 #define ADDR_GAME_MOUSE_WHEEL_COUNTER     0x9DB6D8  // WM_MOUSEWHEEL delta accumulator

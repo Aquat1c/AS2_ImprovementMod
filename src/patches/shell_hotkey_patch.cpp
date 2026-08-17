@@ -19,9 +19,33 @@
 #include <windows.h>
 
 typedef LRESULT(CALLBACK* GameWndProc_t)(HWND, UINT, WPARAM, LPARAM);
+typedef int(__cdecl* WindowSizeEnforcer_t)();
 
 static GameWndProc_t g_origGameWndProc = nullptr;
+static WindowSizeEnforcer_t g_origWindowSizeEnforcer = nullptr;
 static bool s_installed = false;
+static bool s_sizeEnforcerHooked = false;
+
+// sub_63a110 no-op (window resize fix).
+//
+// Retail behavior: the vanilla msg-hook helper sets the 0x9DB660 gate to 1 at
+// startup, and sub_63a110 starts with `if (gate != 1)` — so in an unmodded
+// game this per-frame "snap the window back to the expected client size"
+// enforcement NEVER runs and the user can freely drag-resize the window.
+//
+// This patch forces the gate to 0 (ForceDisableCustomWndProcPaths, to kill the
+// vanilla shell-key swallow paths), which as a side effect re-armed the
+// enforcer: the DXLib wndproc calls it on WM_SIZE for every wParam except
+// SIZE_MAXIMIZED, and ProcessMessage calls it per frame, so every edge-drag
+// resize snapped back to 640x480 within a frame (maximize alone survived).
+//
+// No-oping the function reproduces the retail (gate==1) skip exactly: it
+// always returns 0 and no caller consumes its side effects in the gate==1
+// world retail users run in. Window sizing stays owned by the d3d9 proxy
+// (WM_SIZING aspect keeping + scaling swap chain).
+static int __cdecl Hook_WindowSizeEnforcer() {
+    return 0;
+}
 
 static bool IsMiddleMouseMessage(UINT msg) {
     return msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP || msg == WM_MBUTTONDBLCLK;
@@ -213,6 +237,24 @@ bool ShellHotkeyPatch_Install() {
     WriteMemory<intptr_t>(ADDR_GAME_WNDPROC_MSG_CALLBACK, 0);
     WriteMemory<int32_t>(ADDR_SHELL_HOTKEY_SUPPRESS_FLAG, 0);
 
+    // Forcing the gate to 0 above re-arms the DXLib windowed-size enforcer
+    // (skipped in retail where the gate is 1) — no-op it so user window
+    // resizing keeps working. See Hook_WindowSizeEnforcer.
+    status = MH_CreateHook(reinterpret_cast<void*>(ADDR_GAME_WINDOW_SIZE_ENFORCER),
+                           reinterpret_cast<void*>(&Hook_WindowSizeEnforcer),
+                           reinterpret_cast<void**>(&g_origWindowSizeEnforcer));
+    if (status == MH_OK) {
+        s_sizeEnforcerHooked = true;
+        LOG_INFO("[ShellHotkey] No-op'd DXLib windowed-size enforcer sub_63a110 at 0x%08X "
+                 "(restores user window resize; retail skips it via the 0x9DB660 gate)",
+                 ADDR_GAME_WINDOW_SIZE_ENFORCER);
+    } else {
+        LOG_WARN("[ShellHotkey] Failed to hook windowed-size enforcer at 0x%08X (status=%d) — "
+                 "edge-drag window resize will snap back to 640x480",
+                 ADDR_GAME_WINDOW_SIZE_ENFORCER,
+                 status);
+    }
+
     s_installed = true;
     LOG_INFO("[ShellHotkey] Hooked sub_633490 at 0x%08X (workarounds=%d) — use ModCallGameWndProc (see SHELL_HOTKEY_POLICY.md)",
              ADDR_GAME_WNDPROC,
@@ -227,6 +269,12 @@ void ShellHotkeyPatch_Remove() {
 
     MH_DisableHook(reinterpret_cast<void*>(ADDR_GAME_WNDPROC));
     MH_RemoveHook(reinterpret_cast<void*>(ADDR_GAME_WNDPROC));
+    if (s_sizeEnforcerHooked) {
+        MH_DisableHook(reinterpret_cast<void*>(ADDR_GAME_WINDOW_SIZE_ENFORCER));
+        MH_RemoveHook(reinterpret_cast<void*>(ADDR_GAME_WINDOW_SIZE_ENFORCER));
+        s_sizeEnforcerHooked = false;
+    }
+    g_origWindowSizeEnforcer = nullptr;
     g_origGameWndProc = nullptr;
     s_installed = false;
 }

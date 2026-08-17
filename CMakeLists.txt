@@ -294,6 +294,7 @@ set(ROLLBACK_HEADERS
     include/rollback/rollback_debug.h
     include/rollback/desync_diag.h
     include/rollback/desync_dump.h
+    include/rollback/desync_fine_diag.h
     include/rollback/netplay_log.h
     include/rollback/rollback_audio.h
     include/rollback/rollback_combo_fx.h
@@ -423,6 +424,7 @@ set(ROLLBACK_SOURCES
     src/rollback/rollback_debug.cpp
     src/rollback/desync_diag.cpp
     src/rollback/desync_dump.cpp
+    src/rollback/desync_fine_diag.cpp
     src/rollback/netplay_log.cpp
     src/rollback/rollback_audio.cpp
     src/rollback/rollback_combo_fx.cpp
@@ -805,7 +807,19 @@ if(EXISTS ${GAME_DIR})
             ${GAME_DIR}/as2_rollback.dll
         COMMENT "Copying as2_rollback.dll to game directory"
     )
-    
+
+    # wsock32.dll carries the shell-hotkey/middle-click EARLYPATCH layer
+    # (phantom keybd_event(VK7) drop, cursor-hide bypass, SC_TASKLIST /
+    # SC_SCREENSAVE swallow bypasses — see docs/SHELL_HOTKEY_POLICY.md).
+    # It was never part of the post-build deploy, so game dirs silently ran
+    # stale pre-fix copies. Keep it in lockstep with the other proxies.
+    add_custom_command(TARGET wsock32 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:wsock32>
+            ${GAME_DIR}/wsock32.dll
+        COMMENT "Copying wsock32.dll to game directory"
+    )
+
     # SDL3.dll is required (no static prebuilt available)
     if(EXISTS ${SDL3_DIR}/lib/x86/SDL3.dll)
         add_custom_command(TARGET as2_rollback POST_BUILD
@@ -830,6 +844,13 @@ if(TEST_GAME_DIR AND EXISTS ${TEST_GAME_DIR})
             $<TARGET_FILE:as2_rollback>
             ${TEST_GAME_DIR}/as2_rollback.dll
         COMMENT "Copying as2_rollback.dll to test game directory"
+    )
+
+    add_custom_command(TARGET wsock32 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:wsock32>
+            ${TEST_GAME_DIR}/wsock32.dll
+        COMMENT "Copying wsock32.dll to test game directory"
     )
 
     if(EXISTS ${SDL3_DIR}/lib/x86/SDL3.dll)
