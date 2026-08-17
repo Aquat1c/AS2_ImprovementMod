@@ -14,6 +14,11 @@ namespace {
 constexpr uint32_t kResendIntervalMs = 250;
 constexpr size_t   kMaxKinds = 7;  // NetTransitionKind range (None..EpochAlign)
 
+// Match-boundary generation. Every boundary-scoped barrier (WinScreenExit,
+// PostMatchDecision) belongs to exactly one boundary; proposals from an older
+// one must not satisfy a newer one's commit.
+static uint16_t s_boundaryGeneration = 1;
+
 struct BarrierSlot {
     bool     localProposed  = false;
     bool     localAcked     = false;   // remote acked OUR proposal
@@ -33,6 +38,8 @@ struct BarrierSlot {
     uint32_t remoteEpoch    = 0;
     uint8_t  remoteFirstPhase = 0;
     uint8_t  remoteNativeMode = 0;
+    // Boundary generation this slot's local proposal belongs to.
+    uint16_t generation     = 0;
 };
 
 bool        s_initialized = false;
@@ -48,6 +55,7 @@ BarrierSlot* SlotFor(NetTransitionKind kind) {
 void SendProposal(NetTransitionKind kind, BarrierSlot& slot) {
     PhaseTransitionPayload p{};
     p.transition_seq = slot.localSeq;
+    p.generation = slot.generation ? slot.generation : s_boundaryGeneration;
     p.kind = (uint8_t)kind;
     p.intent = slot.localIntent;
     p.session_id = slot.sessionId;
@@ -141,6 +149,17 @@ void TransitionBarrier_Clear(NetTransitionKind kind, const char* reason) {
     }
 }
 
+void TransitionBarrier_BeginBoundary(const char* reason) {
+    if (!s_initialized) return;
+    ++s_boundaryGeneration;
+    if (s_boundaryGeneration == 0) s_boundaryGeneration = 1;   // never 0 (sentinel)
+    TransitionBarrier_Clear(NetTransitionKind::WinScreenExit, reason);
+    TransitionBarrier_Clear(NetTransitionKind::PostMatchDecision, reason);
+    Rollback::NetplayLog_Write("TRANSIT", -1,
+        "Boundary %u opened (%s): WinScreenExit + PostMatchDecision cleared",
+        s_boundaryGeneration, reason ? reason : "?");
+}
+
 void TransitionBarrier_FrameUpdate() {
     if (!s_initialized) return;
     const DWORD now = GetTickCount();
@@ -158,8 +177,12 @@ void TransitionBarrier_Propose(NetTransitionKind kind, uint8_t intent, uint32_t 
     BarrierSlot* slot = SlotFor(kind);
     if (!slot) return;
     if (slot->localProposed) {
-        // Intent change before commit re-proposes with a fresh seq.
-        if (slot->localIntent == intent || slot->committed) return;
+        // Idempotence keys on (generation, intent), never intent alone. A NEW
+        // boundary proposing the SAME intent as a stale, never-committed
+        // proposal from the PREVIOUS boundary used to be swallowed here and
+        // never resent, so that boundary's barrier could never commit.
+        const bool sameBoundary = (slot->generation == s_boundaryGeneration);
+        if (sameBoundary && (slot->localIntent == intent || slot->committed)) return;
         slot->localAcked = false;
         slot->committed = false;
         slot->commitConsumed = false;
@@ -167,6 +190,7 @@ void TransitionBarrier_Propose(NetTransitionKind kind, uint8_t intent, uint32_t 
     slot->localProposed = true;
     slot->localIntent = intent;
     slot->sessionId = sessionId;
+    slot->generation = s_boundaryGeneration;
     slot->localSeq = s_nextSeq++;
     LOG_NETPLAY(LOG_INFO, "[Transition] Propose %s seq=%u intent=%u",
         NetTransitionKindName(kind), slot->localSeq, intent);
@@ -261,6 +285,18 @@ bool TransitionBarrier_OnPacket(PacketType type, const void* payload, size_t pay
     }
 
     if (type == PacketType::PhaseTransitionProposal) {
+        // Reject proposals from a PREVIOUS boundary. Without this a leftover
+        // proposal could satisfy the next boundary's commit condition, since
+        // the boundary-scoped slots were cleared on only one code path.
+        if (p->generation != 0 && s_boundaryGeneration != 0 &&
+            (int16_t)(p->generation - s_boundaryGeneration) < 0) {
+            Rollback::NetplayLog_Write("TRANSIT", -1,
+                "Stale %s proposal ignored: generation=%u current=%u seq=%u",
+                NetTransitionKindName(kind), p->generation, s_boundaryGeneration,
+                p->transition_seq);
+            SendAck(kind, p->transition_seq, p->intent, *p);
+            return true;
+        }
         // Idempotent: duplicates and stale seqs are re-acked, never fatal.
         const bool duplicate =
             slot->remoteProposed && slot->remoteSeq == p->transition_seq;

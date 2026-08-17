@@ -137,6 +137,11 @@ static void ClearExpectedPostMatchIntent() {
 }
 
 static void ArmMatchEndLadder(const char* reason) {
+    // Open a fresh boundary FIRST: bumps the generation and clears the
+    // boundary-scoped barriers unconditionally, so this boundary can never
+    // inherit a stale proposal from the previous one (which happened whenever
+    // the previous boundary exited by any route other than ladder-complete).
+    Net::TransitionBarrier_BeginBoundary(reason);
     if (s_ladderArmed) return;
     s_ladderArmed = true;
     s_ladderWseConsumed = false;

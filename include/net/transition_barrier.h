@@ -31,6 +31,14 @@ void TransitionBarrier_Reset(const char* reason);
 // match without disturbing unrelated in-flight barriers).
 void TransitionBarrier_Clear(NetTransitionKind kind, const char* reason);
 
+/// Open a NEW match boundary: bumps the boundary generation and clears the
+/// boundary-scoped slots (WinScreenExit, PostMatchDecision) unconditionally.
+/// Those two were previously cleared on exactly one code path — the
+/// ladder-complete route — so any other exit from a boundary (fail-open
+/// watchdog, ForceExitToCharsel, WinScreenSync_Abort, cross-phase restart)
+/// left them dirty and the NEXT boundary inherited a stale proposal.
+void TransitionBarrier_BeginBoundary(const char* reason);
+
 // Propose a transition (idempotent — safe to call every frame while the local
 // side wants the transition). `intent` carries PostMatchIntentWire for
 // PostMatchDecision barriers, else 0.

@@ -311,7 +311,11 @@ struct PhaseTransitionPayload {
     uint32_t transition_seq;  // monotonic per session, minted by the proposer
     uint8_t  kind;            // NetTransitionKind
     uint8_t  intent;          // PostMatchIntentWire for PostMatchDecision, else 0
-    uint16_t _pad;
+    // Match-boundary generation (was _pad). Without it a proposal from
+    // boundary N can satisfy boundary N+1's commit, because the receive path
+    // has no staleness test and the boundary-scoped slots were cleared on only
+    // one code path. Wraps at 65535 boundaries, which no session reaches.
+    uint16_t generation;
     uint32_t session_id;      // pregame session id context (0 if none)
     // v2 EpochAlign fields (§3.2/§4.5); zero for every other kind. Populated
     // by match_setup (M5): host-minted epoch, first phase, sender native mode.
