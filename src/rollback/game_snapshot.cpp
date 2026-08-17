@@ -254,9 +254,51 @@ bool GameSnapshot_Capture(GameSnapshot* snapshot, int32_t frame) {
     return true;
 }
 
+// ── Render-cadence expiry byte: captured, but NOT rewound on restore ──────
+// entity+0x1A4 is a ONE-BYTE display-expiry counter for the hit/combo popup.
+// Ownership is split and unambiguous in the decomp:
+//   SIM   writes it exactly once, to 0, to start the popup (decomp:106761,
+//         `*(_BYTE *)(a1 + 420) = 0;` inside the hit-processing path).
+//   RENDER owns its lifetime: sub_4C1F90 reads it and increments it once per
+//         drawn frame, retiring the popup at 90 (decomp:113438-113445 for P1
+//         at match+41492, 113546-113553 for P2 at match+150304):
+//              v13 = v12 + 1; *(_BYTE*)(a1+41492) = v13;
+//              if (v13 == 90) *(_BYTE*)(a1+41492) = -1;
+//   The simulation never READS it — every read in the decomp is inside that
+//   render function.
+//
+// Because it advances at RENDER cadence but lives inside the captured region,
+// every restore rewinds the progress the renderer made. Under per-frame
+// depth-30 forcing it is set back 30 frames each frame and can never reach 90,
+// so the popup never retires — the operator's permanently stuck "HIT" and
+// leading combo digit, which persist across round transitions and appear ONLY
+// under rollback (A/B confirmed: absent at RB:0/30).
+//
+// EXACTLY ONE BYTE PER ENTITY. An earlier attempt excluded the whole 8-byte
+// +0x1A4 window AND the 4-byte +0x7C4 block and desynced live at frame 58:
+// +0x7C4 is simulation state (Entity_UpdateHitReaction reads and writes it),
+// and +0x1A5..+0x1AB carry sim-written popup parameters. Only the single
+// render-owned counter is held back.
+constexpr size_t kDisplayExpiryByteP1 = kP1EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF;
+constexpr size_t kDisplayExpiryByteP2 = kP2EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF;
+static_assert(ENTITY_RENDER_ANIM_TIMER_MASK_OFF == 0x01A4,
+              "display expiry byte offset moved");
+
 bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
     if (!snapshot || !snapshot->valid) {
         return false;
+    }
+
+    // Preserve the renderer's expiry progress across the bulk restore.
+    uint8_t liveExpiryP1 = 0;
+    uint8_t liveExpiryP2 = 0;
+    bool liveExpiryValid = false;
+    __try {
+        liveExpiryP1 = *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP1);
+        liveExpiryP2 = *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP2);
+        liveExpiryValid = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        liveExpiryValid = false;
     }
 
     __try {
@@ -264,6 +306,17 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("[GameSnapshot] Restore AV at main region 0x%08X", kMainStart);
         return false;
+    }
+
+    // Hand the renderer its own counter back, un-rewound. A popup the sim has
+    // just (re)started reads 0 from the snapshot on both sides anyway, so a
+    // fresh popup is unaffected; only an in-flight expiry keeps its progress.
+    if (liveExpiryValid) {
+        __try {
+            *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP1) = liveExpiryP1;
+            *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP2) = liveExpiryP2;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
     }
 
     __try {

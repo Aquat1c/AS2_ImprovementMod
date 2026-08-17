@@ -2362,14 +2362,31 @@ static void HandleAutoConnect() {
                 break;
             }
 
-            // Safety timeout
+            // Per-match safety timeout. It used to call
+            // AutoConnectHarness_Shutdown() and go to Failed, which stops the
+            // fighting AI PERMANENTLY — so on a multi-match soak the driver
+            // died at the first timeout and every later "match" was two idle
+            // characters. Live run 01-12-58 showed exactly that: rollbacks
+            // frozen at 2703, peer_depth 0, sim still at 60 fps, for the rest
+            // of the session.
+            //
+            // A stuck match must not end the soak. Stop DRIVING this match and
+            // let the normal match-end path carry us to the next one; the
+            // session, the harness and the AI all stay alive.
             if (s_autoConnect.matchDurationSec > 0) {
                 int elapsedSec = (int)(s_autoConnectMatchFrame / 60);
                 if (elapsedSec >= s_autoConnect.matchDurationSec) {
-                    LOG_NETPLAY(LOG_INFO, "[AutoConnect] Safety timeout after %d seconds",
+                    LOG_NETPLAY(LOG_WARNING,
+                        "[AutoConnect] Match ran past %ds without ending — "
+                        "releasing this match, harness stays live (match %d/%d)",
+                        elapsedSec, s_autoConnectCompletedMatches + 1,
+                        s_autoConnect.matchCount);
+                    Rollback::NetplayLog_Write("AUTOCONN", -1,
+                        "Match duration limit reached (%ds): released, driver kept alive",
                         elapsedSec);
-                    AutoConnectHarness_Shutdown();
-                    AutoConnectTransition(AutoConnectState::Failed, "duration limit");
+                    s_autoConnectMatchFrame = 0;
+                    AutoConnectTransition(AutoConnectState::ConfirmingWinScreen,
+                                          "match duration limit");
                 }
             }
             break;

@@ -326,12 +326,18 @@ static void LogComboStatePeriodic(const ComboSnapshot& p1, const ComboSnapshot& 
     const DWORD now = GetTickCount();
     if (s_lastMs != 0 && (DWORD)(now - s_lastMs) < 1000) return;
     s_lastMs = now;
+    // expiry = entity+0x1A4, the render-owned popup timer (sub_4C1F90
+    // increments it per drawn frame and retires the popup at 90 -> 255).
+    // Its progress is what the restore used to wipe; watching it climb is the
+    // direct proof the fix works, rather than reading pixels off a screenshot.
+    const uint8_t exp1 = ReadMemory<uint8_t>(ADDR_P1_ENTITY_BASE + ENTITY_RENDER_ANIM_TIMER_MASK_OFF);
+    const uint8_t exp2 = ReadMemory<uint8_t>(ADDR_P2_ENTITY_BASE + ENTITY_RENDER_ANIM_TIMER_MASK_OFF);
     NetplayLog_Write("COMBOFX", s_currentRbFrame,
-        "STATE rb=%d rolling=%d | P1 combo=%u shown=%u anim=%u life=%u keep=%u "
-        "| P2 combo=%u shown=%u anim=%u life=%u keep=%u",
+        "STATE rb=%d rolling=%d | P1 combo=%u shown=%u anim=%u life=%u keep=%u expiry=%u "
+        "| P2 combo=%u shown=%u anim=%u life=%u keep=%u expiry=%u",
         s_currentRbFrame, s_currentRollingBack ? 1 : 0,
-        p1.display_combo, p1.shown_flag, p1.anim_timer, p1.life_timer, p1.keep_flag,
-        p2.display_combo, p2.shown_flag, p2.anim_timer, p2.life_timer, p2.keep_flag);
+        p1.display_combo, p1.shown_flag, p1.anim_timer, p1.life_timer, p1.keep_flag, exp1,
+        p2.display_combo, p2.shown_flag, p2.anim_timer, p2.life_timer, p2.keep_flag, exp2);
 }
 
 int __cdecl Hook_Match_UpdateComboTimers(int match) {
