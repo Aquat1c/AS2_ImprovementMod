@@ -51,7 +51,15 @@ constexpr MaskRange kMainDigestMasks[] = {
     // low-32 hash halves equal = divergent bytes only at +4..7 of 8-byte
     // blocks = sound ids 4-7). Captured+restored as before (restore's
     // explicit clear = vanilla pass-top semantics); digest-masked only.
-    { (size_t)MATCH_PER_FRAME_TEMP_OFFSET, (size_t)MATCH_PER_FRAME_TEMP_SIZE },        // F7c
+    // Announcer voice handles (match+712..763): same class as SE_Handles below.
+    { (size_t)MATCH_ANNOUNCER_HANDLES_OFF, (size_t)MATCH_ANNOUNCER_HANDLES_SIZE },     // F9
+    // SE_Handles (match+976..1791) MERGED with the F7c per-frame temp
+    // (match+1792..1859) — the two spans are exactly adjacent (0x3D0 + 0x330
+    // == 0x700). The handles carry a process-global allocation serial in their
+    // VALUE (see as2_constants.h), so peers with different allocation
+    // histories differ here with no gameplay meaning whatsoever.
+    { (size_t)MATCH_SE_HANDLES_OFF,
+      (size_t)(MATCH_SE_HANDLES_SIZE + MATCH_PER_FRAME_TEMP_SIZE) },                   // F9 + F7c
     // F7e (2026-08-17, first combat-load run 19-17-3x): the fine-diag ring
     // caught two transient per-side windows in the entities the moment real
     // combat inputs started flowing — the render flash/tint block (F5

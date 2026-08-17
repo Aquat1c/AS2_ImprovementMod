@@ -177,6 +177,21 @@
 // without returning to the outer function, so this clearing never runs
 // between resim frames.  We must clear it ourselves before each frame
 // to prevent stale collision/hit temp data from bleeding across frames.
+// Sound-system handle storage inside the match struct. These are DirectSound
+// handles, not gameplay state, and their VALUES are per-process: the allocator
+// (0x62A480) bakes a process-global monotonic serial into every handle --
+//     *(_DWORD *)*v3 = dword_9D0454++;            (decomp:321905)
+//     return v2 | ((*(_DWORD *)*v3 | 0x1000) << 16);  (decomp:321934)
+// so two peers that allocated a DIFFERENT NUMBER of sounds before the match
+// hold different handle values for the same sounds. Stored unmasked inside the
+// hashed region, that is a silent cross-machine desync source -- and invisible
+// to same-machine testing, because two instances of the same build share an
+// allocation history. Digest-masked on the F4/F7h rationale (sound-system
+// bookkeeping, no gameplay meaning); still captured and restored.
+#define MATCH_ANNOUNCER_HANDLES_OFF  0x2C8                // match+712..763
+#define MATCH_ANNOUNCER_HANDLES_SIZE 0x34
+#define MATCH_SE_HANDLES_OFF         0x3D0                // match+976..1791 (204 handles)
+#define MATCH_SE_HANDLES_SIZE        0x330
 #define MATCH_PER_FRAME_TEMP_OFFSET  0x700                // match + 0x700 = 0x76CCF8
 #define MATCH_PER_FRAME_TEMP_SIZE    0x44                 // 68 bytes (memset to 0)
 #define ADDR_MATCH_PER_FRAME_TEMP    (ADDR_MATCH_BASE + MATCH_PER_FRAME_TEMP_OFFSET)
