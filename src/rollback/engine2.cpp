@@ -202,6 +202,13 @@ bool RollbackEngine::RotateEpoch(uint32_t new_epoch, uint32_t epoch_frame_origin
     }
     epoch_ = new_epoch;
     epoch_frame_origin_ = epoch_frame_origin;
+    // A mismatch pending on a now-pre-origin frame is dead with its match
+    // (see MarkMismatch): the savestates below the origin are being wiped
+    // by the adapter, so correcting it is impossible by construction.
+    if (pending_mismatch_valid_ &&
+        frameBefore(pending_mismatch_, epoch_frame_origin_)) {
+        pending_mismatch_valid_ = false;
+    }
     return true;
 }
 
@@ -354,6 +361,19 @@ bool RollbackEngine::ProduceLocalInputAhead(uint16_t fresh_sample) {
 // ============================================================================
 
 void RollbackEngine::MarkMismatch(uint32_t frame) {
+    // Pre-origin frames are DEAD (2026-08-17, run 21-12 rotation abort):
+    // an epoch rotation at a match boundary can leave a short speculative
+    // suffix from the OLD match below the new frame origin (observed:
+    // origin 10823 minted with confirmed 10821). The peer's actuals for
+    // those frames arrive late; a mismatch there would demand a restore
+    // below the origin — into savestate slots the rotation just wiped
+    // (fail-closed abort: "restore failed at frame 10821 (epoch 2)").
+    // State identity changed at the origin (§2.6.5) and the old match's
+    // archive was sealed at OnMatchEnd: the values can never affect the
+    // new match, so the mismatch is absorbed, never corrected.
+    if (frameBefore(frame, epoch_frame_origin_)) {
+        return;
+    }
     if (in_rollback_ && !frameBefore(frame, replay_cursor_)) {
         // The running replay will consume this actual itself.
         return;

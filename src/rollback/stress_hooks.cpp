@@ -65,17 +65,23 @@ void StressHooks_Init() {
         }
     }
 
-    // AS2_STRESS_FORCED_ROLLBACK=N arms per-frame forced depth-N rollback
-    // transactions (engine SetForcedRollback passthrough): every advanced
-    // frontier performs a genuine depth-N restore/replay during live combat.
-    // The adapter emits a per-second [FORCED] line with achieved depths.
+    // AS2_STRESS_FORCED_ROLLBACK=N (alias: AS2_FORCE_ROLLBACK=N) arms
+    // per-frame forced depth-N rollback transactions (engine
+    // SetForcedRollback passthrough): every advanced frontier performs a
+    // genuine depth-N restore/replay during live combat. The adapter emits
+    // a per-second [FORCED] evidence line with the executed transaction
+    // count and achieved depths, and logs "[FORCED_RB] depth=N ACTIVE" at
+    // every session arm/rotate.
     char envFr[16] = {};
-    if (GetEnvironmentVariableA("AS2_STRESS_FORCED_ROLLBACK", envFr, sizeof(envFr)) > 0) {
+    if (GetEnvironmentVariableA("AS2_STRESS_FORCED_ROLLBACK", envFr, sizeof(envFr)) == 0) {
+        GetEnvironmentVariableA("AS2_FORCE_ROLLBACK", envFr, sizeof(envFr));
+    }
+    if (envFr[0] != '\0') {
         const int depth = atoi(envFr);
         if (depth > 0) {
             s_enabled = true;
             s_forcedRollbackDepth = depth > 48 ? 48 : depth;
-            LOG_INFO("[StressHooks] Env-armed: forced_rollback_depth=%d per frame (AS2_STRESS_FORCED_ROLLBACK)",
+            LOG_INFO("[StressHooks] Env-armed: forced_rollback_depth=%d per frame (AS2_STRESS_FORCED_ROLLBACK/AS2_FORCE_ROLLBACK)",
                      s_forcedRollbackDepth);
         }
     }

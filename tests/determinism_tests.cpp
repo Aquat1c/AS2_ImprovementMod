@@ -489,6 +489,15 @@ void RunCell(const CellSpec& c) {
         CELL_CHECK(c.name,
                    a.eng.GetStats().max_rollback_depth >= c.forced_depth,
                    "forced depth-N transactions reached the requested depth");
+        // The ENGINE-SYNTHESIZED transaction counter (stats.forced_transactions,
+        // 2026-08-17): one explicit restore/replay transaction per advanced
+        // frame, minus only the per-epoch depth ramp at the origin clamp.
+        // This is the same counter the live [FORCED] per-second evidence line
+        // reports — the offline pin for the live tx=60/s depth=N bar.
+        CELL_CHECK(c.name,
+                   a.eng.GetStats().forced_transactions >= total_frames - kEpochs * c.forced_depth &&
+                   b.eng.GetStats().forced_transactions >= total_frames - kEpochs * c.forced_depth,
+                   "engine-synthesized forced transactions ~= advanced frames");
     }
 
     // Full-speed invariant: holds only where structurally unavoidable.
@@ -667,6 +676,12 @@ const CellSpec kCells[] = {
     { "loss-jitter-r12-force8",     5,  3,  4,  0,  2, 12,  8, 0xD000000Fu },
     { "reorder-dup-r8-force1",      0,  1,  3, 20,  2,  8,  1, 0xD0000010u },
     { "reorder-dup-r12",            3,  1,  3, 20,  2, 12,  0, 0xD0000011u },
+    // 2026-08-17 live acceptance twin: the exact deep-forced configuration
+    // the field runs use (budget 30, forced depth-30 restore/replay on EVERY
+    // advanced frontier, D=1). The forced-cell assertions below pin one
+    // engine-synthesized transaction per advanced frame at depth 30 with
+    // identical cross-peer confirmed streams (the determinism claim itself).
+    { "stable-r30-force30",         0,  1,  0,  0,  1, 30, 30, 0xD0000012u },
 };
 
 } // namespace

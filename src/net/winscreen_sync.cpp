@@ -375,6 +375,11 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
         return false;
     }
 
+    // Raw confirmed words, preserved before the skip-propagation OR below —
+    // ContinueFlow consumes these (see the block at the bottom).
+    const uint16_t rawLocalInput = localInput;
+    const uint16_t rawRemoteInput = remoteInput;
+
     const bool localAdvance = IsAdvanceIntent(localInput);
     const bool remoteAdvance = IsAdvanceIntent(remoteInput);
     if (localAdvance) {
@@ -424,7 +429,28 @@ bool WinScreenSync_ConsumeCurrentFrame(uint16_t* outP1, uint16_t* outP2) {
     // place its edge state may come from (determinism: confirmed inputs only).
     // Runs before the caller injects the words, so a suppression mask decided
     // here already applies to this same frame.
-    ContinueFlow_OnConsumedFrame(*outP1, *outP2);
+    //
+    // RAW words, NOT the propagated ones (2026-08-17, run 21-01 boundary-2
+    // divergence): the skip-propagation OR above is gated on
+    // !ContinueFlow_IsPromptActive(), a PER-MACHINE state whose start used
+    // to be per-machine timed — the two peers then consumed DIFFERENT word
+    // streams at the prompt (observed: instB resolved DECLINE both-NO at
+    // its frames 2/4 while the host, whose prompt began 2 consumed frames
+    // later on OR'd words, never saw P2's lock edge and hung in mode 9
+    // until the driver timeout). The prompt's decisions must come from the
+    // confirmed raw stream, which is identical on both machines by
+    // construction; the OR'd words remain injection-only (native screen).
+    {
+        uint16_t rawP1 = 0, rawP2 = 0;
+        if (s_isHost) {
+            rawP1 = rawLocalInput;
+            rawP2 = rawRemoteInput;
+        } else {
+            rawP1 = rawRemoteInput;
+            rawP2 = rawLocalInput;
+        }
+        ContinueFlow_OnConsumedFrame(rawP1, rawP2);
+    }
     return true;
 }
 

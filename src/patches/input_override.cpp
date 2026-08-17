@@ -3194,6 +3194,33 @@ int __cdecl Hook_InputProcess(int gameState) {
         resetWinScreenProcessState();
     }
 
+    // ── FAIL-CLOSED mode-9 raw-input guard (2026-08-17, run 21-18) ─────────
+    // The win-screen route is on screen, netplay owns the match, but the
+    // lockstep stream is DOWN (e.g. aborted by a cross-phase pregame restart
+    // when the peer resolved the continue prompt first and moved on). Raw
+    // local inputs must NEVER reach the vanilla mode-9 handlers in that
+    // state: sub_601BB0 acts on them directly — observed: the harness
+    // driver's continue taps executed the VANILLA "no continue" branch and
+    // one side showed GAME OVER while the peer sat in the next charsel.
+    // Hold neutral; the pregame adoption / mode_ownership recovery or the
+    // supervisor decides how the screen ends. (Rematch-latched fades keep
+    // the same neutral hold — no mode-9 screen needs local input then.)
+    if (winScreenRoute &&
+        Net::MatchLifecycle_IsMatchOwned() &&
+        Net::Session_IsConnected() &&
+        !Net::WinScreenSync_IsActive()) {
+        static uint32_t s_winscreenFailClosedCount = 0;
+        ++s_winscreenFailClosedCount;
+        if (s_winscreenFailClosedCount <= 5 || (s_winscreenFailClosedCount % 300) == 0) {
+            Rollback::NetplayLog_Write("WINLOCK", -1,
+                "FAIL-CLOSED: raw input suppressed on ownerless win-screen route "
+                "(#%u mode=%u sub=%u lockstep=down)",
+                s_winscreenFailClosedCount, gameMode, subState);
+        }
+        clearLiveInputBuffers();
+        return result;
+    }
+
     // Netplay override: when rollback session is active, inject rollback-controlled
     // inputs instead of SDL data. The netplay inputs were stored by
     // RollbackSession_FrameUpdate Step 7 via InputSystem_SetNetplayInput.

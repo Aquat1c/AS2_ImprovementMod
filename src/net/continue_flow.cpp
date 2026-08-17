@@ -445,14 +445,20 @@ void ContinueFlow_OnConsumedFrame(uint16_t p1Inputs, uint16_t p2Inputs) {
             const uint32_t sub = FlowSubstate();
             if (sub == STORY_SUB_DIALOGUE_ADV) {
                 s_sawWinPose = true;
-                if (((uint16_t)(p1Inputs | p2Inputs) & kAdvanceMask) != 0) {
-                    // This consumed frame carries the (skip-propagated)
-                    // advance — without intervention sub_6019F0 skips the
-                    // continue screen for gametype 2. Runs before the words
-                    // are injected, so the suppression mask already applies
-                    // to this same frame.
-                    BeginPrompt("advance in consumed stream at sub 3");
-                }
+            }
+            if (((uint16_t)(p1Inputs | p2Inputs) & kAdvanceMask) != 0) {
+                // This consumed frame carries an advance press. Begin the
+                // prompt on the WORD ALONE (2026-08-17): the old gate
+                // additionally required the LIVE substate to be the win
+                // pose (sub 3), but native sub timing is per-machine — the
+                // peers' prompts then began on different consumed frames
+                // and their edge decisions diverged (run 21-01 boundary 2:
+                // one side resolved DECLINE, the other hung with P2
+                // unlocked). The consumed stream is identical on both
+                // machines, so this anchor is deterministic; BeginPrompt
+                // forces sub=4 regardless of how far the native fade got
+                // (the forced continue screen owns the display from here).
+                BeginPrompt("advance in consumed stream");
             } else if (sub > STORY_SUB_DIALOGUE_END && s_sawWinPose) {
                 // Vanilla 640-frame idle timeout advanced sub 3 without any
                 // lockstep input — pull the flow back to the prompt. Entry is
