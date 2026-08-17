@@ -1906,6 +1906,8 @@ static uint16_t s_winscreenPrevP1 = 0;
 static uint16_t s_winscreenPrevP2 = 0;
 static uint32_t s_winscreenDispatchCount = 0;
 static uint32_t s_winscreenWaitCount = 0;
+// Consecutive frames on the mode-9 route with the lockstep stream down.
+static uint32_t s_winscreenOwnerlessFrames = 0;
 static bool s_winscreenFirstLog = false;
 static bool s_winscreenFrameProduced = false;
 static uint16_t s_winscreenFrameP1 = 0;
@@ -3037,11 +3039,19 @@ int __cdecl Hook_InputProcess(int gameState) {
     // ContinueFlow rematch latched: the winscreen lockstep was already
     // finalized at resolution and PregameSync owns the new epoch — restarting
     // a winscreen input phase during the mode-9 fade would stomp it.
+    if (!winScreenRoute) {
+        // Off the mode-9 route: a released route is over, and the next
+        // win-screen phase gets a clean re-arm.
+        Net::ContinueFlow_ClearRouteRelease();
+        s_winscreenOwnerlessFrames = 0;
+    }
+
     if (winScreenRoute &&
         !Net::WinScreenSync_IsActive() &&
         Net::MatchLifecycle_IsMatchOwned() &&
         Net::Session_IsConnected() &&
-        !Net::ContinueFlow_IsRematchLatched()) {
+        !Net::ContinueFlow_IsRematchLatched() &&
+        !Net::ContinueFlow_IsRouteReleased()) {
         Rollback::NetplayLog_Write("WINLOCK", -1,
             "InputProcess activating winscreen lockstep on-demand (mode=%u sub=%u phase=%s)",
             gameMode,
@@ -3209,17 +3219,40 @@ int __cdecl Hook_InputProcess(int gameState) {
         Net::MatchLifecycle_IsMatchOwned() &&
         Net::Session_IsConnected() &&
         !Net::WinScreenSync_IsActive()) {
-        static uint32_t s_winscreenFailClosedCount = 0;
-        ++s_winscreenFailClosedCount;
-        if (s_winscreenFailClosedCount <= 5 || (s_winscreenFailClosedCount % 300) == 0) {
+        // A resolved route running its exit fade (sub 5 rematch / sub 8
+        // charsel / sub 36 mode change) has no lockstep by design and needs
+        // no input — it is not "ownerless", so it neither counts toward the
+        // escape hatch nor spams the log. Only the decision substates do.
+        const bool decisionScreen =
+            gameMode == MODE_WINSCREEN &&
+            (subState == STORY_SUB_DIALOGUE_ADV || subState == STORY_SUB_DIALOGUE_END);
+        if (!decisionScreen || Net::ContinueFlow_IsRematchLatched()) {
+            clearLiveInputBuffers();
+            return result;
+        }
+        ++s_winscreenOwnerlessFrames;
+        if (s_winscreenOwnerlessFrames <= 5 || (s_winscreenOwnerlessFrames % 300) == 0) {
             Rollback::NetplayLog_Write("WINLOCK", -1,
                 "FAIL-CLOSED: raw input suppressed on ownerless win-screen route "
-                "(#%u mode=%u sub=%u lockstep=down)",
-                s_winscreenFailClosedCount, gameMode, subState);
+                "(#%u mode=%u sub=%u lockstep=down released=%d)",
+                s_winscreenOwnerlessFrames, gameMode, subState,
+                Net::ContinueFlow_IsRouteReleased() ? 1 : 0);
+        }
+        // Escape hatch. Neutral-holding is the right instinct — raw inputs
+        // must never reach sub_601BB0 — but held forever it IS the failure:
+        // run 21-58 sat on an ownerless continue prompt until the peer's
+        // session timed out. If the route has been ownerless for a full
+        // second, nothing is coming back; drive mode 9 out to charsel, the
+        // one destination both peers can reach without agreeing on anything.
+        constexpr uint32_t kOwnerlessEscapeFrames = 60;
+        if (s_winscreenOwnerlessFrames == kOwnerlessEscapeFrames &&
+            !Net::ContinueFlow_IsRouteReleased()) {
+            Net::ContinueFlow_ForceExitToCharsel("ownerless win-screen route (1s)");
         }
         clearLiveInputBuffers();
         return result;
     }
+    s_winscreenOwnerlessFrames = 0;
 
     // Netplay override: when rollback session is active, inject rollback-controlled
     // inputs instead of SDL data. The netplay inputs were stored by

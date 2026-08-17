@@ -35,6 +35,102 @@ static int  s_totalDelayed         = 0;
 static int  s_totalMismatchesForced= 0;
 
 // ============================================================================
+// Config file (as2_stress.cfg)
+// ============================================================================
+
+// Marker so callers/HUD can say where the arming came from — the operator has
+// been burned by silent non-arming often enough that "armed from WHAT" is part
+// of the contract now.
+static char s_configSourcePath[MAX_PATH] = {};
+
+static bool ParseStressConfigAt(const char* path) {
+    FILE* sf = nullptr;
+    if (fopen_s(&sf, path, "r") != 0 || !sf) {
+        return false;
+    }
+    bool sawKey = false;
+    char line[128];
+    while (fgets(line, sizeof(line), sf)) {
+        int depth = 0;
+        if (sscanf_s(line, "forced_rollback=%d", &depth) == 1 && depth > 0) {
+            s_enabled = true;
+            s_forcedRollbackDepth = depth > 48 ? 48 : depth;
+            sawKey = true;
+        }
+        int dd = 0;
+        if (sscanf_s(line, "delivery_delay=%d", &dd) == 1 && dd > 0) {
+            s_enabled = true;
+            s_inputDeliveryDelay = dd;
+            sawKey = true;
+        }
+    }
+    fclose(sf);
+    if (sawKey) {
+        strncpy_s(s_configSourcePath, sizeof(s_configSourcePath), path, _TRUNCATE);
+    }
+    return sawKey;
+}
+
+// Build "<dir of module>\as2_stress.cfg". module == nullptr gives the EXE.
+static bool BuildSiblingPath(HMODULE module, char* out, size_t outSize) {
+    char modulePath[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameA(module, modulePath, (DWORD)sizeof(modulePath));
+    if (n == 0 || n >= sizeof(modulePath)) return false;
+    char* slash = strrchr(modulePath, '\\');
+    if (!slash) return false;
+    *slash = '\0';
+    return _snprintf_s(out, outSize, _TRUNCATE, "%s\\as2_stress.cfg", modulePath) > 0;
+}
+
+static void LoadStressConfigFile() {
+    s_configSourcePath[0] = '\0';
+
+    char candidates[3][MAX_PATH] = {};
+    int count = 0;
+
+    // 1) Beside the game executable — where the operator puts the file.
+    if (BuildSiblingPath(nullptr, candidates[count], MAX_PATH)) ++count;
+
+    // 2) Beside this DLL (instance folders that keep the mod next to the exe
+    //    resolve to the same path; separate deployments do not).
+    HMODULE self = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&LoadStressConfigFile),
+                           &self) &&
+        self != nullptr) {
+        if (BuildSiblingPath(self, candidates[count], MAX_PATH)) ++count;
+    }
+
+    // 3) Process CWD, last (the old behaviour, kept for harness runs).
+    strncpy_s(candidates[count], MAX_PATH, "as2_stress.cfg", _TRUNCATE);
+    ++count;
+
+    for (int i = 0; i < count; ++i) {
+        if (i > 0 && strcmp(candidates[i], candidates[0]) == 0) continue;
+        if (ParseStressConfigAt(candidates[i])) {
+            LOG_INFO("[StressHooks] as2_stress.cfg armed: forced_rollback=%d delivery_delay=%d (from %s)",
+                     s_forcedRollbackDepth, s_inputDeliveryDelay, s_configSourcePath);
+            NetplayLog_Write("STRESS", -1,
+                "as2_stress.cfg armed: forced_rollback=%d delivery_delay=%d source=%s",
+                s_forcedRollbackDepth, s_inputDeliveryDelay, s_configSourcePath);
+            return;
+        }
+    }
+
+    // Say so out loud. A missing/unreadable file used to be indistinguishable
+    // from a file that armed nothing.
+    LOG_INFO("[StressHooks] No as2_stress.cfg found — stress forcing OFF. Looked in: %s%s%s",
+             candidates[0],
+             count > 1 ? " | " : "",
+             count > 1 ? candidates[1] : "");
+}
+
+const char* StressHooks_GetConfigSource() {
+    return s_configSourcePath[0] ? s_configSourcePath : nullptr;
+}
+
+// ============================================================================
 // Lifecycle
 // ============================================================================
 
@@ -64,33 +160,19 @@ void StressHooks_Init() {
     // two-instance loopback pair sustains real prediction depth ~N (forcing
     // deep restore/replay under combat without a WAN shim). Menu toggles
     // still work on top.
-    // Dedicated stress config: as2_stress.cfg in the game directory. The
-    // settings ini is rewritten (and its tail corrupted) by the game's own
+    // Dedicated stress config: as2_stress.cfg beside the game exe / this DLL.
+    // The settings ini is rewritten (and its tail corrupted) by the game's own
     // save path, and env vars never reach user-launched sessions — this file
     // is touched by nobody but the user/harness. Format: forced_rollback=N
-    {
-        FILE* sf = nullptr;
-        if (fopen_s(&sf, "as2_stress.cfg", "r") == 0 && sf) {
-            char line[128];
-            while (fgets(line, sizeof(line), sf)) {
-                int depth = 0;
-                if (sscanf_s(line, "forced_rollback=%d", &depth) == 1 && depth > 0) {
-                    s_enabled = true;
-                    s_forcedRollbackDepth = depth > 48 ? 48 : depth;
-                }
-                int dd = 0;
-                if (sscanf_s(line, "delivery_delay=%d", &dd) == 1 && dd > 0) {
-                    s_enabled = true;
-                    s_inputDeliveryDelay = dd;
-                }
-            }
-            fclose(sf);
-            if (s_forcedRollbackDepth > 0) {
-                LOG_INFO("[StressHooks] as2_stress.cfg armed: forced_rollback=%d",
-                         s_forcedRollbackDepth);
-            }
-        }
-    }
+    //
+    // Resolved against the EXE and DLL directories, never the bare relative
+    // name (2026-08-17): fopen("as2_stress.cfg") resolves against the process
+    // CWD, which is the game folder only when the game is started from it.
+    // Launch it from a shortcut, a debugger, or any launcher that sets a
+    // different working directory and the file silently does not exist — the
+    // arming vanishes with no diagnostic, which is exactly the "it never
+    // rolls back in MY session" reports. CWD is kept as a last resort.
+    LoadStressConfigFile();
 
     char env[16] = {};
     if (GetEnvironmentVariableA("AS2_STRESS_DELIVERY_DELAY", env, sizeof(env)) > 0) {

@@ -263,6 +263,31 @@ struct RollbackSessionSnapshot {
 
 void RollbackSession_GetSnapshot(RollbackSessionSnapshot* out);
 
+/// Live forced-rollback readout (stress/determinism testing). `configured_depth`
+/// is what the operator asked for; `effective_depth_now` is what the adapter is
+/// actually handing the engine this pass, with `gate_reason` explaining any gap
+/// (fight-substate gate, round-seam ramp). The per-second fields are the last
+/// COMPLETED one-second window of executed restore/replay transactions.
+struct ForcedRollbackLiveStats {
+    int         configured_depth;
+    int         effective_depth_now;
+    uint32_t    transactions_per_sec;
+    uint32_t    achieved_min;
+    uint32_t    achieved_max;
+    uint32_t    real_corrections_per_sec;
+    uint32_t    truncated_per_sec;
+    // Local replay self-test totals (QOH99 model): every replayed frame whose
+    // inputs match its original execution must reproduce the same pre-state
+    // hash. replay_mismatches > 0 == the simulation is nondeterministic under
+    // save/restore, caught locally at the exact frame.
+    uint32_t    replay_verifications;
+    uint32_t    replay_mismatches;
+    const char* gate_reason;
+    const char* config_source;     // as2_stress.cfg path, or nullptr
+};
+
+void RollbackSession_GetForcedStats(ForcedRollbackLiveStats* out);
+
 /// Authoritative gameplay checksum (savestate save/load equivalent: main match region + effect index).
 uint32_t RollbackSession_ComputeLiveStateChecksum();
 

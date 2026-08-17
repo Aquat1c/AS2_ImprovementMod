@@ -70,6 +70,9 @@ int  StressHooks_GetRemainingForcedMismatches();
 void StressHooks_SetForcedRollbackDepth(int depth);
 int  StressHooks_GetForcedRollbackDepth();
 
+/// Path the arming came from, or nullptr when no as2_stress.cfg was found.
+const char* StressHooks_GetConfigSource();
+
 // ============================================================================
 // Delayed Input Delivery
 // ============================================================================

@@ -399,6 +399,12 @@ static uint16_t StressPredictionTap(uint16_t predicted) {
 static uint32_t s_forcedFightWindowOrigin = 0;
 static bool     s_forcedFightWindowValid = false;
 
+// Live forced-rollback readout for the debug GUI. The operator has had to
+// take the logs' word for this repeatedly; the panel shows the effective
+// depth THIS pass and why it differs from the configured one, plus the last
+// completed one-second window of executed transactions.
+static ForcedRollbackLiveStats s_forcedLive = {};
+
 // Stress hook application (M6 tap + post-M8 forced-rollback depth): kept in
 // one place so every arm/rotate/poll site applies the identical mapping.
 static void ApplyStressHooks(RollbackEngine& engine) {
@@ -406,6 +412,8 @@ static void ApplyStressHooks(RollbackEngine& engine) {
     engine.SetPredictionTap(on ? &StressPredictionTap : nullptr);
     uint8_t forced = on ? (uint8_t)StressHooks_GetForcedRollbackDepth()
                         : (uint8_t)0;
+    s_forcedLive.configured_depth = StressHooks_GetForcedRollbackDepth();
+    s_forcedLive.gate_reason = on ? "active" : "stress hooks disabled";
     if (forced > 0) {
         // Forced transactions only inside the FIGHT substate (2026-08-17):
         // outside sub 3 the dispatcher is consulted at most ONCE per outer
@@ -425,6 +433,8 @@ static void ApplyStressHooks(RollbackEngine& engine) {
             sub != (uint32_t)LIFECYCLE_SUBSTATE_FIGHT) {
             forced = 0;
             s_forcedFightWindowValid = false;
+            s_forcedLive.gate_reason =
+                "off screen: forcing runs only in the fight substate (mode 8 sub 3)";
         } else {
             // ── Round-seam clamp (run 20-46 livelock root cause) ────────
             // A forced window must NEVER span a round transition: replaying
@@ -442,9 +452,12 @@ static void ApplyStressHooks(RollbackEngine& engine) {
                 s_forcedFightWindowOrigin, engine.SimFrontier());
             if ((uint32_t)forced > sinceFight) {
                 forced = (uint8_t)sinceFight;
+                s_forcedLive.gate_reason =
+                    "ramping after round start (a forced window may not span a round seam)";
             }
         }
     }
+    s_forcedLive.effective_depth_now = forced;
     engine.SetForcedRollback(forced);
 }
 
@@ -932,11 +945,34 @@ void NoteRollbackTransactionDone(bool truncated) {
         // Evidence line: `transactions` counts ENGINE-SYNTHESIZED forced
         // restore/replay cycles only (SetForcedRollback pending-mismatch
         // path); real prediction corrections are reported separately.
+        const auto& est = s_engine.GetStats();
         NetplayLog_Write("FORCED", RbFrame(s_engine.ConfirmedFrontier()),
             "forced_rb: transactions=%u/s depth=%d achieved_min=%u max=%u "
-            "real_corrections=%u truncated=%u",
+            "real_corrections=%u truncated=%u replay_verified=%u replay_bad=%u",
             forcedTx, cfgDepth, s_forcedStatDepthMin,
-            s_forcedStatDepthMax, realTx, s_forcedStatTruncated);
+            s_forcedStatDepthMax, realTx, s_forcedStatTruncated,
+            est.replay_verifications, est.replay_mismatches);
+        if (est.replay_mismatches != s_forcedLive.replay_mismatches) {
+            // Local nondeterminism: the same frame, replayed from a restored
+            // snapshot with identical inputs, produced a different state.
+            NetplayLog_Write("FORCED", (int32_t)est.last_replay_mismatch_frame,
+                "REPLAY MISMATCH (local nondeterminism): frame=%u expected_pre_hash=0x%016llX "
+                "replayed=0x%016llX total_bad=%u/%u",
+                est.last_replay_mismatch_frame,
+                (unsigned long long)est.last_replay_expect_hash,
+                (unsigned long long)est.last_replay_actual_hash,
+                est.replay_mismatches, est.replay_verifications);
+            LOG_NETPLAY(LOG_WARNING,
+                "[Forced] Replay mismatch at frame %u — the sim did not reproduce under save/restore",
+                est.last_replay_mismatch_frame);
+        }
+        s_forcedLive.replay_verifications = est.replay_verifications;
+        s_forcedLive.replay_mismatches = est.replay_mismatches;
+        s_forcedLive.transactions_per_sec = forcedTx;
+        s_forcedLive.real_corrections_per_sec = realTx;
+        s_forcedLive.achieved_min = s_forcedStatDepthMin;
+        s_forcedLive.achieved_max = s_forcedStatDepthMax;
+        s_forcedLive.truncated_per_sec = s_forcedStatTruncated;
         s_forcedStatWindowStartMs = now;
         s_forcedStatEngineBase = engForced;
         s_forcedStatTx = 0;
@@ -945,6 +981,17 @@ void NoteRollbackTransactionDone(bool truncated) {
 }
 
 } // namespace
+
+void RollbackSession_GetForcedStats(ForcedRollbackLiveStats* out) {
+    if (!out) return;
+    *out = s_forcedLive;
+    out->configured_depth = StressHooks_GetForcedRollbackDepth();
+    out->config_source = StressHooks_GetConfigSource();
+    if (out->configured_depth <= 0) {
+        out->gate_reason = "not armed";
+        out->effective_depth_now = 0;
+    }
+}
 
 void RollbackSession_OnInputStreamPacket(const void* data, size_t len) {
     // v2 ingest (§3.2 InputStreamPayload) — the M5 routing-table entry point.

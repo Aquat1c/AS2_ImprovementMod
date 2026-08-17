@@ -47,6 +47,7 @@
 #include "net/session2.h"
 #include "net/spectator_runtime.h"
 #include "net/transition_barrier.h"
+#include "net/continue_flow.h"
 #include "net/winscreen_sync.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
@@ -2417,6 +2418,59 @@ bool PregameSync_HandleCrossPhaseSessionPacket(PacketType type,
     if (s_phase != PregamePhase::Idle && s_phase != PregamePhase::GameplayHandoff) {
         return false;
     }
+
+    // ── Win-screen deferral (2026-08-17, run 21-58) ────────────────────────
+    // The peer resolved the continue prompt a few consumed frames before us
+    // and announced immediately (PregameSync_Begin / _BeginRematch both send
+    // SyncAnnounce). Our own lockstep stream carries the IDENTICAL decision
+    // and resolves within those frames — so this packet is not news, it is a
+    // few frames early.
+    //
+    // Acting on it destroyed the match: the restart aborts the win-screen
+    // phase, but nothing drives the game out of mode 9 sub 4, so the screen
+    // sits there with the lockstep down and the fail-closed input guard holds
+    // neutral forever (host had P2's YES latched, P1's YES was 4 consumed
+    // frames away, peer had already resolved REMATCH and announced).
+    //
+    // The peer retransmits every ~250 ms while it waits for our announce, so
+    // ignoring it costs nothing: the normal handler picks the retransmit up
+    // the moment our own resolution lands. The wall clock below is a recovery
+    // bound only — it gates nothing that either side's decision depends on.
+    static DWORD s_deferStartTick = 0;
+    static DWORD s_lastDeferLogTick = 0;
+    if (WinScreenSync_IsActive() && ContinueFlow_ShouldHoldWinScreenFinalize()) {
+        const DWORD now = GetTickCount();
+        if (s_deferStartTick == 0) {
+            s_deferStartTick = now;
+        }
+        constexpr DWORD kMaxDeferMs = 3000;
+        if ((now - s_deferStartTick) < kMaxDeferMs) {
+            if (s_lastDeferLogTick == 0 || (now - s_lastDeferLogTick) >= 500) {
+                s_lastDeferLogTick = now;
+                Rollback::NetplayLog_Write(
+                    "PREGAME", -1,
+                    "Cross-phase %s deferred: win-screen decision still in flight "
+                    "(consume=%u remote_latest=%u waited=%ums)",
+                    PacketTypeName(type),
+                    WinScreenSync_GetConsumeFrame(),
+                    WinScreenSync_GetRemoteLatestFrame(),
+                    (unsigned)(now - s_deferStartTick));
+            }
+            return true;  // consumed: peer retransmits
+        }
+        // Deferral exhausted — our stream is genuinely gone (the peer left the
+        // win screen and stopped producing frames). Take the restart, but
+        // drive mode 9 off screen first so the recovery cannot strand the
+        // game on an ownerless continue prompt.
+        Rollback::NetplayLog_Write(
+            "PREGAME", -1,
+            "Cross-phase %s deferral exhausted after %ums — releasing win-screen route",
+            PacketTypeName(type), (unsigned)(now - s_deferStartTick));
+        ContinueFlow_ForceExitToCharsel("cross-phase restart, win-screen stream lost");
+    }
+    // One deferral budget per win-screen route, not per process.
+    s_deferStartTick = 0;
+    s_lastDeferLogTick = 0;
 
     const SessionRole role = Session_GetRole();
     if (role != SessionRole::Join) {

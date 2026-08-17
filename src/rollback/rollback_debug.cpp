@@ -9,6 +9,7 @@
 #include "rollback/netplay_log.h"
 #include "rollback/desync_dump.h"
 #include "rollback/online_wiring.h"
+#include "rollback/stress_hooks.h"
 #include "net/delay_policy.h"
 #include "net/sync_policy.h"
 #include "net/session_manager.h"
@@ -656,6 +657,56 @@ void RollbackDebug_RenderImGui(bool* p_open) {
         ImGui::Text("Last RB Start:    %d", snap.rb_last_rollback_start_frame);
         ImGui::Text("Last RB Length:   %d", snap.last_rollback_replay_length);
         ImGui::Text("Predicted Outstanding: %d", snap.predicted_frames_outstanding);
+
+        // ── Forced rollback (determinism stress) ───────────────────────────
+        // The panel used only ever REPORT rollbacks that happened on their
+        // own, which made "force a depth-N rollback every frame" unreachable
+        // from the GUI — the cfg file was the only way to arm it, and a cfg
+        // that failed to load looked identical to one that worked. Arm it
+        // here, and show what is actually executing right beside the control.
+        ImGui::Separator();
+        ImGui::Text("Forced Rollback (stress)");
+        {
+            Rollback::ForcedRollbackLiveStats fr{};
+            Rollback::RollbackSession_GetForcedStats(&fr);
+
+            int depth = fr.configured_depth;
+            bool armed = depth > 0;
+            if (ImGui::Checkbox("Force rollback every frame##forcedrb", &armed)) {
+                Rollback::StressHooks_SetEnabled(armed || Rollback::StressHooks_IsEnabled());
+                Rollback::StressHooks_SetForcedRollbackDepth(armed ? (depth > 0 ? depth : 30) : 0);
+            }
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::SliderInt("Depth##forcedrb", &depth, 0, 48)) {
+                Rollback::StressHooks_SetForcedRollbackDepth(depth);
+                if (depth > 0) Rollback::StressHooks_SetEnabled(true);
+            }
+            ImGui::Text("Effective now:    %d", fr.effective_depth_now);
+            if (fr.gate_reason) {
+                ImGui::TextWrapped("Why: %s", fr.gate_reason);
+            }
+            if (fr.configured_depth > 0) {
+                const bool healthy =
+                    fr.transactions_per_sec >= 50 &&
+                    (int)fr.achieved_min >= fr.configured_depth;
+                ImGui::TextColored(
+                    healthy ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
+                            : ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                    "Executed: %u/s  depth %u..%u  (real corrections %u/s, truncated %u)",
+                    fr.transactions_per_sec, fr.achieved_min, fr.achieved_max,
+                    fr.real_corrections_per_sec, fr.truncated_per_sec);
+            }
+            // The actual verdict: replayed frames that failed to reproduce.
+            if (fr.replay_verifications > 0) {
+                const bool clean = fr.replay_mismatches == 0;
+                ImGui::TextColored(clean ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
+                                         : ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                    "Determinism: %u frames replayed, %u failed to reproduce",
+                    fr.replay_verifications, fr.replay_mismatches);
+            }
+            ImGui::Text("Armed from:       %s",
+                        fr.config_source ? fr.config_source : "GUI / not from a file");
+        }
 
         // Prediction stats
         ImGui::Separator();

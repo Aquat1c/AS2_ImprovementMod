@@ -8,6 +8,7 @@
  */
 
 #include "ui/netplay_hud.h"
+#include "rollback/stress_hooks.h"
 
 #include "core/game_state.h"
 #include "core/mod_main.h"
@@ -455,6 +456,16 @@ void NetplayHud_Render() {
             snprintf(stats, sizeof(stats), "PING:--  D:%d  RB:%d/%d",
                      hud.delay_frames,
                      hud.rollback_depth_now, hud.rollback_frames);
+        }
+
+        // Forced-rollback badge: when the stress config arms per-frame depth-N
+        // rollback, say so on screen. "RB:30/30" alone is ambiguous — it looks
+        // the same as a link that merely permits depth 30 — and the operator
+        // has repeatedly (and correctly) refused to take the logs' word for it.
+        // FORCE:N present == every frame is executing a depth-N restore+replay.
+        if (const int forced = Rollback::StressHooks_GetForcedRollbackDepth()) {
+            const size_t len = strlen(stats);
+            snprintf(stats + len, sizeof(stats) - len, "  FORCE:%d", forced);
         }
 
         // Coverage badge (M6, INV-6): the delay-policy verdict is shown,

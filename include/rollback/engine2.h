@@ -365,6 +365,17 @@ public:
         uint32_t confirmed_frames = 0;
         uint32_t sync_hashes_sent = 0;
         uint32_t sync_hashes_verified = 0;
+        // Local replay determinism self-test (QOH99 model). A replayed frame
+        // whose inputs are byte-identical to its original execution MUST
+        // reproduce the identical pre-state hash. Verified on every replayed
+        // frame, so forced depth-N rollback becomes a real determinism test
+        // on ONE machine at the exact frame, instead of waiting for the
+        // 30-frame cross-peer digest to notice something downstream.
+        uint32_t replay_verifications = 0;
+        uint32_t replay_mismatches = 0;
+        uint32_t last_replay_mismatch_frame = 0;
+        uint64_t last_replay_expect_hash = 0;
+        uint64_t last_replay_actual_hash = 0;
     };
     const Stats& GetStats() const { return stats_; }
 

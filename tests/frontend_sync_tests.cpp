@@ -1023,6 +1023,137 @@ static size_t CountProposals(Net::NetTransitionKind kind, uint8_t intent) {
     return n;
 }
 
+// Regression: run 21-58 (2026-08-17). The two peers consumed the IDENTICAL
+// lockstep stream but entered the continue prompt on different consumed
+// frames — join at consume=23 ("sub self-advanced past continue gate"), host
+// at consume=25 ("advance in consumed stream") — because mode 9's subs 0-2 are
+// per-machine asset/fade states, so the vanilla win-pose handler reached its
+// 640-frame self-advance at different points in the stream. The host's prompt
+// was then torn down before it could resolve, and the match wedged.
+//
+// Both halves of the fix are asserted here: the native timer can no longer
+// advance the pose (HoldWinPose), and no consumed frame reaches the vanilla
+// handlers while the route is armed (suppress mask).
+static void TestContinuePromptEntryIsStreamDeterministic() {
+    struct Outcome {
+        bool     enteredPrompt;
+        uint32_t entryConsumeFrame;
+        uint32_t subAtEntry;
+    };
+
+    // The same consumed stream on both machines: neutral frames, then a
+    // remote advance press on frame 5.
+    auto runMachine = [](uint32_t initialPoseTimer) {
+        ResetSubsystems(100);
+        g_sessionConnected = true;
+        g_matchOwned = true;
+        g_lockedConfigAvailable = true;
+        Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x900u, 2,
+            "determinism epoch");
+        Net::ContinueFlow_Test_SetGameState(MODE_WINSCREEN, STORY_SUB_DIALOGUE_ADV);
+        Net::ContinueFlow_Test_SetSubStateTimer(initialPoseTimer);
+        Net::WinScreenSync_Begin();
+
+        Outcome out = {false, 0, 0};
+        uint16_t p1 = 0, p2 = 0;
+        for (uint32_t f = 0; f <= 5 && !out.enteredPrompt; ++f) {
+            const uint16_t remoteWord = (f == 5) ? (uint16_t)INPUT_A : (uint16_t)0;
+            if (!StepWinScreenFrame(f, 0, remoteWord, &p1, &p2)) break;
+            // The native win-pose timer keeps running on a per-machine
+            // schedule; the flow must keep it away from its advance point.
+            Net::ContinueFlow_Test_SetSubStateTimer(
+                Net::ContinueFlow_Test_GetSubStateTimer() + 1);
+            if (Net::ContinueFlow_IsPromptActive()) {
+                out.enteredPrompt = true;
+                out.entryConsumeFrame = f;
+                out.subAtEntry = Net::ContinueFlow_Test_GetSubState();
+            }
+        }
+        return out;
+    };
+
+    // Machine A: fresh win pose. Machine B: pose already one tick from the
+    // vanilla self-advance (sub_6019F0 fires on `subTimer == 640`).
+    const Outcome a = runMachine(0);
+    const Outcome b = runMachine(639);
+
+    TEST_CHECK(a.enteredPrompt && b.enteredPrompt,
+        "both machines enter the continue prompt");
+    TEST_CHECK(a.entryConsumeFrame == b.entryConsumeFrame,
+        "prompt entry is anchored to the shared consumed frame, not native sub timing");
+    TEST_CHECK(a.subAtEntry == (uint32_t)STORY_SUB_DIALOGUE_END &&
+                   b.subAtEntry == (uint32_t)STORY_SUB_DIALOGUE_END,
+        "entry forces the continue substate on both machines");
+
+    // The vanilla handlers must never see the bits they act on while the
+    // route is armed — this is the one-frame hole that let sub_6019F0 skip
+    // the pose and hand mode 9 to sub_601BB0 unsynchronized.
+    ResetSubsystems(100);
+    g_sessionConnected = true;
+    g_matchOwned = true;
+    g_lockedConfigAvailable = true;
+    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x901u, 2,
+        "mask epoch");
+    Net::ContinueFlow_Test_SetGameState(MODE_WINSCREEN, STORY_SUB_DIALOGUE_ADV);
+    Net::ContinueFlow_Test_SetSubStateTimer(639);
+    Net::WinScreenSync_Begin();
+
+    const uint16_t armMask = Net::ContinueFlow_GetSuppressMask();
+    TEST_CHECK((armMask & (INPUT_A | INPUT_C | INPUT_LEFT | INPUT_RIGHT)) ==
+                   (INPUT_A | INPUT_C | INPUT_LEFT | INPUT_RIGHT),
+        "the arming frame already masks every bit the vanilla mode-9 handlers act on");
+
+    uint16_t p1 = 0, p2 = 0;
+    TEST_CHECK(StepWinScreenFrame(0, INPUT_A, INPUT_A, &p1, &p2),
+        "arming frame consumes with a held confirm");
+    TEST_CHECK(Net::ContinueFlow_Test_GetSubStateTimer() < 640,
+        "the win-pose timer is parked below the vanilla self-advance point");
+}
+
+// Recovery: the shared win-screen stream is gone (peer already left the
+// screen). The route must not sit on an ownerless continue prompt with input
+// suppressed — it drives itself to charsel, the destination both peers can
+// reach without agreeing on anything — and must never present that as a
+// lockstep-derived decision.
+static void TestOwnerlessWinScreenRouteReleasesToCharsel() {
+    ResetSubsystems(100);
+    g_sessionConnected = true;
+    g_matchOwned = true;
+    g_lockedConfigAvailable = true;
+    Net::FrontendInputSync_BeginEpoch(Net::SessionRole::Host, 0x902u, 2,
+        "release epoch");
+    Net::ContinueFlow_Test_SetGameState(MODE_WINSCREEN, STORY_SUB_DIALOGUE_ADV);
+    Net::WinScreenSync_Begin();
+
+    uint16_t p1 = 0, p2 = 0;
+    TEST_CHECK(StepWinScreenFrame(0, 0, 0, &p1, &p2), "route arms");
+    TEST_CHECK(!Net::ContinueFlow_IsRouteReleased(),
+        "a healthy route is never marked released");
+
+    Net::WinScreenSync_Abort();
+    const size_t proposalsBefore = g_barrierProposals.size();
+
+    TEST_CHECK(Net::ContinueFlow_ForceExitToCharsel("test: stream lost"),
+        "the ownerless route issues its own exit");
+    TEST_CHECK(Net::ContinueFlow_Test_GetSubState() == (uint32_t)STORY_SUB_PREMATCH,
+        "exit routes through the plain fade to charsel, not the GAME OVER slide");
+    TEST_CHECK(Net::ContinueFlow_IsRouteReleased(),
+        "the release latch blocks the on-demand lockstep re-arm");
+    TEST_CHECK(g_barrierProposals.size() == proposalsBefore,
+        "a recovery exit proposes nothing — it is not a lockstep decision");
+
+    // Off the mode-9 route the latch clears, and a fresh phase owns the
+    // screen again.
+    Net::ContinueFlow_ClearRouteRelease();
+    TEST_CHECK(!Net::ContinueFlow_IsRouteReleased(),
+        "the latch clears once the route is off screen");
+
+    // Already past the decision point: nothing to force.
+    Net::ContinueFlow_Test_SetGameState(MODE_WINSCREEN, STORY_SUB_EVENT_SETUP);
+    TEST_CHECK(!Net::ContinueFlow_ForceExitToCharsel("test: already leaving"),
+        "a screen that is already leaving is not re-routed");
+}
+
 static void TestContinueRematchHandoffCycles() {
     ResetSubsystems(100);
     g_sessionConnected = true;
@@ -1352,6 +1483,8 @@ int main() {
     TestLocalInputLatchPreservesTapWhileLeadCapped();
     TestFrontendInputPacketsCarrySixteenFramesOfHistory();
     TestSimultaneousNavigationOverJitteryLink();
+    TestContinuePromptEntryIsStreamDeterministic();
+    TestOwnerlessWinScreenRouteReleasesToCharsel();
     TestContinueRematchHandoffCycles();
 
     Net::FrontendInputSync_Test_ClearClockOverride();

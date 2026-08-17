@@ -2840,3 +2840,144 @@ reader under deep skew (F8 hunt; byte suspects listed above); (2) a
 completed full-length SOAK-PASS with char/stage variation + both routes
 under the aligned build; (3) analyzer profile for boundary lifecycle
 holds (54/soak currently counted against online-clean).
+
+---
+
+## 2026-08-17 (runs 22-25 / 22-35) — winscreen handoff root cause, mode-9 determinism, forced-rollback reachability
+
+### The 21-58 wedge: the peers AGREED, and the agreement destroyed the match
+
+Post-mortem of run 21-58's dead session, from both sides' logs:
+
+| | instB (Join) | host |
+|---|---|---|
+| prompt entry | consume=23, `sub self-advanced past continue gate` | consume=25, `advance in consumed stream` |
+| locks | P2 YES f1, **P1 YES f5 -> REMATCH** | P2 YES f1, then nothing |
+| next | `PregameSync_BeginRematch` -> SyncAnnounce | receives it -> cross-phase HOST restart |
+
+The host was 4 consumed frames from resolving the SAME rematch. The peer's
+announce arrived first, `PregameSync_HandleCrossPhaseSessionPacket` tore the
+win-screen phase down mid-prompt, and nothing drove the game out of mode 9
+sub 4 — leaving an ownerless continue prompt with the fail-closed input guard
+holding neutral forever, `WinScreenSync_Begin` re-deferring every frame
+("no active frontend epoch yet"), until the peer's session timed out.
+
+Three defects, all fixed:
+
+**1. Announce race (root cause).** `PregameSync_HandleCrossPhaseSessionPacket`
+now DEFERS `SyncAnnounce`/`SyncConfirm` while `WinScreenSync_IsActive() &&
+ContinueFlow_ShouldHoldWinScreenFinalize()`. The packet is not news — our own
+lockstep stream carries the identical decision within a few frames — and the
+peer retransmits on a ~250 ms cadence, so ignoring it costs nothing. Bounded
+at 3 s (wall clock, recovery-only: it gates nothing either side's DECISION
+reads), after which the old recovery runs, preceded by an explicit exit.
+Budget resets per win-screen route, not per process.
+
+**2. Divergent prompt entry (latent desync source).** Mode 9 subs 0-2 are
+per-machine asset/fade states, so the vanilla win-pose handler (`sub_6019F0`,
+advances on `subTimer == 640` or on a confirm) reached its advance at
+different points in the shared stream on the two peers — that is the entry
+skew above, and with a cursor toggle in the window it is a divergent prompt
+decision from a "local patch on both sides". Mode 9 is now mod-driven end to
+end:
+
+- `HoldWinPose()` parks the native timer at 300 when it reaches 600 (the
+  handler tests `== 640` exactly, and re-plays the win voice at `== 1`, so
+  mid-range is the quiet park).
+- `ContinueFlow_GetSuppressMask()` returns the full LEFT|RIGHT|A|C mask in
+  **Armed and Idle** too (scoped to a live lockstep on an owned match), not
+  only in Prompt. The old one-frame hole was the `Idle -> Armed` transition
+  frame, which returned mask 0 — enough for a held confirm to reach
+  `sub_6019F0`, skip the pose, and hand mode 9 to the VANILLA `sub_601BB0`
+  cursor/confirm logic, per-machine and unsynchronized.
+- The idle fallback entry is now the SHARED consume index
+  (`kIdlePromptConsumeFrames = 640`) instead of the live substate. The old
+  per-machine trigger survives as a fail-safe and logs `ANOMALY` when it
+  fires, because entry is non-deterministic on that path.
+
+**3. No escape from an ownerless route.** `ContinueFlow_ForceExitToCharsel()`
+drives the mode-9 exit (matchPhaseTimer=0, sub=8 fade -> 36 -> charsel; the
+same routing DECLINE uses, skipping the 1920-frame GAME OVER slide) and
+latches `route_released`, which blocks the on-demand lockstep re-arm. It
+proposes NOTHING on the barrier — a recovery is not a lockstep-derived
+decision and must never be presented as one. Called from the exhausted
+cross-phase deferral and from the input guard after 60 consecutive ownerless
+frames on a DECISION substate (resolved exit fades are excluded — they are
+lockstep-free by design, and used to spam FAIL-CLOSED at sub 5).
+
+Regression tests (frontend_sync_tests, 511 checks): the same consumed stream
+replayed on a "fresh pose" machine and a "one tick from self-advance" machine
+must enter the prompt on the same consumed frame; the arming frame must
+already mask every bit the vanilla handlers act on; the recovery exit must
+route to charsel, latch, and propose nothing.
+
+### Forced rollback: it ran, and the operator still could not reach it
+
+Three separate reachability defects, all of which look identical from the
+outside ("it doesn't roll back"):
+
+1. **`as2_stress.cfg` was opened by RELATIVE path**, so it resolved against
+   the process CWD — the game folder only when the game is started from it.
+   Any shortcut, debugger, or launcher with a different working directory
+   silently armed nothing. Now resolved against the EXE dir, then this DLL's
+   dir, then CWD; the chosen path is logged, and a miss logs the paths
+   searched instead of staying silent. Verified by launching with
+   `-WorkingDirectory C:\Windows`: `armed: forced_rollback=30 (from
+   D:\...\Alice in wonderland 2\as2_stress.cfg)`.
+2. **The GUI had no forced-rollback control at all** — it only ever REPORTED
+   rollbacks that happened on their own, which is why driving it from the
+   panel produced rollbacks on misprediction and nothing else. The rollback
+   panel now has a "Force rollback every frame" checkbox + depth slider
+   (0..48), the effective depth this pass with the reason it differs
+   (fight-substate gate / round-seam ramp), the last completed second of
+   executed transactions with achieved depth range, and the arming source.
+3. **`RB:30/30` on the HUD is ambiguous** — indistinguishable from a link that
+   merely permits depth 30. A `FORCE:N` badge now appears whenever forcing is
+   armed.
+
+### Local replay determinism self-test (QOH99 model)
+
+QOH99's determinism self-test does not just replay — it restores, re-simulates
+K frames, and COMPARES the replay against the truth state, reporting
+`GameplaySync OK bad=0` per frame (`NetplayLifecyclePolicy.h:32`, and the
+replay block in `GameHooks.cpp`). Ours replayed but verified only cross-peer,
+every 30 frames, which finds the CONSEQUENCES of nondeterminism long after
+its cause.
+
+`CommitReplayFrame` now compares the incoming pre-state hash against the
+record it is about to overwrite, whenever the replay consumed byte-identical
+inputs in the same epoch (a real correction legitimately changes state). Any
+mismatch is local nondeterminism under save/restore, caught on ONE machine at
+the exact frame — `replay_verified`/`replay_bad` on the per-second `[FORCED]`
+line, a loud `REPLAY MISMATCH` record with both hashes, and a verdict line in
+the GUI panel. engine2_tests pins both directions: a faithful replay is
+silent, a divergent one is caught and named (301 checks).
+
+This also validates capture/restore fidelity on every single forced frame,
+since the first replayed frame's pre-state IS the restored snapshot.
+
+### Run results
+
+- Run 22-25 (2 matches): REMATCH boundary and DECLINE boundary both completed
+  — `CONTINUE RESOLVED: DECLINE (p1=NO p2=YES)` -> PostMatchDecision barrier
+  COMMIT with both intents -> winscreen finalize -> charsel -> pregame
+  restart, with no wedge. Forced depth-30 at 60 tx/s throughout,
+  `achieved_min=30`, zero desync. Ended by operator close ("Remote canceled").
+- Full suite green: engine2 301, determinism 648 (incl. stable-r30-force30 at
+  `rb=3597/3600 depth_max=30`), frontend_sync 511, transition_barrier,
+  frame_arithmetic 31, frame_scheduler 44, async_log.
+
+### B1/F8 — new lead, NOT yet fixed
+
+The audit attributes entity `+1244` to the superbg render dispatcher and masks
+`+0x4C4..+0x73B` wholesale. The decomp does not corroborate that: `sub_4C47C0`
+never touches 1244/1248, while **`Entity_CheckPriority` (sub_49ECB0) writes
+`entity+1244`/`+1248` and READS THE OPPONENT'S** to resolve attack-trade
+priority by Y-then-X position. Those are sim-critical words sitting inside a
+digest mask — a divergence there is invisible until it surfaces downstream,
+which is exactly B1's signature (a KO tick diverging from "identical" hashed
+state, only under deep skew). Proposed fix: split the mask to leave
+`+0x4DC..+0x4E3` hashed and re-soak; the F7g churn evidence only ever covered
+`+0x4C4..+0x4DB`. Deliberately NOT applied mid-run — narrowing a mask on
+speculation could flood a validation soak with false desyncs, and the new
+per-frame replay self-test may name the byte first.

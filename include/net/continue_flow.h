@@ -80,6 +80,24 @@ bool ContinueFlow_ShouldHoldWinScreenFinalize();
 bool ContinueFlow_IsRematchLatched();
 void ContinueFlow_ConsumeRematchLatch();
 
+// ============================================================================
+// Recovery (no lockstep stream available)
+// ============================================================================
+
+/// Drive the mode-9 screen out to character select WITHOUT a lockstep
+/// decision. Only for paths that have already lost the shared win-screen
+/// stream (cross-phase pregame restart, ownerless route) — charsel is the
+/// convergent rendezvous both peers can always reach. Returns true if the
+/// routing writes were issued (false when mode 9 isn't on screen).
+bool ContinueFlow_ForceExitToCharsel(const char* reason);
+
+/// True while this machine is driving the mode-9 exit itself after the above.
+/// Callers must NOT re-arm the win-screen lockstep while it is set.
+bool ContinueFlow_IsRouteReleased();
+
+/// Clear the release latch once the mode-9 route is off screen.
+void ContinueFlow_ClearRouteRelease();
+
 /// Choice status for the HUD (single source of truth for both players).
 ContinueChoiceState ContinueFlow_GetLocalChoiceState();
 ContinueChoiceState ContinueFlow_GetRemoteChoiceState();
@@ -90,6 +108,8 @@ ContinueChoiceState ContinueFlow_GetRemoteChoiceState();
 void ContinueFlow_Test_SetGameState(uint32_t mode, uint32_t sub);
 uint32_t ContinueFlow_Test_GetSubState();
 uint8_t ContinueFlow_Test_GetCursor();
+void ContinueFlow_Test_SetSubStateTimer(uint32_t timer);
+uint32_t ContinueFlow_Test_GetSubStateTimer();
 #endif
 
 } // namespace Net

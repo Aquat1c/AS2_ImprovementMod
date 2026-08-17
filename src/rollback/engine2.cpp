@@ -684,6 +684,30 @@ bool RollbackEngine::CommitReplayFrame(uint32_t frame, uint64_t pre_state_hash,
         return false;
     }
     ExecRecord* rec = &exec_[frame % exec_.size()];
+
+    // ── Local replay determinism self-test (QOH99 model) ───────────────────
+    // Re-executing a frame from a restored snapshot with byte-identical
+    // inputs must land on a byte-identical pre-state. When it doesn't, the
+    // SIMULATION is nondeterministic under save/restore — and this catches it
+    // on one machine, at the exact frame, without a peer and without waiting
+    // for the 30-frame cross-peer digest to notice the consequences later.
+    //
+    // Only compares when the replay consumed exactly what the original
+    // execution did: a real correction legitimately changes the state, and a
+    // record from another epoch describes different state identity entirely.
+    if (rec->valid && rec->committed && rec->frame == frame &&
+        rec->epoch == epoch_ &&
+        rec->inputs[0] == replay_pending_inputs_[0] &&
+        rec->inputs[1] == replay_pending_inputs_[1]) {
+        ++stats_.replay_verifications;
+        if (rec->pre_hash != pre_state_hash) {
+            ++stats_.replay_mismatches;
+            stats_.last_replay_mismatch_frame = frame;
+            stats_.last_replay_expect_hash = rec->pre_hash;
+            stats_.last_replay_actual_hash = pre_state_hash;
+        }
+    }
+
     rec->valid = true;
     rec->frame = frame;
     rec->inputs[0] = replay_pending_inputs_[0];

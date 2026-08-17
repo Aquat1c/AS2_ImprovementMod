@@ -94,8 +94,26 @@ static bool     s_sawWinPose    = false;
 static bool s_rematchLatched    = false;
 static bool s_declineCarryClear = false;
 
+// Recovery latch: this machine lost the shared win-screen stream and is
+// driving the mode-9 exit on its own (see ContinueFlow_ForceExitToCharsel).
+static bool s_routeReleased     = false;
+
 // Timeout counts consumed lockstep frames (~60 s), never wall time.
 constexpr uint32_t kPromptTimeoutFrames = 3600;
+
+// Deterministic prompt entry fallback: vanilla sub 3 self-advances at
+// subTimer == 640 (sub_6019F0), but that timer is per-machine — subs 0-2 are
+// asset-load/fade states whose duration differs between peers, so the two
+// sides reached sub 3 (and therefore the vanilla advance) on DIFFERENT
+// consumed frames. We hold the win pose instead (below) and enter the prompt
+// off the shared consume index, which is identical on both machines.
+constexpr uint32_t kIdlePromptConsumeFrames = 640;
+
+// Win-pose hold: sub_6019F0 advances on `subTimer == 640` exactly, and replays
+// the win voice when the timer becomes 1. Parking it mid-range keeps the pose
+// looping with neither side effect.
+constexpr uint32_t kWinPoseHoldCeiling = 600;
+constexpr uint32_t kWinPoseHoldFloor   = 300;
 
 constexpr uint16_t kPromptSuppressMask =
     (uint16_t)(INPUT_LEFT | INPUT_RIGHT | INPUT_A | INPUT_C);
@@ -117,6 +135,7 @@ static uint8_t  s_shimContinueCursor = 0;
 
 static uint32_t FlowGameMode() { return s_shimGameMode; }
 static uint32_t FlowSubstate() { return s_shimSubState; }
+static uint32_t FlowSubStateTimer() { return s_shimSubStateTimer; }
 static void FlowWriteSubState(uint32_t v) { s_shimSubState = v; }
 static void FlowWriteSubStateTimer(uint32_t v) { s_shimSubStateTimer = v; }
 static void FlowWriteMatchPhaseTimer(uint32_t v) { s_shimMatchPhaseTimer = v; }
@@ -130,6 +149,7 @@ static BgmPlayTrack_t s_bgmPlay = reinterpret_cast<BgmPlayTrack_t>(ADDR_BGM_PLAY
 
 static uint32_t FlowGameMode() { return GetGameMode(); }
 static uint32_t FlowSubstate() { return GetSubstate(); }
+static uint32_t FlowSubStateTimer() { return ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER); }
 static void FlowWriteSubState(uint32_t v) { WriteMemory<uint32_t>(ADDR_SUB_STATE, v); }
 static void FlowWriteSubStateTimer(uint32_t v) { WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, v); }
 static void FlowWriteMatchPhaseTimer(uint32_t v) { WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, v); }
@@ -173,6 +193,18 @@ static void ForceContinueScreen(const char* why) {
     Rollback::NetplayLog_Write("CONTINUE", -1,
         "Forced continue screen (sub=4): %s consume=%u",
         why ? why : "?", WinScreenSync_GetConsumeFrame());
+}
+
+// Park the vanilla win-pose timer below its self-advance point. Without this
+// the pose exits on a per-machine schedule (sub_6019F0: `subTimer == 640`),
+// which is exactly how the two peers entered the prompt on different consumed
+// frames in run 21-58 (join consume=23 "sub self-advanced", host consume=25
+// "advance in consumed stream"). Entry must be a function of the shared
+// stream alone; this makes the native timer a non-participant.
+static void HoldWinPose() {
+    if (FlowSubStateTimer() >= kWinPoseHoldCeiling) {
+        FlowWriteSubStateTimer(kWinPoseHoldFloor);
+    }
 }
 
 static void BeginPrompt(const char* why) {
@@ -356,6 +388,9 @@ static void ResetAll(const char* reason) {
     s_sawWinPose = false;
     s_rematchLatched = false;
     s_declineCarryClear = false;
+    // A fresh route (WinScreenSync_Begin -> ContinueFlow_Reset) owns the
+    // screen again; ForceExitToCharsel re-latches after calling this.
+    s_routeReleased = false;
 }
 
 static ContinueChoiceState SideChoiceState(int side) {
@@ -445,6 +480,7 @@ void ContinueFlow_OnConsumedFrame(uint16_t p1Inputs, uint16_t p2Inputs) {
             const uint32_t sub = FlowSubstate();
             if (sub == STORY_SUB_DIALOGUE_ADV) {
                 s_sawWinPose = true;
+                HoldWinPose();
             }
             if (((uint16_t)(p1Inputs | p2Inputs) & kAdvanceMask) != 0) {
                 // This consumed frame carries an advance press. Begin the
@@ -459,14 +495,26 @@ void ContinueFlow_OnConsumedFrame(uint16_t p1Inputs, uint16_t p2Inputs) {
                 // forces sub=4 regardless of how far the native fade got
                 // (the forced continue screen owns the display from here).
                 BeginPrompt("advance in consumed stream");
+            } else if (WinScreenSync_GetConsumeFrame() >= kIdlePromptConsumeFrames) {
+                // Nobody pressed anything: enter the prompt off the SHARED
+                // consume index (vanilla's 640-frame idle, re-expressed on the
+                // one clock both peers agree on). Deterministic by
+                // construction — HoldWinPose keeps the native timer from
+                // beating us to it on either machine.
+                BeginPrompt("consumed-frame idle threshold");
             } else if (sub > STORY_SUB_DIALOGUE_END && s_sawWinPose) {
-                // Vanilla 640-frame idle timeout advanced sub 3 without any
-                // lockstep input — pull the flow back to the prompt. Entry is
-                // per-machine timed here; continuous prev-input tracking means
-                // a divergent lock would need a release + re-press inside the
-                // few-frame entry skew (not humanly reachable). The
-                // s_sawWinPose gate keeps a phase re-armed during the
-                // post-decline fade from ever re-forcing the prompt.
+                // Fail-safe only. With the pose held and the advance bits
+                // masked (GetSuppressMask, Armed) the native handlers can no
+                // longer self-transition, so reaching here means something
+                // else moved the substate — recover to the prompt and say so
+                // loudly, because entry is per-machine timed on this path and
+                // the peers' edge decisions can diverge from here.
+                Rollback::NetplayLog_Write("CONTINUE", -1,
+                    "ANOMALY: substate escaped the held win pose (sub=%u consume=%u) "
+                    "— per-machine prompt entry", sub, WinScreenSync_GetConsumeFrame());
+                LOG_NETPLAY(LOG_WARNING,
+                    "[ContinueFlow] Substate escaped held win pose (sub=%u) — non-deterministic prompt entry",
+                    sub);
                 BeginPrompt("sub self-advanced past continue gate");
             }
             break;
@@ -509,9 +557,26 @@ uint16_t ContinueFlow_GetSuppressMask() {
             return kCarrySuppressMask;
         case FlowState::DeclineCooldown:
             return s_declineCarryClear ? (uint16_t)0 : kCarrySuppressMask;
-        default:
-            return 0;
+        case FlowState::Armed:
+        case FlowState::Idle:
+            // Mode 9 is mod-driven end to end: while the win-screen route is
+            // on an owned match, NO consumed frame may reach the vanilla
+            // sub 3 / sub 4 handlers with the bits they act on. Run 21-58 had
+            // a one-frame hole here — the Idle->Armed transition frame
+            // returned mask 0, the held confirm reached sub_6019F0, the pose
+            // advanced to the VANILLA continue screen, and from there
+            // sub_601BB0 ran the cursor/confirm itself, per-machine and
+            // unsynchronized. This is the guard that made that unreachable.
+            // Scoped to a live lockstep: the mask is only ever applied to a
+            // consumed frame, and once the phase finalizes (rematch fade,
+            // decline carry cleared) the screen is leaving anyway.
+            return (WinScreenSync_IsActive() &&
+                    FlowGameMode() == MODE_WINSCREEN &&
+                    MatchLifecycle_IsMatchOwned())
+                       ? kPromptSuppressMask
+                       : (uint16_t)0;
     }
+    return 0;
 }
 
 bool ContinueFlow_ShouldHoldWinScreenFinalize() {
@@ -542,6 +607,51 @@ void ContinueFlow_ConsumeRematchLatch() {
     ResetAll("rematch latch consumed");
 }
 
+bool ContinueFlow_ForceExitToCharsel(const char* reason) {
+    if (!s_initialized) return false;
+    if (FlowGameMode() != MODE_WINSCREEN) {
+        return false;
+    }
+    const uint32_t sub = FlowSubstate();
+    // Already past the decision point (sub 5 rematch fade, sub 8 charsel fade,
+    // sub 36 mode change) — the screen is leaving on its own.
+    if (sub != STORY_SUB_DIALOGUE_ADV && sub != STORY_SUB_DIALOGUE_END) {
+        return false;
+    }
+
+    Rollback::NetplayLog_Write("CONTINUE", -1,
+        "=== ROUTE RELEASED: forcing charsel exit (%s) state=%s sub=%u ===",
+        reason ? reason : "?", FlowStateName(s_state), sub);
+    LOG_NETPLAY(LOG_WARNING,
+        "[ContinueFlow] Win-screen stream lost (%s) — driving mode 9 out to charsel",
+        reason ? reason : "?");
+
+    // Same routing the lockstep DECLINE uses: sub 8 is the plain 25-frame fade
+    // -> sub 36 -> charsel, skipping the 1920-frame GAME OVER slide. Charsel is
+    // the rendezvous both peers can always reach without agreeing on anything.
+    FlowWriteMatchPhaseTimer(0u);
+    FlowWriteSubState((uint32_t)STORY_SUB_PREMATCH);
+    FlowWriteSubStateTimer(0u);
+    FlowBgmStop();
+
+    // No TransitionBarrier proposal and no expected-intent registration: this
+    // is NOT a lockstep-derived decision and must never be presented as one.
+    ResetAll(reason ? reason : "route released");
+    s_routeReleased = true;
+    return true;
+}
+
+bool ContinueFlow_IsRouteReleased() {
+    return s_initialized && s_routeReleased;
+}
+
+void ContinueFlow_ClearRouteRelease() {
+    if (!s_routeReleased) return;
+    s_routeReleased = false;
+    Rollback::NetplayLog_Write("CONTINUE", -1, "Route release latch cleared (mode=%u)",
+        FlowGameMode());
+}
+
 ContinueChoiceState ContinueFlow_GetLocalChoiceState() {
     return SideChoiceState(ResolveLocalSide());
 }
@@ -562,6 +672,14 @@ uint32_t ContinueFlow_Test_GetSubState() {
 
 uint8_t ContinueFlow_Test_GetCursor() {
     return s_shimContinueCursor;
+}
+
+void ContinueFlow_Test_SetSubStateTimer(uint32_t timer) {
+    s_shimSubStateTimer = timer;
+}
+
+uint32_t ContinueFlow_Test_GetSubStateTimer() {
+    return s_shimSubStateTimer;
 }
 #endif
 

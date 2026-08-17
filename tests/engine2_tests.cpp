@@ -989,6 +989,61 @@ void Microbench() {
 
 } // namespace
 
+// The forced-rollback determinism self-test (QOH99 model): a replayed frame
+// with identical inputs must reproduce its original pre-state hash. Proves
+// BOTH directions — a faithful replay is silent, a divergent one is caught at
+// the exact frame — because a self-test that cannot fail proves nothing.
+static void TestReplayDeterminismSelfTest() {
+    // Faithful replay: same inputs, same hashes -> verified, zero bad.
+    {
+        RollbackEngine e;
+        e.Arm(MakeConfig(0, 0, 8), 1);
+        for (uint32_t f = 0; f < 5; ++f) {
+            e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+            const EngineAction a = e.NextAction();
+            e.CommitAdvance(a.frame, 100 + f);
+        }
+        e.SetForcedRollback(3);
+        const EngineAction a = e.NextAction();
+        TEST_CHECK(a.kind == EngineActionKind::Rollback && a.frame == 2,
+                   "forced depth-3 transaction from the frontier");
+        TEST_CHECK(e.BeginRollback(a.frame), "begin forced rollback");
+        uint32_t f = 0; uint16_t in[2];
+        while (e.NextReplayInputs(&f, in)) {
+            e.CommitReplayFrame(f, 100 + f);   // reproduce the original hash
+        }
+        TEST_CHECK(e.GetStats().replay_verifications == 3,
+                   "every replayed frame is verified");
+        TEST_CHECK(e.GetStats().replay_mismatches == 0,
+                   "a faithful replay reports no mismatch");
+    }
+    // Nondeterministic replay: same inputs, different state -> caught.
+    {
+        RollbackEngine e;
+        e.Arm(MakeConfig(0, 0, 8), 1);
+        for (uint32_t f = 0; f < 5; ++f) {
+            e.CaptureLocalInput(e.SimFrontier(), 0x0001);
+            const EngineAction a = e.NextAction();
+            e.CommitAdvance(a.frame, 100 + f);
+        }
+        e.SetForcedRollback(3);
+        const EngineAction a = e.NextAction();
+        TEST_CHECK(e.BeginRollback(a.frame), "begin forced rollback");
+        uint32_t f = 0; uint16_t in[2];
+        while (e.NextReplayInputs(&f, in)) {
+            // Frame 3 lands somewhere else than it did the first time.
+            e.CommitReplayFrame(f, f == 3 ? 0xDEAD : (100 + f));
+        }
+        TEST_CHECK(e.GetStats().replay_mismatches == 1,
+                   "the divergent frame is caught");
+        TEST_CHECK(e.GetStats().last_replay_mismatch_frame == 3,
+                   "and named exactly");
+        TEST_CHECK(e.GetStats().last_replay_expect_hash == 103 &&
+                       e.GetStats().last_replay_actual_hash == 0xDEAD,
+                   "with both hashes for the diff");
+    }
+}
+
 int main() {
     TestCaptureOnce();          // T-ENG-1
     TestDelayRelabel();         // T-ENG-2
@@ -1004,6 +1059,7 @@ int main() {
     TestSyncHashCadence();      // T-ENG-12
     TestDesyncDiagnostics();    // post-M8 divergence diagnostics
     TestLifecycleWindow();      // INV-25 / M4-7 predicate
+    TestReplayDeterminismSelfTest();  // QOH99-model local determinism check
     SoakRun();                  // §7.2 socket-free soak (M4 exit gate)
     Microbench();               // §7.5 #4
 
