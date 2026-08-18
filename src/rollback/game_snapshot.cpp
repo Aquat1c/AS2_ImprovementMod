@@ -68,6 +68,11 @@ constexpr MaskRange kMainDigestMasks[] = {
     // histories differ here with no gameplay meaning whatsoever.
     { (size_t)MATCH_SE_HANDLES_OFF,
       (size_t)(MATCH_SE_HANDLES_SIZE + MATCH_PER_FRAME_TEMP_SIZE) },                   // F9 + F7c
+    // F10d: the stage background image handle (match+7468), written by
+    // sub_4C3D90 and read only by Weather_Draw. Same sub_612DF0 provenance as
+    // the tables above; it was the last unmasked window under a skewed run.
+    { (size_t)MATCH_STAGE_IMAGE_HANDLE_OFF,
+      (size_t)MATCH_STAGE_IMAGE_HANDLE_SIZE },                                         // F10d
     // F7e (2026-08-17, first combat-load run 19-17-3x): the fine-diag ring
     // caught two transient per-side windows in the entities the moment real
     // combat inputs started flowing — the render flash/tint block (F5
@@ -93,7 +98,8 @@ constexpr MaskRange kMainDigestMasks[] = {
     { kP1EntityOff + ENTITY_HIT_REACTION_DISPLAY_MASK_OFF,
       ENTITY_HIT_REACTION_DISPLAY_MASK_SIZE },                                         // F7e
     { kP1EntityOff + ENTITY_RENDER_OUTPUT_BLOCK_OFF,
-      ENTITY_RENDER_OUTPUT_BLOCK_SIZE },                                               // F7f render output
+      ENTITY_RENDER_OUTPUT_BLOCK_SIZE },
+    { kP1EntityOff + ENTITY_SPRITE_HANDLES_OFF,   ENTITY_SPRITE_HANDLES_SIZE },      // F10c                                               // F7f render output
     { kP1EntityOff + ENTITY_OFF_VOICE_BOOKKEEPING, ENTITY_VOICE_BOOKKEEPING_SIZE },    // F4
     { kP1EntityOff + ENTITY_VOICE_TAIL_MASK_OFF,   ENTITY_VOICE_TAIL_MASK_SIZE },       // F7h
     { kP2EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF,
@@ -106,7 +112,8 @@ constexpr MaskRange kMainDigestMasks[] = {
     { kP2EntityOff + ENTITY_HIT_REACTION_DISPLAY_MASK_OFF,
       ENTITY_HIT_REACTION_DISPLAY_MASK_SIZE },                                         // F7e
     { kP2EntityOff + ENTITY_RENDER_OUTPUT_BLOCK_OFF,
-      ENTITY_RENDER_OUTPUT_BLOCK_SIZE },                                               // F7f render output
+      ENTITY_RENDER_OUTPUT_BLOCK_SIZE },
+    { kP2EntityOff + ENTITY_SPRITE_HANDLES_OFF,   ENTITY_SPRITE_HANDLES_SIZE },      // F10c                                               // F7f render output
     { kP2EntityOff + ENTITY_OFF_VOICE_BOOKKEEPING, ENTITY_VOICE_BOOKKEEPING_SIZE },    // F4
     { kP2EntityOff + ENTITY_VOICE_TAIL_MASK_OFF,   ENTITY_VOICE_TAIL_MASK_SIZE },       // F7h
 };

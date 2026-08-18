@@ -230,6 +230,23 @@
 #define MATCH_EFT_IMAGE_HANDLES_OFF  0x2FC                // match+764..975 (53 handles)
 #define MATCH_EFT_IMAGE_HANDLES_SIZE 0x0D4
 
+// F10d: the STAGE BACKGROUND image handle, match+7468 (0x76E324) -- a single
+// dword sitting immediately below ADDR_EFFECT_ARRAY (match+7472).
+//     sub_4C3D90 (decomp:114303-114304):
+//         result = Asset_LoadFromArchive(aDataStgBin, aDataStgPal,
+//                                        BYTE1(dword_816470), 0);
+//         *(_DWORD *)(a1 + 7468) = result;
+// Same sub_612DF0 provenance as F10a-c, so the VALUE carries the process-global
+// serial. Its only other accessor in the decomp is Weather_Draw, which reads it
+// to draw; no simulation reader.
+//
+// Found by byte-level fine-diag (AS2_FINE_DIAG=1) under an asymmetric
+// handle_serial_skew run: after F10a/F10b/F10c the ONLY remaining unmasked
+// differing 64-byte window was match+[7424,7488), and this dword is the one
+// thing written inside it.
+#define MATCH_STAGE_IMAGE_HANDLE_OFF 0x1D2C                // match+7468, 1 handle
+#define MATCH_STAGE_IMAGE_HANDLE_SIZE 0x004
+
 #define MATCH_SE_HANDLES_OFF         0x3D0                // match+976..1791 (204 handles)
 #define MATCH_SE_HANDLES_SIZE        0x330
 #define MATCH_PER_FRAME_TEMP_OFFSET  0x700                // match + 0x700 = 0x76CCF8
@@ -909,6 +926,43 @@
 // group, +0x820.. overlay x/y/blend/alpha) that render_guard itself
 // classifies as render state and REWRITES on rollback corrections at its
 // own cadence. Masked wholesale; captured/restored unchanged.
+// F10c: the per-entity CHARACTER SPRITE HANDLE TABLE, entity+0x834.
+// sub_4C8FF0 (decomp:117529-117534) loads each fighter's own archive into it:
+//     v2 = a2 + 10793;                       // match+43172 = entity+0x834
+//     Asset_LoadAllFromArchive(v2, &aDataRanBin[100 * charId], ...);
+//     v2 += 27203;                           // += ENTITY_SIZE, once per entity
+// Verified both ways: 43172 - kP1EntityOff(41072) == 2100 == 0x834, and
+// 151984 - kP2EntityOff(149884) == 2100 as well.
+//
+// Every entry is an image handle from sub_612DF0, so the VALUE carries the
+// process-global serial -- the same class as F9/F7h/F10a/F10b, and by far the
+// largest instance: up to 450 handles per entity (the biggest character
+// archive; ran.bin is 350, mar.bin 188).
+//
+// SIZE IS THE RESERVATION, NOT THE ARCHIVE. The table has to be a fixed
+// reservation or the entity layout would shift per character, and the next
+// known field bounds it: entity+4100 (0x1004) is the index for the 104-byte
+// array at entity+4104. So the reservation is 0x1004 - 0x834 = 0x7D0 = 500
+// dwords, which comfortably holds the 450-asset maximum.
+//
+// The span looked at first like it contained simulation accessors -- a naive
+// scan attributes entity-relative 2364, 2858 and 3922 to it from
+// Entity_UpdateHitDetection, Entity_UpdateDamageApplication and
+// Players_ResetFlags. Those are OFFSET POINTERS, not entity bases:
+// decomp:107560 uses playerPtr+2364 where playerPtr == entity+1736, and
+// decomp:118029 uses v2+3922 where v2 == entity+178 -- both resolve to
+// entity+4100, the index field, OUTSIDE this window. No accessor resolves
+// inside it.
+//
+// This is what the handle_serial_skew test caught: with only the match-level
+// tables masked, an asymmetric run agreed at BASELINE (agreement CRCs exclude
+// loader/handle regions by design) and then desynced at frame 29 with
+// identical rng and identical hp, because the gameplay digest does NOT
+// exclude them. p1_entity and p2_entity were the differing regions in the
+// desync dump; effect_array and summon_array matched.
+#define ENTITY_SPRITE_HANDLES_OFF           0x0834   // .. +0x1003 (500 handles)
+#define ENTITY_SPRITE_HANDLES_SIZE          0x07D0
+
 #define ENTITY_RENDER_OUTPUT_BLOCK_OFF      0x07F0
 #define ENTITY_RENDER_OUTPUT_BLOCK_SIZE     0x44
 // +440/+444 are advanced/terminated by the RENDER-phase player renderer
