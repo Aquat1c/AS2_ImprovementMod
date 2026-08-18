@@ -1113,7 +1113,6 @@ void RollbackSession_GetAdvanceInputs(uint16_t* p1, uint16_t* p2) {
 namespace {
 
 void IngestInputStreamNow(const Net::InputStreamPayload& p) {
-    const int32_t localDepth = (int32_t)s_engine.SpeculativeFrames();
     if (!s_engine.IngestInputStream(p)) {
         ReportEngineTerminal();
         return;
@@ -1121,6 +1120,19 @@ void IngestInputStreamNow(const Net::InputStreamPayload& p) {
     ++s_remoteInputsRecv;
 
     // M2 obligation: feed the §2.8.4 pace-slew input from PressureReport.
+    //
+    // Local depth is read AFTER the ingest, not before. Before it still counts
+    // the very frames this packet is about to confirm, which inflates it by
+    // however many frames arrived -- and PaceSlew compares
+    // `lag = peer_depth - local_depth` against a 2-frame deadband, so the
+    // inflation lands directly on the side that is supposed to act.
+    //
+    // Measured on run 2026-08-18_10-34-13: true depths were host 4.86 /
+    // client 1.88 (lag ~3), but read pre-ingest the client's own depth looked
+    // like ~3.9, giving lag ~0.96 -- under kDeadbandEnterFrames. The
+    // controller therefore sat disengaged for 758 of ~1160 samples and never
+    // converged, while the host stayed pinned at the budget=8 ceiling.
+    const int32_t localDepth = (int32_t)s_engine.SpeculativeFrames();
     FrameScheduler_SubmitPeerDepthSample((int32_t)p.pressure.prediction_depth,
                                          localDepth);
 }
