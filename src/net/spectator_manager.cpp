@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "net/spectator_manager.h"
+#include "net/nat_traversal.h"
 #include "net/enet_transport.h"
 #include "net/session_manager.h"
 #include "rollback/netplay_log.h"
@@ -686,10 +687,23 @@ void SpectatorManager_EndMatch(const char* reason) {
         reason && reason[0] ? reason : "unspecified");
 }
 
+// Log the share endpoint once, when STUN finally yields a public IP.
+static void LogShareEndpointOnce() {
+    static char s_lastShare[128] = {};
+    char share[128] = {};
+    if (!SpectatorManager_GetShareEndpoint(share, sizeof(share))) return;
+    if (strcmp(share, s_lastShare) == 0) return;
+    CopyText(s_lastShare, sizeof(s_lastShare), share);
+    SMGR_LOG(LOG_INFO, -1,
+        "[SpectatorMgr] Spectate endpoint: %s (share this; the relay maps our "
+        "internal port to the NAT port when a spectator looks us up)", share);
+}
+
 void SpectatorManager_FrameUpdate() {
     if (!s_initialized) {
         return;
     }
+    LogShareEndpointOnce();
     if (!EnsureServer()) {
         return;
     }
@@ -793,6 +807,19 @@ void SpectatorManager_FrameUpdate() {
         Transport_AutopunchServiceForHost(s_server, GetTickCount(), false);
     }
     enet_host_flush(s_server);
+}
+
+bool SpectatorManager_GetShareEndpoint(char* out, size_t cap) {
+    if (!out || cap == 0) return false;
+    out[0] = '\0';
+    if (!s_server || s_boundListenPort == 0) return false;
+
+    NatSnapshot nat{};
+    Nat_GetSnapshot(&nat);
+    if (nat.external_ip[0] == '\0') return false;
+
+    return _snprintf_s(out, cap, _TRUNCATE, "%s:%u",
+                       nat.external_ip, (unsigned)s_boundListenPort) > 0;
 }
 
 bool SpectatorManager_IsServerActive() {

@@ -50,6 +50,13 @@ void SpectatorManager_BeginMatch(uint32_t match_id, uint32_t match_ordinal);
 void SpectatorManager_EndMatch(const char* reason);
 void SpectatorManager_FrameUpdate();
 
+/// Endpoint a remote spectator should be given: "<public-ip>:<listen-port>".
+/// The port is our INTERNAL one on purpose -- that is the key we registered
+/// with the autopunch relay, and the relay translates it to our NAT port when
+/// the spectator looks us up. Returns false until the server is listening and
+/// STUN has produced a public IP.
+bool SpectatorManager_GetShareEndpoint(char* out, size_t cap);
+
 bool SpectatorManager_IsServerActive();
 int SpectatorManager_GetConnectedCount();
 int SpectatorManager_GetPeerSnapshots(SpectatorPeerSnapshot* out, int maxPeers);

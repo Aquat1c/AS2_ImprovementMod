@@ -486,22 +486,9 @@ void NetplayHud_Render() {
                      Net::CoverageClassName(cov));
         }
 
-        // Hold-cause line (M6, §2.10 vocabulary replacing the NETCLASS/debt
-        // readouts): live run state + peer readouts from PressureReport.
-        if (Rollback::RollbackSession_IsActive()) {
-            FrameSchedulerSnapshot sched{};
-            FrameScheduler_GetSnapshot(&sched);
-            Rollback::RollbackSessionSnapshot rb{};
-            Rollback::RollbackSession_GetSnapshot(&rb);
-            if (sched.run_state != Rollback::RunState::Running ||
-                rb.peer_prediction_depth > 0) {
-                const size_t len = strlen(stats);
-                snprintf(stats + len, sizeof(stats) - len,
-                         "  %s  peer-depth:%u",
-                         Rollback::RunStateName(sched.run_state),
-                         rb.peer_prediction_depth);
-            }
-        }
+        // No run-state/peer-depth appendage here: it was conditional on
+        // peer_prediction_depth > 0, which toggles every frame, so the string
+        // length changed constantly and the bar (sized from the text) blinked.
     } else if (hud.status_text[0]) {
         snprintf(stats, sizeof(stats), "%s", hud.status_text);
     }
