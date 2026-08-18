@@ -39,7 +39,12 @@ constexpr size_t kBaselineHashHeaderSize = 16;
 constexpr size_t kBaselineHashContextSize = ADDR_EFFECT_ARRAY - (ADDR_MATCH_BASE + kBaselineHashHeaderSize);
 constexpr size_t kBaselineHashEffectSize = ADDR_SUMMON_ARRAY - ADDR_EFFECT_ARRAY;
 constexpr size_t kBaselineHashSummonSize = ADDR_P1_ENTITY_BASE - ADDR_SUMMON_ARRAY;
-constexpr size_t kAgreementHeaderStableBytes = 14;
+// F10a: match+12 is the first prm.bin sprite handle, and its LOW word
+// (bytes 12..13) is sub_612DF0's free-slot index -- process history, not
+// gameplay. The agreement CRC must stop at 12 or its mismatch dumps point at a
+// phantom. Diagnostic only: the actual gate is the masked digest, and nothing
+// branches on header_agreement_crc.
+constexpr size_t kAgreementHeaderStableBytes = 12;
 constexpr size_t kAgreementEntityStablePrefixSize = 0x07D0;
 constexpr size_t kAgreementEntityAnimDataOffset = 0x1000;
 constexpr size_t kAgreementEntityAnimDataSize = 0x9000;

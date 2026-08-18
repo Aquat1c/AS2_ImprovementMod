@@ -51,8 +51,16 @@ constexpr MaskRange kMainDigestMasks[] = {
     // low-32 hash halves equal = divergent bytes only at +4..7 of 8-byte
     // blocks = sound ids 4-7). Captured+restored as before (restore's
     // explicit clear = vanilla pass-top semantics); digest-masked only.
+    // F10a: 175 prm.bin UI/HUD sprite handles (match+12..711). Handle VALUES
+    // carry sub_612DF0's free-slot index and process-global serial; no gameplay
+    // meaning and no sim reader. Captured and restored as before, masked only
+    // from the cross-peer digest.
+    { (size_t)MATCH_UI_IMAGE_HANDLES_OFF,  (size_t)MATCH_UI_IMAGE_HANDLES_SIZE },      // F10a
     // Announcer voice handles (match+712..763): same class as SE_Handles below.
     { (size_t)MATCH_ANNOUNCER_HANDLES_OFF, (size_t)MATCH_ANNOUNCER_HANDLES_SIZE },     // F9
+    // F10b: 53 eft.bin effect-sprite handles (match+764..975) — the 212-byte
+    // window that sat HASHED between the announcer and SE_Handles masks.
+    { (size_t)MATCH_EFT_IMAGE_HANDLES_OFF, (size_t)MATCH_EFT_IMAGE_HANDLES_SIZE },     // F10b
     // SE_Handles (match+976..1791) MERGED with the F7c per-frame temp
     // (match+1792..1859) — the two spans are exactly adjacent (0x3D0 + 0x330
     // == 0x700). The handles carry a process-global allocation serial in their

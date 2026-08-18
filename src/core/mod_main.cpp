@@ -523,6 +523,7 @@ static void DeferredInit() {
     // pregame/frontend paths untested at high RTT).
     LogInitStep("LinkEmulator_LoadConfig", "BEGIN");
     Net::LinkEmulator_LoadConfig();
+    Net::LinkEmulator_ApplyHandleSerialSkew();
     LogInitStep("LinkEmulator_LoadConfig", "END");
     LogInitStep("TransitionBarrier_Init", "BEGIN");
     Net::TransitionBarrier_Init();

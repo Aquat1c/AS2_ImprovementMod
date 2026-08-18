@@ -38,6 +38,12 @@
 namespace Net {
 
 struct LinkEmulatorConfig {
+    // Not a link property. Starting value forced into the game's image-handle
+    // serial (dword_91EA74) so a same-machine pair can reproduce a divergent
+    // ALLOCATION HISTORY -- the one cross-machine difference this harness
+    // cannot otherwise produce. 0 = off.
+    uint32_t handle_serial_skew;
+
     uint32_t one_way_latency_ms = 0;  // 0 disables the emulator entirely
     uint32_t jitter_ms = 0;           // uniform [0, jitter_ms], added only
     uint32_t loss_percent = 0;        // unreliable packets only
@@ -49,6 +55,9 @@ struct LinkEmulatorConfig {
 /// link_loss_pct. Safe to call more than once; logs what it armed, and what
 /// it searched when it finds nothing.
 void LinkEmulator_LoadConfig();
+
+/// Apply handle_serial_skew (no-op when 0). Call once, before a match loads.
+void LinkEmulator_ApplyHandleSerialSkew();
 
 void LinkEmulator_Configure(const LinkEmulatorConfig& cfg);
 void LinkEmulator_GetConfig(LinkEmulatorConfig* out);

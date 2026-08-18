@@ -188,8 +188,48 @@
 // to same-machine testing, because two instances of the same build share an
 // allocation history. Digest-masked on the F4/F7h rationale (sound-system
 // bookkeeping, no gameplay meaning); still captured and restored.
+// F10a: 175 UI/HUD sprite handles from DATA/prm.bin, match+12..+711.
+// Written once per match load by sub_4C0490 (decomp:112341-112376), which is
+// called with the match base (decomp:117524, inside sub_4C8FF0 whose a2 is
+// &unk_76C5F8). Destination indices -- NOT the source asset index, which runs
+// to 237 and is easy to mistake for the count:
+//     a1[3]..a1[31]   29   a1[32],a1[33]    2
+//     a1[34]..a1[81]  48   a1[82],a1[83]    2
+//     a1[84]..a1[177] 94
+// = 175 dwords at a1[3..177] = bytes 12..711, and 12 + 175*4 == 712, so the
+// array butts the announcer block exactly.
+//
+// These are IMAGE handles, so the allocator is sub_612DF0 rather than the sound
+// allocator, and BOTH halves of the value are process-history dependent: the
+// low word is the first free slot in g_HandleTable, the high word is a
+// monotonic serial (dword_91EA74++ | 0x800) with no reset site. Two peers whose
+// processes have loaded a different NUMBER of images hold different values for
+// the same sprites, with identical gameplay. The simulation never branches on a
+// handle -- they are opaque ids handed to draw calls -- and an
+// absolute-address/match-symbol scan finds no reference to the range outside
+// the loader. Same class as F9 and F7h, and same blind spot: invisible to
+// same-machine testing, where both instances allocate in lockstep.
+// Process-global IMAGE-handle allocation serial, incremented by sub_612DF0
+// (decomp:302974 `*v3 = dword_91EA74++`, wrapped at 2047) and packed into the
+// high word of every handle it returns. No reset site anywhere in the binary,
+// which is what makes the handle tables below process-history dependent.
+#define ADDR_IMAGE_HANDLE_SERIAL     0x91EA74
+
+#define MATCH_UI_IMAGE_HANDLES_OFF   0x00C                // match+12..711 (175 handles)
+#define MATCH_UI_IMAGE_HANDLES_SIZE  0x2BC
+
 #define MATCH_ANNOUNCER_HANDLES_OFF  0x2C8                // match+712..763
 #define MATCH_ANNOUNCER_HANDLES_SIZE 0x34
+// F10b: 53 effect-sprite handles from DATA/eft.bin, match+764..+975. Written by
+// sub_4A9280 (decomp:108566-108570): Asset_LoadAllFromArchive(a1 + 764, ...),
+// called with the match base at decomp:117526. The shipped DATA/eft.bin header
+// dword is 0x30810435, and 0x30810435 ^ 0x30810400 == 53 assets == 212 bytes,
+// so 764 + 212 == 976 and the array butts SE_Handles exactly. With F10a below
+// it, match+12..1859 is now one contiguous span of non-gameplay handle storage.
+// Same allocator and same process-global provenance as F10a.
+#define MATCH_EFT_IMAGE_HANDLES_OFF  0x2FC                // match+764..975 (53 handles)
+#define MATCH_EFT_IMAGE_HANDLES_SIZE 0x0D4
+
 #define MATCH_SE_HANDLES_OFF         0x3D0                // match+976..1791 (204 handles)
 #define MATCH_SE_HANDLES_SIZE        0x330
 #define MATCH_PER_FRAME_TEMP_OFFSET  0x700                // match + 0x700 = 0x76CCF8

@@ -3,6 +3,7 @@
  */
 
 #include "net/link_emulator.h"
+#include "core/as2_constants.h"
 
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
@@ -87,12 +88,50 @@ bool ParseAt(const char* path, LinkEmulatorConfig* cfg) {
             cfg->loss_percent = (uint32_t)(v > 100 ? 100 : v);
             sawKey = true;
         }
+        // Not a link property: it skews this process's IMAGE-HANDLE ALLOCATION
+        // HISTORY so a same-machine pair can reproduce the one cross-machine
+        // difference this harness otherwise cannot. See LinkEmulator_ApplyHandleSerialSkew.
+        if (sscanf_s(line, "handle_serial_skew=%d", &v) == 1 && v > 0) {
+            cfg->handle_serial_skew = (uint32_t)(v % 2048);
+            sawKey = true;
+        }
     }
     fclose(f);
     return sawKey;
 }
 
 } // namespace
+
+// Reproduce a divergent allocation history on demand.
+//
+// F9/F7h/F10a/F10b all mask handle VALUES that carry a process-global serial
+// (sub_612DF0: `*v3 = dword_91EA74++`, wrapping at 2047, with the result packed
+// as free_slot | ((serial|0x800) << 16)). Two instances of one build on one
+// machine allocate in lockstep, so those bytes always agree here and the masks
+// are unfalsifiable by this harness -- which is exactly why the defects
+// survived so long.
+//
+// Writing a different starting serial into one instance makes every subsequent
+// image handle differ from the peer's for the same sprites, with identical
+// gameplay: precisely the cross-machine condition. With the masks correct the
+// baseline still agrees; without them it cannot.
+void LinkEmulator_ApplyHandleSerialSkew() {
+    LinkEmulatorConfig cfg{};
+    LinkEmulator_GetConfig(&cfg);
+    const uint32_t skew = cfg.handle_serial_skew;
+    if (skew == 0) return;
+    __try {
+        *(volatile uint32_t*)ADDR_IMAGE_HANDLE_SERIAL = skew;
+        LOG_WARN("[LinkEmu] Image-handle serial skewed to %u — this instance's "
+                 "handle VALUES will differ from the peer's for identical sprites "
+                 "(cross-machine allocation-history simulation)",
+                 skew);
+        Rollback::NetplayLog_Write("LINKEMU", -1,
+            "Handle serial skew applied: dword_91EA74 = %u", skew);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("[LinkEmu] Handle serial skew write faulted — skipped");
+    }
+}
 
 void LinkEmulator_LoadConfig() {
     LinkEmulatorConfig cfg{};
