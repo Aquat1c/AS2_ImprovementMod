@@ -165,11 +165,12 @@ static void FlowBgmStop() {
 // player slot with session-role fallback (host = P1). Display-only — the
 // decision logic is side-symmetric, so this never affects determinism.
 static int ResolveLocalSide() {
-    int slot = PlayerMapping_GetLocalGameSlot();
-    if (slot != 0 && slot != 1) {
-        slot = (Session_GetRole() == SessionRole::Host) ? 0 : 1;
-    }
-    return slot;
+    // ROLE, not game slot. WinScreenSync feeds this flow role-ordered
+    // (host -> index 0, join -> index 1, winscreen_sync.cpp), so s_locked[0] is
+    // always the host's. Resolving by game slot agreed only when host_side==0;
+    // with the host on P2 both peers read the OTHER side and the player who
+    // locked still saw "You: DECIDING".
+    return (Session_GetRole() == SessionRole::Host) ? 0 : 1;
 }
 
 static void SetState(FlowState next, const char* why) {
@@ -358,6 +359,28 @@ static void StepPrompt(uint16_t p1, uint16_t p2) {
     // exclusively from resolution.
     FlowWriteContinueCursor(s_cursor[ResolveLocalSide()]);
 
+    // Diagnostic: any frame where a confirm/direction bit is present in the
+    // consumed stream, or the lock state changes. Shows whether a press
+    // reached the stream, whether it locked, and which side we display as
+    // "You" -- the three links between pressing and the on-screen label.
+    {
+        static bool s_lastLocked[2] = {false, false};
+        const uint16_t interesting = (uint16_t)(INPUT_A | INPUT_C | INPUT_LEFT | INPUT_RIGHT);
+        if (((p1 | p2) & interesting) != 0 ||
+            s_locked[0] != s_lastLocked[0] || s_locked[1] != s_lastLocked[1]) {
+            Rollback::NetplayLog_Write("CONTINUE", -1,
+                "prompt f=%u p1=0x%04X p2=0x%04X locked=%d/%d choice=%d/%d "
+                "localSide=%d role=%s",
+                s_promptFrames, p1, p2,
+                s_locked[0] ? 1 : 0, s_locked[1] ? 1 : 0,
+                s_choice[0], s_choice[1],
+                ResolveLocalSide(),
+                Session_GetRole() == SessionRole::Host ? "host" : "join");
+            s_lastLocked[0] = s_locked[0];
+            s_lastLocked[1] = s_locked[1];
+        }
+    }
+
     s_promptFrames++;
 
     if (s_locked[0] && s_locked[1]) {
@@ -482,7 +505,17 @@ void ContinueFlow_OnConsumedFrame(uint16_t p1Inputs, uint16_t p2Inputs) {
                 s_sawWinPose = true;
                 HoldWinPose();
             }
-            if (((uint16_t)(p1Inputs | p2Inputs) & kAdvanceMask) != 0) {
+            // RISING edge, not the raw word: a confirm still held from the
+            // match satisfies the word test on the first consumed frame, so
+            // the win pose was skipped entirely and the prompt appeared
+            // instantly. s_prevInputs is tracked on every consumed frame from
+            // the shared stream, so the edge is just as deterministic as the
+            // word -- this does NOT reintroduce the per-machine substate gate
+            // described below.
+            const uint16_t advanceRising = (uint16_t)(
+                ((uint16_t)(p1Inputs & (uint16_t)~s_prevInputs[0])) |
+                ((uint16_t)(p2Inputs & (uint16_t)~s_prevInputs[1])));
+            if ((advanceRising & kAdvanceMask) != 0) {
                 // This consumed frame carries an advance press. Begin the
                 // prompt on the WORD ALONE (2026-08-17): the old gate
                 // additionally required the LIVE substate to be the win
@@ -494,7 +527,7 @@ void ContinueFlow_OnConsumedFrame(uint16_t p1Inputs, uint16_t p2Inputs) {
                 // machines, so this anchor is deterministic; BeginPrompt
                 // forces sub=4 regardless of how far the native fade got
                 // (the forced continue screen owns the display from here).
-                BeginPrompt("advance in consumed stream");
+                BeginPrompt("advance edge in consumed stream");
             } else if (WinScreenSync_GetConsumeFrame() >= kIdlePromptConsumeFrames) {
                 // Nobody pressed anything: enter the prompt off the SHARED
                 // consume index (vanilla's 640-frame idle, re-expressed on the

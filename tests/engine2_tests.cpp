@@ -424,8 +424,16 @@ void TestIngestTaxonomy() {
     {
         RollbackEngine e;
         e.Arm(MakeConfig(0, 0, 8), 1);
-        TEST_CHECK(e.ReceiveRemoteInput(0, 0x4000) == IngestResult::InvalidValue,
+        // 0x4000 is now the reserved INPUT_MENU_HOLD transport bit and must be
+        // accepted; 0x8000 is still outside the mask and must not be.
+        TEST_CHECK(e.ReceiveRemoteInput(0, 0x8000) == IngestResult::InvalidValue,
                    "out-of-mask bits invalid");
+    }
+    {
+        RollbackEngine e;
+        e.Arm(MakeConfig(0, 0, 8), 1);
+        TEST_CHECK(e.ReceiveRemoteInput(0, 0x4000) != IngestResult::InvalidValue,
+                   "reserved menu-hold bit survives ingest");
     }
     {
         RollbackEngine e;

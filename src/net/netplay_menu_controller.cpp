@@ -116,7 +116,7 @@ static uint32_t      s_natConnectTimeoutMs = 8000;
 static uint32_t      s_natMappingTimeoutMs = 2000;
 static uint8_t       s_natLogVerbosity = 1;
 static bool          s_spectatorsEnabled = true;
-static uint16_t      s_spectatorListenPort = 10701;
+static uint16_t      s_spectatorListenPort = 0;   // 0 = ephemeral
 static bool          s_paletteSyncEnabled = true;
 static bool          s_remotePalettePreviewEnabled = false;
 static bool          s_continueScreenEnabled = true;
@@ -2676,6 +2676,32 @@ static MenuState ResolveDisconnectReturnMenu() {
     return MenuState::MenuRoot;
 }
 
+// Player-facing wording. The raw text stays in the log; hashes, packet names
+// and internal state never reach the screen.
+static const char* FriendlyError(const char* raw) {
+    if (!raw || !raw[0]) return "Disconnected.";
+    struct Rule { const char* needle; const char* text; };
+    static const Rule kRules[] = {
+        { "build hash mismatch",   "The other player is running a different version of the mod." },
+        { "build fingerprint",     "Couldn't verify this installation's mod files." },
+        { "Baseline digest",       "Couldn't start the match: the two games disagreed on the starting state." },
+        { "Config rejected",       "The other player's match settings didn't match yours." },
+        { "confirmed-desync",      "The match went out of sync and had to stop." },
+        { "sync hash mismatch",    "The match went out of sync and had to stop." },
+        { "ProtocolViolation",     "The other player sent something this version didn't understand." },
+        { "Failed to send Session","Lost contact with the other player while setting up." },
+        { "network worker",        "Couldn't start networking on this machine." },
+        { "IPv6",                  "IPv6 addresses aren't supported yet — use an IPv4 address." },
+        { "Remote canceled",       "The other player left." },
+        { "stopped responding",    "The other player stopped responding." },
+        { "timed out",             "The connection timed out." },
+    };
+    for (const Rule& r : kRules) {
+        if (ContainsInsensitive(raw, r.needle)) return r.text;
+    }
+    return raw;
+}
+
 static void OpenDisconnectError(const char* why) {
     const char* rollbackReason = Rollback::RollbackSession_GetErrorReason();
     const char* effectiveWhy = why;
@@ -2715,8 +2741,8 @@ static void OpenDisconnectError(const char* why) {
     Net::Session_Cancel();
 
     ClearTextEditState();
-    SetError("%s", why ? why : "Disconnected.");
-    SetStatus("%s", why ? why : "Disconnected.");
+    SetError("%s", FriendlyError(why));
+    SetStatus("%s", FriendlyError(why));
     s_phase = MenuPhase::Active;
     s_fadeFrames = kFadeFrames;
     s_captureInput = true;
@@ -3066,7 +3092,7 @@ static void TryAutoRestartPregameFromPostMatchCharSel() {
 
 static int ItemCount(MenuState st) {
     switch (st) {
-        case MenuState::MenuRoot:            return 4; // Direct Play, Spectate, Settings, Close
+        case MenuState::MenuRoot:            return 4; // Host, Join, Settings, Close
         case MenuState::DirectConnectEntry:  return 3; // Host, Join, Back
         case MenuState::HostEntry:           return 3; // Host, Listen Port, Back
         case MenuState::JoinEntry:           return 3; // Join, Remote Endpoint, Back
@@ -3076,10 +3102,10 @@ static int ItemCount(MenuState st) {
         case MenuState::SettingsCategoryMenu: return 6; // Player, Appearance, Network, Watch, Diagnostics, Back
         case MenuState::SettingsEntry: {
             switch (s_settingsCategory) {
-                case SettingsCategory::Identity:     return 6; // Name, Delay, Rollback, Bias, Delay Mode, Back
+                case SettingsCategory::Identity:     return 4; // Name, Delay, Rollback, Back
                 case SettingsCategory::Appearance:   return 8; // Trail, Text, Score, Length, Position, Font, Render, Back
                 case SettingsCategory::Endpoint:     return 8; // Route, UPnP, STUN, Hole, IPv6, Relay, STUN srv, Back
-                case SettingsCategory::SessionMatch: return 5; // Watchers, Port, PalSync, PalPreview, Back
+                case SettingsCategory::SessionMatch: return 4; // Watchers, PalSync, PalPreview, Back
                 case SettingsCategory::Diagnostics:  return 2; // Debug logging, Back
                 default: return 5;
             }
@@ -3104,8 +3130,6 @@ static int SettingGlobalId() {
                 case 0: return 0;   // Display Name
                 case 1: return 1;   // Input Delay
                 case 2: return 2;   // Max Rollback
-                case 3: return 3;   // Stability Bias
-                case 4: return 16;  // Gameplay Delay Mode
                 default: return -1; // Back
             }
         case SettingsCategory::Appearance:
@@ -3133,9 +3157,8 @@ static int SettingGlobalId() {
         case SettingsCategory::SessionMatch:
             switch (s_selectedIndex) {
                 case 0: return 11;  // Watchers
-                case 1: return 12;  // Watch Port
-                case 2: return 13;  // Sync Palettes
-                case 3: return 14;  // Preview Remote
+                case 1: return 13;  // Sync Palettes
+                case 2: return 14;  // Preview Remote
                 default: return -1; // Back
             }
         case SettingsCategory::Diagnostics:
@@ -4026,14 +4049,16 @@ static void ActivateCurrentSelection() {
             if (s_selectedIndex == 0) {
                 s_activeBranch = RootBranch::DirectPlay;
                 s_selectedIndex = 0;
-                SetStatus("Play Online selected.");
+                SetStatus("Set up your room.");
                 MenuUtils::BeginPublicIPFetch();
-                TransitionTo(MenuState::DirectConnectEntry, "open direct connect");
+                TransitionTo(MenuState::HostEntry, "open host config");
             } else if (s_selectedIndex == 1) {
-                s_activeBranch = RootBranch::Spectate;
+                // Join covers spectating: a busy room fails the gameplay
+                // connect and the spectator probe offers to watch instead.
+                s_activeBranch = RootBranch::DirectPlay;
                 s_selectedIndex = 0;
-                SetStatus("Watch a Match selected.");
-                TransitionTo(MenuState::SpectateEntry, "open spectate");
+                SetStatus("Enter the host address.");
+                TransitionTo(MenuState::JoinEntry, "open join config");
             } else if (s_selectedIndex == 2) {
                 s_activeBranch = RootBranch::Settings;
                 s_selectedIndex = 0;
@@ -4119,7 +4144,7 @@ static void ActivateCurrentSelection() {
                 BeginTextEdit(TextEditField::ListenPort, portBuf, "Enter the room port (1-65535).");
             } else {
                 s_selectedIndex = 0;
-                TransitionTo(MenuState::DirectConnectEntry, "back from host");
+                TransitionTo(MenuState::MenuRoot, "back from host");
             }
             break;
 
@@ -4136,7 +4161,7 @@ static void ActivateCurrentSelection() {
                 BeginTextEdit(TextEditField::RemoteEndpoint, s_remoteEndpoint, "Enter the host address as host:port or [ipv6]:port.");
             } else {
                 s_selectedIndex = 0;
-                TransitionTo(MenuState::DirectConnectEntry, "back from join");
+                TransitionTo(MenuState::MenuRoot, "back from join");
             }
             break;
 
@@ -4356,11 +4381,11 @@ static void HandleBackNavigation() {
             break;
         case MenuState::HostEntry:
             s_selectedIndex = 0;
-            TransitionTo(MenuState::DirectConnectEntry, "back from host");
+            TransitionTo(MenuState::MenuRoot, "back from host");
             break;
         case MenuState::JoinEntry:
             s_selectedIndex = 0;
-            TransitionTo(MenuState::DirectConnectEntry, "back from join");
+            TransitionTo(MenuState::MenuRoot, "back from join");
             break;
         case MenuState::SpectateEntry:
             s_selectedIndex = 0;
@@ -4609,7 +4634,16 @@ void HandleGracefulSessionQuit(const char* reason) {
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Graceful session quit: %s", msg);
     s_gracefulQuitUntilMs = GetTickCount() + 5000;
 
+    // Same teardown the error path does. Without aborting pregame sync its
+    // watchdog keeps reporting "Session lost during pre-game sync" long after
+    // the quit, and the suppression window above just delays the error box
+    // instead of preventing it.
     Net::MatchLifecycle_OnDisconnect(msg);
+    Rollback::OnlineWiring_OnDisconnect(msg);
+    Net::PregameSync_Abort(msg);
+    Net::FrontendInputSync_AbortEpoch(msg);
+    ClearJoinSpectatorProbe("graceful_quit");
+    ModeOwnership::ClearVanillaNetplayFlags();
     Net::Session_Cancel();
 
     ModeOwnership::EnterCustomMenuContext();

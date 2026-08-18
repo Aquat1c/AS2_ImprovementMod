@@ -669,8 +669,11 @@ static void FormatFrameTimingInfo(const NetMenu::MenuSnapshot* snap,
 
 static void RenderMenuRoot(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
     int y = startY;
-    RenderRow(y, "Play Online", "Host or join", snap->selected_index == 0, true, alpha); y += kRowStep;
-    RenderRow(y, "Watch", "Spectate a room", snap->selected_index == 1, true, alpha); y += kRowStep;
+    // Host/Join are the root actions now. Join covers watching too: if the
+    // room is already playing, the gameplay connect fails and the existing
+    // spectator probe offers "watch instead?".
+    RenderRow(y, "Host", "Open a room", snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Join", "Connect or watch", snap->selected_index == 1, true, alpha); y += kRowStep;
     RenderRow(y, "Settings", "Name and routing", snap->selected_index == 2, true, alpha); y += kRowStep;
     RenderRow(y, "Close", "Return to game", snap->selected_index == 3, true, alpha);
 }
@@ -706,7 +709,7 @@ static void RenderHostEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, in
         _snprintf_s(portVal, sizeof(portVal), _TRUNCATE, "%u", snap->listen_port);
     }
     RenderRow(y, "Room Port", portVal, snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Back", "Play Online", snap->selected_index == 2, true, alpha);
+    RenderRow(y, "Back", "Online Menu", snap->selected_index == 2, true, alpha);
     y += kRowStep + 6;
 
     RenderSectionLabel(y, "Share This Room", alpha);
@@ -719,17 +722,9 @@ static void RenderHostEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, in
     }
     RenderInfoLine(y, "Address", addrBuf, alpha);
     y += kInfoStep;
-    RenderInfoLine(y, "Route", snap->nat_route_status, alpha);
-    y += kInfoStep;
-    RenderInfoLine(y, "Mapping", snap->nat_mapping_status, alpha);
-    y += kInfoStep;
-    RenderInfoLine(y, "Punch", snap->nat_punch_status, alpha);
-    y += kInfoStep;
-    {
-        char stunBuf[96];
-        FormatStunStatusWithEndpoint(stunBuf, sizeof(stunBuf), snap);
-        RenderInfoLine(y, "STUN", stunBuf, alpha);
-    }
+    // Route/Mapping/Punch/STUN are diagnostics, not player information; they
+    // stay in the log.
+    RenderInfoLine(y, "Status", snap->nat_route_status, alpha);
 }
 
 static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
@@ -744,17 +739,11 @@ static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, in
         _snprintf_s(endpointVal, sizeof(endpointVal), _TRUNCATE, "%s", snap->remote_endpoint);
     }
     RenderRow(y, "Host Address", endpointVal,  snap->selected_index == 1, true, alpha); y += kRowStep;
-    RenderRow(y, "Back", "Play Online", snap->selected_index == 2, true, alpha);
+    RenderRow(y, "Back", "Online Menu", snap->selected_index == 2, true, alpha);
     y += kRowStep + 6;
     RenderSectionLabel(y, "Connection", alpha);
     y += 16;
-    RenderInfoLine(y, "Route", snap->nat_route_status, alpha);
-    y += kInfoStep;
-    RenderInfoLine(y, "Mapping", snap->nat_mapping_status, alpha);
-    y += kInfoStep;
-    RenderInfoLine(y, "Punch", snap->nat_punch_status, alpha);
-    y += kInfoStep;
-    RenderInfoLine(y, "STUN", snap->nat_stun_status, alpha);
+    RenderInfoLine(y, "Status", snap->nat_route_status, alpha);
 }
 
 static void RenderSpectateEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
@@ -834,25 +823,9 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
         _snprintf_s(rbVal, sizeof(rbVal), _TRUNCATE, "< %d > prediction depth", snap->rollback_budget);
         RenderRow(y, "Max rollback", rbVal, snap->selected_index == 2, true, alpha); y += kRowStep;
 
-        char tolVal[48];
-        _snprintf_s(tolVal, sizeof(tolVal), _TRUNCATE, "< %d > smoothness bias", snap->rollback_tolerance);
-        RenderRow(y, "Stability Bias", tolVal, snap->selected_index == 3, true, alpha); y += kRowStep;
-
-        const bool perPlayerDelayMode = snap->gameplay_delay_mode == 1;
-        RenderRow(y,
-            "Delay mode",
-            perPlayerDelayMode ? "< Per-player > default" : "< Shared max >",
-            snap->selected_index == 4,
-            true,
-            alpha);
-        y += kRowStep;
-
-        if (!perPlayerDelayMode) {
-            RenderInfoLine(y, "Shared", "Both peers use the higher delay", alpha);
-            y += kInfoStep;
-        }
-
-        RenderRow(y, "Back", "Settings", snap->selected_index == 5, true, alpha);
+        // Stability Bias (raw tolerance K) and Delay mode are expert knobs the
+        // peers negotiate anyway; config-file only now.
+        RenderRow(y, "Back", "Settings", snap->selected_index == 3, true, alpha);
         break;
     }
     case NetMenu::SettingsCategory::Appearance: {
@@ -939,18 +912,12 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
     case NetMenu::SettingsCategory::SessionMatch: {
         RenderRow(y, "Watchers", snap->spectators_enabled ? "< On > allow spectation" : "< Off > allow spectation", snap->selected_index == 0, true, alpha); y += kRowStep;
 
-        char spectatorPortVal[16];
-        if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::SpectatorPort) {
-            FormatEditBufferWithCursor(spectatorPortVal, sizeof(spectatorPortVal), snap->text_edit_buffer, snap->text_cursor_pos);
-        } else {
-            _snprintf_s(spectatorPortVal, sizeof(spectatorPortVal), _TRUNCATE, "%u", snap->spectator_listen_port);
-        }
-        RenderRow(y, "Watch Port", spectatorPortVal, snap->selected_index == 1, true, alpha); y += kRowStep;
+        // Watch Port is bound ephemerally; the relay maps it on lookup, so
+        // there is nothing for a player to choose. Config-file only.
+        RenderRow(y, "Sync Palettes", snap->palette_sync_enabled ? "< On > share colors" : "< Off > share colors", snap->selected_index == 1, true, alpha); y += kRowStep;
+        RenderRow(y, "Preview Remote", snap->remote_palette_preview_enabled ? "< On > see opponent" : "< Off > see opponent", snap->selected_index == 2, true, alpha); y += kRowStep;
 
-        RenderRow(y, "Sync Palettes", snap->palette_sync_enabled ? "< On > share colors" : "< Off > share colors", snap->selected_index == 2, true, alpha); y += kRowStep;
-        RenderRow(y, "Preview Remote", snap->remote_palette_preview_enabled ? "< On > see opponent" : "< Off > see opponent", snap->selected_index == 3, true, alpha); y += kRowStep;
-
-        RenderRow(y, "Back", "Settings", snap->selected_index == 4, true, alpha);
+        RenderRow(y, "Back", "Settings", snap->selected_index == 3, true, alpha);
         break;
     }
     case NetMenu::SettingsCategory::Diagnostics: {
@@ -1074,33 +1041,8 @@ static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha, i
         y += kInfoStep;
     }
 
-    if (snap->rtt_ms > 0.0f) {
-        char pingBuf[32];
-        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms", snap->rtt_ms);
-        RenderInfoLine(y, "Ping", pingBuf, alpha);
-        y += kInfoStep;
-    }
-    {
-        char fpsBuf[96];
-        FormatFrameTimingInfo(snap, fpsBuf, sizeof(fpsBuf));
-        RenderInfoLine(y, "FPS", fpsBuf, alpha);
-        y += kInfoStep;
-    }
-    RenderInfoLine(y, "Route", snap->nat_route_status, alpha);
-    y += kInfoStep;
-    RenderInfoLine(y, "Mapping", snap->nat_mapping_status, alpha);
-    y += kInfoStep;
-    RenderInfoLine(y, "Punch", snap->nat_punch_status, alpha);
-    y += kInfoStep;
-    {
-        char stunBuf[96];
-        if (snap->connecting_as_host) {
-            FormatStunStatusWithEndpoint(stunBuf, sizeof(stunBuf), snap);
-        } else {
-            strncpy_s(stunBuf, sizeof(stunBuf), snap->nat_stun_status, _TRUNCATE);
-        }
-        RenderInfoLine(y, "STUN", stunBuf, alpha);
-    }
+    // Ping/FPS/Mapping/Punch/STUN are diagnostics; they live in the log.
+    RenderInfoLine(y, "Status", snap->nat_route_status, alpha);
 }
 
 static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
@@ -1157,32 +1099,12 @@ static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t al
     }
     // Ping / recommendations
     if (snap->rtt_ms > 0.0f) {
-        char pingBuf[72];
-        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0fms  delay %d  rb %d",
-            snap->rtt_ms, snap->recommended_delay, snap->recommended_max_rollback);
+        char pingBuf[32];
+        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms", snap->rtt_ms);
         RenderInfoLine(y, "Ping", pingBuf, alpha);
         y += kInfoStep;
     }
-    if (snap->stall_threshold > 0) {
-        char stallBuf[72];
-        _snprintf_s(stallBuf, sizeof(stallBuf), _TRUNCATE, "%d frame%s%s",
-            snap->stall_threshold,
-            snap->stall_threshold == 1 ? "" : "s",
-            snap->stall_warning ? " (warning)" : "");
-        RenderInfoLine(y, "Stall", stallBuf, alpha);
-        y += kInfoStep;
-    }
-    RenderInfoLine(y,
-        "Delay Mode",
-        snap->gameplay_delay_mode == 1 ? "Per-player" : "Shared max",
-        alpha);
-    y += kInfoStep;
-    {
-        char fpsBuf[96];
-        FormatFrameTimingInfo(snap, fpsBuf, sizeof(fpsBuf));
-        RenderInfoLine(y, "FPS", fpsBuf, alpha);
-        y += kInfoStep;
-    }
+    // Stall threshold, delay mode and frame-timing internals: log only.
     if (snap->current_rounds_label[0]) {
         RenderInfoLine(y, "Rounds", snap->current_rounds_label, alpha);
         y += kInfoStep;

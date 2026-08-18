@@ -51,9 +51,17 @@ bool MenuKeyHeld() {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     if (pid != GetCurrentProcessId()) {
-        return false;  // alt-tabbed; ESC belongs to whatever has focus
+        return false;  // alt-tabbed; the key belongs to whatever has focus
     }
-    return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) return true;
+
+    // ...or the player's bound menu key (SELECT). Read raw so this stays out
+    // of the rollback input stream like ESC does.
+    if (const PlayerBindings_t* b = InputSystem_GetBindings(0)) {
+        const int vk = InputSystem_ScancodeToVirtualKey(b->select.keyboard_key);
+        if (vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0) return true;
+    }
+    return false;
 }
 
 bool SessionLive() {
@@ -224,7 +232,15 @@ uint16_t SessionExit_LocalMenuBit() {
     if (!s_initialized) SessionExit_Init();
     if (!SessionLive()) return 0;
     if (GetGameMode() != MODE_MATCH) return 0;
-    return MenuKeyHeld() ? (uint16_t)INPUT_MENU_HOLD : (uint16_t)0;
+    const bool held = MenuKeyHeld();
+    static bool s_lastHeld = false;
+    if (held != s_lastHeld) {
+        s_lastHeld = held;
+        Rollback::NetplayLog_Write("EXIT", -1,
+            "menu key %s (mode=%u)", held ? "DOWN" : "up",
+            (unsigned)GetGameMode());
+    }
+    return held ? (uint16_t)INPUT_MENU_HOLD : (uint16_t)0;
 }
 
 void SessionExit_ResetHoldTracking(const char* why) {
@@ -243,6 +259,13 @@ void SessionExit_NoteConfirmedInputs(int32_t matchRelFrame, uint16_t p1, uint16_
 
     s_holdFramesP1 = (p1 & INPUT_MENU_HOLD) ? (s_holdFramesP1 + 1) : 0;
     s_holdFramesP2 = (p2 & INPUT_MENU_HOLD) ? (s_holdFramesP2 + 1) : 0;
+
+    if ((s_holdFramesP1 > 0 && s_holdFramesP1 % 15 == 0) ||
+        (s_holdFramesP2 > 0 && s_holdFramesP2 % 15 == 0)) {
+        Rollback::NetplayLog_Write("EXIT", matchRelFrame,
+            "menu-hold confirmed frames p1=%d p2=%d (need %d) words=%04X/%04X",
+            s_holdFramesP1, s_holdFramesP2, kHoldFrames, p1, p2);
+    }
 
     const bool p1Fires = s_holdFramesP1 >= kHoldFrames;
     const bool p2Fires = s_holdFramesP2 >= kHoldFrames;

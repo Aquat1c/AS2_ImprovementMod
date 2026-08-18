@@ -8,6 +8,7 @@
  */
 
 #include "ui/netplay_hud.h"
+#include "net/continue_flow.h"
 #include "rollback/stress_hooks.h"
 
 #include "core/game_state.h"
@@ -329,7 +330,13 @@ static bool QueryActiveHud(MatchHudData* outHud) {
     const uint32_t mode = GetGameMode();
     const uint32_t substate = GetSubstate();
     const uint32_t gameType = GetGameType();
-    if (s_cachedHudFrame != frame ||
+    // The continue prompt pins frame/mode/substate/gameType by design (the
+    // forced screen and HoldWinPose keep entry deterministic), so the cache key
+    // cannot move and the status line froze at "DECIDING" for the whole prompt.
+    // Refresh every frame while it is up; it is a short window.
+    const bool promptActive = Net::ContinueFlow_IsPromptActive();
+    if (promptActive ||
+        s_cachedHudFrame != frame ||
         s_cachedHudMode != mode ||
         s_cachedHudSubstate != substate ||
         s_cachedHudGameType != gameType) {

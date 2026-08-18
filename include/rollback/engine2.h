@@ -57,7 +57,9 @@ struct EngineConfig {
 };
 
 /// Valid AS2 input word: INPUT_UP..INPUT_R2 (input_system.h bits 0..13).
-constexpr uint16_t ENGINE_INPUT_VALID_MASK = 0x3FFF;
+// Bits 0..13 are the game's buttons; bit 14 is the reserved non-game transport
+// bit (INPUT_MENU_HOLD). It must survive sealing or it never reaches the peer.
+constexpr uint16_t ENGINE_INPUT_VALID_MASK = 0x7FFF;
 /// The game's "no input yet" history marker — invalid on the wire (INV-19).
 constexpr uint16_t ENGINE_INPUT_INVALID_WORD = 0xFFFF;
 
