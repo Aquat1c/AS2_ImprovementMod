@@ -775,6 +775,10 @@ __declspec(dllexport) void ModOnGameExit(int exitCode, const char* reason) {
     // where process state may be unreliable.
     if (exitCode == 0 && g_initialized) {
         Net::Session_NotifyGameExit();
+        // Spectators need the same courtesy. Without it the watch server just
+        // dies with the process and every viewer waits out ENet's timeout (up
+        // to 30 s) staring at a frozen frame.
+        Net::SpectatorRuntime_OnDisconnect("host closed the game");
     }
 
     // The fast-exit path terminates without running ModShutdown; flush every
@@ -1055,7 +1059,9 @@ __declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
                 break;
             case Net::SpectatorPlaybackState::EndOfMatch:
             case Net::SpectatorPlaybackState::WaitingNextMatch:
-                statusText = "SPECTATING / WAITING";
+                // The last frame stays on screen while we wait, which reads as
+                // a freeze unless it is spelled out.
+                statusText = "SPECTATING / PAUSED - WAITING FOR NEXT MATCH";
                 break;
             case Net::SpectatorPlaybackState::PlaybackError:
                 statusText = "SPECTATING / ERROR";

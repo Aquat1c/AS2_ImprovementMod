@@ -9,6 +9,7 @@
 
 #include "ui/netplay_hud.h"
 #include "net/continue_flow.h"
+#include "net/spectator_playback.h"
 #include "rollback/stress_hooks.h"
 
 #include "core/game_state.h"
@@ -335,7 +336,18 @@ static bool QueryActiveHud(MatchHudData* outHud) {
     // cannot move and the status line froze at "DECIDING" for the whole prompt.
     // Refresh every frame while it is up; it is a short window.
     const bool promptActive = Net::ContinueFlow_IsPromptActive();
-    if (promptActive ||
+    // Same reason as the prompt: a spectator waiting between matches holds the
+    // last frame, so frame/mode/substate/gameType all stop moving and the
+    // cached line would never show the "waiting" status.
+    bool spectatorWaiting = false;
+    {
+        Net::SpectatorPlaybackSnapshot sp{};
+        Net::SpectatorPlayback_GetSnapshot(&sp);
+        spectatorWaiting =
+            sp.state == Net::SpectatorPlaybackState::WaitingNextMatch ||
+            sp.state == Net::SpectatorPlaybackState::EndOfMatch;
+    }
+    if (promptActive || spectatorWaiting ||
         s_cachedHudFrame != frame ||
         s_cachedHudMode != mode ||
         s_cachedHudSubstate != substate ||

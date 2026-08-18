@@ -1,6 +1,8 @@
 #include "net/session_exit.h"
 
 #include "net/session_manager.h"
+#include "net/spectator_client.h"
+#include "net/spectator_runtime.h"
 #include "net/session_types.h"
 #include "net/session2.h"
 #include "net/protocol.h"
@@ -68,6 +70,13 @@ bool SessionLive() {
     return Session_IsConnected();
 }
 
+// A spectator has no player session, so SessionLive() is false for it.
+bool SpectatingLive() {
+    SpectatorClientSnapshot snap{};
+    SpectatorClient_GetSnapshot(&snap);
+    return snap.active;
+}
+
 // EXACTLY the vanilla pause menu's "return to character select" branch
 // (sub_4CA120, decomp:118367-118376):
 //     *(_BYTE *)(a2 + 10) = (dword_816410 == 5) ? 3 : 1;   // route
@@ -93,6 +102,11 @@ void AbortToCharsel(const char* who) {
     // pause-quit produced. End the session's rollback first, so these writes
     // can no longer reach a digest, then route.
     Rollback::RollbackSession_End();
+    // RollbackSession_End alone does NOT tell spectators. That notification
+    // lives in the director's StopRollbackSession, which this path bypasses --
+    // without it the archive just stops growing and every spectator waits for
+    // frames that will never arrive.
+    Net::SpectatorRuntime_OnMatchEnd("players left to character select");
     RouteToCharselLikePauseMenu();
     s_holdFramesP1 = s_holdFramesP2 = 0;
 
@@ -171,6 +185,32 @@ void SessionExit_FrameUpdate() {
         InputSystem_SetPauseBlocked(false);
         s_pauseBlockOwned = false;
         Rollback::NetplayLog_Write("EXIT", -1, "Pause menu unblocked (no session)");
+    }
+
+    // SPECTATOR: the gesture ends the watch session from ANY mode -- there is
+    // no "back to character select" for a spectator, only stop watching.
+    if (!live && SpectatingLive()) {
+        const bool downSpec = MenuKeyHeld();
+        if (!downSpec) {
+            s_holding = false;
+            s_firedThisHold = false;
+            return;
+        }
+        if (!s_holding) {
+            s_holding = true;
+            s_holdStart = GetTickCount();
+            return;
+        }
+        if (!s_firedThisHold && GetTickCount() - s_holdStart >= kHoldMs) {
+            s_firedThisHold = true;
+            Rollback::NetplayLog_Write("EXIT", -1,
+                "Menu hold while spectating (mode=%u) — leaving the watch session",
+                (unsigned)GetGameMode());
+            LOG_NETPLAY(LOG_INFO, "[SessionExit] Stopped watching (menu hold)");
+            SpectatorClient_Disconnect("stopped watching (menu hold)");
+            NetMenu::HandleGracefulSessionQuit("You stopped watching.");
+        }
+        return;
     }
 
     if (!live) {

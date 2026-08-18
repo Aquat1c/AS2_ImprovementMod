@@ -655,6 +655,20 @@ static uint32_t ResolveBootstrapOrdinal(const SpectatorClientSnapshot& client) {
         : (client.pre_match_ordinal != 0 ? client.pre_match_ordinal : 1);
 }
 
+// Between matches the spectator must sit on the WIN SCREEN until the players
+// rematch or quit. Left alone the local game walks its own timer straight
+// through to character select, so pin the pose the same way ContinueFlow does
+// for players (sub_6019F0 advances at 640; hold well under it).
+static void HoldSpectatorWinScreen() {
+    if (GetGameMode() != MODE_WINSCREEN) return;
+    constexpr uint32_t kHoldCeiling = 600;
+    constexpr uint32_t kHoldFloor   = 300;
+    const uint32_t timer = ReadMemory<uint32_t>(ADDR_SUB_STATE_TIMER);
+    if (timer >= kHoldCeiling) {
+        WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, kHoldFloor);
+    }
+}
+
 // Re-enter the next match the way a player REMATCH does, instead of driving
 // the character- and stage-select UI again.
 //
@@ -1219,6 +1233,13 @@ void SpectatorPlayback_Shutdown() {
 }
 
 void SpectatorPlayback_FrameUpdate() {
+    // Pin the win screen for the whole gap between matches; the local timer
+    // advances every frame, so this cannot be a one-shot at the transition.
+    if (s_state == SpectatorPlaybackState::WaitingNextMatch ||
+        s_state == SpectatorPlaybackState::EndOfMatch) {
+        HoldSpectatorWinScreen();
+    }
+
     if (!s_initialized) {
         return;
     }
@@ -1463,6 +1484,7 @@ void SpectatorPlayback_FrameUpdate() {
         // charsel-drive path -- caught by run 2026-08-18_11-44 logging
         // "Starting watch playback for game 2" instead of the re-entry.)
         if (OwnsLocalSimulation() && GetGameMode() != MODE_MENU) {
+            HoldSpectatorWinScreen();
             SpectatorClient_ArmForNextMatch("match ended, holding in-game for re-entry");
             ClearSpectatorPaletteHints();
             TransitionState(SpectatorPlaybackState::WaitingNextMatch,
