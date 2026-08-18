@@ -1573,6 +1573,20 @@ SpectatorDispatchAction SpectatorPlayback_GetDispatcherFrame(uint16_t* outP1,
          s_state == SpectatorPlaybackState::Live);
     if (!gameplayOwned || GetGameMode() != MODE_MATCH) {
         s_dispatchFramesProducedThisLoop = 0;
+        // Unhandled hands the frame back to LOCAL input. That is right for a
+        // player, and wrong for a spectator sitting in MODE_MATCH between
+        // games: the match becomes locally playable. Hold those frames.
+        //
+        // ONLY the post-match hold, never the bootstrap states: during
+        // BootstrappingFrontend/WaitingInteractiveStart the game is already in
+        // MODE_MATCH playing its intro and MUST keep advancing to reach
+        // playable gameplay, or the origin is never set and bootstrap
+        // deadlocks.
+        if (GetGameMode() == MODE_MATCH &&
+            (s_state == SpectatorPlaybackState::WaitingNextMatch ||
+             s_state == SpectatorPlaybackState::EndOfMatch)) {
+            return SpectatorDispatchAction::BreakLoop;
+        }
         return SpectatorDispatchAction::Unhandled;
     }
 
