@@ -841,12 +841,30 @@
 // frame-58 desync, and a standing suspect for the B1/F8 round-end divergence.
 // The window is therefore split so these eight bytes are hashed again; the
 // render-churn parts either side stay masked.
+// 2026-08-18 (second narrowing): the window swallowed the ATTACK-TRADE
+// PRIORITY pair as well. Entity_CheckPriority (sub_49ECB0, decomp:100433-100479)
+// writes entity+1244 = priority and entity+1248 = 0, then takes the OPPONENT
+// via `result = *(_DWORD *)(entity + 4)` and both READS and WRITES the
+// opponent's +1244/+1248 to resolve a trade by Y-then-X position
+// (decomp:100445-100476). Cross-entity sim state, and it decides who wins a
+// simultaneous attack — the single most rollback-sensitive decision in a
+// fighting game.
+//
+// Attribution scan over the whole decomp: +1244 has exactly 6 references and
+// +1248 exactly 2, ALL inside Entity_CheckPriority. There is no render-side
+// writer. And sub_4C47C0, the render function this mask exists for, touches no
+// literal offset in +0x4C4..+0x73B at all — the original 632-byte window was
+// never justified by that function's own accesses.
+//
+// Only the eight VERIFIED bytes are unmasked here; the rest of the high window
+// stays masked rather than narrowed on speculation. That merges the two hashed
+// gaps into one contiguous [+0x4D4,+0x4E4).
 #define ENTITY_SUPERBG_MASK_LOW_OFF      0x04C4   // .. +0x4D3 (render churn)
 #define ENTITY_SUPERBG_MASK_LOW_SIZE     0x0010
-#define ENTITY_SIM_PAUSE_TIMERS_OFF      0x04D4   // .. +0x4DB  HASHED (sim)
-#define ENTITY_SIM_PAUSE_TIMERS_SIZE     0x0008
-#define ENTITY_SUPERBG_MASK_HIGH_OFF     0x04DC   // .. +0x73B (particle scratch)
-#define ENTITY_SUPERBG_MASK_HIGH_SIZE    0x0260
+#define ENTITY_SIM_PAUSE_TIMERS_OFF      0x04D4   // .. +0x4E3  HASHED (sim):
+#define ENTITY_SIM_PAUSE_TIMERS_SIZE     0x0010   //   pause/hitstop + trade priority
+#define ENTITY_SUPERBG_MASK_HIGH_OFF     0x04E4   // .. +0x73B (particle scratch)
+#define ENTITY_SUPERBG_MASK_HIGH_SIZE    0x0258
 
 // Character voice bookkeeping (SAVESTATE_AUDIT F4): 3 dwords per entity at
 // +107084 driven by Entity_UpdateAudio (sub_4C38F0) — [0] requested voice id
