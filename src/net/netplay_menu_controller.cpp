@@ -3115,6 +3115,7 @@ static int ItemCount(MenuState st) {
                 case SettingsCategory::Diagnostics:  return 2; // Debug logging, Back
                 case SettingsCategory::GameRoot:     return GameSettingsRoot_RowCount();
                 case SettingsCategory::GameKeys:     return GameSettingsKeys_RowCount();
+                case SettingsCategory::GameSystem:   return GameSettingsSystem_RowCount();
                 case SettingsCategory::GameGeneral:  return GameSettingsMenu_RowCount();
                 case SettingsCategory::GameVoice:    return GameSettingsVoice_RowCount();
                 default: return 5;
@@ -3167,6 +3168,10 @@ static int SettingGlobalId() {
         case SettingsCategory::GameRoot:
         case SettingsCategory::GameKeys:
             return -1; // every row is an action
+        case SettingsCategory::GameSystem:
+            // 60 + row; the trailing entry is Back.
+            return ((int)s_selectedIndex < GameSettingsSystem_RowCount() - 1)
+                ? (int)(60 + s_selectedIndex) : -1;
         case SettingsCategory::GameGeneral:
             // 20 + visible row; the trailing entry is Back.
             return ((int)s_selectedIndex < GameSettingsMenu_RowCount() - 1)
@@ -3870,6 +3875,14 @@ static void HandleNavigationInput() {
                 if (msg[0]) {
                     SetStatus("%s", msg);
                 }
+            } else if (gid >= 60) {
+                char msg[96];
+                if (GameSettingsSystem_Adjust(gid - 60, left, right, msg, sizeof(msg))) {
+                    changed = true;
+                }
+                if (msg[0]) {
+                    SetStatus("%s", msg);
+                }
             } else if (gid >= 40) {
                 char msg[96];
                 if (GameSettingsVoice_Adjust(gid - 40, left, right, msg, sizeof(msg))) {
@@ -4305,6 +4318,11 @@ static void ActivateCurrentSelection() {
                         s_selectedIndex = 0;
                         TransitionTo(MenuState::SettingsEntry, "open general settings");
                         break;
+                    case kGameRootSystem:
+                        s_settingsCategory = SettingsCategory::GameSystem;
+                        s_selectedIndex = 0;
+                        TransitionTo(MenuState::SettingsEntry, "open system settings");
+                        break;
                     case kGameRootKeys:
                         s_settingsCategory = SettingsCategory::GameKeys;
                         s_selectedIndex = 0;
@@ -4536,6 +4554,9 @@ static void HandleBackNavigation() {
             } else if (s_settingsCategory == SettingsCategory::GameVoice) {
                 s_settingsCategory = SettingsCategory::GameGeneral;
                 TransitionTo(MenuState::SettingsEntry, "back from voice volume");
+            } else if (s_settingsCategory == SettingsCategory::GameSystem) {
+                s_settingsCategory = SettingsCategory::GameRoot;
+                TransitionTo(MenuState::SettingsEntry, "back from system settings");
             } else if (s_settingsCategory == SettingsCategory::GameGeneral) {
                 s_settingsCategory = SettingsCategory::GameRoot;
                 TransitionTo(MenuState::SettingsEntry, "back to settings categories");

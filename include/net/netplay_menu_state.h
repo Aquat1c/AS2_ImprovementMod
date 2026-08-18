@@ -91,6 +91,7 @@ enum class SettingsCategory : uint32_t {
     GameVoice,
     GameRoot,
     GameKeys,
+    GameSystem,
 };
 
 // ============================================================================

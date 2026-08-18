@@ -54,6 +54,7 @@ bool GameSettingsMenu_Locked();
 // settings, the two viewers, exit.
 enum GameSettingsRootRow : int {
     kGameRootGeneral = 0,
+    kGameRootSystem,
     kGameRootKeys,
     kGameRootBattleHistory,
     kGameRootTitles,
@@ -62,6 +63,13 @@ enum GameSettingsRootRow : int {
 };
 
 int  GameSettingsRoot_RowCount();
+
+// Settings that until now existed only in the ImGui overlay. Practice options
+// are deliberately absent: those belong to the pause menu replacement.
+int  GameSettingsSystem_RowCount();
+void GameSettingsSystem_RenderScreen(uint32_t selectedIndex, uint8_t alpha);
+bool GameSettingsSystem_Adjust(int row, bool left, bool right,
+                               char* outStatus, size_t outStatusSize);
 void GameSettingsRoot_RenderScreen(uint32_t selectedIndex, uint8_t alpha);
 
 // Hands the player to one of the native option sub-screens (the viewers we do

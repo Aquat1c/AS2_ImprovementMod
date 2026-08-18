@@ -1462,13 +1462,16 @@ void Render(const NetMenu::MenuSnapshot* snap) {
         (snap->settings_category == NetMenu::SettingsCategory::GameGeneral ||
          snap->settings_category == NetMenu::SettingsCategory::GameVoice  ||
          snap->settings_category == NetMenu::SettingsCategory::GameRoot   ||
-         snap->settings_category == NetMenu::SettingsCategory::GameKeys)) {
+         snap->settings_category == NetMenu::SettingsCategory::GameKeys   ||
+         snap->settings_category == NetMenu::SettingsCategory::GameSystem)) {
         if (snap->settings_category == NetMenu::SettingsCategory::GameVoice) {
             NetMenu::GameSettingsVoice_RenderScreen(snap->selected_index, alpha);
         } else if (snap->settings_category == NetMenu::SettingsCategory::GameRoot) {
             NetMenu::GameSettingsRoot_RenderScreen(snap->selected_index, alpha);
         } else if (snap->settings_category == NetMenu::SettingsCategory::GameKeys) {
             NetMenu::GameSettingsKeys_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameSystem) {
+            NetMenu::GameSettingsSystem_RenderScreen(snap->selected_index, alpha);
         } else {
             NetMenu::GameSettingsMenu_RenderScreen(snap->selected_index, alpha);
         }

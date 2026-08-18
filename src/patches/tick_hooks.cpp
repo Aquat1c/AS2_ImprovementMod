@@ -45,10 +45,14 @@ static float ClampTickScale(float scale) {
     return scale;
 }
 
+// The correction from the native 17ms limiter (58.8fps) to a true 60 is always
+// on. A netplay session can still force the other value, because a peer running
+// the old cadence must be matched exactly or the two diverge -- that override is
+// the only thing that may turn it off.
 static bool EffectiveFrameLimiter60FpsEnabled() {
     return g_frameLimiter60FpsSessionOverrideActive
         ? g_frameLimiter60FpsSessionEnabled
-        : g_frameLimiter60FpsPreferenceEnabled;
+        : true;
 }
 
 // One speed authority (INV-5): with the FrameScheduler limiter detour
@@ -253,39 +257,21 @@ void TickHooks_LoadSettings() {
         return;
     }
 
-    bool found = false;
-    g_frameLimiter60FpsPreferenceEnabled =
-        ReadIniBool(L"ModSettings", L"proper_60fps", true, &found);
+    // Deliberately not read from the ini: exposing a key invites someone to
+    // turn the cadence off by hand, which is never what they want.
+    g_frameLimiter60FpsPreferenceEnabled = true;
     g_tickSettingsLoaded = true;
 
     LOG_INFO(
-        "[TickHooks] 60fps cadence preference: enabled=%d effective=%d fallback_scale=%.5f source=%s path=%s",
-        g_frameLimiter60FpsPreferenceEnabled ? 1 : 0,
+        "[TickHooks] 60fps cadence enforced: effective=%d scale=%.5f",
         EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
-        kFrameLimiter60FpsScale,
-        found ? "ini" : "default",
-        g_tickSettingsPathUtf8[0] ? g_tickSettingsPathUtf8 : "as2_rollback_settings.ini");
-
-    if (!found) {
-        TickHooks_SaveSettings();
-    }
+        kFrameLimiter60FpsScale);
 }
 
 void TickHooks_SaveSettings() {
+    // Nothing to persist: the cadence is fixed, so a fresh config never carries
+    // a key that could be edited into the wrong value.
     ResolveTickSettingsPath();
-    const wchar_t* value = g_frameLimiter60FpsPreferenceEnabled ? L"1" : L"0";
-    if (!WritePrivateProfileStringW(L"ModSettings", L"proper_60fps", value, g_tickSettingsPathW)) {
-        LOG_WARN(
-            "[TickHooks] Failed to save 60fps limiter setting to %s",
-            g_tickSettingsPathUtf8[0] ? g_tickSettingsPathUtf8 : "as2_rollback_settings.ini");
-        return;
-    }
-    LOG_INFO(
-        "[TickHooks] Saved 60fps cadence preference: enabled=%d effective=%d override=%d path=%s",
-        g_frameLimiter60FpsPreferenceEnabled ? 1 : 0,
-        EffectiveFrameLimiter60FpsEnabled() ? 1 : 0,
-        g_frameLimiter60FpsSessionOverrideActive ? 1 : 0,
-        g_tickSettingsPathUtf8[0] ? g_tickSettingsPathUtf8 : "as2_rollback_settings.ini");
 }
 
 void SetFrameLimiter60FpsPatchEnabled(bool enabled) {

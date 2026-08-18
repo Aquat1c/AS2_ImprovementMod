@@ -356,29 +356,13 @@ static void TabAdvancedDebug() {
     }
 
     if (ImGui::CollapsingHeader("Timing")) {
-        bool proper60 = IsFrameLimiter60FpsPatchEnabled();
-        const bool fpsLocked = TickHooks_IsFrameLimiter60FpsSessionOverrideActive();
-        if (fpsLocked) {
-            ImGui::BeginDisabled();
-        }
-        if (ImGui::Checkbox("Correct 17ms limiter to 60 FPS", &proper60)) {
-            SetFrameLimiter60FpsPatchEnabled(proper60);
-            TickHooks_SaveSettings();
-        }
-        if (fpsLocked) {
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("(session locked)");
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("The native limiter waits for 17ms (~58.8 FPS).\n"
-                              "This applies a %.2fx tick correction so that 17 game-ms take 16.67 real-ms.\n"
-                              "During netplay, the host's FPS mode is locked for both peers.",
-                              GetFrameLimiter60FpsCorrectionScale());
-        }
+        // The 60fps cadence is enforced, not a choice, so it is reported
+        // rather than offered.
+        ImGui::Text("Frame cadence: 60 FPS (%.2fx correction, enforced)",
+                    GetFrameLimiter60FpsCorrectionScale());
 
+        // Manual tick scaling still has to yield to a locked netplay session.
+        const bool fpsLocked = TickHooks_IsFrameLimiter60FpsSessionOverrideActive();
         float globalScale = GetGlobalTickScale();
         if (fpsLocked) {
             ImGui::BeginDisabled();

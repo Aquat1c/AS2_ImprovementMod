@@ -410,8 +410,7 @@ static bool SavePersistentSettings(const char* reason) {
         "; Friendly values are safe to edit. Raw blocks preserve vanilla settings we do not name yet.\r\n"
         "\r\n"
         "[ModSettings]\r\n"
-        "; proper_60fps: 1 corrects the native 17ms limiter to 60.000fps; 0 keeps vanilla ~58.8fps\r\n"
-        "proper_60fps=%d\r\n"
+        "; The 60fps cadence correction is always on and has no key.\r\n"
         "; input_guard_shell_hotkeys_ime: 1 clears vanilla Win/Alt+Shift suppression hooks\r\n"
         "input_guard_shell_hotkeys_ime=%d\r\n"
         "\r\n"
@@ -436,7 +435,6 @@ static bool SavePersistentSettings(const char* reason) {
         "[RawSettings]\r\n"
         "settings_block_a=%s\r\n"
         "settings_block_b=%s\r\n",
-        TickHooks_GetFrameLimiter60FpsPreferenceEnabled() ? 1 : 0,
         inputGuard.shell_hotkeys_ime ? 1 : 0,
         ReadMemory<uint8_t>(kGameOptionDifficulty),
         GameSettingsSync_RoundsToWin(s_persistedRoundOption),

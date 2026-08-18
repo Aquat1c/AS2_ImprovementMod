@@ -15,6 +15,8 @@
 #include "net/mode_ownership.h"
 #include "net/netplay_menu_controller.h"
 #include "input/input_system.h"
+#include "patches/tick_hooks.h"
+#include "core/game_console.h"
 
 namespace NetMenu {
 
@@ -573,6 +575,199 @@ bool GameSettingsKeys_Confirm(int row, bool* outClose, char* outStatus, size_t o
     return true;
 }
 
+// ============================================================================
+// System settings — the overlay-only toggles, minus anything practice related
+// ============================================================================
+
+namespace {
+
+enum SystemRow : int {
+    kSysBorderless = 0,
+    kSysKeepAspect,
+    kSysWindowScale,
+    kSysBackgroundInput,
+    kSysControlSwap,
+    kSysDebugCapture,
+    kSysBack,
+    kSysCount,
+};
+
+// Display state belongs to the d3d9 proxy, which owns the window and the swap
+// chain, so it is driven through exports rather than duplicated here.
+typedef int  (*ProxyGetInt_t)();
+typedef void (*ProxySetInt_t)(int);
+
+struct ProxyDisplayApi {
+    ProxyGetInt_t getBorderless = nullptr;
+    ProxySetInt_t setBorderless = nullptr;
+    ProxyGetInt_t getKeepAspect = nullptr;
+    ProxySetInt_t setKeepAspect = nullptr;
+    ProxyGetInt_t getScale = nullptr;
+    ProxySetInt_t setScale = nullptr;
+    bool resolved = false;
+    bool available = false;
+};
+
+ProxyDisplayApi& DisplayApi() {
+    static ProxyDisplayApi api;
+    if (!api.resolved) {
+        api.resolved = true;
+        if (HMODULE proxy = GetModuleHandleA("d3d9.dll")) {
+            api.getBorderless = (ProxyGetInt_t)GetProcAddress(proxy, "AS2Proxy_GetDisplayBorderless");
+            api.setBorderless = (ProxySetInt_t)GetProcAddress(proxy, "AS2Proxy_SetDisplayBorderless");
+            api.getKeepAspect = (ProxyGetInt_t)GetProcAddress(proxy, "AS2Proxy_GetKeepAspect");
+            api.setKeepAspect = (ProxySetInt_t)GetProcAddress(proxy, "AS2Proxy_SetKeepAspect");
+            api.getScale      = (ProxyGetInt_t)GetProcAddress(proxy, "AS2Proxy_GetWindowScale");
+            api.setScale      = (ProxySetInt_t)GetProcAddress(proxy, "AS2Proxy_SetWindowScale");
+        }
+        api.available = api.getBorderless && api.setBorderless &&
+                        api.getKeepAspect && api.setKeepAspect &&
+                        api.getScale && api.setScale;
+    }
+    return api;
+}
+
+struct SystemRowDef {
+    const char* name;
+    const char* hint;
+};
+
+const SystemRowDef kSystemRows[kSysCount] = {
+    { "Fullscreen",       "borderless window"      },
+    { "Keep Aspect",      "4:3 letterbox"          },
+    { "Window Size",      "windowed only"          },
+    { "Background Input", "keep playing unfocused" },
+    { "Swap P1/P2",       "trade control sides"    },
+    { "Debug Capture",    "log the game's output"  },
+    { "Back",             "settings"               },
+};
+
+bool ReadSystemRow(int row) {
+    switch (row) {
+        case kSysBorderless:
+            return DisplayApi().available && DisplayApi().getBorderless() != 0;
+        case kSysKeepAspect:
+            return DisplayApi().available && DisplayApi().getKeepAspect() != 0;
+        case kSysBackgroundInput: return InputSystem_IsBackgroundInputEnabled();
+        case kSysControlSwap:     return InputSystem_GetControlSwap();
+        case kSysDebugCapture:    return GameConsole_IsEnabled();
+        default:                  return false;
+    }
+}
+
+} // namespace
+
+int GameSettingsSystem_RowCount() {
+    return kSysCount;
+}
+
+void GameSettingsSystem_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
+    DrawPanel(kSysCount + 1, alpha);
+    MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright,
+                      kSettingsTextSize, "SYSTEM");
+    DrawHighlight((int)selectedIndex, alpha);
+
+    for (int i = 0; i < kSysCount; ++i) {
+        const int y = RowText(i, kRowPitch);
+        MenuDrawTextSized(kLabelX, y, kInk, kInk, kInk, kSettingsTextSize,
+                          kSystemRows[i].name);
+        if (i == kSysBack) {
+            MenuDrawTextSized(kValueX, y, kInkDim, kInkDim, kInkDim,
+                              kSettingsTextSize, kSystemRows[i].hint);
+            continue;
+        }
+        char text[48];
+        if (i == kSysWindowScale) {
+            const int scale = DisplayApi().available ? DisplayApi().getScale() : 1;
+            _snprintf_s(text, sizeof(text), _TRUNCATE, "< %dx  %dx%d >",
+                        scale, 640 * scale, 480 * scale);
+        } else {
+            _snprintf_s(text, sizeof(text), _TRUNCATE, "< %s >",
+                        ReadSystemRow(i) ? "On" : "Off");
+        }
+        const bool dim = (i <= kSysWindowScale) && !DisplayApi().available;
+        const uint8_t ink = dim ? kInkFaint : kInkBright;
+        MenuDrawTextSized(kValueX, y, ink, ink, ink, kSettingsTextSize, text);
+    }
+
+}
+
+bool GameSettingsSystem_Adjust(int row, bool left, bool right,
+                               char* outStatus, size_t outStatusSize) {
+    if (outStatus && outStatusSize) {
+        outStatus[0] = '\0';
+    }
+    if (row < 0 || row >= kSysBack || (!left && !right)) {
+        return false;
+    }
+
+    if (row <= kSysWindowScale) {
+        ProxyDisplayApi& api = DisplayApi();
+        if (!api.available) {
+            if (outStatus && outStatusSize) {
+                _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
+                            "Display settings need the mod's d3d9 proxy.");
+            }
+            return false;
+        }
+        if (row == kSysWindowScale) {
+            const int cur = api.getScale();
+            int next = cur + (right ? 1 : -1);
+            if (next < 1) next = 1;
+            if (next > 4) next = 4;
+            if (next == cur) {
+                return false;
+            }
+            api.setScale(next);
+            if (outStatus && outStatusSize) {
+                _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
+                            "Window size: %dx (%dx%d)", next, 640 * next, 480 * next);
+            }
+            return true;
+        }
+
+        const bool want = right;
+        if (want == ReadSystemRow(row)) {
+            return false;
+        }
+        if (row == kSysBorderless) {
+            api.setBorderless(want ? 1 : 0);
+        } else {
+            api.setKeepAspect(want ? 1 : 0);
+        }
+        if (outStatus && outStatusSize) {
+            _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "%s: %s",
+                        kSystemRows[row].name, want ? "On" : "Off");
+        }
+        return true;
+    }
+
+    const bool next = right;   // left = off, right = on
+    if (next == ReadSystemRow(row)) {
+        return false;
+    }
+
+    switch (row) {
+        case kSysBackgroundInput:
+            InputSystem_SetBackgroundInputEnabled(next);
+            break;
+        case kSysControlSwap:
+            InputSystem_SetControlSwap(next);
+            break;
+        case kSysDebugCapture:
+            GameConsole_SetEnabled(next);
+            break;
+        default:
+            return false;
+    }
+
+    if (outStatus && outStatusSize) {
+        _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "%s: %s",
+                    kSystemRows[row].name, next ? "On" : "Off");
+    }
+    return true;
+}
+
 int GameSettingsRoot_RowCount() {
     return kGameRootCount;
 }
@@ -580,6 +775,7 @@ int GameSettingsRoot_RowCount() {
 void GameSettingsRoot_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     static const char* const kLabels[kGameRootCount] = {
         "General Settings",
+        "System",
         "Key Settings",
         "Battle History",
         "Titles",
@@ -587,6 +783,7 @@ void GameSettingsRoot_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     };
     static const char* const kHints[kGameRootCount] = {
         "rules and audio",
+        "mod options",
         "controls",
         "past results",
         "earned titles",

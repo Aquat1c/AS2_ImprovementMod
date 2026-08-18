@@ -6651,3 +6651,89 @@ extern "C" __declspec(dllexport)
 int AS2Proxy_MenuFontReady() {
     return g_menuFont != nullptr ? 1 : 0;
 }
+
+// ============================================================================
+// Display settings bridge (called by as2_rollback.dll)
+// ============================================================================
+//
+// The display state lives here, not in the mod: the proxy owns the window, the
+// swap chain and the letterbox rect. These mirror what ToggleBorderlessFullscreen
+// already does, so the in-game menu drives the same paths as the hotkey rather
+// than a second copy of the logic.
+
+extern "C" __declspec(dllexport)
+int AS2Proxy_GetDisplayBorderless() {
+    return g_isCurrentlyBorderless ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport)
+void AS2Proxy_SetDisplayBorderless(int enable) {
+    const bool want = enable != 0;
+    if (want == g_isCurrentlyBorderless) {
+        return;
+    }
+    HWND hWnd = g_gameWindow ? g_gameWindow : GetActiveWindow();
+    if (!hWnd) {
+        return;
+    }
+    g_useBorderlessFullscreen = want;
+    SetBorderlessState(hWnd, want);
+    DisplayConfig_Save();
+}
+
+extern "C" __declspec(dllexport)
+int AS2Proxy_GetKeepAspect() {
+    return g_keepAspectRatio ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport)
+void AS2Proxy_SetKeepAspect(int enable) {
+    const bool want = enable != 0;
+    if (want == g_keepAspectRatio) {
+        return;
+    }
+    g_keepAspectRatio = want;
+    g_letterboxActive = want && g_isCurrentlyBorderless;
+
+    // Recompute the view rect immediately; input mapping reads it before the
+    // next Present would refresh it.
+    if (want) {
+        CalculateLetterboxDestRect(g_screenWidth, g_screenHeight,
+                                   g_nativeWidth, g_nativeHeight,
+                                   &g_letterboxDestRect);
+    } else {
+        g_letterboxDestRect = { 0, 0, g_screenWidth, g_screenHeight };
+    }
+    ReleaseScalingSwapChain();
+    g_windowResizedNeedsReinit = true;
+    DisplayConfig_Save();
+}
+
+// Windowed size as a whole multiple of the game's 640x480, which is what a
+// menu row can sensibly step through.
+extern "C" __declspec(dllexport)
+int AS2Proxy_GetWindowScale() {
+    const int w = g_currentWindowWidth > 0 ? g_currentWindowWidth : g_nativeWidth;
+    int scale = g_nativeWidth > 0 ? (w / g_nativeWidth) : 1;
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;
+    return scale;
+}
+
+extern "C" __declspec(dllexport)
+void AS2Proxy_SetWindowScale(int scale) {
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;
+
+    g_windowedWidth = g_nativeWidth * scale;
+    g_windowedHeight = g_nativeHeight * scale;
+
+    // Only meaningful while windowed; borderless already fills the monitor.
+    if (!g_isCurrentlyBorderless) {
+        HWND hWnd = g_gameWindow ? g_gameWindow : GetActiveWindow();
+        if (hWnd) {
+            SetBorderlessState(hWnd, false);
+        }
+    }
+    DisplayConfig_Save();
+}
