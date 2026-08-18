@@ -92,6 +92,9 @@ const char* GetRenderModeLabel();
 
 HudRenderMode GetRenderMode();
 float GetNickYRatio(bool modMenuOpen);
+
+/// Fixed top row, used by character select and the win screen.
+float GetNickYTopRatio();
 float GetNickYRatioForSide(uint8_t vertical_position, bool modMenuOpen);
 float GetFontSizePx();
 float GetFontSizePxForPreset(uint8_t font_size);

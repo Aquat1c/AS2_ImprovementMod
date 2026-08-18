@@ -68,7 +68,9 @@ constexpr int kFooterStep   = 16;
 constexpr int kFadeFrames   = 25;
 constexpr int kContentBottom = kFooterTop - 6;
 
-constexpr size_t kLabelChars  = 18;   // (218-66)/8 - 1
+// 16, not 18: the selector column starts at x=200, so an 18-char label
+// (66 + 18*8 = 210) ran INTO it. 16 chars ends at 194 and leaves a clean gap.
+constexpr size_t kLabelChars  = 16;   // 66 + 16*8 = 194 < kSelectorX(200)
 constexpr size_t kValueChars  = 44;   // (582-218)/8 - 1
 constexpr size_t kSelectorChars = 14; // fixed selector column width
 constexpr size_t kHintChars   = 32;   // (582-318)/8 - 1
@@ -548,11 +550,14 @@ static void RenderInfoLine(int y, const char* label, const char* value, uint8_t 
     GameSetBlend(1, alpha);
     char clippedLabel[80];
     ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
-    GameDrawText(kLabelX, y, 148, 140, 128, "%s", clippedLabel);
+    GameDrawText(kLabelX, y, 170, 162, 148, "%s", clippedLabel);
     if (value && value[0]) {
+        // Value column, not the hint column. An info line has two columns, so
+        // starting at kHintX (318) left a 252px gap that visually detached the
+        // value from its label; kValueX also lines it up with the rows above.
         char clippedValue[192];
-        ClipText(clippedValue, sizeof(clippedValue), value, kHintChars);
-        GameDrawText(kHintX, y, 188, 182, 172, "%s", clippedValue);
+        ClipText(clippedValue, sizeof(clippedValue), value, kValueChars);
+        GameDrawText(kValueX, y, 214, 208, 196, "%s", clippedValue);
     }
 }
 

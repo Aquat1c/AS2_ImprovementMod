@@ -397,7 +397,15 @@ void NetplayHud_Render() {
         (GetGameMode() == MODE_MATCH ||
          GetGameMode() == MODE_CHARSEL ||
          GetGameMode() == MODE_WINSCREEN)) {
-        const float nickY = H * NetplayHudStyle::GetNickYRatio(modMenuOpen);
+        // Character select / win screen pin the names to the top row; gameplay
+        // keeps the player's "Name position" setting. The mod menu still wins,
+        // so an open menu is not overlapped.
+        const uint32_t hudMode = GetGameMode();
+        const bool frontendScreen =
+            (hudMode == MODE_CHARSEL || hudMode == MODE_WINSCREEN);
+        const float nickY = H * ((frontendScreen && !modMenuOpen)
+                                     ? NetplayHudStyle::GetNickYTopRatio()
+                                     : NetplayHudStyle::GetNickYRatio(modMenuOpen));
         const HudFontBinding p1Font = ResolveHudFontBinding(hud.p1_font_size);
         const HudFontBinding p2Font = ResolveHudFontBinding(hud.p2_font_size);
         const float p1BarHeight = H * kBarHeightRatio * (p1Font.sizePx / 14.0f);

@@ -370,6 +370,16 @@ float GetNickYRatio(bool modMenuOpen) {
     return GetNickYRatioForSide(s_local.vertical_position, modMenuOpen);
 }
 
+// Character select and the win screen always use the top row: the game's own
+// art occupies the menu-safe band there, and the setting only governs
+// gameplay.
+float GetNickYTopRatio() {
+    if (!s_loaded) {
+        Init();
+    }
+    return kNickYTopRatio;
+}
+
 float GetNickYRatioForSide(uint8_t vertical_position, bool modMenuOpen) {
     if (modMenuOpen) {
         return kNickYMenuSafeRatio;

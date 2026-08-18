@@ -146,7 +146,15 @@ static int SideNickY(bool charSel) {
     if (charSel) {
         return kCharSelNickY;
     }
-    const float ratio = NetplayHudStyle::GetNickYRatio(ModMenu_IsOpen());
+    // Same rule as the overlay renderer: top row on character select and the
+    // win screen, the configured position during gameplay.
+    const bool vanillaMenuOpen = ModMenu_IsOpen();
+    const uint32_t vanillaMode = GetGameMode();
+    const bool vanillaFrontend =
+        (vanillaMode == MODE_CHARSEL || vanillaMode == MODE_WINSCREEN);
+    const float ratio = (vanillaFrontend && !vanillaMenuOpen)
+                            ? NetplayHudStyle::GetNickYTopRatio()
+                            : NetplayHudStyle::GetNickYRatio(vanillaMenuOpen);
     return (int)(ratio * (float)kNativeH + 0.5f);
 }
 
