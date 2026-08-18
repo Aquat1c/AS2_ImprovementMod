@@ -27,11 +27,21 @@ static ENetHost*  s_enetHost       = nullptr;
 
 namespace {
 
+// Fast cadence during the punch window; qoh99's steady-state values after it.
 constexpr uint32_t AUTOPUNCH_REGISTER_INTERVAL_MS  = 500;
 constexpr uint32_t AUTOPUNCH_LOOKUP_INTERVAL_MS    = 500;
 constexpr uint32_t AUTOPUNCH_DIRECT_INTERVAL_MS    = 125;
 constexpr uint32_t AUTOPUNCH_ACTIVE_WINDOW_MS      = 10000;
 constexpr uint32_t AUTOPUNCH_KEEPALIVE_INTERVAL_MS = 2000;
+
+// Idle cadence: 2000ms is well inside the shortest NAT mapping lifetimes.
+constexpr uint32_t AUTOPUNCH_IDLE_REGISTER_INTERVAL_MS = 2000;
+constexpr uint32_t AUTOPUNCH_IDLE_LOOKUP_INTERVAL_MS   = 1000;
+constexpr uint32_t AUTOPUNCH_IDLE_DIRECT_INTERVAL_MS   = 250;
+
+// Failed name resolution backs off; enet_address_set_host blocks the caller.
+constexpr uint32_t AUTOPUNCH_RESOLVE_RETRY_BASE_MS = 1000;
+constexpr uint32_t AUTOPUNCH_RESOLVE_RETRY_MAX_MS  = 30000;
 
 // Keepalive wire format: [magic 4 | connectID 4 | reserved 4]. The leading
 // 0xFF 0xFF parses on a pre-keepalive build as peerID 0xFFF with the
@@ -66,6 +76,11 @@ struct AutopunchState {
     uint32_t    keepalive_sent;
     uint32_t    keepalive_received;
     uint32_t    rebind_heals;
+    bool        active_window_done;
+    uint32_t    relay_resolve_fail_ms;      // last failed attempt
+    uint32_t    relay_resolve_fails;
+    uint32_t    target_resolve_fail_ms;
+    uint32_t    target_resolve_fails;
     // GetTickCount of the last AUTHENTICATED keepalive accepted from the
     // connected peer (connectID verified). Feeds transport2's
     // protocol_silence_ms so autopunch keepalives count as liveness (INV-14).
@@ -170,6 +185,17 @@ static int RawSendToAddress(AutopunchState& state,
     return sent;
 }
 
+// Exponential backoff after a failed resolve, capped.
+static bool ResolveBackoffElapsed(uint32_t lastFailMs, uint32_t fails) {
+    if (fails == 0 || lastFailMs == 0) return true;
+    uint32_t wait = AUTOPUNCH_RESOLVE_RETRY_BASE_MS;
+    for (uint32_t i = 1; i < fails && wait < AUTOPUNCH_RESOLVE_RETRY_MAX_MS; ++i) {
+        wait *= 2;
+    }
+    if (wait > AUTOPUNCH_RESOLVE_RETRY_MAX_MS) wait = AUTOPUNCH_RESOLVE_RETRY_MAX_MS;
+    return (GetTickCount() - lastFailMs) >= wait;
+}
+
 static bool AutopunchResolveRelay(AutopunchState& state) {
     if (!state.enabled) {
         return false;
@@ -177,12 +203,21 @@ static bool AutopunchResolveRelay(AutopunchState& state) {
     if (state.relay_resolved) {
         return true;
     }
+    if (!ResolveBackoffElapsed(state.relay_resolve_fail_ms, state.relay_resolve_fails)) {
+        return false;
+    }
 
     state.relay_resolved = ResolveEnetAddress(
         state.relay_host,
         state.relay_port,
         &state.relay,
         "Autopunch relay");
+    if (!state.relay_resolved) {
+        state.relay_resolve_fail_ms = GetTickCount();
+        ++state.relay_resolve_fails;
+    } else {
+        state.relay_resolve_fails = 0;
+    }
     return state.relay_resolved;
 }
 
@@ -193,12 +228,21 @@ static bool AutopunchResolveTarget(AutopunchState& state) {
     if (state.target_resolved) {
         return true;
     }
+    if (!ResolveBackoffElapsed(state.target_resolve_fail_ms, state.target_resolve_fails)) {
+        return false;
+    }
 
     state.target_resolved = ResolveEnetAddress(
         state.target_host,
         state.target_port,
         &state.target,
         "Autopunch target");
+    if (!state.target_resolved) {
+        state.target_resolve_fail_ms = GetTickCount();
+        ++state.target_resolve_fails;
+    } else {
+        state.target_resolve_fails = 0;
+    }
     return state.target_resolved;
 }
 
@@ -1095,35 +1139,47 @@ void Transport_AutopunchServiceForHost(ENetHost* enetHost,
 
     state->last_keepalive_ms = 0;
 
+    // Log the window elapsing once, then decay to the idle cadence. started_ms
+    // is no longer restamped, so ageMs stays a true age.
     const uint32_t ageMs = nowMs - state->started_ms;
-    if (ageMs > AUTOPUNCH_ACTIVE_WINDOW_MS) {
+    if (!state->active_window_done && ageMs > AUTOPUNCH_ACTIVE_WINDOW_MS) {
+        state->active_window_done = true;
         Rollback::NetplayLog_Write("ENET", -1,
-            "%s Autopunch active window elapsed: age=%ums registers=%u lookups=%u direct=%u mappings=%u",
+            "%s Autopunch active window elapsed: age=%ums registers=%u lookups=%u direct=%u mappings=%u (idle cadence now %ums)",
             AutopunchLabel(*state),
             ageMs,
             state->relay_register_sent,
             state->relay_lookup_sent,
             state->direct_punch_sent,
-            state->relay_mappings_received);
-        state->started_ms = nowMs;
+            state->relay_mappings_received,
+            AUTOPUNCH_IDLE_REGISTER_INTERVAL_MS);
     }
 
+    const uint32_t registerInterval = state->active_window_done
+        ? AUTOPUNCH_IDLE_REGISTER_INTERVAL_MS : AUTOPUNCH_REGISTER_INTERVAL_MS;
+    const uint32_t lookupInterval = state->active_window_done
+        ? AUTOPUNCH_IDLE_LOOKUP_INTERVAL_MS : AUTOPUNCH_LOOKUP_INTERVAL_MS;
+    const uint32_t directInterval = state->active_window_done
+        ? AUTOPUNCH_IDLE_DIRECT_INTERVAL_MS : AUTOPUNCH_DIRECT_INTERVAL_MS;
+
+    // Registration never stops: a listen-only host depends on the relay
+    // answering someone else's lookup. Only the rate decays.
     if (state->last_register_ms == 0 ||
-        nowMs - state->last_register_ms >= AUTOPUNCH_REGISTER_INTERVAL_MS) {
+        nowMs - state->last_register_ms >= registerInterval) {
         state->last_register_ms = nowMs;
         AutopunchSendRegister(*state);
     }
 
     if (state->target_host[0]) {
         if (state->last_lookup_ms == 0 ||
-            nowMs - state->last_lookup_ms >= AUTOPUNCH_LOOKUP_INTERVAL_MS) {
+            nowMs - state->last_lookup_ms >= lookupInterval) {
             state->last_lookup_ms = nowMs;
             AutopunchSendLookup(*state);
         }
 
         if (AutopunchResolveTarget(*state) &&
             (state->last_direct_ms == 0 ||
-             nowMs - state->last_direct_ms >= AUTOPUNCH_DIRECT_INTERVAL_MS)) {
+             nowMs - state->last_direct_ms >= directInterval)) {
             state->last_direct_ms = nowMs;
             const int sent = AutopunchSendDirectPings(*state, state->target, 1, "Autopunch direct");
             if (sent > 0) {
