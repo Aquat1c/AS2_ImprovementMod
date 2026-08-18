@@ -99,7 +99,16 @@ def newest_run(gamedir):
     return max(runs, key=os.path.getmtime) if runs else None
 
 
-def scan_file(path, since, fatal, degraded, other, reports):
+# Shapes that are the harness's OWN shutdown after the ladder finishes. They are
+# only benign AFTER the final "ladder complete" -- the same words mid-run mean a
+# real mid-match loss, so they are suppressed by position, never by wording.
+TEARDOWN = re.compile(
+    r"Remote canceled the session|Hidden netplay flow lost session|"
+    r"OpenDisconnectError|Disconnect during PlayableGameplay|"
+    r"MatchSetup\] Abort:|Forcing return to menu")
+
+
+def scan_file(path, since, fatal, degraded, other, reports, ladder_done_at=None):
     benign = re.compile("|".join(BENIGN))
     try:
         fh = open(path, encoding="utf-8", errors="replace")
@@ -107,6 +116,10 @@ def scan_file(path, since, fatal, degraded, other, reports):
         return
     with fh:
         for line in fh:
+            if ladder_done_at:
+                m = TIME_RE.match(line)
+                if m and m.group(1) >= ladder_done_at and TEARDOWN.search(line):
+                    continue
             if since:
                 m = TIME_RE.match(line)
                 if m and m.group(1) < since:
@@ -148,8 +161,23 @@ def main():
         if not run:
             continue
         scanned.append(run)
-        for f in glob.glob(os.path.join(run, "*.log")):
-            scan_file(f, args.since, fatal, degraded, other, reports)
+        run_files = glob.glob(os.path.join(run, "*.log"))
+        # The ladder-completion time is run-wide: the marker and the teardown
+        # warnings land in DIFFERENT log files, so a per-file search finds
+        # nothing and suppresses nothing.
+        ladder_done_at = None
+        for f in run_files:
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    for l in fh:
+                        if "ladder complete" in l:
+                            m = TIME_RE.match(l)
+                            if m and (ladder_done_at is None or m.group(1) > ladder_done_at):
+                                ladder_done_at = m.group(1)
+            except OSError:
+                pass
+        for f in run_files:
+            scan_file(f, args.since, fatal, degraded, other, reports, ladder_done_at)
 
     print("=== scanned runs ===")
     for r in scanned:

@@ -2479,6 +2479,22 @@ static void ReleaseCachedGameBackBuffer() {
 // Device Lost Recovery
 // ============================================================================
 
+// Reset-retry pacing. Recovery used to re-attempt every frame, which on a
+// device that cannot be reset produced a ~20Hz storm of identical failures
+// (run 2026-08-18_11-18: hundreds of "Reset failed 0x8876086C" lines while the
+// game thread stalled ~1s per frame and the netplay session died).
+static DWORD g_lastResetAttemptMs = 0;
+static int   g_resetFailStreak    = 0;
+static bool  g_resetDiagnosed     = false;
+static constexpr DWORD kResetRetryBaseMs = 250;
+static constexpr DWORD kResetRetryMaxMs  = 5000;
+
+static DWORD ResetRetryDelayMs() {
+    DWORD d = kResetRetryBaseMs;
+    for (int i = 0; i < g_resetFailStreak && d < kResetRetryMaxMs; ++i) d *= 2;
+    return d > kResetRetryMaxMs ? kResetRetryMaxMs : d;
+}
+
 static bool TryRecoverFromDeviceLost(IDirect3DDevice9* pDevice) {
     HRESULT hr = pDevice->TestCooperativeLevel();
 
@@ -2488,6 +2504,13 @@ static bool TryRecoverFromDeviceLost(IDirect3DDevice9* pDevice) {
     }
 
     if (hr == D3DERR_DEVICENOTRESET) {
+        const DWORD now = GetTickCount();
+        if (g_resetFailStreak > 0 &&
+            (now - g_lastResetAttemptMs) < ResetRetryDelayMs()) {
+            return false;   // backing off; do not spam Reset or the log
+        }
+        g_lastResetAttemptMs = now;
+
         ProxyLog("[DEVICELOST] Device ready for reset — recovering...");
 
         // Release all D3DPOOL_DEFAULT resources before Reset
@@ -2524,10 +2547,36 @@ static bool TryRecoverFromDeviceLost(IDirect3DDevice9* pDevice) {
         g_internalReset = false;
 
         if (FAILED(hr)) {
-            ProxyLog("[DEVICELOST] ERROR: Reset failed during recovery: 0x%08X", hr);
+            ++g_resetFailStreak;
+            ProxyLog("[DEVICELOST] ERROR: Reset failed during recovery: 0x%08X "
+                     "(attempt %d, next retry in %ums)",
+                     hr, g_resetFailStreak, ResetRetryDelayMs());
+            if (hr == D3DERR_INVALIDCALL && !g_resetDiagnosed) {
+                g_resetDiagnosed = true;
+                // Say what this actually means, once, instead of repeating the
+                // hex forever. Every resource the MOD owns is released above --
+                // HUD state block and font, both swap chains, letterbox and
+                // scaler resources, the cached back buffer, and the ImGui
+                // objects -- and nothing under src/ creates a D3D resource at
+                // all. D3DERR_INVALIDCALL here therefore means the resources
+                // still outstanding belong to the GAME, which predates any
+                // expectation of device loss and never releases them. We cannot
+                // release them on its behalf: it would keep using the dangling
+                // pointers. So this device is not recoverable in-process.
+                ProxyLog("[DEVICELOST] D3DERR_INVALIDCALL means D3DPOOL_DEFAULT "
+                         "resources are still outstanding. All mod-owned resources "
+                         "were released before Reset, so these belong to the game, "
+                         "which has no device-loss handling. This device cannot be "
+                         "recovered in-process — the game must be restarted. "
+                         "Prevention is the real fix: a netplay session now holds "
+                         "ES_DISPLAY_REQUIRED so the monitor timeout cannot trigger "
+                         "this mid-match.");
+            }
             return false;
         }
 
+        g_resetFailStreak = 0;
+        g_resetDiagnosed = false;
         ProxyLog("[DEVICELOST] Reset succeeded — recreating resources");
 
         // Recreate resources

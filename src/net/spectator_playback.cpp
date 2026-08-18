@@ -57,6 +57,12 @@ static uint32_t s_matchOrdinal = 0;
 static uint32_t s_configCrc = 0;
 static uint32_t s_sessionSeed = 0;
 static bool s_launchIssued = false;
+// Survives ResetLocalSimulationState, unlike s_launchIssued. It answers "is
+// there a local game context to re-enter", which is NOT the same question as
+// "is a launch currently in flight" -- s_launchIssued is cleared on the
+// WaitingNextMatch -> ConnectedWaitingMetadata transition, so using it as the
+// not-the-first-match test silently disabled the re-entry for every match.
+static bool s_localMatchEverLaunched = false;
 static int32_t s_localFrameOriginAbs = -1;
 static int32_t s_localPlaybackRbFrame = -1;
 static int32_t s_nextDispatchRbFrame = -1;
@@ -380,6 +386,14 @@ static void RestoreSpectatorMatchSettings(const char* reason) {
         reason ? reason : "?");
 }
 
+static void ClearLocalMatchHistory(const char* why) {
+    if (s_localMatchEverLaunched) {
+        SPLAY_LOG(-1, "Local match history cleared (%s): next launch is a full bootstrap",
+                  why ? why : "?");
+    }
+    s_localMatchEverLaunched = false;
+}
+
 static void ResetLocalSimulationState() {
     ClearPlaybackOverrides();
     RestoreSpectatorMatchSettings("spectator local simulation reset");
@@ -641,19 +655,49 @@ static uint32_t ResolveBootstrapOrdinal(const SpectatorClientSnapshot& client) {
         : (client.pre_match_ordinal != 0 ? client.pre_match_ordinal : 1);
 }
 
-// Re-enter the next match from the WIN SCREEN using the game's own rematch
-// route, instead of driving the character- and stage-select UI again.
+// Re-enter the next match the way a player REMATCH does, instead of driving
+// the character- and stage-select UI again.
 //
-// A player rematch works because mode 7 re-reads the LIVE charsel globals
-// rather than the selection screen (continue_flow.cpp: "Mode 7 re-reads the
-// live charsel globals"). So the spectator can inject the next match's
-// selection straight into those globals and take the same route: win screen
-// sub 5 (STORY_SUB_EVENT_SETUP) -> 36 -> mode change. Character select and
-// stage select never run, which removes the whole forced-UI drive
-// (ForceSelectionLocked / ForceBootstrapStageGridConfirm) from every match
-// after the first.
-static bool TryWinScreenRematchReentry(const LockedMatchConfig& cfg, const char* reason) {
-    if (GetGameMode() != MODE_WINSCREEN) return false;
+// A rematch skips both selection screens because MODE_PREMATCH_INTRO (7)
+// re-reads the LIVE charsel globals rather than the selection screen
+// (continue_flow.cpp: "Mode 7 re-reads the live charsel globals"). So the
+// spectator injects the next match's selection into those globals and enters
+// mode 7 directly. ForceSelectionLocked and ForceBootstrapStageGridConfirm --
+// the whole forced-UI drive -- never run again after the first match.
+//
+// This deliberately does NOT route through the win screen. Measured from run
+// 2026-08-18_11-44, the spectator's local game never enters MODE_WINSCREEN at
+// all (mode histogram: 6 x720, 8 x597, 7 x44, 3 x6, 0 x5 -- no 9), because it
+// drives its own local game rather than replaying the players' frontend. A
+// win-screen-gated re-entry is therefore dead code, which is exactly what the
+// first attempt turned out to be.
+static bool TryWinScreenRematchReentry(const LockedMatchConfig& cfg,
+                                       const SpectatorClientSnapshot& client,
+                                       const char* reason) {
+    // Never inject an unpopulated config: bootstrap can legitimately reach
+    // ReadyToBootstrap with cfg=0x00000000 while the identity is still in
+    // flight, and injecting that would select character 0 on both sides.
+    const bool cfgUsable =
+        (client.have_match_state && client.config_crc != 0) ||
+        (client.have_pre_match_state && client.pre_match_config_crc != 0);
+    if (!cfgUsable) return false;
+
+    const uint32_t mode = GetGameMode();
+    // Only from a live local game. Out of the menu there is no context to
+    // re-enter and the full launch is correct.
+    if (mode != MODE_MATCH && mode != MODE_PREMATCH_INTRO && mode != MODE_CHARSEL) {
+        return false;
+    }
+    if (!s_localMatchEverLaunched) return false;   // first match of the session
+
+    // Re-assert what BeginLocalSpectatorLaunch would have set. These almost
+    // certainly still hold from the previous match now that we stay in-game,
+    // but "almost certainly" is not a basis for the mode the next match runs
+    // in -- and they are idempotent writes.
+    WriteMemory<uint32_t>(ADDR_GAME_TYPE, GAMETYPE_VS_HUMAN);
+    ModeOwnership::ClearVanillaNetplayFlags();
+    WriteMemory<uint8_t>(ADDR_P1_CPU_FLAG, 0);
+    WriteMemory<uint8_t>(ADDR_P2_CPU_FLAG, 0);
 
     WriteMemory<uint32_t>(ADDR_CHARSEL_P1_CHAR_ID, (uint32_t)cfg.p1_character);
     WriteMemory<uint8_t>(ADDR_CHARSEL_P1_PALETTE,  cfg.p1_palette);
@@ -664,14 +708,16 @@ static bool TryWinScreenRematchReentry(const LockedMatchConfig& cfg, const char*
     ApplySpectatorMatchSettings(cfg, reason ? reason : "spectator winscreen re-entry");
     DetVer_SetRngSeed(cfg.session_seed);
 
+    // Straight into the match intro, the same mode a rematch lands in.
     WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, 0u);
-    WriteMemory<uint32_t>(ADDR_SUB_STATE, (uint32_t)STORY_SUB_EVENT_SETUP);
+    WriteMemory<uint32_t>(ADDR_SUB_STATE, 0u);
     WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0u);
+    ModeOwnership::CallOriginalSetGameMode(MODE_PREMATCH_INTRO, 1);
 
     SPLAY_LOG(-1,
-        "Win-screen re-entry (%s): injected chars=(%u,%u) palettes=(%u,%u) stage=%u "
-        "— taking the rematch route, skipping charsel/stagesel",
-        reason ? reason : "?",
+        "Rematch re-entry (%s) from mode %u: injected chars=(%u,%u) palettes=(%u,%u) "
+        "stage=%u — entering mode 7 directly, skipping charsel/stagesel",
+        reason ? reason : "?", mode,
         (unsigned)cfg.p1_character, (unsigned)cfg.p2_character,
         (unsigned)cfg.p1_palette,  (unsigned)cfg.p2_palette,
         (unsigned)cfg.stage_id);
@@ -695,6 +741,7 @@ static void BeginLocalSpectatorLaunch(const SpectatorClientSnapshot& client) {
     ApplySpectatorMatchSettings(cfg, "spectator playback launch");
 
     s_launchIssued = true;
+    s_localMatchEverLaunched = true;
     const bool earlyStart = client.have_pre_match_state && !client.have_match_state;
     SetStatus("%sStarting watch playback for game %u.",
         earlyStart ? "Early " : "",
@@ -1209,6 +1256,7 @@ void SpectatorPlayback_FrameUpdate() {
 
         EnterSafeMenuIfNeeded();
         ResetLocalSimulationState();
+        ClearLocalMatchHistory("playback failed");
         ClearTrackedIdentity();
         ClearSpectatorPaletteHints();
         TransitionState(SpectatorPlaybackState::PlaybackError,
@@ -1222,6 +1270,7 @@ void SpectatorPlayback_FrameUpdate() {
         client.state == SpectatorClientState::Redirected) {
         EnterSafeMenuIfNeeded();
         ResetLocalSimulationState();
+        ClearLocalMatchHistory("reconnecting");
         ClearTrackedIdentity();
         ClearSpectatorPaletteHints();
         TransitionState(SpectatorPlaybackState::Connecting,
@@ -1384,24 +1433,31 @@ void SpectatorPlayback_FrameUpdate() {
         ClearPlaybackOverrides();
         InputSyncHooks_SetTimesyncFreeze(false);
         ApplyCatchupScale(1.0f, 0);
+        // Hold on the WIN SCREEN between matches. Bouncing out to the online
+        // menu tore down the whole local match context, which is why the next
+        // match had to rebuild it by driving the character and stage grids.
+        // Staying here keeps that context alive so the next match re-enters
+        // through the rematch route (TryWinScreenRematchReentry).
+        //
+        // This MUST be tested before the EndOfMatch early-return below: that
+        // return fires for every mode except MENU and CHARSEL, so the win
+        // screen exits there and any winscreen test placed after it is
+        // unreachable. (It was, and the spectator silently kept taking the old
+        // charsel-drive path -- caught by run 2026-08-18_11-44 logging
+        // "Starting watch playback for game 2" instead of the re-entry.)
+        if (OwnsLocalSimulation() && GetGameMode() != MODE_MENU) {
+            SpectatorClient_ArmForNextMatch("match ended, holding in-game for re-entry");
+            ClearSpectatorPaletteHints();
+            TransitionState(SpectatorPlaybackState::WaitingNextMatch,
+                "Match over. Waiting for the next game.");
+            return;
+        }
+
         if (OwnsLocalSimulation() &&
             GetGameMode() != MODE_MENU &&
             GetGameMode() != MODE_CHARSEL) {
             TransitionState(SpectatorPlaybackState::EndOfMatch,
                 "Match ended. Waiting for the menu to catch up.");
-            return;
-        }
-
-        // Hold on the WIN SCREEN between matches. Bouncing out to the online
-        // menu tore down the whole local match context, which is why the next
-        // match had to rebuild it through the character/stage select drive.
-        // Staying here keeps that context alive so the next match can re-enter
-        // through the rematch route.
-        if (OwnsLocalSimulation() && GetGameMode() == MODE_WINSCREEN) {
-            SpectatorClient_ArmForNextMatch("match ended, holding on win screen");
-            ClearSpectatorPaletteHints();
-            TransitionState(SpectatorPlaybackState::WaitingNextMatch,
-                "Match over. Waiting for the next game.");
             return;
         }
 
@@ -1420,6 +1476,22 @@ void SpectatorPlayback_FrameUpdate() {
     // Handle ReadyToBootstrap explicitly so BeginLocalSpectatorLaunch and the
     // mode transition happen before DriveBootstrap is called (next frame).
     if (s_state == SpectatorPlaybackState::ReadyToBootstrap) {
+        // If we held on the win screen from the previous match, take the
+        // rematch route with the next match's selection injected, rather than
+        // dropping to MODE_CHARSEL and driving the character and stage grids
+        // again. Only valid from the win screen; the first match of a session
+        // still goes through the full launch below.
+        const LockedMatchConfig& reentryCfg = ResolveBootstrapConfig(client);
+        if (TryWinScreenRematchReentry(reentryCfg, client, "next match")) {
+            s_launchIssued = true;
+            s_localMatchEverLaunched = true;
+            UpdateSpectatorPaletteHints(client);
+            TransitionState(SpectatorPlaybackState::BootstrappingFrontend,
+                "Starting game %u.",
+                ResolveBootstrapOrdinal(client));
+            return;
+        }
+
         BeginLocalSpectatorLaunch(client);
         TransitionState(SpectatorPlaybackState::BootstrappingFrontend,
             "Starting watch playback for game %u.",
