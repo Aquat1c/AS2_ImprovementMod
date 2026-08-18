@@ -39,6 +39,7 @@
 namespace NetMenu {
     bool IsMenuActive();
     void HandleNetworkSelected();
+    void HandleGameSettingsSelected();
     void HandleDisconnection(const char* reason);
     void HandlePostMatchDirectCharsel(const char* reason);
     void RenderFrame();
@@ -219,6 +220,15 @@ static int __cdecl Hook_SetGameMode(int mode, char fade) {
     Net::SessionSnapshot snap{};
     Net::Session_GetSnapshot(&snap);
     bool hasSession = snap.active && snap.state != Net::SessionState::Failed;
+
+    // The native options screen is Japanese-only and its key-config half is
+    // dead since the mod owns the bindings, so route the title-screen entry to
+    // our own settings instead.
+    if (s_interceptEnabled && mode == MODE_OPTIONS && sourceMode == MODE_MENU) {
+        LOG_NETPLAY(LOG_INFO, "[ModeOwn] Intercepted MODE_MENU -> MODE_OPTIONS");
+        NetMenu::HandleGameSettingsSelected();
+        return 0;
+    }
 
     // Intercept ALL transitions to MODE_LOBBY
     if (s_interceptEnabled && mode == MODE_LOBBY) {

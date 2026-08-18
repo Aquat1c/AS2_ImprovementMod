@@ -24,5 +24,9 @@ void UnlockAllContent() {
     // Enable stage selection by default (BYTE2 of dword_8E93EC)
     *(volatile uint8_t*)ADDR_STAGESEL_ENABLE = 1;
 
-    LOG_INFO("All content unlocked (characters, boss, gallery, stage select enabled)");
+    // Special-character slots: unlocking the roster is pointless if the option
+    // that surfaces those slots stays off.
+    *(volatile uint8_t*)ADDR_GAMEOPT_SPECIAL_CHARS = 1;
+
+    LOG_INFO("All content unlocked (characters, boss, gallery, stage select, special characters)");
 }

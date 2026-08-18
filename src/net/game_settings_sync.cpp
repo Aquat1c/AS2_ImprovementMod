@@ -306,6 +306,40 @@ static void ApplyFriendlyIniOverrides() {
             ClampByteSetting(value, 0, 1, current));
     }
 
+    // Rows the mod's settings menu owns. Ranges mirror the ones the native
+    // options screen enforces (decomp sub_55CB90).
+    struct IniByteSetting {
+        const wchar_t* key;
+        uintptr_t      addr;
+        int            maxValue;
+    };
+    static const IniByteSetting kIniBytes[] = {
+        { L"simple_effects",   0x8E93EF, 1  },
+        { L"battle_recording", 0x8E93F0, 1  },
+        { L"se_volume",        0x8E9409, 10 },
+        { L"bgm_volume",       0x8E940A, 10 },
+        { L"system_voice",     0x8E940B, 18 },
+        { L"ai_learning",      0x8E940D, 1  },
+    };
+    for (const IniByteSetting& setting : kIniBytes) {
+        if (ReadIniInt(L"GameSettings", setting.key, &value)) {
+            const uint8_t current = ReadMemory<uint8_t>(setting.addr);
+            WriteMemory<uint8_t>(setting.addr,
+                ClampByteSetting(value, 0, setting.maxValue, current));
+        }
+    }
+
+    // Per-character voice volumes: 0x8E93F1 .. 0x8E9407.
+    for (int i = 0; i < 23; ++i) {
+        wchar_t key[32];
+        swprintf_s(key, L"voice_volume_%d", i);
+        if (ReadIniInt(L"GameSettings", key, &value)) {
+            const uintptr_t addr = 0x8E93F1 + (uintptr_t)i;
+            const uint8_t current = ReadMemory<uint8_t>(addr);
+            WriteMemory<uint8_t>(addr, ClampByteSetting(value, 0, 10, current));
+        }
+    }
+
     if (ReadIniInt(L"TrainingSettings", L"health_regen", &value)) {
         const uint8_t current = ReadMemory<uint8_t>(ADDR_TRAINING_HEALTH_REGEN_SETTING);
         WriteMemory<uint8_t>(ADDR_TRAINING_HEALTH_REGEN_SETTING,
@@ -638,6 +672,10 @@ void GameSettingsSync_FormatRoundLabel(uint8_t roundOption, char* out, size_t ou
         "First to %d win%s",
         wins,
         wins == 1 ? "" : "s");
+}
+
+bool GameSettingsSync_LocalOptionsLocked() {
+    return s_sessionCached;
 }
 
 uint8_t GameSettingsSync_BuildHostRoundOption(const char* reason) {

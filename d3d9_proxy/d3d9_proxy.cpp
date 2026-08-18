@@ -11,6 +11,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "overlay_resources.h"
 #include <windowsx.h>  // For GET_X_LPARAM, GET_Y_LPARAM
 #include <d3d9.h>
 #include <stdint.h>
@@ -1322,9 +1323,100 @@ static bool g_titleApplied = false;
 
 static ImFont* g_netplayHudFonts[3] = {};
 
+// Shippori Mincho Bold, for the in-game menus. The vanilla settings labels are
+// Mincho (verified against the sprites in data/opt.bin), so the mod's menus use
+// the same family instead of the game's built-in bitmap font.
+static ImFont* g_menuFont = nullptr;
+
+// Text the mod queued this frame, in the game's 640x480 space. ImGui's
+// DisplaySize is already native, so these coordinates need no mapping.
+struct QueuedMenuText {
+    float x, y;
+    float size;   // 0 = the font's own size
+    ImU32 color;
+    char  text[192];
+};
+static QueuedMenuText g_menuTextQueue[256];
+static int            g_menuTextCount = 0;
+
+// Kept alive for the lifetime of the atlas: ImGui stores the pointer rather
+// than copying the ranges.
+static ImVector<ImWchar> g_overlayGlyphRanges;
+
 static void ConfigureOverlayFonts(ImGuiIO& io) {
     ImFont* loadedFont = nullptr;
-    const ImWchar* glyphRanges = io.Fonts->GetGlyphRangesJapanese();
+
+    // Nicknames come from other players, so the overlay has to cover more than
+    // Latin: Japanese for the game's own audience and Cyrillic on top of it.
+    // GetGlyphRangesJapanese() carries no Cyrillic, so merge the two.
+    ImFontGlyphRangesBuilder rangeBuilder;
+    rangeBuilder.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+    rangeBuilder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+    g_overlayGlyphRanges.clear();
+    rangeBuilder.BuildRanges(&g_overlayGlyphRanges);
+    const ImWchar* glyphRanges = g_overlayGlyphRanges.Data;
+
+    // Prefer the font we ship: it makes rendering identical everywhere instead
+    // of depending on which fonts the host happens to have installed.
+    const void* embeddedFont = nullptr;
+    DWORD embeddedFontSize = 0;
+    HMODULE selfModule = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)&ConfigureOverlayFonts, &selfModule);
+    if (HRSRC res = FindResourceA(selfModule, MAKEINTRESOURCEA(IDR_OVERLAY_FONT), RT_RCDATA)) {
+        if (HGLOBAL handle = LoadResource(selfModule, res)) {
+            embeddedFont = LockResource(handle);
+            embeddedFontSize = SizeofResource(selfModule, res);
+        }
+    }
+
+    if (embeddedFont && embeddedFontSize > 0) {
+        ImFontConfig embeddedConfig{};
+        embeddedConfig.OversampleH = 1;
+        embeddedConfig.OversampleV = 1;
+        embeddedConfig.PixelSnapH = true;
+        // The bytes live in the module image; ImGui must not free them.
+        embeddedConfig.FontDataOwnedByAtlas = false;
+
+        loadedFont = io.Fonts->AddFontFromMemoryTTF(
+            const_cast<void*>(embeddedFont), (int)embeddedFontSize,
+            16.0f, &embeddedConfig, glyphRanges);
+
+        if (loadedFont) {
+            ProxyLog("[IMGUI] Loaded embedded overlay font (%lu bytes, JP + Cyrillic ranges)",
+                     embeddedFontSize);
+            if (HRSRC mres = FindResourceA(selfModule, MAKEINTRESOURCEA(IDR_MENU_FONT), RT_RCDATA)) {
+                if (HGLOBAL mh = LoadResource(selfModule, mres)) {
+                    void* mdata = LockResource(mh);
+                    const DWORD msize = SizeofResource(selfModule, mres);
+                    if (mdata && msize) {
+                        ImFontConfig menuConfig{};
+                        menuConfig.OversampleH = 1;
+                        menuConfig.OversampleV = 1;
+                        menuConfig.PixelSnapH = true;
+                        menuConfig.FontDataOwnedByAtlas = false;
+                        g_menuFont = io.Fonts->AddFontFromMemoryTTF(
+                            mdata, (int)msize, 19.0f, &menuConfig, glyphRanges);
+                        ProxyLog("[IMGUI] Menu font (Shippori Mincho Bold): %s",
+                                 g_menuFont ? "loaded" : "FAILED");
+                    }
+                }
+            }
+            io.FontDefault = loadedFont;
+            for (int i = 0; i < 3; ++i) {
+                const float sizes[] = { 12.0f, 14.0f, 16.0f };
+                g_netplayHudFonts[i] = io.Fonts->AddFontFromMemoryTTF(
+                    const_cast<void*>(embeddedFont), (int)embeddedFontSize,
+                    sizes[i], &embeddedConfig, glyphRanges);
+                if (!g_netplayHudFonts[i]) {
+                    g_netplayHudFonts[i] = loadedFont;
+                }
+            }
+            return;
+        }
+        ProxyLog("[IMGUI] WARNING: embedded font failed to load, falling back to system fonts");
+    }
 
     char windowsDir[MAX_PATH] = {};
     if (GetWindowsDirectoryA(windowsDir, MAX_PATH) == 0) {
@@ -1333,29 +1425,33 @@ static void ConfigureOverlayFonts(ImGuiIO& io) {
         return;
     }
 
+    // MS Gothic first: it is the closest match to the game's own bitmap face and
+    // covers both scripts. Yu Gothic is the fallback when it is absent.
     const char* candidates[] = {
+        "msgothic.ttc",
         "YuGothM.ttc",
         "YuGothL.ttc",
-        "msgothic.ttc",
+        "meiryo.ttc",
     };
 
     char fontPath[MAX_PATH] = {};
     ImFontConfig fontConfig{};
-    fontConfig.OversampleH = 2;
-    fontConfig.OversampleV = 2;
+    fontConfig.OversampleH = 1;
+    fontConfig.OversampleV = 1;
+    fontConfig.PixelSnapH = true;
     fontConfig.FontNo = 0;
 
     for (const char* candidate : candidates) {
         snprintf(fontPath, sizeof(fontPath), "%s\\Fonts\\%s", windowsDir, candidate);
         loadedFont = io.Fonts->AddFontFromFileTTF(fontPath, 16.0f, &fontConfig, glyphRanges);
         if (loadedFont) {
-            ProxyLog("[IMGUI] Loaded overlay font: %s", fontPath);
+            ProxyLog("[IMGUI] Loaded overlay font: %s (JP + Cyrillic ranges)", fontPath);
             break;
         }
     }
 
     if (!loadedFont) {
-        ProxyLog("[IMGUI] WARNING: Failed to load a Japanese-capable system font, using default font only");
+        ProxyLog("[IMGUI] WARNING: no Japanese/Cyrillic-capable system font found, using default font only");
         loadedFont = io.Fonts->AddFontDefault();
         fontPath[0] = '\0';
     }
@@ -4118,7 +4214,9 @@ void RenderImGui() {
     bool modShouldRender = true;
     if (!g_showMenu && !exclusiveOverlay) {
         modShouldRender = g_pModShouldRenderImGui ? g_pModShouldRenderImGui() : true;
-        if (!modShouldRender) {
+        // Menu text queued by the mod still needs a pass, even when nothing
+        // else wants the overlay this frame.
+        if (!modShouldRender && g_menuTextCount == 0) {
             g_imguiDrawDataReady = false;
             return;
         }
@@ -4137,7 +4235,24 @@ void RenderImGui() {
         io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
     }
     ImGui::NewFrame();
-    
+
+    // Draw whatever the mod queued for its in-game menus, in the game's own
+    // coordinate space, using the Mincho face that matches the vanilla labels.
+    if (g_menuTextCount > 0) {
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        ImFont* font = g_menuFont ? g_menuFont : ImGui::GetFont();
+        const float size = g_menuFont ? g_menuFont->FontSize : ImGui::GetFontSize();
+        for (int i = 0; i < g_menuTextCount; ++i) {
+            const QueuedMenuText& q = g_menuTextQueue[i];
+            const float drawSize = q.size > 0.0f ? q.size : size;
+            // A soft dark edge, the way the vanilla labels are drawn.
+            const ImU32 shadow = IM_COL32(20, 20, 20, (int)(q.color >> IM_COL32_A_SHIFT & 0xFF));
+            dl->AddText(font, drawSize, ImVec2(q.x + 1.0f, q.y + 1.0f), shadow, q.text);
+            dl->AddText(font, drawSize, ImVec2(q.x, q.y), q.color, q.text);
+        }
+        g_menuTextCount = 0;
+    }
+
     // Main menu bar
     if (g_showMenu && !exclusiveOverlay) {
         const ImVec4 menuBarBg = ImGui::GetStyleColorVec4(ImGuiCol_MenuBarBg);
@@ -6506,4 +6621,33 @@ extern "C" __declspec(dllexport) void* GetNetplayHudFont(int preset) {
         return ImGui::GetIO().FontDefault;
     }
     return nullptr;
+}
+
+// ============================================================================
+// Menu text bridge (called by as2_rollback.dll)
+// ============================================================================
+
+// Queues one string for this frame, positioned in the game's 640x480 space.
+// Rendered with the embedded Mincho face so the mod's menus match the vanilla
+// settings screen instead of the game's built-in bitmap font.
+extern "C" __declspec(dllexport)
+void AS2Proxy_DrawMenuText(float x, float y, unsigned int abgr, const char* utf8, float size) {
+    if (!utf8 || !utf8[0]) {
+        return;
+    }
+    if (g_menuTextCount >= (int)(sizeof(g_menuTextQueue) / sizeof(g_menuTextQueue[0]))) {
+        return;
+    }
+    QueuedMenuText& q = g_menuTextQueue[g_menuTextCount++];
+    q.x = x;
+    q.y = y;
+    q.size = size;
+    q.color = (ImU32)abgr;
+    strncpy_s(q.text, utf8, _TRUNCATE);
+}
+
+// Lets the mod fall back to the game's own renderer when the face is missing.
+extern "C" __declspec(dllexport)
+int AS2Proxy_MenuFontReady() {
+    return g_menuFont != nullptr ? 1 : 0;
 }

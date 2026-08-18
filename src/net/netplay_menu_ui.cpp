@@ -6,7 +6,11 @@
  */
 
 #include "net/netplay_menu_ui.h"
+#include "rollback/netplay_log.h"
+#include "ui/log_window.h"
 #include "net/netplay_menu_state.h"
+#include "ui/game_settings_menu.h"
+#include "net/netplay_menu_render.h"
 #include "net/player_side_mapping.h"
 #include "net/session_manager.h"
 #include "net/set_tracker.h"
@@ -49,33 +53,36 @@ typedef int (__cdecl *RenderSetDrawColor_t)(unsigned __int8 r, unsigned __int8 g
 // Layout constants — 640x480, font 8px/char half-width, 16px tall
 // ============================================================================
 
-constexpr int kPanelLeft    = 44;
-constexpr int kPanelTop     = 28;
-constexpr int kPanelRight   = 596;
+constexpr int kPanelLeft    = 16;
+constexpr int kPanelTop     = 16;  // same as the key config screen
+constexpr int kPanelRight   = 604;
 constexpr int kPanelBottom  = 452;
-constexpr int kContentLeft  = 58;
-constexpr int kContentRight = 582;
-constexpr int kLabelX       = 66;
-constexpr int kValueX       = 218;
-constexpr int kSelectorX    = 200;
-constexpr int kHintX        = 318;
-constexpr int kHeaderBottom = 78;
-constexpr int kRowStartY    = 86;
-constexpr int kRowStep      = 26;
-constexpr int kInfoStep     = 20;
+constexpr int kContentLeft  = 24;
+constexpr int kContentRight = 588;
+constexpr int kLabelX       = 32;
+constexpr int kValueX       = 240;
+constexpr int kSelectorX    = 220;
+constexpr int kHintX        = 360;
+constexpr int kHeaderBottom = 96;   // title + subtitle + status need room
+constexpr int kRowStartY    = 106;
+constexpr int kRowStep      = 32;  // vanilla row pitch, kept comfortable to navigate
+constexpr int kSectionGap   = 18;  // between the action rows and an info block
+constexpr int kSectionLabel = 22;  // between a section heading and its first line
+constexpr int kInfoStep     = 24;
 constexpr int kFooterTop    = 418;
 constexpr int kFooterStep   = 16;
 constexpr int kFadeFrames   = 25;
 constexpr int kContentBottom = kFooterTop - 6;
 
-// 16, not 18: the selector column starts at x=200, so an 18-char label
-// (66 + 18*8 = 210) ran INTO it. 16 chars ends at 194 and leaves a clean gap.
-constexpr size_t kLabelChars  = 16;   // 66 + 16*8 = 194 < kSelectorX(200)
-constexpr size_t kValueChars  = 44;   // (582-218)/8 - 1
-constexpr size_t kSelectorChars = 14; // fixed selector column width
-constexpr size_t kHintChars   = 32;   // (582-318)/8 - 1
-constexpr size_t kFullChars   = 63;   // (582-66)/8 - 1
-constexpr size_t kFooterChars = 63;
+// Widths are in characters, so they track the face being drawn. The 19px
+// Mincho averages ~10px per character, not the 8px the vanilla bitmap font used,
+// so every column holds proportionally fewer.
+constexpr size_t kLabelChars  = 18;   // 32 -> kSelectorX(220), 188px / 10
+constexpr size_t kValueChars  = 30;   // 240 -> kContentRight(544)
+constexpr size_t kSelectorChars = 13; // fixed selector column width
+constexpr size_t kHintChars   = 18;   // 360 -> 544
+constexpr size_t kFullChars   = 50;   // 32 -> 544
+constexpr size_t kFooterChars = 50;
 
 static void FormatPlayerMatchupLine(char* out, size_t outCap,
                                     const char* p1Name, int p1Wins,
@@ -132,7 +139,15 @@ static uint32_t ReadU32(uintptr_t a, uint32_t d = 0) {
     __try { return *(volatile uint32_t*)a; } __except(EXCEPTION_EXECUTE_HANDLER) { return d; }
 }
 
+// The overlay draws through ImGui, which knows nothing about the game's blend
+// state, so text ignored every fade. Remember the alpha the menu just set and
+// carry it into the text colour.
+static uint8_t s_menuTextAlpha = 255;
+
 static void GameSetBlend(int mode, uint8_t alpha) {
+    if (mode != 0) {
+        s_menuTextAlpha = alpha;
+    }
     ((RenderSetBlendMode_t)ADDR_RENDER_SET_BLEND)(mode, alpha);
 }
 
@@ -220,6 +235,39 @@ static std::string Utf8ToGameText(const char* text) {
     return WideToGameText(wideText);
 }
 
+// The proxy hosts ImGui and the Mincho face that matches the vanilla labels.
+// Its coordinate space is already the game's 640x480, so positions pass through
+// unchanged. Resolved once; if it is missing we keep using the game's renderer.
+typedef void (*ProxyDrawMenuText_t)(float, float, unsigned int, const char*, float);
+typedef int  (*ProxyMenuFontReady_t)();
+
+static ProxyDrawMenuText_t  s_proxyDrawMenuText = nullptr;
+static bool                 s_proxyMenuTextResolved = false;
+
+static ProxyDrawMenuText_t ResolveProxyMenuText() {
+    if (s_proxyMenuTextResolved) {
+        return s_proxyDrawMenuText;
+    }
+    s_proxyMenuTextResolved = true;
+
+    HMODULE proxy = GetModuleHandleA("d3d9.dll");
+    if (!proxy) {
+        return nullptr;
+    }
+    auto ready = (ProxyMenuFontReady_t)GetProcAddress(proxy, "AS2Proxy_MenuFontReady");
+    if (!ready || !ready()) {
+        return nullptr;
+    }
+    s_proxyDrawMenuText =
+        (ProxyDrawMenuText_t)GetProcAddress(proxy, "AS2Proxy_DrawMenuText");
+    return s_proxyDrawMenuText;
+}
+
+// Netplay screens keep the tighter size their column widths were built around;
+// the settings screens ask for a larger one explicitly.
+constexpr float kNetplayTextSize = 22.0f;  // same proportion vanilla uses in a 32px row
+static float s_menuTextSize = kNetplayTextSize;
+
 static void GameDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* fmt, ...) {
     char utf8Buf[256];
     va_list args;
@@ -227,10 +275,41 @@ static void GameDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const ch
     _vsnprintf_s(utf8Buf, sizeof(utf8Buf), _TRUNCATE, fmt, args);
     va_end(args);
 
+    if (ProxyDrawMenuText_t draw = ResolveProxyMenuText()) {
+        // ImGui packs colour as ABGR; UTF-8 goes straight through, so this path
+        // also carries scripts the game's CP932 font cannot show.
+        const unsigned int abgr = ((unsigned)s_menuTextAlpha << 24) |
+                                  ((unsigned)b << 16) | ((unsigned)g << 8) | (unsigned)r;
+        draw((float)x, (float)y, abgr, utf8Buf, s_menuTextSize);
+        return;
+    }
+
     const std::string gameText = Utf8ToGameText(utf8Buf);
     const char* drawText = gameText.empty() ? utf8Buf : gameText.c_str();
     ((DrawFormatString_t)ADDR_DRAW_FORMAT_STRING)(x, y, (unsigned int)GameCreateColor(r, g, b), (char*)"%s", (char*)drawText);
 }
+
+// Same as GameDrawText but at an explicit size, so headings, body rows and
+// footnotes can differ instead of all rendering at one weight.
+static void GameDrawTextSized(int x, int y, uint8_t r, uint8_t g, uint8_t b,
+                              float size, const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    const float prev = s_menuTextSize;
+    s_menuTextSize = size;
+    GameDrawText(x, y, r, g, b, "%s", buf);
+    s_menuTextSize = prev;
+}
+
+// One scale for the whole menu: heading, body, and the quieter notes under it.
+constexpr float kTitleSize    = 26.0f;
+constexpr float kBodySize     = 22.0f;
+constexpr float kNoteSize     = 17.0f;
+constexpr float kFootSize     = 16.0f;
 
 static void ClipText(char* out, size_t outCap, const char* in, size_t maxChars) {
     if (!out || outCap == 0) return;
@@ -329,6 +408,19 @@ static int WrapTextLines(const char* text,
     return lineCount;
 }
 
+// The panel is drawn before the content, so it sizes itself from the extent the
+// previous frame recorded. A menu holds still, so the one-frame lag never shows;
+// it stops short screens sitting in a tall empty box.
+static int s_contentBottomCur  = 0;
+static int s_contentBottomPrev = 0;
+
+static void NoteContentBottom(int y) {
+    const int bottom = y + 20;
+    if (bottom > s_contentBottomCur) {
+        s_contentBottomCur = bottom;
+    }
+}
+
 static bool HasRowSpace(int y) {
     return y >= kHeaderBottom && (y + 20) <= kContentBottom;
 }
@@ -339,11 +431,12 @@ static bool HasInfoSpace(int y) {
 
 static void RenderSectionLabel(int y, const char* label, uint8_t alpha) {
     if (!HasInfoSpace(y)) return;
+    NoteContentBottom(y);
 
     char clippedLabel[64];
     ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
     GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 180));
-    GameDrawText(kLabelX, y, 180, 160, 130, "%s", clippedLabel);
+    GameDrawText(kLabelX, y, 163, 163, 163, "%s", clippedLabel);
 }
 
 static const char* GetHeaderBadge(const NetMenu::MenuSnapshot* snap) {
@@ -370,10 +463,12 @@ static void RenderHeaderBadge(const char* label, uint8_t alpha) {
         return;
     }
 
-    const int width = (int)strlen(label) * 8;
+    // Measured for the face actually in use; at 8px/char the badge ran off the
+    // panel edge instead of sitting inside it.
+    const int width = (int)((float)strlen(label) * kNoteSize * 0.62f);
     const int x = kContentRight - width;
     GameSetBlend(1, alpha);
-    GameDrawText(x, kPanelTop + 12, 200, 180, 160, "%s", label);
+    GameDrawTextSized(x, kPanelTop + 10, 184, 184, 184, kNoteSize, "%s", label);
 }
 
 static const char* GetStateSummary(const NetMenu::MenuSnapshot* snap) {
@@ -447,15 +542,16 @@ static void RenderStatusCard(const NetMenu::MenuSnapshot* snap, uint8_t alpha, f
         return;
     }
 
-    const int cardTop = kHeaderBottom + 6;
-    const int cardBottom = cardTop + 20;
-    if (outBottom) *outBottom = cardBottom + 6;
+    const int cardTop = kHeaderBottom + 4;
+    const int cardBottom = cardTop + 26;
+    if (outBottom) *outBottom = cardBottom + 10;
 
     char primaryText[192] = {};
     ClipText(primaryText, sizeof(primaryText), primary, kFullChars);
 
     GameSetBlend(1, alpha);
-    GameDrawText(kLabelX, cardTop + 2, 220, 190, 140, "%s", primaryText);
+    GameDrawTextSized(kLabelX, cardTop + 2, 193, 193, 193, kNoteSize,
+                      "%s", primaryText);
 }
 
 // ============================================================================
@@ -463,20 +559,24 @@ static void RenderStatusCard(const NetMenu::MenuSnapshot* snap, uint8_t alpha, f
 // ============================================================================
 
 static void DrawRowHighlight(int y, bool selected, bool enabled, uint8_t alpha) {
+    // Same treatment as the vanilla options screen: a red bar over the selected
+    // row (decomp sub_55C720 / sub_55D6F0), everything else just dimmed.
     if (selected) {
         GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 70));
-        GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 22, 0, 0, 0);
-        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 150));
-        GameFillRect(kContentLeft, y - 4, kContentRight, y + 20,
-            enabled ? 180 : 120, enabled ? 60 : 70, enabled ? 50 : 70);
+        GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 24, 0, 0, 0);
+        GameSetBlend(2, (uint8_t)Alpha8((float)alpha / 255.0f, 128));
+        GameFillRect(kContentLeft, y - 5, kContentRight, y + 23,
+            enabled ? 255 : 120, 0, 0);
+        GameSetBlend(1, alpha);
     } else {
         GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 60));
-        GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 22, 0, 0, 0);
+        GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 24, 0, 0, 0);
     }
 }
 
 static void RenderRow(int y, const char* label, const char* value, bool selected, bool enabled, uint8_t alpha) {
     if (!HasRowSpace(y)) return;
+    NoteContentBottom(y);
 
     DrawRowHighlight(y, selected, enabled, alpha);
 
@@ -484,17 +584,17 @@ static void RenderRow(int y, const char* label, const char* value, bool selected
     char clippedLabel[80];
     ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
     GameDrawText(kLabelX, y,
-        selected ? (enabled ? 255 : 200) : (enabled ? 236 : 168),
-        selected ? (enabled ? 248 : 200) : (enabled ? 228 : 168),
-        selected ? (enabled ? 240 : 204) : (enabled ? 216 : 172),
+        selected ? (enabled ? 255 : 200) : (enabled ? 232 : 168),
+        selected ? (enabled ? 255 : 200) : (enabled ? 232 : 168),
+        selected ? (enabled ? 255 : 200) : (enabled ? 232 : 168),
         "%s", clippedLabel);
     if (value && value[0]) {
         char clippedValue[192];
         ClipText(clippedValue, sizeof(clippedValue), value, kValueChars);
         GameDrawText(kValueX, y,
-            selected ? (enabled ? 210 : 164) : (enabled ? 168 : 140),
-            selected ? (enabled ? 210 : 164) : (enabled ? 192 : 144),
-            selected ? (enabled ? 220 : 172) : (enabled ? 208 : 152),
+            selected ? (enabled ? 232 : 164) : (enabled ? 190 : 144),
+            selected ? (enabled ? 232 : 164) : (enabled ? 190 : 144),
+            selected ? (enabled ? 232 : 164) : (enabled ? 190 : 144),
             "%s", clippedValue);
     }
 }
@@ -546,18 +646,19 @@ static void RenderSettingRow(int y,
 
 static void RenderInfoLine(int y, const char* label, const char* value, uint8_t alpha) {
     if (!HasInfoSpace(y)) return;
+    NoteContentBottom(y);
 
     GameSetBlend(1, alpha);
     char clippedLabel[80];
     ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
-    GameDrawText(kLabelX, y, 170, 162, 148, "%s", clippedLabel);
+    GameDrawText(kLabelX, y, 163, 163, 163, "%s", clippedLabel);
     if (value && value[0]) {
         // Value column, not the hint column. An info line has two columns, so
         // starting at kHintX (318) left a 252px gap that visually detached the
         // value from its label; kValueX also lines it up with the rows above.
         char clippedValue[192];
         ClipText(clippedValue, sizeof(clippedValue), value, kValueChars);
-        GameDrawText(kValueX, y, 214, 208, 196, "%s", clippedValue);
+        GameDrawText(kValueX, y, 208, 208, 208, "%s", clippedValue);
     }
 }
 
@@ -584,7 +685,7 @@ static void RenderPromptOverlay(const NetMenu::MenuSnapshot* snap, uint8_t alpha
     ClipText(clippedTitle, sizeof(clippedTitle),
         snap->prompt_title[0] ? snap->prompt_title : "Confirm",
         30);
-    GameDrawText(modalLeft + 28, modalTop + 20, 255, 242, 224, "%s", clippedTitle);
+    GameDrawText(modalLeft + 28, modalTop + 20, 244, 244, 244, "%s", clippedTitle);
 
     char wrappedLines[3][96] = {};
     const int lineCount = WrapTextLines(
@@ -594,7 +695,7 @@ static void RenderPromptOverlay(const NetMenu::MenuSnapshot* snap, uint8_t alpha
         40);
     int bodyY = modalTop + 54;
     for (int index = 0; index < lineCount; index++) {
-        GameDrawText(modalLeft + 28, bodyY, 214, 208, 200, "%s", wrappedLines[index]);
+        GameDrawText(modalLeft + 28, bodyY, 209, 209, 209, "%s", wrappedLines[index]);
         bodyY += 18;
     }
 
@@ -715,10 +816,10 @@ static void RenderHostEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, in
     }
     RenderRow(y, "Room Port", portVal, snap->selected_index == 1, true, alpha); y += kRowStep;
     RenderRow(y, "Back", "Online Menu", snap->selected_index == 2, true, alpha);
-    y += kRowStep + 6;
+    y += kRowStep + kSectionGap;
 
     RenderSectionLabel(y, "Share This Room", alpha);
-    y += 16;
+    y += kSectionLabel;
     char addrBuf[144];
     if (snap->clipboard_flash[0]) {
         _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s  (%s)", snap->your_address, snap->clipboard_flash);
@@ -745,9 +846,9 @@ static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, in
     }
     RenderRow(y, "Host Address", endpointVal,  snap->selected_index == 1, true, alpha); y += kRowStep;
     RenderRow(y, "Back", "Online Menu", snap->selected_index == 2, true, alpha);
-    y += kRowStep + 6;
+    y += kRowStep + kSectionGap;
     RenderSectionLabel(y, "Connection", alpha);
-    y += 16;
+    y += kSectionLabel;
     RenderInfoLine(y, "Status", snap->nat_route_status, alpha);
 }
 
@@ -776,10 +877,10 @@ static void RenderSpectateEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha
     }
     RenderRow(y, "Watch Address", endpointVal, snap->selected_index == 2, true, alpha); y += kRowStep;
     RenderRow(y, "Back", "Online menu", snap->selected_index == 3, true, alpha);
-    y += kRowStep + 6;
+    y += kRowStep + kSectionGap;
 
     RenderSectionLabel(y, "Details", alpha);
-    y += 16;
+    y += kSectionLabel;
     RenderInfoLine(y, "LAN Search", snap->spectator_lan_discovery_status, alpha);
     y += kInfoStep;
 
@@ -939,10 +1040,10 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
 static void RenderSpectatorConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
     int y = startY;
     RenderRow(y, "Cancel", "Stop connecting", snap->selected_index == 0, true, alpha);
-    y += kRowStep + 6;
+    y += kRowStep + kSectionGap;
 
     RenderSectionLabel(y, "Details", alpha);
-    y += 16;
+    y += kSectionLabel;
 
     if (snap->join_spectator_probe_active && snap->remote_endpoint[0]) {
         RenderInfoLine(y, "Host", snap->remote_endpoint, alpha);
@@ -978,10 +1079,10 @@ static void RenderSpectatorConnecting(const NetMenu::MenuSnapshot* snap, uint8_t
 static void RenderSpectatorConnected(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
     int y = startY;
     RenderRow(y, "Stop Watching", "Return to menu", snap->selected_index == 0, true, alpha);
-    y += kRowStep + 6;
+    y += kRowStep + kSectionGap;
 
     RenderSectionLabel(y, "Match", alpha);
-    y += 16;
+    y += kSectionLabel;
 
     RenderInfoLine(y, "Address", snap->spectator_endpoint, alpha);
     y += kInfoStep;
@@ -1027,10 +1128,10 @@ static void RenderSpectatorConnected(const NetMenu::MenuSnapshot* snap, uint8_t 
 static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
     int y = startY;
     RenderRow(y, "Cancel", "Stop connecting", snap->selected_index == 0, true, alpha);
-    y += kRowStep + 6;
+    y += kRowStep + kSectionGap;
 
     RenderSectionLabel(y, "Details", alpha);
-    y += 16;
+    y += kSectionLabel;
 
     if (snap->connecting_as_host) {
         char addrBuf[144];
@@ -1218,6 +1319,7 @@ static const char* GetHeaderTitle(const NetMenu::MenuSnapshot* snap) {
                 case NetMenu::SettingsCategory::Endpoint:    return "Network";
                 case NetMenu::SettingsCategory::SessionMatch: return "Watch";
                 case NetMenu::SettingsCategory::Diagnostics:  return "Diagnostics";
+                case NetMenu::SettingsCategory::GameGeneral:  return "Game";
                 default: return "Settings";
             }
         case NetMenu::MenuState::DisconnectError:
@@ -1263,6 +1365,48 @@ static const char* GetHeaderSubtitle(const NetMenu::MenuSnapshot* snap) {
 }
 
 } // anonymous namespace
+
+namespace NetMenu {
+
+// Shared with the game settings menu so both screens keep one row style.
+void RenderMenuRow(int y, const char* label, const char* value,
+                   bool selected, bool enabled, uint8_t alpha) {
+    RenderRow(y, label, value, selected, enabled, alpha);
+}
+
+void RenderMenuInfoLine(int y, const char* label, const char* value, uint8_t alpha) {
+    RenderInfoLine(y, label, value, alpha);
+}
+
+int MenuRowStep() {
+    return kRowStep;
+}
+
+void MenuSetTextAlpha(uint8_t alpha) {
+    s_menuTextAlpha = alpha;
+}
+
+void MenuSetBlend(int mode, uint8_t alpha) {
+    GameSetBlend(mode, alpha);
+}
+
+void MenuFillRect(int l, int t, int r, int b, uint8_t cr, uint8_t cg, uint8_t cb) {
+    GameFillRect(l, t, r, b, cr, cg, cb);
+}
+
+void MenuDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* text) {
+    GameDrawText(x, y, r, g, b, "%s", text ? text : "");
+}
+
+void MenuDrawTextSized(int x, int y, uint8_t r, uint8_t g, uint8_t b, float size, const char* text) {
+    const float prev = s_menuTextSize;
+    s_menuTextSize = size > 0.0f ? size : kNetplayTextSize;
+    GameDrawText(x, y, r, g, b, "%s", text ? text : "");
+    s_menuTextSize = prev;
+}
+
+} // namespace NetMenu
+
 
 // ============================================================================
 // Public API
@@ -1312,14 +1456,48 @@ void Render(const NetMenu::MenuSnapshot* snap) {
         return;
     }
 
+    // The game settings pages reproduce the native options screen, so they draw
+    // the whole screen themselves instead of sitting inside the netplay frame.
+    if (snap->state == NetMenu::MenuState::SettingsEntry &&
+        (snap->settings_category == NetMenu::SettingsCategory::GameGeneral ||
+         snap->settings_category == NetMenu::SettingsCategory::GameVoice  ||
+         snap->settings_category == NetMenu::SettingsCategory::GameRoot   ||
+         snap->settings_category == NetMenu::SettingsCategory::GameKeys)) {
+        if (snap->settings_category == NetMenu::SettingsCategory::GameVoice) {
+            NetMenu::GameSettingsVoice_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameRoot) {
+            NetMenu::GameSettingsRoot_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameKeys) {
+            NetMenu::GameSettingsKeys_RenderScreen(snap->selected_index, alpha);
+        } else {
+            NetMenu::GameSettingsMenu_RenderScreen(snap->selected_index, alpha);
+        }
+        GameSetBlend(0, 255);
+        GameSetDrawColor(255, 255, 255);
+        return;
+    }
+
+    // Panel backing, matched to the key config screen exactly: two passes at
+    // half alpha. Three passes at 150 went muddy.
+    s_contentBottomCur = kRowStartY;
+    const int footerTop = (s_contentBottomPrev > 0 ? s_contentBottomPrev : kFooterTop) + 10;
+    const int panelBottom = footerTop + 2 * kFooterStep + 12 < kPanelBottom
+                          ? footerTop + 2 * kFooterStep + 12
+                          : kPanelBottom;
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 128));
+    GameFillRect(kPanelLeft, kPanelTop, kPanelRight, panelBottom, 0, 0, 0);
+    GameFillRect(kPanelLeft, kPanelTop, kPanelRight, panelBottom, 0, 0, 0);
+
     // Header shadow
     GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 40));
     GameFillRect(kContentLeft - 4, kPanelTop + 6, kContentRight + 4, kHeaderBottom + 2, 0, 0, 0);
 
     // Header
     GameSetBlend(1, alpha);
-    GameDrawText(kLabelX, kPanelTop + 10, 248, 238, 220, "%s", GetHeaderTitle(snap));
-    GameDrawText(kLabelX, kPanelTop + 32, 168, 152, 128, "%s", GetHeaderSubtitle(snap));
+    GameDrawTextSized(kLabelX, kPanelTop + 6, 255, 255, 255, kTitleSize,
+                      "%s", GetHeaderTitle(snap));
+    GameDrawTextSized(kLabelX, kPanelTop + 40, 160, 160, 160, kNoteSize,
+                      "%s", GetHeaderSubtitle(snap));
     RenderHeaderBadge(GetHeaderBadge(snap), alpha);
 
     // Status card
@@ -1348,9 +1526,10 @@ void Render(const NetMenu::MenuSnapshot* snap) {
 
     RenderPromptOverlay(snap, alpha, fadeNorm);
 
-    // Footer shadow
+    // Footer sits just under the content, the way the key config screen does,
+    // rather than pinned to the bottom of the screen.
     GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 40));
-    GameFillRect(kContentLeft - 4, kFooterTop - 2, kContentRight + 4, kPanelBottom + 8, 0, 0, 0);
+    GameFillRect(kContentLeft - 4, footerTop - 2, kContentRight + 4, panelBottom - 2, 0, 0, 0);
 
     // Footer
     GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 180));
@@ -1379,19 +1558,15 @@ void Render(const NetMenu::MenuSnapshot* snap) {
     }
     char clippedHint[96];
     ClipText(clippedHint, sizeof(clippedHint), hint1, kFooterChars);
-    GameDrawText(kLabelX, kFooterTop + 6, 176, 168, 156,  "%s", clippedHint);
+    GameDrawTextSized(kLabelX, footerTop + 4, 150, 150, 150, kFootSize, "%s", clippedHint);
 
-    char footerLine[96];
+    // Only worth a second line when it says something the heading does not.
     if (snap->prompt_active) {
-        _snprintf_s(footerLine, sizeof(footerLine), _TRUNCATE,
-            "Decision Required");
-    } else {
-        _snprintf_s(footerLine, sizeof(footerLine), _TRUNCATE,
-            "%s", GetFooterLabel(snap));
+        GameDrawTextSized(kLabelX, footerTop + 4 + kFooterStep, 255, 255, 255,
+                          kFootSize, "Decision Required");
     }
-    char clippedFooter[96];
-    ClipText(clippedFooter, sizeof(clippedFooter), footerLine, kFooterChars);
-    GameDrawText(kLabelX, kFooterTop + 6 + kFooterStep, 238, 228, 212, "%s", clippedFooter);
+
+    s_contentBottomPrev = s_contentBottomCur;
 
     // Restore render state (blend + draw color) so the game's next frame
     // starts clean — matches what the old working code does.

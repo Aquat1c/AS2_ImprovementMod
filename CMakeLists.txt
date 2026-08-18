@@ -181,6 +181,7 @@ endif()
 
 add_library(d3d9 SHARED
     d3d9_proxy/d3d9_proxy.cpp
+    d3d9_proxy/overlay_resources.rc
     d3d9_proxy/letterbox_scaler.cpp
 )
 
@@ -400,6 +401,7 @@ set(UI_SOURCES
     src/ui/menu_utils.cpp
     src/ui/hitbox_viewer.cpp
     src/ui/netplay_hud.cpp
+    src/ui/game_settings_menu.cpp
     src/ui/netplay_hud_style.cpp
     src/ui/netplay_hud_vanilla.cpp
 )

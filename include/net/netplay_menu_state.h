@@ -87,6 +87,10 @@ enum class SettingsCategory : uint32_t {
     Endpoint,
     SessionMatch,
     Diagnostics,
+    GameGeneral,
+    GameVoice,
+    GameRoot,
+    GameKeys,
 };
 
 // ============================================================================

@@ -25,12 +25,129 @@ static bool g_initialized = false;
 static InputState_t g_inputState[2] = {};
 static PlayerBindings_t g_bindings[2] = {};
 
-// SDL3 Gamepad state — indexed by player slot (0=P1, 1=P2).
-// Slots are stable: a controller that disconnects and reconnects returns to
-// its original slot (matched by GUID). Each slot is either live or nullptr.
-static SDL_Gamepad* g_playerGamepad[2] = {};       // open handle for each player
-static SDL_GUID     g_playerGUID[2] = {};           // hardware GUID for reconnect matching
-static bool         g_playerGUIDValid[2] = {};      // whether g_playerGUID[i] is populated
+// Every connected pad is opened into this pool; a pool entry is separate from
+// whether a player is using it. That is what lets a third or fourth controller
+// exist and be claimed by rebinding with it.
+static SDL_Gamepad* g_padHandle[Input::kMaxGamepads] = {};
+// Unmapped devices have no gamepad handle and are driven positionally instead.
+static SDL_Joystick* g_padJoystick[Input::kMaxGamepads] = {};
+static SDL_GUID     g_padGUID[Input::kMaxGamepads] = {};
+static bool         g_padGUIDValid[Input::kMaxGamepads] = {};
+
+// Which pool entry each player is driving, or -1 for none (keyboard only).
+static int          g_playerPad[2] = { -1, -1 };
+
+// The pad a player last held, so it returns to the same player on reconnect and
+// across restarts. Following qoh99's identity rules: the live SDL instance id is
+// never identity, and two indistinguishable pads are ambiguous rather than a
+// guess -- silently picking one binds the wrong board.
+struct PlayerDeviceKey {
+    bool     valid = false;
+    SDL_GUID guid{};
+    uint16_t vendor = 0;
+    uint16_t product = 0;
+    char     name[64] = {};
+};
+
+static SDL_GUID        g_playerGUID[2] = {};
+static bool            g_playerGUIDValid[2] = {};
+static PlayerDeviceKey g_playerKey[2] = {};
+
+
+static bool GUIDMatches(const SDL_GUID& a, const SDL_GUID& b) {
+    return memcmp(a.data, b.data, sizeof(a.data)) == 0;
+}
+
+// Resolve a player to its live handle.
+static SDL_Gamepad* PadForPlayer(int player) {
+    if (player < 0 || player >= 2) return nullptr;
+    const int idx = g_playerPad[player];
+    if (idx < 0 || idx >= Input::kMaxGamepads) return nullptr;
+    return g_padHandle[idx];
+}
+
+// The raw stick a player holds, when the device has no standardized mapping.
+static SDL_Joystick* RawStickForPlayer(int player) {
+    if (player < 0 || player >= 2) return nullptr;
+    const int idx = g_playerPad[player];
+    if (idx < 0 || idx >= Input::kMaxGamepads) return nullptr;
+    return g_padHandle[idx] ? nullptr : g_padJoystick[idx];
+}
+
+static bool PlayerHasDevice(int player) {
+    return PadForPlayer(player) != nullptr || RawStickForPlayer(player) != nullptr;
+}
+
+// Give a pool entry to a player, taking it off the other player if needed.
+static void AssignPadToPlayer(int player, int padIndex) {
+    if (player < 0 || player >= 2) return;
+    if (padIndex >= 0) {
+        const int other = 1 - player;
+        if (g_playerPad[other] == padIndex) {
+            g_playerPad[other] = -1;
+            g_playerGUIDValid[other] = false;
+        }
+    }
+    g_playerPad[player] = padIndex;
+    if (padIndex >= 0 && g_padGUIDValid[padIndex]) {
+        g_playerGUID[player] = g_padGUID[padIndex];
+        g_playerGUIDValid[player] = true;
+
+        PlayerDeviceKey& key = g_playerKey[player];
+        key.valid = true;
+        key.guid = g_padGUID[padIndex];
+        if (SDL_Gamepad* gp = g_padHandle[padIndex]) {
+            key.vendor = SDL_GetGamepadVendor(gp);
+            key.product = SDL_GetGamepadProduct(gp);
+            const char* nm = SDL_GetGamepadName(gp);
+            snprintf(key.name, sizeof(key.name), "%s", nm ? nm : "");
+        }
+    }
+}
+
+// A saved key matches a connected pad only on the strong parts; the name is a
+// tiebreaker, never the whole answer.
+static bool DeviceKeyMatches(const PlayerDeviceKey& key, int padIndex) {
+    if (!key.valid || padIndex < 0 || !g_padGUIDValid[padIndex]) {
+        return false;
+    }
+    if (!GUIDMatches(key.guid, g_padGUID[padIndex])) {
+        return false;
+    }
+    SDL_Gamepad* gp = g_padHandle[padIndex];
+    if (gp && (key.vendor || key.product)) {
+        if (SDL_GetGamepadVendor(gp) != key.vendor ||
+            SDL_GetGamepadProduct(gp) != key.product) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Exactly one connected pad may answer a saved key. Two identical sticks are
+// the whole reason identity matching exists, so an ambiguous result assigns
+// nothing rather than binding the wrong one.
+static int ResolveSavedDevice(int player) {
+    int found = -1;
+    int matches = 0;
+    for (int i = 0; i < Input::kMaxGamepads; ++i) {
+        if (!g_padHandle[i]) continue;
+        if (g_playerPad[1 - player] == i) continue;   // held by the other player
+        if (DeviceKeyMatches(g_playerKey[player], i)) {
+            ++matches;
+            found = i;
+        }
+    }
+    if (matches != 1) {
+        if (matches > 1) {
+            LOG_WARN("[Input] Saved pad for player %d matches %d connected devices; "
+                     "leaving it unassigned rather than guessing",
+                     player + 1, matches);
+        }
+        return -1;
+    }
+    return found;
+}
 
 // Background worker owns SDL_OpenGamepad / SDL_CloseGamepad. Main thread keeps
 // slot assignment and reads only from live handles (never queued-for-close).
@@ -242,12 +359,15 @@ static void LogGamepadDetails(int slot, SDL_Gamepad* gp, const char* eventName) 
 
 static void SyncSlotSnapshotToWorker() {
     Input::GamepadWorkerSlotSnapshot snapshot{};
-    for (int slot = 0; slot < 2; slot++) {
-        snapshot.occupied[slot] = g_playerGamepad[slot] != nullptr;
-        snapshot.guid_valid[slot] = g_playerGUIDValid[slot];
-        snapshot.guid[slot] = g_playerGUID[slot];
-        if (g_playerGamepad[slot]) {
-            snapshot.live_instance_id[slot] = SDL_GetGamepadID(g_playerGamepad[slot]);
+    for (int slot = 0; slot < Input::kMaxGamepads; slot++) {
+        snapshot.occupied[slot] = g_padHandle[slot] != nullptr ||
+                                  g_padJoystick[slot] != nullptr;
+        snapshot.guid_valid[slot] = g_padGUIDValid[slot];
+        snapshot.guid[slot] = g_padGUID[slot];
+        if (g_padHandle[slot]) {
+            snapshot.live_instance_id[slot] = SDL_GetGamepadID(g_padHandle[slot]);
+        } else if (g_padJoystick[slot]) {
+            snapshot.live_instance_id[slot] = SDL_GetJoystickID(g_padJoystick[slot]);
         }
     }
     Input::GamepadWorker_UpdateSlotSnapshot(&snapshot);
@@ -303,36 +423,63 @@ static void FlushPendingCloseRetries() {
 }
 
 static void ApplyGamepadAttachResult(const Input::GamepadWorkerOpenResult& result) {
-    if (result.slot < 0 || result.slot > 1) {
+    if (result.slot < 0 || result.slot >= Input::kMaxGamepads) {
         if (result.gamepad) {
             QueueGamepadClose(result.gamepad);
         }
         return;
     }
 
-    if (!result.gamepad) {
-        LOG_WARN("[Input] SDL_OpenGamepad failed for slot=%d id=%u: %s",
+    // A raw stick has no gamepad handle by design, so success means "either".
+    if (!result.gamepad && !result.joystick) {
+        LOG_WARN("[Input] Opening device failed for slot=%d id=%u: %s",
                  result.slot,
                  (unsigned)result.instance_id,
                  SDL_GetError());
         return;
     }
 
-    if (g_playerGamepad[result.slot]) {
+    if (g_padHandle[result.slot] || g_padJoystick[result.slot]) {
         Rollback::NetplayLog_Write("INPUT", -1,
             "Discarding duplicate gamepad attach: slot=%d id=%u existing=0x%p new=0x%p",
             result.slot,
             (unsigned)result.instance_id,
-            static_cast<void*>(g_playerGamepad[result.slot]),
+            static_cast<void*>(g_padHandle[result.slot]),
             static_cast<void*>(result.gamepad));
         QueueGamepadClose(result.gamepad);
         return;
     }
 
-    g_playerGamepad[result.slot] = result.gamepad;
+    g_padHandle[result.slot] = result.gamepad;
+    g_padJoystick[result.slot] = result.joystick;
     if (result.guid_valid) {
-        g_playerGUID[result.slot] = result.guid;
-        g_playerGUIDValid[result.slot] = true;
+        g_padGUID[result.slot] = result.guid;
+        g_padGUIDValid[result.slot] = true;
+    }
+
+    // Prefer the player who last held this exact pad, then any player without
+    // one. Extra pads simply sit in the pool until someone binds with them.
+    int claimant = -1;
+    for (int p = 0; p < 2 && claimant < 0; ++p) {
+        if (g_playerPad[p] < 0 && ResolveSavedDevice(p) == result.slot) {
+            claimant = p;
+        }
+    }
+    if (result.guid_valid) {
+        for (int p = 0; p < 2 && claimant < 0; ++p) {
+            if (g_playerGUIDValid[p] && g_playerPad[p] < 0 &&
+                GUIDMatches(g_playerGUID[p], result.guid)) {
+                claimant = p;
+            }
+        }
+    }
+    for (int p = 0; p < 2 && claimant < 0; ++p) {
+        if (g_playerPad[p] < 0) {
+            claimant = p;
+        }
+    }
+    if (claimant >= 0) {
+        AssignPadToPlayer(claimant, result.slot);
     }
     LogGamepadDetails(result.slot, result.gamepad, "connected");
     Net::ChurnPause_NotifyLocalGamepadChurn(
@@ -354,13 +501,28 @@ static void DrainGamepadWorkerResults() {
 }
 
 static void DetachGamepadSlot(int slot, SDL_JoystickID instanceId, const char* reason) {
-    if (slot < 0 || slot > 1 || !g_playerGamepad[slot]) {
+    if (slot < 0 || slot >= Input::kMaxGamepads ||
+        (!g_padHandle[slot] && !g_padJoystick[slot])) {
         return;
     }
 
-    LogGamepadDetails(slot, g_playerGamepad[slot], reason ? reason : "disconnected");
-    SDL_Gamepad* handle = g_playerGamepad[slot];
-    g_playerGamepad[slot] = nullptr;
+    SDL_Gamepad* handle = g_padHandle[slot];
+    if (handle) {
+        LogGamepadDetails(slot, handle, reason ? reason : "disconnected");
+    }
+    if (SDL_Joystick* js = g_padJoystick[slot]) {
+        if (!handle) {
+            SDL_CloseJoystick(js);   // raw sticks are ours to close
+        }
+        g_padJoystick[slot] = nullptr;
+    }
+    g_padHandle[slot] = nullptr;
+    // The player keeps its GUID memory so the pad returns to them on reconnect.
+    for (int p = 0; p < 2; ++p) {
+        if (g_playerPad[p] == slot) {
+            g_playerPad[p] = -1;
+        }
+    }
     QueueGamepadClose(handle);
     Net::ChurnPause_NotifyLocalGamepadChurn(
         Net::ChurnPauseReason::GamepadDisconnect,
@@ -374,17 +536,19 @@ static void DetachGamepadSlot(int slot, SDL_JoystickID instanceId, const char* r
 }
 
 static void CheckDisconnectedGamepads() {
-    for (int p = 0; p < 2; p++) {
-        SDL_Gamepad* gp = g_playerGamepad[p];
-        if (!gp) {
+    for (int p = 0; p < Input::kMaxGamepads; p++) {
+        SDL_Gamepad* gp = g_padHandle[p];
+        SDL_Joystick* js = g_padJoystick[p];
+        if (!gp && !js) {
             continue;
         }
 
-        if (SDL_GamepadConnected(gp)) {
+        if (gp ? SDL_GamepadConnected(gp) : SDL_JoystickConnected(js)) {
             continue;
         }
 
-        const SDL_JoystickID instanceId = SDL_GetGamepadID(gp);
+        const SDL_JoystickID instanceId = gp ? SDL_GetGamepadID(gp)
+                                             : SDL_GetJoystickID(js);
         DetachGamepadSlot(p, instanceId, "disconnected");
         Input::GamepadWorker_CancelOpen(instanceId);
     }
@@ -474,9 +638,53 @@ static const int16_t TRIGGER_THRESHOLD = 8000;
 static uint16_t ReadGamepadPlayer(int player) {
     if (!g_gamepadSubsystemInitialized) return 0;
     if (player < 0 || player >= 2) return 0;
-    SDL_Gamepad* gp = g_playerGamepad[player];
-    if (!gp) return 0;
+    SDL_Gamepad* gp = PadForPlayer(player);
+    SDL_Joystick* raw = RawStickForPlayer(player);
+    if (!gp && !raw) return 0;
     if (!IsGameWindowActive()) return 0;
+
+    if (!gp && raw) {
+        // Positional read for a stick SDL has no mapping for. The stored index
+        // is a physical button/axis here, which is what an arcade stick or a
+        // custom board actually exposes.
+        const PlayerBindings_t* rb = &g_bindings[player];
+        const KeyBinding_t* flat = &rb->up;
+        const uint16_t flags[INPUT_ACTION_COUNT] = {
+            INPUT_UP, INPUT_DOWN, INPUT_LEFT, INPUT_RIGHT,
+            INPUT_A, INPUT_B, INPUT_C, INPUT_D,
+            INPUT_START, INPUT_SELECT, INPUT_L1, INPUT_R1, INPUT_L2, INPUT_R2,
+        };
+        const int buttonCount = SDL_GetNumJoystickButtons(raw);
+        const int axisCount = SDL_GetNumJoystickAxes(raw);
+        const int hatCount = SDL_GetNumJoystickHats(raw);
+        uint16_t rawInput = 0;
+
+        for (int i = 0; i < INPUT_ACTION_COUNT; ++i) {
+            const KeyBinding_t& bind = flat[i];
+            if (bind.gamepad_button >= 0 && bind.gamepad_button < buttonCount &&
+                SDL_GetJoystickButton(raw, bind.gamepad_button)) {
+                rawInput |= flags[i];
+                continue;
+            }
+            if (bind.gamepad_axis >= 0 && bind.gamepad_axis < axisCount) {
+                const int16_t v = SDL_GetJoystickAxis(raw, bind.gamepad_axis);
+                if ((bind.axis_direction > 0 && v > STICK_DEADZONE) ||
+                    (bind.axis_direction < 0 && v < -STICK_DEADZONE)) {
+                    rawInput |= flags[i];
+                }
+            }
+        }
+
+        // Sticks report the d-pad as a hat, so directions come from there.
+        for (int h = 0; h < hatCount; ++h) {
+            const uint8_t hat = SDL_GetJoystickHat(raw, h);
+            if (hat & SDL_HAT_UP)    rawInput |= INPUT_UP;
+            if (hat & SDL_HAT_DOWN)  rawInput |= INPUT_DOWN;
+            if (hat & SDL_HAT_LEFT)  rawInput |= INPUT_LEFT;
+            if (hat & SDL_HAT_RIGHT) rawInput |= INPUT_RIGHT;
+        }
+        return rawInput;
+    }
 
     const PlayerBindings_t* b = &g_bindings[player];
     uint16_t input = 0;
@@ -732,7 +940,9 @@ bool InputSystem_Init(void) {
     g_initialized = true;
     g_gamepadSubsystemInitialized = false;
     g_gamepadSubsystemFailed = false;
-    memset(g_playerGamepad, 0, sizeof(g_playerGamepad));
+    memset(g_padHandle, 0, sizeof(g_padHandle));
+    g_playerPad[0] = -1;
+    g_playerPad[1] = -1;
     memset(g_playerGUID, 0, sizeof(g_playerGUID));
     memset(g_playerGUIDValid, 0, sizeof(g_playerGUIDValid));
     memset(g_pendingCloseRetry, 0, sizeof(g_pendingCloseRetry));
@@ -749,12 +959,14 @@ void InputSystem_Shutdown(void) {
 
     DrainGamepadWorkerResults();
 
-    for (int i = 0; i < 2; i++) {
-        if (g_playerGamepad[i]) {
-            QueueGamepadClose(g_playerGamepad[i]);
-            g_playerGamepad[i] = nullptr;
+    for (int i = 0; i < Input::kMaxGamepads; i++) {
+        if (g_padHandle[i]) {
+            QueueGamepadClose(g_padHandle[i]);
+            g_padHandle[i] = nullptr;
         }
     }
+    g_playerPad[0] = -1;
+    g_playerPad[1] = -1;
 
     FlushPendingCloseRetries();
     Input::GamepadWorker_Shutdown();
@@ -805,6 +1017,8 @@ void InputSystem_Update(void) {
             // Suppress game input while in binding capture mode or cooldown
             g_inputState[p].current = 0;
         } else {
+            // Each player reads only the pad in its own slot, so two pads drive
+            // two players; the keyboard stays available to both.
             uint16_t kbInput = ReadKeyboardPlayer(p);
             uint16_t gpInput = ReadGamepadPlayer(p);
             g_inputState[p].current = kbInput | gpInput;
@@ -953,7 +1167,7 @@ bool InputSystem_IsNetplayInputActive(int player) {
 
 bool InputSystem_HasGamepad(int player) {
     if (!g_gamepadSubsystemInitialized) return false;
-    return (player >= 0 && player < 2 && g_playerGamepad[player] != nullptr);
+    return PlayerHasDevice(player);
 }
 
 bool InputSystem_HasXInput(int player) {
@@ -962,8 +1176,13 @@ bool InputSystem_HasXInput(int player) {
 
 const char* InputSystem_GetGamepadName(int player) {
     if (!g_gamepadSubsystemInitialized) return nullptr;
-    if (player < 0 || player >= 2 || !g_playerGamepad[player]) return nullptr;
-    return SDL_GetGamepadName(g_playerGamepad[player]);
+    if (SDL_Gamepad* gp = PadForPlayer(player)) {
+        return SDL_GetGamepadName(gp);
+    }
+    if (SDL_Joystick* js = RawStickForPlayer(player)) {
+        return SDL_GetJoystickName(js);
+    }
+    return nullptr;
 }
 
 // ============================================================================
@@ -1077,9 +1296,71 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
         }
     }
 
-    // 2. Check gamepad buttons and axes
-    SDL_Gamepad* gp = (g_bindingPlayer >= 0 && g_bindingPlayer < 2)
-                      ? g_playerGamepad[g_bindingPlayer] : nullptr;
+    // 2. Check gamepad buttons and axes.
+    //    Every connected pad is scanned, not just the one already sitting in
+    //    this player's slot: binding with a pad is how you hand that whole
+    //    device to the player, so pressing it here claims it (swapping with the
+    //    other slot if another player held it).
+    // Raw sticks first: they have no gamepad handle, so the mapped scan below
+    // would never see them and they could never be bound.
+    for (int scanSlot = 0; scanSlot < Input::kMaxGamepads; ++scanSlot) {
+        SDL_Joystick* raw = g_padHandle[scanSlot] ? nullptr : g_padJoystick[scanSlot];
+        if (!raw || g_bindingPlayer < 0 || g_bindingPlayer >= 2) {
+            continue;
+        }
+        const int buttons = SDL_GetNumJoystickButtons(raw);
+        for (int b = 0; b < buttons; ++b) {
+            if (!SDL_GetJoystickButton(raw, b)) continue;
+            AssignPadToPlayer(g_bindingPlayer, scanSlot);
+            outBinding->keyboard_key = 0;
+            outBinding->gamepad_button = b;
+            outBinding->gamepad_axis = -1;
+            outBinding->axis_direction = 0;
+            if (outSource) *outSource = 1;
+            g_bindingMode = false;
+            g_bindingCooldown = BINDING_COOLDOWN_FRAMES;
+            return true;
+        }
+        const int axes = SDL_GetNumJoystickAxes(raw);
+        for (int a = 0; a < axes; ++a) {
+            const int16_t v = SDL_GetJoystickAxis(raw, a);
+            if (v > 16000 || v < -16000) {
+                AssignPadToPlayer(g_bindingPlayer, scanSlot);
+                outBinding->keyboard_key = 0;
+                outBinding->gamepad_button = -1;
+                outBinding->gamepad_axis = a;
+                outBinding->axis_direction = v > 0 ? 1 : -1;
+                if (outSource) *outSource = 2;
+                g_bindingMode = false;
+                g_bindingCooldown = BINDING_COOLDOWN_FRAMES;
+                return true;
+            }
+        }
+    }
+
+    for (int scanSlot = 0; scanSlot < Input::kMaxGamepads; ++scanSlot) {
+    SDL_Gamepad* gp = g_padHandle[scanSlot];
+    if (gp && g_playerPad[g_bindingPlayer] != scanSlot &&
+        g_bindingPlayer >= 0 && g_bindingPlayer < 2) {
+        // Peek first; only claim the device if it is actually the one pressed.
+        bool pressed = false;
+        for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && !pressed; b++) {
+            if (SDL_GetGamepadButton(gp, (SDL_GamepadButton)b)) pressed = true;
+        }
+        for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT && !pressed; a++) {
+            const int16_t v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)a);
+            if (v > 16000 || v < -16000) pressed = true;
+        }
+        if (pressed) {
+            // Binding with a pad is how you hand that whole device to a player.
+            AssignPadToPlayer(g_bindingPlayer, scanSlot);
+            gp = g_padHandle[scanSlot];
+            printf("[Input] Pad %d claimed by player %d during rebind\n",
+                   scanSlot, g_bindingPlayer + 1);
+        } else {
+            continue;
+        }
+    }
     if (gp) {
         // Buttons
         for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++) {
@@ -1120,6 +1401,7 @@ bool InputSystem_FinishBinding(KeyBinding_t* outBinding, int* outSource) {
             }
         }
     }
+    }
 
     return false;
 }
@@ -1157,7 +1439,7 @@ bool InputSystem_IsBindingDown(int player, const KeyBinding_t* binding) {
     }
 
     if (player >= 0 && player < 2) {
-        SDL_Gamepad* gp = g_playerGamepad[player];
+        SDL_Gamepad* gp = PadForPlayer(player);
         if (gp) {
             if (binding->gamepad_button >= 0 &&
                 SDL_GetGamepadButton(gp, (SDL_GamepadButton)binding->gamepad_button)) {
@@ -1250,7 +1532,7 @@ void InputSystem_GetBindingDisplayName(const KeyBinding_t* binding, char* out, i
 // ============================================================================
 
 #define CONFIG_MAGIC   0x49325341  // "AS2I"
-#define CONFIG_VERSION 2           // v2 = SDL3 Gamepad bindings
+#define CONFIG_VERSION 3           // v3 = bindings + per-player device identity
 
 struct ConfigHeader {
     uint32_t magic;
@@ -1267,11 +1549,21 @@ bool InputSystem_LoadConfig(const char* filename) {
     ConfigHeader hdr = {};
     size_t hdrRead = fread(&hdr, sizeof(hdr), 1, f);
 
-    if (hdrRead == 1 && hdr.magic == CONFIG_MAGIC && hdr.version == CONFIG_VERSION) {
-        // v2 format: header + bindings
+    // v2 files hold bindings only; v3 adds the device identity tail. Both are
+    // accepted so bumping the format does not throw away existing bindings.
+    const bool versionOk = (hdr.version == CONFIG_VERSION || hdr.version == 2);
+    if (hdrRead == 1 && hdr.magic == CONFIG_MAGIC && versionOk) {
+        // Bindings, then the per-player device identity. Files written before
+        // v3 simply stop after the bindings, so the tail read is optional.
         size_t read = fread(g_bindings, sizeof(PlayerBindings_t), 2, f);
+        PlayerDeviceKey keys[2] = {};
+        const size_t keyRead = fread(keys, sizeof(PlayerDeviceKey), 2, f);
         fclose(f);
         if (read == 2) {
+            if (keyRead == 2) {
+                g_playerKey[0] = keys[0];
+                g_playerKey[1] = keys[1];
+            }
             printf("[Input] Loaded v2 config from %s\n", filename);
             return true;
         }
@@ -1294,6 +1586,8 @@ bool InputSystem_SaveConfig(const char* filename) {
     ConfigHeader hdr = {CONFIG_MAGIC, CONFIG_VERSION};
     fwrite(&hdr, sizeof(hdr), 1, f);
     fwrite(g_bindings, sizeof(PlayerBindings_t), 2, f);
+    // Which physical pad each player was using, so it comes back on restart.
+    fwrite(g_playerKey, sizeof(PlayerDeviceKey), 2, f);
     fclose(f);
 
     printf("[Input] Saved config to %s\n", filename);

@@ -1,4 +1,5 @@
 #include "replay/replay_runtime.h"
+#include "net/netplay_menu_render.h"
 
 #include "core/as2_constants.h"
 #include "core/game_state.h"
@@ -62,7 +63,7 @@ constexpr size_t kReplaySelectDisplayBytes = ADDR_REPLAY_HEADER_BASE - ADDR_REPL
 constexpr int32_t kCoarseCheckpointInterval = 600;
 constexpr int32_t kSeekFramesPerHotkey = 60;
 constexpr int32_t kTakeoverCountdownFrames = 60;
-constexpr int32_t kReplayBrowserPageSize = 11;
+constexpr int32_t kReplayBrowserPageSize = 8;  // matches the rows the browser draws
 constexpr float kSeekScale = 16.0f;
 constexpr float kSpeedSteps[] = {0.5f, 1.0f, 1.25f, 1.5f, 2.0f, 4.0f};
 
@@ -72,6 +73,15 @@ constexpr uintptr_t kAddrRenderCreateColor = 0x5D3150;
 constexpr uintptr_t kAddrRenderDrawSprite = 0x5D3130;
 constexpr uintptr_t kAddrDrawFormatString = 0x629A20;
 constexpr uintptr_t kAddrReplayMenuBackgroundHandle = 0x815E04;
+
+// Vanilla label sprites sample neutral grey, so nothing here is tinted.
+constexpr uint8_t kRepInk       = 232;
+constexpr uint8_t kRepInkBright = 255;
+constexpr uint8_t kRepInkDim    = 168;
+constexpr uint8_t kRepInkFaint  = 132;
+constexpr float   kRepTitleSize = 26.0f;
+constexpr float   kRepBodySize  = 20.0f;
+constexpr float   kRepNoteSize  = 16.0f;
 
 constexpr int kReplayBrowserPanelLeft = 28;
 constexpr int kReplayBrowserPanelTop = 34;
@@ -2574,6 +2584,9 @@ static void GameDrawSprite(int x, int y, int spriteHandle) {
 }
 
 static void GameSetBlend(int mode, uint8_t alpha) {
+    if (mode != 0) {
+        NetMenu::MenuSetTextAlpha(alpha);
+    }
     reinterpret_cast<RenderSetBlendMode_t>(kAddrRenderSetBlendMode)(mode, alpha);
 }
 
@@ -2587,15 +2600,24 @@ static void GameFillRect(int left, int top, int right, int bottom, uint8_t r, ui
         1);
 }
 
+// Explicit size, so the browser has a heading / body / note ladder instead of
+// rendering everything at one weight.
+static void GameDrawTextAt(int x, int y, uint8_t r, uint8_t g, uint8_t b,
+                           float size, const char* text) {
+    if (!text || !text[0]) {
+        return;
+    }
+    NetMenu::MenuDrawTextSized(x, y, r, g, b, size, text);
+}
+
 static void GameDrawTextShadowed(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* text) {
     if (!text || !text[0]) {
         return;
     }
 
-    const unsigned int shadowColor = static_cast<unsigned int>(GameCreateColor(0, 0, 0));
-    const unsigned int textColor = static_cast<unsigned int>(GameCreateColor(r, g, b));
-    reinterpret_cast<DrawFormatString_t>(kAddrDrawFormatString)(x + 1, y + 1, shadowColor, (char*)"%s", (char*)text);
-    reinterpret_cast<DrawFormatString_t>(kAddrDrawFormatString)(x, y, textColor, (char*)"%s", (char*)text);
+    // Same Mincho path as the settings and netplay menus; it draws its own
+    // shadow, so only the fallback needs one here.
+    NetMenu::MenuDrawText(x, y, r, g, b, text);
 }
 
 static bool IsGameTextLeadByte(unsigned char value) {
@@ -2697,249 +2719,165 @@ static void RenderReplayBrowserHud() {
 
     GameDrawSprite(0, 0, ReadMemory<int>(kAddrReplayMenuBackgroundHandle));
 
-    // Dim overlay
-    GameSetBlend(1, 100);
-    GameFillRect(0, 0, 639, 479, 0, 0, 0);
-    GameSetBlend(0, 255);
+    // Layout matches the settings and netplay screens: one panel, 32px rows,
+    // a red bar on the selection, and a footer that follows the content.
+    constexpr int kLeft      = 16;
+    constexpr int kTop       = 16;
+    constexpr int kRight     = 604;
+    constexpr int kTextX     = 32;
+    constexpr int kMatchX    = 300;   // who fought
+    constexpr int kDateX     = 430;   // when
+    constexpr int kMetaX     = 505;   // how long
+    constexpr int kBarRight  = 588;
+    constexpr int kRowPitch  = 32;
+    constexpr int kFirstRow  = 108;  // room for heading, path and column titles
+    constexpr int kRowsShown = 8;  // 9 pushed the panel to the screen edge
 
     const int totalEntries = static_cast<int>(s_browserEntries.size());
-    const int visibleEntries = totalEntries -
-        (!s_browserCurrentDirectory.empty() && totalEntries > 0 ? 1 : 0);
-    const bool hasSelection = totalEntries > 0 &&
-        s_browserSelected >= 0 && s_browserSelected < totalEntries;
-    const ReplayBrowserEntry* selectedEntry = hasSelection
-        ? &s_browserEntries[s_browserSelected]
-        : nullptr;
-    const int32_t listEnd = (std::min)(s_browserScroll + kReplayBrowserPageSize,
-        static_cast<int32_t>(s_browserEntries.size()));
-    const int listRowsTop = kReplayBrowserListTop + 30;
+    const bool hasSelection = s_browserSelected >= 0 && s_browserSelected < totalEntries;
+    const ReplayBrowserEntry* selected = hasSelection
+        ? &s_browserEntries[s_browserSelected] : nullptr;
 
-    GameSetBlend(0, 255);
+    // Keep the selection on screen.
+    if (s_browserScroll > s_browserSelected) {
+        s_browserScroll = s_browserSelected;
+    }
+    if (s_browserSelected >= s_browserScroll + kRowsShown) {
+        s_browserScroll = s_browserSelected - kRowsShown + 1;
+    }
+    if (s_browserScroll < 0) {
+        s_browserScroll = 0;
+    }
 
-    // Header shadow
-    GameSetBlend(1, 40);
-    GameFillRect(kReplayBrowserPanelLeft + 8, kReplayBrowserHeaderY - 4, kReplayBrowserPanelRight - 8, kReplayBrowserListTop - 2, 0, 0, 0);
-    GameSetBlend(0, 255);
+    const int listEnd = (std::min)(s_browserScroll + kRowsShown, totalEntries);
+    const int shown = (std::max)(0, listEnd - s_browserScroll);
 
-    // List area shadow
-    GameSetBlend(1, 30);
-    GameFillRect(kReplayBrowserListLeft - 2, kReplayBrowserListTop - 2, kReplayBrowserListRight + 2, kReplayBrowserListBottom + 2, 0, 0, 0);
-    GameSetBlend(0, 255);
+    // Panel sized to what it holds, plus the detail block and footer.
+    const int listBottom = kFirstRow + shown * kRowPitch;
+    const int detailTop  = listBottom + 10;
+    const int footerTop  = detailTop + (selected ? 46 : 8);
+    const int panelBottom = footerTop + 28;
 
-    // Detail area shadow
-    GameSetBlend(1, 30);
-    GameFillRect(kReplayBrowserDetailLeft - 2, kReplayBrowserDetailTop - 2, kReplayBrowserDetailRight + 2, kReplayBrowserDetailBottom + 2, 0, 0, 0);
-    GameSetBlend(0, 255);
+    GameSetBlend(1, 128);
+    GameFillRect(kLeft, kTop, kRight, panelBottom, 0, 0, 0);
+    GameFillRect(kLeft, kTop, kRight, panelBottom, 0, 0, 0);
+    GameSetBlend(1, 255);
 
-    // Header
-    const std::string pathText = GetBrowserCurrentPathText();
-    char clippedPath[192] = {};
-    ClipGameText(clippedPath, sizeof(clippedPath), pathText.c_str(), 38);
+    // Heading, with the folder being browsed underneath it.
+    GameDrawTextAt(kTextX, kTop + 6, kRepInkBright, kRepInkBright, kRepInkBright,
+                   kRepTitleSize, "REPLAYS");
 
-    char headerRight[64] = {};
-    if (hasSelection) {
-        snprintf(headerRight, sizeof(headerRight), "%d/%d  (%d items)",
-            s_browserSelected + 1, totalEntries,
-            (std::max)(visibleEntries, 0));
+    std::string pathText = s_browserCurrentDirectory.empty()
+        ? std::string("replay/")
+        : ("replay/" + s_browserCurrentDirectory.string());
+    char clippedPath[160] = {};
+    ClipGameText(clippedPath, sizeof(clippedPath), pathText.c_str(), 40);
+    GameDrawTextAt(kTextX, kTop + 44, kRepInkDim, kRepInkDim, kRepInkDim,
+                   kRepNoteSize, clippedPath);
+
+    char counter[48] = {};
+    if (totalEntries > 0) {
+        snprintf(counter, sizeof(counter), "%d / %d", s_browserSelected + 1, totalEntries);
     } else {
-        snprintf(headerRight, sizeof(headerRight), "%d items",
-            (std::max)(visibleEntries, 0));
+        snprintf(counter, sizeof(counter), "empty");
+    }
+    GameDrawTextAt(kRight - 110, kTop + 44, kRepInkDim, kRepInkDim, kRepInkDim,
+                   kRepNoteSize, counter);
+
+    GameDrawTextAt(kTextX + 8, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
+                   kRepInkFaint, kRepNoteSize, "Name");
+    GameDrawTextAt(kMatchX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
+                   kRepInkFaint, kRepNoteSize, "Matchup");
+    GameDrawTextAt(kDateX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
+                   kRepInkFaint, kRepNoteSize, "Date");
+    GameDrawTextAt(kMetaX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
+                   kRepInkFaint, kRepNoteSize, "Time");
+
+    if (totalEntries == 0) {
+        GameDrawTextAt(kTextX, kFirstRow + 6, kRepInkDim, kRepInkDim, kRepInkDim,
+                       kRepBodySize, "No replays here yet.");
     }
 
-    GameDrawTextShadowed(kReplayBrowserPanelLeft + 14, kReplayBrowserHeaderY, 248, 238, 220, "Replays");
-    GameDrawTextShadowed(kReplayBrowserPanelLeft + 80, kReplayBrowserHeaderY, 148, 140, 128, clippedPath);
-    GameDrawTextShadowed(kReplayBrowserPanelRight - 160, kReplayBrowserPathY, 148, 140, 128, headerRight);
+    // Rows.
+    for (int i = 0; i < shown; ++i) {
+        const int index = s_browserScroll + i;
+        const ReplayBrowserEntry& entry = s_browserEntries[index];
+        const int rowTop = kFirstRow + i * kRowPitch;
+        const bool isSelected = index == s_browserSelected;
 
-    GameSetBlend(0, 255);
-
-    // List entries
-    for (int32_t i = s_browserScroll; i < listEnd; ++i) {
-        const ReplayBrowserEntry& entry = s_browserEntries[i];
-        const int rowIndex = i - s_browserScroll;
-        const int rowTop = listRowsTop + rowIndex * kReplayBrowserRowHeight;
-        const bool selected = i == s_browserSelected;
-
-        if (selected) {
-            GameSetBlend(1, 30);
-            GameFillRect(
-                kReplayBrowserListLeft + 4,
-                rowTop - 4,
-                kReplayBrowserListRight - 4,
-                rowTop + kReplayBrowserRowHeight - 1,
-                0, 0, 0);
-            GameSetBlend(1, 128);
-            GameFillRect(
-                kReplayBrowserListLeft + 6,
-                rowTop - 2,
-                kReplayBrowserListRight - 6,
-                rowTop + kReplayBrowserRowHeight - 3,
-                180, 60, 50);
-        } else {
-            GameSetBlend(1, 22);
-            GameFillRect(
-                kReplayBrowserListLeft + 4,
-                rowTop - 4,
-                kReplayBrowserListRight - 4,
-                rowTop + kReplayBrowserRowHeight - 1,
-                0, 0, 0);
-        }
-        GameSetBlend(0, 255);
-
-        const char* typeTag = "RPL";
-        uint8_t tagR = 200, tagG = 204, tagB = 216;
-        if (entry.type == ReplayBrowserEntryType::ParentDirectory) {
-            typeTag = "UP";
-            tagR = 160; tagG = 200; tagB = 236;
-        } else if (entry.type == ReplayBrowserEntryType::Directory) {
-            typeTag = "DIR";
-            tagR = 224; tagG = 200; tagB = 130;
-        } else if (!entry.metadata.valid) {
-            typeTag = "BAD";
-            tagR = 240; tagG = 140; tagB = 140;
+        if (isSelected) {
+            GameSetBlend(2, 128);
+            GameFillRect(kTextX, rowTop, kBarRight, rowTop + kRowPitch - 2, 255, 0, 0);
+            GameSetBlend(1, 255);
         }
 
-        char label[160] = {};
-        ClipGameText(label, sizeof(label), entry.display_name.c_str(), 18);
-        const std::string valueText = GetBrowserEntryValueText(entry);
-        char clippedValue[64] = {};
-        ClipGameText(clippedValue, sizeof(clippedValue), valueText.c_str(), 6);
+        const bool isFolder = entry.type != ReplayBrowserEntryType::ReplayFile;
+        char name[96] = {};
+        ClipGameText(name, sizeof(name),
+                     (isFolder ? ("[ " + entry.display_name + " ]") : entry.display_name).c_str(), 24);
+        const uint8_t ink = isSelected ? kRepInkBright : kRepInk;
+        GameDrawTextAt(kTextX + 8, rowTop + 6, ink, ink, ink, kRepBodySize, name);
 
-        GameDrawTextShadowed(kReplayBrowserListLeft + 14, rowTop + 5, tagR, tagG, tagB, typeTag);
-        GameDrawTextShadowed(kReplayBrowserListLeft + 50, rowTop + 5,
-            entry.type == ReplayBrowserEntryType::ReplayFile && !entry.metadata.valid
-                ? (selected ? 255 : 240) : (selected ? 255 : 220),
-            entry.type == ReplayBrowserEntryType::ReplayFile && !entry.metadata.valid
-                ? (selected ? 150 : 140) : (selected ? 244 : 216),
-            entry.type == ReplayBrowserEntryType::ReplayFile && !entry.metadata.valid
-                ? (selected ? 150 : 140) : (selected ? 228 : 212),
-            label);
-        GameDrawTextShadowed(kReplayBrowserListLeft + 200, rowTop + 5, 140, 148, 164, clippedValue);
-    }
-
-    // Scrollbar
-    if (totalEntries > kReplayBrowserPageSize) {
-        const int trackLeft = kReplayBrowserListRight - 10;
-        const int trackTop = listRowsTop;
-        const int trackBottom = kReplayBrowserListBottom - 8;
-        const int trackHeight = trackBottom - trackTop;
-        const int thumbHeight = (std::max)(20, trackHeight * kReplayBrowserPageSize / totalEntries);
-        const int maxScroll = (std::max)(1, totalEntries - kReplayBrowserPageSize);
-        const int thumbTop = trackTop + (trackHeight - thumbHeight) * s_browserScroll / maxScroll;
-
-        GameSetBlend(1, 48);
-        GameFillRect(trackLeft, trackTop, trackLeft + 3, trackBottom, 80, 80, 100);
-        GameSetBlend(1, 120);
-        GameFillRect(trackLeft, thumbTop, trackLeft + 3, thumbTop + thumbHeight, 180, 160, 140);
-        GameSetBlend(0, 255);
-    }
-
-    // Detail panel content
-    auto drawDetailPair = [&](int y, const char* label, const char* value, uint8_t vr, uint8_t vg, uint8_t vb) {
-        if (!value || !value[0]) return;
-        char clippedValue[192] = {};
-        ClipGameText(clippedValue, sizeof(clippedValue), value, 30);
-        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, y, 148, 140, 128, label);
-        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, y + 14, vr, vg, vb, clippedValue);
-    };
-
-    auto drawDetailNote = [&](int y, uint8_t r, uint8_t g, uint8_t b, const char* value) {
-        if (!value || !value[0]) return;
-        char clippedValue[192] = {};
-        ClipGameText(clippedValue, sizeof(clippedValue), value, 30);
-        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, y, r, g, b, clippedValue);
-    };
-
-    if (selectedEntry) {
-        char clippedName[192] = {};
-        ClipGameText(clippedName, sizeof(clippedName), selectedEntry->display_name.c_str(), 30);
-        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, kReplayBrowserDetailTop + 38, 240, 220, 160, clippedName);
-
-        const char* typeLabel = "Replay File";
-        uint8_t typeR = 200, typeG = 204, typeB = 216;
-        if (selectedEntry->type == ReplayBrowserEntryType::ParentDirectory) {
-            typeLabel = "Parent Folder";
-            typeR = 160; typeG = 200; typeB = 236;
-        } else if (selectedEntry->type == ReplayBrowserEntryType::Directory) {
-            typeLabel = "Folder";
-            typeR = 224; typeG = 200; typeB = 130;
-        } else if (!selectedEntry->metadata.valid) {
-            typeLabel = "Invalid Replay";
-            typeR = 240; typeG = 140; typeB = 140;
-        }
-        GameDrawTextShadowed(kReplayBrowserDetailLeft + 14, kReplayBrowserDetailTop + 60, typeR, typeG, typeB, typeLabel);
-
-        std::string locationText = NormalizeGameDisplayPath(selectedEntry->full_path.lexically_relative(fs::path(L"replay")));
-        if (locationText.empty()) {
-            locationText = selectedEntry->display_name;
-        }
-
-        if (selectedEntry->type == ReplayBrowserEntryType::ReplayFile) {
-            if (selectedEntry->metadata.valid) {
-                const std::string matchupText = GetBrowserEntryMatchupText(*selectedEntry);
-                const std::string durationText = GetBrowserEntryValueText(*selectedEntry);
-
-                char frameText[64] = {};
-                snprintf(frameText, sizeof(frameText), "%d", selectedEntry->metadata.frames);
-
-                drawDetailPair(kReplayBrowserDetailTop + 86, "Matchup", matchupText.c_str(), 210, 210, 220);
-                drawDetailPair(kReplayBrowserDetailTop + 118, "Length", durationText.c_str(), 210, 210, 220);
-                drawDetailPair(kReplayBrowserDetailTop + 150, "Frames", frameText, 210, 210, 220);
-                drawDetailPair(kReplayBrowserDetailTop + 182, "Updated",
-                    selectedEntry->metadata.modified_time.empty() ? "Unknown" : selectedEntry->metadata.modified_time.c_str(),
-                    210, 210, 220);
-                drawDetailPair(kReplayBrowserDetailTop + 214, "Location", locationText.c_str(), 160, 168, 184);
-
-                drawDetailNote(kReplayBrowserDetailBottom - 38, 180, 190, 210,
-                    "A/C or Enter to load.");
-                drawDetailNote(kReplayBrowserDetailBottom - 20, 140, 148, 164,
-                    "L/R page  Home/End jump");
-            } else {
-                drawDetailPair(kReplayBrowserDetailTop + 92, "Status",
-                    "Invalid replay header.",
-                    240, 140, 140);
-                drawDetailPair(kReplayBrowserDetailTop + 124, "Location", locationText.c_str(), 160, 168, 184);
-                drawDetailNote(kReplayBrowserDetailBottom - 24, 180, 190, 210,
-                    "Select another replay.");
+        // Name alone says very little; the matchup and date are what a player
+        // actually picks a replay by.
+        if (!isFolder && entry.metadata.valid) {
+            const std::string matchup = GetBrowserEntryMatchupText(entry);
+            if (!matchup.empty()) {
+                char clipped[64] = {};
+                ClipGameText(clipped, sizeof(clipped), matchup.c_str(), 16);
+                GameDrawTextAt(kMatchX, rowTop + 8, kRepInkDim, kRepInkDim,
+                               kRepInkDim, kRepNoteSize, clipped);
             }
-        } else if (selectedEntry->type == ReplayBrowserEntryType::Directory) {
-            drawDetailPair(kReplayBrowserDetailTop + 92, "Location", locationText.c_str(), 210, 210, 220);
-            drawDetailNote(kReplayBrowserDetailTop + 136, 180, 190, 210,
-                "A/C or Enter to open.");
-        } else {
-            drawDetailPair(kReplayBrowserDetailTop + 92, "Back to",
-                s_browserCurrentDirectory.empty() ? "replay/" : NormalizeGameDisplayPath(s_browserCurrentDirectory.parent_path()).c_str(),
-                210, 210, 220);
-            drawDetailNote(kReplayBrowserDetailTop + 136, 180, 190, 210,
-                "A/C or B/D to go up.");
+            if (!entry.metadata.modified_time.empty()) {
+                char when[48] = {};
+                ClipGameText(when, sizeof(when),
+                             entry.metadata.modified_time.c_str(), 11);
+                GameDrawTextAt(kDateX, rowTop + 8, kRepInkFaint, kRepInkFaint,
+                               kRepInkFaint, kRepNoteSize, when);
+            }
         }
-    } else {
-        drawDetailNote(kReplayBrowserDetailTop + 38, 200, 204, 216,
-            "No entries here.");
-        drawDetailNote(kReplayBrowserDetailTop + 60, 140, 148, 164,
-            "Add replays or go back.");
+
+        const std::string value = GetBrowserEntryValueText(entry);
+        if (!value.empty()) {
+            GameDrawTextAt(kMetaX, rowTop + 8, kRepInkDim, kRepInkDim, kRepInkDim,
+                           kRepNoteSize, value.c_str());
+        }
     }
 
-    // Footer shadow
-    GameSetBlend(1, 40);
-    GameFillRect(kReplayBrowserPanelLeft + 8, kReplayBrowserStatusY - 8, kReplayBrowserPanelRight - 8, kReplayBrowserPanelBottom + 2, 0, 0, 0);
+    // Details for whatever is highlighted, on one quiet block under the list.
+    if (selected) {
+        GameSetBlend(1, 70);
+        GameFillRect(kTextX, detailTop - 4, kBarRight, detailTop - 3, 90, 90, 90);
+        GameSetBlend(1, 255);
 
-    // Footer
+        if (selected->type == ReplayBrowserEntryType::ReplayFile &&
+            selected->metadata.valid) {
+            const std::string matchup = GetBrowserEntryMatchupText(*selected);
+            char line[128] = {};
+            ClipGameText(line, sizeof(line), matchup.c_str(), 40);
+            GameDrawTextAt(kTextX + 8, detailTop + 4, kRepInk, kRepInk, kRepInk,
+                           kRepNoteSize, line);
+
+            char meta[128] = {};
+            snprintf(meta, sizeof(meta), "%s   %s",
+                     GetBrowserEntryValueText(*selected).c_str(),
+                     selected->metadata.modified_time.c_str());
+            char clippedMeta[128] = {};
+            ClipGameText(clippedMeta, sizeof(clippedMeta), meta, 44);
+            GameDrawTextAt(kTextX + 8, detailTop + 24, kRepInkFaint, kRepInkFaint,
+                           kRepInkFaint, kRepNoteSize, clippedMeta);
+        } else {
+            GameDrawTextAt(kTextX + 8, detailTop + 4, kRepInkDim, kRepInkDim, kRepInkDim,
+                           kRepNoteSize,
+                           selected->type == ReplayBrowserEntryType::ParentDirectory
+                               ? "Go up one folder" : "Folder");
+        }
+    }
+
+    GameDrawTextAt(kTextX, footerTop, kRepInkFaint, kRepInkFaint, kRepInkFaint,
+                   kRepNoteSize, "A Open   B Back   Up/Down Move   Left/Right Page");
+
     GameSetBlend(0, 255);
-
-    const char* footerText = s_browserStatus.empty()
-        ? (!s_browserCurrentDirectory.empty()
-            ? "U/D Move  L/R Page  A Open  B/Esc Up"
-            : "U/D Move  L/R Page  A Open  B/Esc Exit")
-        : s_browserStatus.c_str();
-    char clippedFooter[192] = {};
-    ClipGameText(clippedFooter, sizeof(clippedFooter), footerText, 62);
-    GameDrawTextShadowed(
-        kReplayBrowserPanelLeft + 16,
-        kReplayBrowserStatusY,
-        s_browserStatus.empty() ? 148 : 240,
-        s_browserStatus.empty() ? 148 : 208,
-        s_browserStatus.empty() ? 164 : 128,
-        clippedFooter);
 }
 
 } // namespace

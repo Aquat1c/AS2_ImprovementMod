@@ -43,6 +43,9 @@ uint8_t GameSettingsSync_NormalizeRoundOption(uint8_t roundOption, const char* r
 int GameSettingsSync_RoundsToWin(uint8_t roundOption);
 void GameSettingsSync_FormatRoundLabel(uint8_t roundOption, char* out, size_t outSize);
 
+// True while a netplay session holds the local match config cached.
+bool GameSettingsSync_LocalOptionsLocked();
+
 uint8_t GameSettingsSync_BuildHostRoundOption(const char* reason);
 void GameSettingsSync_ApplyRoundOption(uint8_t roundOption, const char* reason);
 void GameSettingsSync_ApplyLockedConfig(const LockedMatchConfig* config, const char* reason);

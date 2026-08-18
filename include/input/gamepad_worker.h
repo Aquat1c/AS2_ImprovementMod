@@ -19,17 +19,23 @@
 
 namespace Input {
 
+// Every connected pad is opened into this pool, not just the two a player can
+// hold. Players are then pointed at a pool entry, so a third or fourth
+// controller can be claimed by rebinding with it.
+constexpr int kMaxGamepads = 8;
+
 struct GamepadWorkerSlotSnapshot {
-    bool             occupied[2];
-    bool             guid_valid[2];
-    SDL_GUID         guid[2];
-    SDL_JoystickID   live_instance_id[2];
+    bool             occupied[kMaxGamepads];
+    bool             guid_valid[kMaxGamepads];
+    SDL_GUID         guid[kMaxGamepads];
+    SDL_JoystickID   live_instance_id[kMaxGamepads];
 };
 
 struct GamepadWorkerOpenResult {
     int              slot;
     SDL_JoystickID   instance_id;
-    SDL_Gamepad*     gamepad;
+    SDL_Gamepad*     gamepad;      // set when SDL has a standardized mapping
+    SDL_Joystick*    joystick;     // set instead for a raw, unmapped stick
     SDL_GUID         guid;
     bool             guid_valid;
     DWORD            duration_ms;

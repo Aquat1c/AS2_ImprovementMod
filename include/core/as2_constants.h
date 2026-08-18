@@ -1205,6 +1205,7 @@
 // When 0, stage is auto-picked from character's home stage lookup table.
 // When 1, the stage selection grid is shown during charsel.
 #define ADDR_STAGESEL_ENABLE    0x8E93EE
+#define ADDR_GAMEOPT_SPECIAL_CHARS 0x8E940E   // special-character slots, forced on by the unlock patch
 
 // ============================================================================
 // CPU Flag Addresses (entity+172 inside player selection structs)

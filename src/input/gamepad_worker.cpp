@@ -62,7 +62,7 @@ static GamepadWorkerStats       s_stats{};
 static std::mutex               s_slotSnapshotMutex;
 static GamepadWorkerSlotSnapshot s_slotSnapshot{};
 
-static SDL_JoystickID           s_workerPendingInstance[2] = {};
+static SDL_JoystickID           s_workerPendingInstance[kMaxGamepads] = {};
 
 static std::atomic<bool>        s_initialized{false};
 static std::atomic<bool>        s_stopRequested{false};
@@ -103,7 +103,7 @@ static GamepadWorkerSlotSnapshot CopySlotSnapshot() {
 }
 
 static void ClearWorkerPendingSlot(int slot) {
-    if (slot >= 0 && slot < 2) {
+    if (slot >= 0 && slot < kMaxGamepads) {
         s_workerPendingInstance[slot] = 0;
     }
 }
@@ -112,7 +112,7 @@ static void ClearWorkerPendingForInstance(SDL_JoystickID instanceId) {
     if (instanceId == 0) {
         return;
     }
-    for (int slot = 0; slot < 2; slot++) {
+    for (int slot = 0; slot < kMaxGamepads; slot++) {
         if (s_workerPendingInstance[slot] == instanceId) {
             s_workerPendingInstance[slot] = 0;
         }
@@ -125,7 +125,7 @@ static bool IsInstanceTrackedOnWorker(SDL_JoystickID instanceId,
         return true;
     }
 
-    for (int slot = 0; slot < 2; slot++) {
+    for (int slot = 0; slot < kMaxGamepads; slot++) {
         if (s_workerPendingInstance[slot] == instanceId) {
             return true;
         }
@@ -138,7 +138,7 @@ static bool IsInstanceTrackedOnWorker(SDL_JoystickID instanceId,
 }
 
 static bool IsSlotAvailable(int slot, const GamepadWorkerSlotSnapshot& snapshot) {
-    if (slot < 0 || slot > 1) {
+    if (slot < 0 || slot >= kMaxGamepads) {
         return false;
     }
     if (snapshot.occupied[slot]) {
@@ -154,7 +154,7 @@ static int PickSlotForDevice(const SDL_GUID& deviceGuid,
                              bool deviceGuidValid,
                              const GamepadWorkerSlotSnapshot& snapshot) {
     if (deviceGuidValid) {
-        for (int slot = 0; slot < 2; slot++) {
+        for (int slot = 0; slot < kMaxGamepads; slot++) {
             if (!IsSlotAvailable(slot, snapshot)) {
                 continue;
             }
@@ -164,7 +164,7 @@ static int PickSlotForDevice(const SDL_GUID& deviceGuid,
         }
     }
 
-    for (int slot = 0; slot < 2; slot++) {
+    for (int slot = 0; slot < kMaxGamepads; slot++) {
         if (IsSlotAvailable(slot, snapshot)) {
             return slot;
         }
@@ -292,7 +292,10 @@ static bool TryQueueConnectForDevice(SDL_JoystickID instanceId) {
 static void BootstrapExistingGamepads() {
     const DWORD startMs = GetTickCount();
     int count = 0;
-    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    // Every joystick, not just the ones SDL has a gamepad mapping for:
+    // arcade sticks, hitboxes and custom boards have no mapping and would
+    // otherwise never be seen at all.
+    SDL_JoystickID* ids = SDL_GetJoysticks(&count);
 
     std::unordered_set<SDL_JoystickID> current;
     if (ids) {
@@ -333,7 +336,10 @@ static void ScanForNewGamepadsIfDue() {
 
     const DWORD startMs = GetTickCount();
     int count = 0;
-    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    // Every joystick, not just the ones SDL has a gamepad mapping for:
+    // arcade sticks, hitboxes and custom boards have no mapping and would
+    // otherwise never be seen at all.
+    SDL_JoystickID* ids = SDL_GetJoysticks(&count);
 
     std::unordered_set<SDL_JoystickID> current;
     if (ids) {
@@ -431,7 +437,16 @@ static void ProcessCommands(std::deque<WorkerCommand>* commands,
             }
 
             const DWORD startMs = GetTickCount();
-            SDL_Gamepad* gp = SDL_OpenGamepad(cmd.instance_id);
+            SDL_Gamepad* gp = nullptr;
+            SDL_Joystick* js = nullptr;
+            if (SDL_IsGamepad(cmd.instance_id)) {
+                gp = SDL_OpenGamepad(cmd.instance_id);
+            } else {
+                // No standardized mapping exists and none is required: the
+                // device is driven positionally, which is how an arcade stick
+                // or a custom board is meant to work.
+                js = SDL_OpenJoystick(cmd.instance_id);
+            }
             const DWORD durationMs = GetTickCount() - startMs;
             MarkChurnActive(durationMs);
 
@@ -439,6 +454,9 @@ static void ProcessCommands(std::deque<WorkerCommand>* commands,
                 cancelledOpens->erase(cmd.instance_id);
                 if (gp) {
                     SDL_CloseGamepad(gp);
+                }
+                if (js) {
+                    SDL_CloseJoystick(js);
                 }
                 ClearWorkerPendingSlot(cmd.slot);
                 std::lock_guard<std::mutex> lock(s_statsMutex);
@@ -465,13 +483,14 @@ static void ProcessCommands(std::deque<WorkerCommand>* commands,
                          cmd.slot,
                          (unsigned)cmd.instance_id,
                          (unsigned long)durationMs,
-                         gp ? 1 : 0);
+                         (gp || js) ? 1 : 0);
             }
 
             GamepadWorkerOpenResult attachResult{};
             attachResult.slot = cmd.slot;
             attachResult.instance_id = cmd.instance_id;
             attachResult.gamepad = gp;
+            attachResult.joystick = js;
             attachResult.guid = cmd.guid;
             attachResult.guid_valid = cmd.guid_valid;
             attachResult.duration_ms = durationMs;

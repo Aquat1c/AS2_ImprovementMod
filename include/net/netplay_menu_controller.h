@@ -40,6 +40,7 @@ void FrameUpdate();
 
 /// Called when the user selects "Network" from the main menu.
 void HandleNetworkSelected();
+void HandleGameSettingsSelected();
 
 /// Called when a disconnection or error forces return to the menu.
 void HandleDisconnection(const char* reason);

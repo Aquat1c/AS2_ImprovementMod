@@ -31,6 +31,8 @@
 #include "net/spectator_playback.h"
 #include "net/netplay_palette_runtime.h"
 #include "net/game_settings_sync.h"
+#include "ui/game_settings_menu.h"
+#include "ui/mod_menu.h"
 #include "rollback/netplay_log.h"
 #include "rollback/online_wiring.h"
 #include "rollback/rematch_cleanup.h"
@@ -76,6 +78,9 @@ static int s_mainMenuReturnFade = 0;
 
 static bool          s_initialized       = false;
 static MenuState     s_state             = MenuState::Inactive;
+// Set when settings were opened from the title screen, so Back closes the menu
+// instead of dropping the player into the online root.
+static bool          s_settingsFromTitle = false;
 static MenuPhase     s_phase             = MenuPhase::Hidden;
 static RootBranch    s_activeBranch      = RootBranch::DirectPlay;
 static SettingsCategory s_settingsCategory = SettingsCategory::Identity;
@@ -2621,6 +2626,7 @@ static void OpenMenu() {
 }
 
 static void FinishClose() {
+    s_settingsFromTitle = false;
     if (s_joinSpectatorProbeActive) {
         Net::SpectatorClient_Disconnect("menu close cleared join spectator probe");
     }
@@ -3099,7 +3105,7 @@ static int ItemCount(MenuState st) {
         case MenuState::SpectateEntry:       return 4; // Connect, Discover LAN, Endpoint, Back
         case MenuState::SpectatorConnecting: return 1; // Cancel
         case MenuState::SpectatorConnected:  return 1; // Disconnect
-        case MenuState::SettingsCategoryMenu: return 6; // Player, Appearance, Network, Watch, Diagnostics, Back
+        case MenuState::SettingsCategoryMenu:  return 6; // 5 categories + Back
         case MenuState::SettingsEntry: {
             switch (s_settingsCategory) {
                 case SettingsCategory::Identity:     return 4; // Name, Delay, Rollback, Back
@@ -3107,6 +3113,10 @@ static int ItemCount(MenuState st) {
                 case SettingsCategory::Endpoint:     return 8; // Route, UPnP, STUN, Hole, IPv6, Relay, STUN srv, Back
                 case SettingsCategory::SessionMatch: return 4; // Watchers, PalSync, PalPreview, Back
                 case SettingsCategory::Diagnostics:  return 2; // Debug logging, Back
+                case SettingsCategory::GameRoot:     return GameSettingsRoot_RowCount();
+                case SettingsCategory::GameKeys:     return GameSettingsKeys_RowCount();
+                case SettingsCategory::GameGeneral:  return GameSettingsMenu_RowCount();
+                case SettingsCategory::GameVoice:    return GameSettingsVoice_RowCount();
                 default: return 5;
             }
         }
@@ -3154,6 +3164,17 @@ static int SettingGlobalId() {
                 case 6: return 10;  // STUN Server
                 default: return -1; // Back
             }
+        case SettingsCategory::GameRoot:
+        case SettingsCategory::GameKeys:
+            return -1; // every row is an action
+        case SettingsCategory::GameGeneral:
+            // 20 + visible row; the trailing entry is Back.
+            return ((int)s_selectedIndex < GameSettingsMenu_RowCount() - 1)
+                ? (int)(20 + s_selectedIndex) : -1;
+        case SettingsCategory::GameVoice:
+            // 40 + character index; the trailing entry is Back.
+            return ((int)s_selectedIndex < GameSettingsVoice_RowCount() - 1)
+                ? (int)(40 + s_selectedIndex) : -1;
         case SettingsCategory::SessionMatch:
             switch (s_selectedIndex) {
                 case 0: return 11;  // Watchers
@@ -3811,6 +3832,16 @@ static void HandleNavigationInput() {
         return;
     }
 
+    // While a rebind is capturing, every key belongs to the capture, not to us.
+    // ESC gets the player out of it.
+    if (GameSettingsKeys_CaptureActive()) {
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            GameSettingsKeys_CancelCapture();
+            SetStatus("Rebind canceled.");
+        }
+        return;
+    }
+
     // Repeat-aware Up/Down
     if (InputSystem_JustPressed(0, INPUT_UP))   MoveSelection(-1);
     if (InputSystem_JustPressed(0, INPUT_DOWN))  MoveSelection(1);
@@ -3826,7 +3857,28 @@ static void HandleNavigationInput() {
         const int gid = SettingGlobalId();
 
         if (left || right) {
-            if (gid == 1) {
+            if (s_settingsCategory == SettingsCategory::GameKeys) {
+                char msg[96];
+                if (GameSettingsKeys_Adjust(left, right, msg, sizeof(msg)) && msg[0]) {
+                    SetStatus("%s", msg);
+                }
+            } else if (gid >= 20 && gid < 40) {
+                char msg[96];
+                if (GameSettingsMenu_Adjust(gid - 20, left, right, msg, sizeof(msg))) {
+                    changed = true;
+                }
+                if (msg[0]) {
+                    SetStatus("%s", msg);
+                }
+            } else if (gid >= 40) {
+                char msg[96];
+                if (GameSettingsVoice_Adjust(gid - 40, left, right, msg, sizeof(msg))) {
+                    changed = true;
+                }
+                if (msg[0]) {
+                    SetStatus("%s", msg);
+                }
+            } else if (gid == 1) {
                 if (left && s_preferredDelay > 0) {
                     s_preferredDelay--;
                     changed = true;
@@ -4232,6 +4284,60 @@ static void ActivateCurrentSelection() {
 
         case MenuState::SettingsEntry: {
             const int gid = SettingGlobalId();
+            if (s_settingsCategory == SettingsCategory::GameKeys) {
+                bool close = false;
+                char msg[96];
+                GameSettingsKeys_Confirm((int)s_selectedIndex, &close, msg, sizeof(msg));
+                if (msg[0]) {
+                    SetStatus("%s", msg);
+                }
+                if (close) {
+                    s_settingsCategory = SettingsCategory::GameRoot;
+                    s_selectedIndex = 0;
+                    TransitionTo(MenuState::SettingsEntry, "back from key settings");
+                }
+                break;
+            }
+            if (s_settingsCategory == SettingsCategory::GameRoot) {
+                switch ((int)s_selectedIndex) {
+                    case kGameRootGeneral:
+                        s_settingsCategory = SettingsCategory::GameGeneral;
+                        s_selectedIndex = 0;
+                        TransitionTo(MenuState::SettingsEntry, "open general settings");
+                        break;
+                    case kGameRootKeys:
+                        s_settingsCategory = SettingsCategory::GameKeys;
+                        s_selectedIndex = 0;
+                        TransitionTo(MenuState::SettingsEntry, "open key settings");
+                        break;
+                    case kGameRootBattleHistory:
+                        BeginClose("open native battle history");
+                        GameSettingsMenu_RequestNativeSubstate(5);
+                        break;
+                    case kGameRootTitles:
+                        BeginClose("open native titles");
+                        GameSettingsMenu_RequestNativeSubstate(6);
+                        break;
+                    default:
+                        s_settingsFromTitle = false;
+                        BeginClose("exit settings");
+                        break;
+                }
+                break;
+            }
+            if (s_settingsCategory == SettingsCategory::GameGeneral &&
+                GameSettingsMenu_RowOpensSubPage((int)s_selectedIndex)) {
+                s_settingsCategory = SettingsCategory::GameVoice;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "open voice volume page");
+                break;
+            }
+            if (s_settingsCategory == SettingsCategory::GameVoice && gid == -1) {
+                s_settingsCategory = SettingsCategory::GameGeneral;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "back from voice volume page");
+                break;
+            }
             if (gid == 0) {
                 BeginTextEdit(TextEditField::Nickname, s_localNickname, "Enter your display name.");
             } else if (gid == 9) {
@@ -4243,9 +4349,17 @@ static void ActivateCurrentSelection() {
                 _snprintf_s(portBuf, sizeof(portBuf), _TRUNCATE, "%u", s_spectatorListenPort);
                 BeginTextEdit(TextEditField::SpectatorPort, portBuf, "Enter the watch port (1-65535).");
             } else if (gid == -1) {
-                // Back to category menu
                 s_selectedIndex = 0;
-                TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
+                if (s_settingsCategory == SettingsCategory::GameGeneral) {
+                    s_settingsCategory = SettingsCategory::GameRoot;
+                    TransitionTo(MenuState::SettingsEntry, "back to settings categories");
+                } else if (s_settingsFromTitle ||
+                           s_settingsCategory == SettingsCategory::GameRoot) {
+                    s_settingsFromTitle = false;
+                    BeginClose("back from settings opened at title");
+                } else {
+                    TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
+                }
             }
             // Most settings are adjusted via left/right.
             break;
@@ -4275,7 +4389,12 @@ static void ActivateCurrentSelection() {
             } else {
                 // Back to main menu
                 s_selectedIndex = 0;
-                TransitionTo(MenuState::MenuRoot, "back from settings categories");
+                if (s_settingsFromTitle) {
+                    s_settingsFromTitle = false;
+                    BeginClose("back from settings opened at title");
+                } else {
+                    TransitionTo(MenuState::MenuRoot, "back from settings categories");
+                }
             }
             break;
 
@@ -4409,7 +4528,23 @@ static void HandleBackNavigation() {
             break;
         case MenuState::SettingsEntry:
             s_selectedIndex = 0;
-            TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
+            // The game settings pages are their own stack; only the netplay
+            // categories belong to the online menu.
+            if (s_settingsCategory == SettingsCategory::GameKeys) {
+                s_settingsCategory = SettingsCategory::GameRoot;
+                TransitionTo(MenuState::SettingsEntry, "back from key settings");
+            } else if (s_settingsCategory == SettingsCategory::GameVoice) {
+                s_settingsCategory = SettingsCategory::GameGeneral;
+                TransitionTo(MenuState::SettingsEntry, "back from voice volume");
+            } else if (s_settingsCategory == SettingsCategory::GameGeneral) {
+                s_settingsCategory = SettingsCategory::GameRoot;
+                TransitionTo(MenuState::SettingsEntry, "back to settings categories");
+            } else if (s_settingsCategory == SettingsCategory::GameRoot) {
+                s_settingsFromTitle = false;
+                BeginClose("back from game settings");
+            } else {
+                TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
+            }
             break;
         case MenuState::Connecting:
         case MenuState::Handshake:
@@ -4506,6 +4641,7 @@ void Shutdown() {
 }
 
 void FrameUpdate() {
+    GameSettingsMenu_FrameUpdate();
     uint32_t mode = GetGameMode();
 
     // ALWAYS pump the session — even when the menu is hidden (CharSel/Match).
@@ -4609,7 +4745,16 @@ void FrameUpdate() {
 }
 
 void HandleNetworkSelected() {
+    s_settingsFromTitle = false;
     OpenMenu();
+}
+
+void HandleGameSettingsSelected() {
+    OpenMenu();
+    s_settingsFromTitle = true;
+    s_settingsCategory = SettingsCategory::GameRoot;
+    s_selectedIndex = 0;
+    TransitionTo(MenuState::SettingsEntry, "open game settings from title");
 }
 
 // Set while a DELIBERATE quit is tearing the session down. The pregame
