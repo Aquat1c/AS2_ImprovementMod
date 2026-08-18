@@ -1948,12 +1948,27 @@ int __cdecl Hook_InputDispatcher(__int16* outputInputs) {
         const bool startupBarrierOwnsGameplay =
             Rollback::OnlineWiring_IsGameplayEntryAdvanceBlocked();
         const bool pregameOwnsLoadBarrier = Net::PregameSync_IsActive();
+        // A SPECTATOR owns the timesync freeze too. It has no RollbackSession,
+        // so without this clause the watchdog judged its freeze stale and
+        // cleared it EVERY FRAME: the freeze exists to hold the local game
+        // while the playback cushion primes to 240 records, and with it
+        // cancelled the game kept consuming at exactly the rate frames
+        // arrived, pinning the cushion at ~44 forever. Observed live on
+        // 2026-08-18: 2.5 minutes stuck in Buffering, alternating
+        // "Runtime freeze ENABLED" / "Clearing stale gameplay freeze".
+        // It only became reachable once the spectator stopped taking the slow
+        // charsel-drive bootstrap, which used to arrive with a ~600-frame
+        // backlog that satisfied the prime instantly.
+        const bool spectatorOwnsGameplay =
+            Net::SpectatorPlayback_OwnsLocalSimulation();
         const bool legitimateFreeze =
             practiceFreeze ||
             (replayFreeze && replayOwnsGameplay) ||
             charselLockstep ||
             (loadBarrierFreeze && pregameOwnsLoadBarrier) ||
-            (timesyncFreeze && (rollbackOwnsGameplay || startupBarrierOwnsGameplay));
+            (timesyncFreeze && (rollbackOwnsGameplay ||
+                                startupBarrierOwnsGameplay ||
+                                spectatorOwnsGameplay));
 
         if (!legitimateFreeze) {
             Rollback::NetplayLog_Write("SYNC", -1,

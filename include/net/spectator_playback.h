@@ -72,4 +72,11 @@ bool SpectatorPlayback_CopyPaletteOverrideBank(uint8_t game_slot,
 
 void SpectatorPlayback_GetSnapshot(SpectatorPlaybackSnapshot* out);
 
+/// True while spectator playback drives the local simulation, i.e. it is a
+/// legitimate owner of the timesync gameplay freeze. The freeze watchdog in
+/// input_override.cpp must consult this: a spectator has no RollbackSession, so
+/// without it the watchdog treats the freeze as stale and clears it every
+/// frame, which stops the playback cushion from ever priming.
+bool SpectatorPlayback_OwnsLocalSimulation();
+
 } // namespace Net

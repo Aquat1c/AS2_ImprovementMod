@@ -683,17 +683,32 @@ static bool TryWinScreenRematchReentry(const LockedMatchConfig& cfg,
     if (!cfgUsable) return false;
 
     const uint32_t mode = GetGameMode();
-    // Only from a live local game. Out of the menu there is no context to
-    // re-enter and the full launch is correct.
-    if (mode != MODE_MATCH && mode != MODE_PREMATCH_INTRO && mode != MODE_CHARSEL) {
-        return false;
-    }
-    if (!s_localMatchEverLaunched) return false;   // first match of the session
+    const bool inLiveGame = (mode == MODE_MATCH ||
+                             mode == MODE_PREMATCH_INTRO ||
+                             mode == MODE_CHARSEL);
 
-    // Re-assert what BeginLocalSpectatorLaunch would have set. These almost
-    // certainly still hold from the previous match now that we stay in-game,
-    // but "almost certainly" is not a basis for the mode the next match runs
-    // in -- and they are idempotent writes.
+    // NOT IN A LIVE GAME -- the first match of the session, and also every
+    // later boundary where the spectator has dipped through the menu for a few
+    // frames before the next match's config arrives (measured: 3 samples of
+    // mode 3 per boundary). Nothing here needs character select either: mode 7
+    // reads the live charsel globals, so the only thing
+    // BeginLocalSpectatorLaunch actually accomplished by dropping into
+    // MODE_CHARSEL was to give DriveBootstrap somewhere to force the grids.
+    // Do its menu-exit work, then enter mode 7 the same way a rematch does.
+    // ResetCharSelFields runs BEFORE the injection below -- it clears the very
+    // globals we are about to write, and the full-launch path only gets away
+    // with the opposite order because the grid drive rewrites them afterwards.
+    if (!inLiveGame) {
+        NetMenu::HideForLaunch("spectator playback");
+        ModeOwnership::SetPendingMenuRestore(false);
+        WriteMemory<uint8_t>(ADDR_STAGESEL_ENABLE, 1);
+        ModeOwnership::ResetCharSelFields();
+    }
+
+    // Re-assert what BeginLocalSpectatorLaunch would have set. On the re-entry
+    // path these almost certainly still hold from the previous match, but
+    // "almost certainly" is not a basis for the mode the next match runs in --
+    // and they are idempotent writes.
     WriteMemory<uint32_t>(ADDR_GAME_TYPE, GAMETYPE_VS_HUMAN);
     ModeOwnership::ClearVanillaNetplayFlags();
     WriteMemory<uint8_t>(ADDR_P1_CPU_FLAG, 0);
@@ -713,11 +728,13 @@ static bool TryWinScreenRematchReentry(const LockedMatchConfig& cfg,
     WriteMemory<uint32_t>(ADDR_SUB_STATE, 0u);
     WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0u);
     ModeOwnership::CallOriginalSetGameMode(MODE_PREMATCH_INTRO, 1);
+    s_launchIssued = true;
+    s_localMatchEverLaunched = true;
 
     SPLAY_LOG(-1,
-        "Rematch re-entry (%s) from mode %u: injected chars=(%u,%u) palettes=(%u,%u) "
+        "Direct match entry (%s) from mode %u%s: injected chars=(%u,%u) palettes=(%u,%u) "
         "stage=%u — entering mode 7 directly, skipping charsel/stagesel",
-        reason ? reason : "?", mode,
+        reason ? reason : "?", mode, inLiveGame ? "" : " [entered from menu]",
         (unsigned)cfg.p1_character, (unsigned)cfg.p2_character,
         (unsigned)cfg.p1_palette,  (unsigned)cfg.p2_palette,
         (unsigned)cfg.stage_id);
@@ -1701,6 +1718,10 @@ bool SpectatorPlayback_CopyPaletteOverrideBank(uint8_t gameSlot,
 
     *out = bank;
     return true;
+}
+
+bool SpectatorPlayback_OwnsLocalSimulation() {
+    return OwnsLocalSimulation();
 }
 
 void SpectatorPlayback_GetSnapshot(SpectatorPlaybackSnapshot* out) {
