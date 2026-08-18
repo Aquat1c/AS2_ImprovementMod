@@ -795,8 +795,72 @@
 // context (decomp hit-processing writes +0x1A4(b)/+0x1A5(b)/+0x1A6(w)/
 // +0x1A8(w); HUD expiry FF-fills all six bytes at its own cadence — B
 // showed ff-fill one frame before A). Mask widened to 8 bytes.
+// 2026-08-18 NARROWING (same class as the F2/F7g and F7h fixes): the round-up
+// to 8 swallowed entity+0x1AA/+0x1AB, which are SIMULATION state, not popup
+// display bytes.
+//
+// The render-owned popup record is exactly SIX bytes, and the decomp gives the
+// layout on both sides:
+//   SIM writes it once per hit (decomp:106761-106765)
+//       *(_BYTE *)(a1 + 420) = 0;      // +0x1A4 expiry clock
+//       *(_BYTE *)(a1 + 421) = v15;    // +0x1A5 combo hit count
+//       *(_WORD *)(a1 + 422) = v22;    // +0x1A6
+//       *(_WORD *)(a1 + 424) = v21;    // +0x1A8
+//   RENDER retires it by FF-filling those SAME six (sub_4C1F90,
+//   decomp:113443-113448 P1 / 113550-113556 P2)
+//       *(_BYTE *)(a1 + 41492) = -1;  *(_BYTE *)(a1 + 41493) = -1;
+//       *(_WORD *)(a1 + 41494) = -1;  *(_WORD *)(a1 + 41496) = -1;
+//   41492..41497 == entity+420..425. Nothing renders +426/+427.
+//
+// +0x1AA MUST BE HASHED -- it is the defensive-state flag with sim readers:
+//   decomp:107062  if (*(_BYTE *)(v3 + 426) == 1) LOWORD(v12) >>= 1;  // halves
+//                  the damage subtracted from HP at decomp:107069
+//   decomp:105871  if (*(_BYTE *)(a1 + 426) == 1) { hitstun /= 2;
+//                  knockback = 3*x/4; }
+// Masking it would hide a real desync in damage and hitstun -- "digest-masked"
+// is strictly weaker than "sim-free". Narrowed to 6.
 #define ENTITY_RENDER_ANIM_TIMER_MASK_OFF   0x01A4
-#define ENTITY_RENDER_ANIM_TIMER_MASK_SIZE  8
+#define ENTITY_RENDER_ANIM_TIMER_MASK_SIZE  6
+
+// The hit/combo popup DISPLAY record -- ONE ATOMIC SIX-BYTE UNIT. The sim
+// writes all four fields exactly once per hit and READS NONE of them; render
+// owns the lifetime (increments +0x1A4 per drawn frame, FF-fills all six at
+// 90). GameSnapshot_Restore must therefore hold back the WHOLE record or none
+// of it: holding back only the clock leaves a live counter pointing at an
+// FF-filled combo field, which is what draws "55 HIT" with a garbage damage
+// number after a rolled-back-past hit.
+#define ENTITY_POPUP_DISPLAY_BLOCK_OFF      0x01A4
+#define ENTITY_POPUP_DISPLAY_BLOCK_SIZE     6
+
+// HOW MUCH OF THAT RECORD THE RESTORE MAY HOLD BACK. Same six bytes, and the
+// question of whether it may be six was settled from the decomp rather than
+// assumed -- twice, because the first answer was wrong.
+//
+// A loose grep for "+ 424)" appears to show ~15 readers of +0x1A8 in the
+// sub_6Fxxxx cluster. They are FALSE POSITIVES of two kinds:
+//   1. `*(_WORD *)(a2 + 236) + 424` is sprite-ID arithmetic -- it reads a word
+//      at +236 and ADDS 424. Not a dereference of +424 at all.
+//   2. The cluster that really does dereference +424 is a different struct.
+//      Its largest offset anywhere is 424, so the whole object is ~428 bytes,
+//      against ENTITY_SIZE 0x1A90C (108812) with live fields at +1200, +1244
+//      and +0x1A650. It reads a DWORD there where the entity holds a WORD. And
+//      decisively, sub_6F49F0 calls THROUGH a1+4 as a vtable
+//      (`(**(int (__cdecl ***)(int,int,int))(a1 + 4))(a1, 1, 28)`) -- while
+//      entity+4 is the OPPONENT POINTER (Entity_CheckPriority,
+//      decomp:100441). That call would crash on an entity.
+//
+// With those excluded, a dereference-only scan leaves exactly two accessors of
+// entity+0x1A4..+0x1A9: sub_4A6710 (sim, writes once per hit, reads none) and
+// sub_4C1F90 (render, owns the lifetime). Holding the record back whole is
+// therefore safe, and holding back only part of it is what tore the popup into
+// "55 HIT" with a garbage damage number.
+//
+// (The 2026-08-18 frame-5099 desync briefly looked like evidence against this.
+// It was not: Windows' 30-minute monitor timeout slept the display mid-match,
+// D3D9 lost the device, recovery failed repeatedly with 0x8876086C, and both
+// game threads stalled ~1s per frame. The session is now held awake with
+// ES_DISPLAY_REQUIRED so that cannot confound a run again.)
+#define ENTITY_POPUP_HOLDBACK_SIZE          6
 // F7f follow-up (run 19-29-2x f2249): +0x7FC diverged next — the companion
 // state byte written when the +0x7F8 timer wraps. Then run 19-38-2x f3929
 // diverged at +0x800..+0x803 (the next dwords of the same region). The

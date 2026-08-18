@@ -270,54 +270,70 @@ bool GameSnapshot_Capture(GameSnapshot* snapshot, int32_t frame) {
     return true;
 }
 
-// ── Render-cadence expiry byte: captured, but NOT rewound on restore ──────
-// entity+0x1A4 is a ONE-BYTE display-expiry counter for the hit/combo popup.
-// Ownership is split and unambiguous in the decomp:
-//   SIM   writes it exactly once, to 0, to start the popup (decomp:106761,
-//         `*(_BYTE *)(a1 + 420) = 0;` inside the hit-processing path).
-//   RENDER owns its lifetime: sub_4C1F90 reads it and increments it once per
-//         drawn frame, retiring the popup at 90 (decomp:113438-113445 for P1
-//         at match+41492, 113546-113553 for P2 at match+150304):
-//              v13 = v12 + 1; *(_BYTE*)(a1+41492) = v13;
-//              if (v13 == 90) *(_BYTE*)(a1+41492) = -1;
-//   The simulation never READS it — every read in the decomp is inside that
-//   render function.
+// ── Render-cadence popup record: captured, but NOT rewound on restore ─────
+// The SIX bytes at entity+0x1A4 are ONE ATOMIC DISPLAY RECORD. Ownership is
+// split and unambiguous in the decomp:
+//   SIM   writes all four fields exactly once per hit (decomp:106761-106765)
+//         and READS NONE of them:
+//             *(_BYTE *)(a1 + 420) = 0;    // +0x1A4 expiry clock
+//             *(_BYTE *)(a1 + 421) = v15;  // +0x1A5 combo hit count
+//             *(_WORD *)(a1 + 422) = v22;  // +0x1A6
+//             *(_WORD *)(a1 + 424) = v21;  // +0x1A8
+//   RENDER owns the lifetime: sub_4C1F90 increments +0x1A4 once per DRAWN
+//         frame and retires by FF-filling the same six bytes at 90
+//         (decomp:113443-113448 P1 at match+41492, 113550-113556 P2).
 //
-// Because it advances at RENDER cadence but lives inside the captured region,
-// every restore rewinds the progress the renderer made. Under per-frame
-// depth-30 forcing it is set back 30 frames each frame and can never reach 90,
-// so the popup never retires — the operator's permanently stuck "HIT" and
-// leading combo digit, which persist across round transitions and appear ONLY
-// under rollback (A/B confirmed: absent at RB:0/30).
+// Two bugs, one cause. Rewinding the record every restore stalled the expiry
+// so the popup never retired (the stuck "HIT" and leading digit). Holding back
+// ONLY the clock replaced that with a TORN record: a rollback past the hit
+// restored the FF-filled combo field under a still-live counter, and the
+// renderer drew "55 HIT" with a garbage damage number. The record is atomic --
+// hold back all six or none.
 //
-// EXACTLY ONE BYTE PER ENTITY. An earlier attempt excluded the whole 8-byte
-// +0x1A4 window AND the 4-byte +0x7C4 block and desynced live at frame 58:
-// +0x7C4 is simulation state (Entity_UpdateHitReaction reads and writes it),
-// and +0x1A5..+0x1AB carry sim-written popup parameters. Only the single
-// render-owned counter is held back.
-constexpr size_t kDisplayExpiryByteP1 = kP1EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF;
-constexpr size_t kDisplayExpiryByteP2 = kP2EntityOff + ENTITY_RENDER_ANIM_TIMER_MASK_OFF;
-static_assert(ENTITY_RENDER_ANIM_TIMER_MASK_OFF == 0x01A4,
-              "display expiry byte offset moved");
+// SIX, NEVER EIGHT. The attempt that excluded the whole 8-byte window (plus
+// the 4-byte +0x7C4 block) desynced live at frame 58, and the reason is now
+// established: +0x1AA/+0x1AB are SIMULATION state -- the defensive-state flag
+// that halves damage (decomp:107062/107069) and hitstun (decomp:105871) -- and
+// +0x7C4 is read and written by Entity_UpdateHitReaction. The static_assert
+// below is what stops that from recurring: every byte we hold back from the
+// restore must also be masked out of the digest, or the two peers' live memory
+// legitimately differs and the hash reports a desync that is not one.
+constexpr size_t kPopupBlockP1   = kP1EntityOff + ENTITY_POPUP_DISPLAY_BLOCK_OFF;
+constexpr size_t kPopupBlockP2   = kP2EntityOff + ENTITY_POPUP_DISPLAY_BLOCK_OFF;
+constexpr size_t kPopupBlockSize = ENTITY_POPUP_HOLDBACK_SIZE;
+static_assert(ENTITY_POPUP_DISPLAY_BLOCK_OFF == ENTITY_RENDER_ANIM_TIMER_MASK_OFF &&
+              ENTITY_POPUP_HOLDBACK_SIZE <= ENTITY_RENDER_ANIM_TIMER_MASK_SIZE,
+              "every restore-held-back popup byte must also be digest-masked");
+static_assert(ENTITY_POPUP_HOLDBACK_SIZE <= ENTITY_POPUP_DISPLAY_BLOCK_SIZE,
+              "holdback cannot exceed the display record");
+static_assert(kPopupBlockP1 + kPopupBlockSize <= kPopupBlockP2,
+              "popup holdback runs must not overlap");
 
 size_t GameSnapshot_RestoreExcludedRun(size_t mainOffset) {
-    if (mainOffset == kDisplayExpiryByteP1 || mainOffset == kDisplayExpiryByteP2) {
-        return 1;
+    // Run-relative: answers anywhere INSIDE a held-back run, not just at its
+    // first byte. While the run was one byte those were indistinguishable.
+    if (mainOffset >= kPopupBlockP1 && mainOffset < kPopupBlockP1 + kPopupBlockSize) {
+        return kPopupBlockP1 + kPopupBlockSize - mainOffset;
+    }
+    if (mainOffset >= kPopupBlockP2 && mainOffset < kPopupBlockP2 + kPopupBlockSize) {
+        return kPopupBlockP2 + kPopupBlockSize - mainOffset;
     }
     return 0;
 }
 
 uint32_t GameSnapshot_MainFingerprintSkippingExcluded(const uint8_t* mainBytes) {
     if (!mainBytes) return 0;
-    // Two one-byte holes; hash the three spans between them so a captured
-    // buffer and live memory agree even though the restore skips those bytes.
-    const size_t a = kDisplayExpiryByteP1 < kDisplayExpiryByteP2
-                         ? kDisplayExpiryByteP1 : kDisplayExpiryByteP2;
-    const size_t b = kDisplayExpiryByteP1 < kDisplayExpiryByteP2
-                         ? kDisplayExpiryByteP2 : kDisplayExpiryByteP1;
+    // Two kPopupBlockSize-byte holes; hash the three spans between them so a
+    // captured buffer and live memory agree even though the restore skips
+    // them. Missing this half is what produced the historical
+    // "BASELINE RESTORED with CHECKSUM MISMATCH" false alarm.
+    const size_t a = kPopupBlockP1 < kPopupBlockP2 ? kPopupBlockP1 : kPopupBlockP2;
+    const size_t b = kPopupBlockP1 < kPopupBlockP2 ? kPopupBlockP2 : kPopupBlockP1;
     uint64_t h = Block64(mainBytes, a);
-    h = Block64_Update(h, mainBytes + a + 1, b - (a + 1));
-    h = Block64_Update(h, mainBytes + b + 1, kMainSize - (b + 1));
+    h = Block64_Update(h, mainBytes + a + kPopupBlockSize,
+                       b - (a + kPopupBlockSize));
+    h = Block64_Update(h, mainBytes + b + kPopupBlockSize,
+                       kMainSize - (b + kPopupBlockSize));
     return Block64_Fold32(h);
 }
 
@@ -326,16 +342,16 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
         return false;
     }
 
-    // Preserve the renderer's expiry progress across the bulk restore.
-    uint8_t liveExpiryP1 = 0;
-    uint8_t liveExpiryP2 = 0;
-    bool liveExpiryValid = false;
+    // Preserve the renderer's whole popup record across the bulk restore.
+    uint8_t livePopupP1[kPopupBlockSize] = {};
+    uint8_t livePopupP2[kPopupBlockSize] = {};
+    bool livePopupValid = false;
     __try {
-        liveExpiryP1 = *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP1);
-        liveExpiryP2 = *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP2);
-        liveExpiryValid = true;
+        memcpy(livePopupP1, (const void*)(kMainStart + kPopupBlockP1), kPopupBlockSize);
+        memcpy(livePopupP2, (const void*)(kMainStart + kPopupBlockP2), kPopupBlockSize);
+        livePopupValid = true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        liveExpiryValid = false;
+        livePopupValid = false;
     }
 
     __try {
@@ -348,10 +364,10 @@ bool GameSnapshot_Restore(const GameSnapshot* snapshot) {
     // Hand the renderer its own counter back, un-rewound. A popup the sim has
     // just (re)started reads 0 from the snapshot on both sides anyway, so a
     // fresh popup is unaffected; only an in-flight expiry keeps its progress.
-    if (liveExpiryValid) {
+    if (livePopupValid) {
         __try {
-            *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP1) = liveExpiryP1;
-            *(volatile uint8_t*)(kMainStart + kDisplayExpiryByteP2) = liveExpiryP2;
+            memcpy((void*)(kMainStart + kPopupBlockP1), livePopupP1, kPopupBlockSize);
+            memcpy((void*)(kMainStart + kPopupBlockP2), livePopupP2, kPopupBlockSize);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }

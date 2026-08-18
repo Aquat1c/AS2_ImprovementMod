@@ -119,6 +119,13 @@ void SpectatorClient_SetPlaybackFrame(int32_t rb_frame);
 SpectatorClientState SpectatorClient_GetState();
 void SpectatorClient_GetSnapshot(SpectatorClientSnapshot* out);
 void SpectatorClient_GetDiscoverySnapshot(SpectatorDiscoverySnapshot* out);
+/// Drop the MatchState latch so the next PreMatchState re-arms the early
+/// bootstrap. Without this, s_haveMatchState stays true from the first match
+/// onward and the early path (have_pre_match_state && !have_match_state) can
+/// never fire again -- every rematch silently falls back to the slow
+/// buffer-then-fast-forward route.
+void SpectatorClient_ArmForNextMatch(const char* reason);
+
 bool SpectatorClient_GetFrameInputs(int32_t rb_frame, uint16_t* outP1, uint16_t* outP2);
 /// M7 (S-4): true when the buffered record exists; *outHasHash reports
 /// whether the host stamped a truncated confirmed pre-state digest on it

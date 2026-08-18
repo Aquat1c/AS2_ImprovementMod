@@ -33,6 +33,13 @@
 #define INPUT_L2        0x1000
 #define INPUT_R2        0x2000
 
+// Reserved, NON-GAME bit: the deterministic menu/ESC hold used to leave a
+// netplay match. It rides the ordinary uint16_t input word, so it is part of
+// the CONFIRMED input stream -- both players and every spectator observe it on
+// exactly the same simulation frame. g_buttonMasks only maps 0x0001..0x0200
+// to the game's ten button slots, so this bit can never reach the game.
+#define INPUT_MENU_HOLD 0x4000
+
 // Combined inputs for convenience
 #define INPUT_ANY_DIR   (INPUT_UP | INPUT_DOWN | INPUT_LEFT | INPUT_RIGHT)
 #define INPUT_ANY_BTN   (INPUT_A | INPUT_B | INPUT_C | INPUT_D)

@@ -2981,3 +2981,243 @@ state, only under deep skew). Proposed fix: split the mask to leave
 `+0x4C4..+0x4DB`. Deliberately NOT applied mid-run — narrowing a mask on
 speculation could flood a validation soak with false desyncs, and the new
 per-frame replay self-test may name the byte first.
+
+> **RESOLVED 2026-08-18** (see "Two more masks that were sized by symptom, not
+> by structure", M2, below). The lead was correct, and the caution was the
+> right call at the time — but it was resolvable by reading rather than by
+> soaking. `Entity_CheckPriority` is the ONLY accessor of either dword (6
+> references to +1244, 2 to +1248, all in that one function), and `sub_4C47C0`
+> touches no literal offset in the whole window, so the render-churn rationale
+> never covered these bytes. Unmasked exactly those 8 bytes and validated live:
+> 2 matches, 26,140 frames, 9,166 host-side rollbacks to depth 5, `desync=0` on
+> both peers, zero false positives. Note this was a DETECTION gap, not a desync
+> source — masking cannot cause divergence, only hide it — so it does not by
+> itself explain B1/F8; it means any such divergence was previously invisible.
+
+---
+
+## 2026-08-18 — determinism, presentation and lifecycle: eleven defects, each verified live
+
+A single session's chain, driven by operator reports. Every fix below was
+confirmed by measurement in a live two-instance session, not by reasoning
+alone; the three that turned out wrong are recorded with what disproved them.
+
+### Determinism (real desync sources)
+
+**D1. A live DirectSound query gated HASHED state.** `Entity_UpdateAudio`
+branches on `Audio_IsPlaying` (0x62C840 — the playback cursor) and on the false
+branch writes `audioStatePtr[1]/[2]` at match+149184/149188. That address is in
+the match region below P2's entity: hashed, unmasked. Two peers whose buffers
+sit at different playback positions take different branches and write different
+hashed state. Live desync f13319 carried exactly that fingerprint — rng
+identical, hp identical, state hash different. Fixed with qoh99's
+`DeterministicAudioPolicy` model: never consult the cursor for a status the
+simulation consumes; expire voices on a canonical TICK
+(`Audio_Play_Wrapper` 0x5D3410 hooked for start stamps, `Audio_IsPlaying`
+answered as frame arithmetic). Scoped to the simulation's handle class
+(`(h & 0x78000000) == 0x10000000`) — the audio library asks about its own
+0x18000000 handles and branches on the -1 the real function returns.
+
+**D2. Sound handle VALUES carry a process-global allocation serial.**
+`*(_DWORD *)*v3 = dword_9D0454++` is baked into every handle
+(decomp:321905/321934). 204 of them (816 B) at match+976..1791 plus the
+announcer's at match+712..763 sat hashed and unmasked. Peers whose processes
+allocated a different NUMBER of sounds differ there with no gameplay meaning.
+Invisible to same-machine testing — two instances of one build share an
+allocation history. Digest-masked (F4/F7h rationale); the span proved exactly
+adjacent to the F7c mask (0x3D0 + 0x330 == 0x700) so they merged.
+
+**D3. The superbg mask hid simulation bytes.** entity+0x4C4..+0x73B covered
++1236..+1243 — hitstop/pause countdowns the simulation branches on
+(decomp:43968 `if ( !*(_BYTE *)(pEntity + 1238) || *(_BYTE *)(pEntity + 1242) )`,
+decomp:111867). The render function the mask exists for (sub_4C47C0) never
+touches +0x4C4..+0x4DB. Window split so those eight bytes are hashed again.
+This can now REPORT divergence that previously went undetected — the point.
+
+### Presentation under rollback
+
+**P1. Stuck HIT / combo digit.** entity+0x1A4 is a one-byte popup expiry
+counter with split ownership: the sim writes it once, to 0, to start the popup
+(decomp:106761); the RENDER pass owns its lifetime, incrementing per drawn
+frame and retiring at 90 (sub_4C1F90, decomp:113438-113445 P1 /
+113546-113553 P2). The simulation never reads it. Living inside the captured
+region, every restore wiped the renderer's progress — under depth-30 forcing it
+was set back 30 frames per frame and could never reach 90. Held back across the
+bulk restore, ONE byte per entity. Verified by watching the counter cycle
+255 -> 0 -> 59 -> 36 -> ... -> 5 -> 255 where it had been pinned near 0.
+The asymmetry the operator described (leading digit and label frozen, last
+digit fine) is structural: only the ones digit's alpha and quad derive from the
+age.
+
+**P2. Sidebar flashes ran backwards.** ADDR_FRAME_COUNTER (0x81635C) is the
+outer-PASS counter with zero simulation readers, but every critical-state flash
+takes its alpha from `-6 - 25 * (*(game+4) % 11)`. Restoring it reversed that
+11-step ramp by the rollback depth on every correction. Captured still; the
+live write-back dropped. Distinct from ADDR_FRAME_DISPLAY (0x816494), which IS
+sim-read and stays restored.
+
+### Input latency and liveness
+
+**L1. The producer sealed 28-40 frames past the sim** (run 23-25, 129 ms).
+SealLocal is permanent, so those frames' inputs were already decided and every
+later press was discarded — about a second of dead input that never recovered,
+because produced_frontier cannot regress and the engine survives match
+boundaries. Its only bound was measured against the peer's ACK (a bandwidth
+bound), which at that RTT trailed 20-30 frames past our own sim.
+
+**L2. ...and capping that unconditionally DEADLOCKED both peers** (run 01-34):
+sim_fps=0.00, hold_pred=61/s, sent=104 vs recv=28722, both reporting
+"opponent's game stopped responding". Producing ahead is the only thing that
+breaks a mutual stall. Final rule: the gate is not how far ahead, it is
+whether the sim can still advance. Unblocked -> the delay window is the whole
+entitlement; blocked at the prediction limit -> peer capacity applies and we
+keep feeding. Both directions are pinned by tests so neither fix can undo the
+other.
+
+### Lifecycle (session-loss paths)
+
+**S1. The F-7 guard terminated sessions for RECOVERING.** Every non-lockstep
+exit announced CharselRestart — the same value the lockstep decline uses — so
+Rematch-vs-CharselRestart read as "divergent lockstep streams" whenever one
+peer merely recovered. Added PostMatchIntentWire::RecoveryRestart: routes
+identically, is not lockstep-derived, cannot trip the guard.
+
+**S2. A 45 s wall clock preempted a 71 s frame clock.** The continue prompt's
+own deterministic timeout (640 consumed frames to enter + 3600 to decide) was
+unreachable behind winscreen_sync's 45 s handoff timeout. Suppressed while the
+prompt holds the finalize.
+
+**S3/S4. The transition barrier had no boundary identity.** Receive had no
+staleness test, and the boundary-scoped slots were cleared on exactly one path
+(ladder-complete), so any other exit left them dirty and the NEXT boundary
+could be committed by the PREVIOUS one's proposal; and Propose keyed
+idempotence on intent alone, silently swallowing a new boundary's proposal.
+Fixed with a boundary generation in the existing PhaseTransition pad:
+BeginBoundary bumps it and clears both slots unconditionally from
+ArmMatchEndLadder; Propose keys on (generation, intent); receive rejects older
+generations (acked, never fatal).
+
+### Cost
+
+Rollback transactions got ~8x cheaper. Measured per replayed frame, before and
+after, from the forensic trace: 457.8 us (436.5 save+hash | 82.8 restore |
+18.6 sim) -> 57.4 us (42.5 | 44.2 | 13.5). Two causes, both the serial-hash
+pattern qoh99 documents in StateProofDigest.h:
+  - Block64 folded 8 bytes per step with one 64-bit multiply, a pure latency
+    chain synthesised from three 32-bit multiplies on this target. Replaced
+    with four independent 32-bit lanes: hash p99 83 us -> 25 us.
+  - CalcCRC32 (byte-at-a-time table CRC) ran over the FULL state twice per
+    frame — once inside every GameSnapshot_Capture for a diagnostic field, once
+    per visible frame in RollbackDebug. At forced depth 30 the first alone is
+    720 ms/s. Both now use the four-lane fingerprint; CalcCRC32 is untouched
+    for cold paths.
+The game's own tick is 18 us. Everything else was our bookkeeping.
+
+### Test integrity (green runs that would have meant nothing)
+
+- `match_duration_sec` was a safety timeout that called
+  AutoConnectHarness_Shutdown() and went to Failed — killing the fighting AI
+  PERMANENTLY. On a multi-match soak the driver died at the first timeout and
+  every later "match" was two idle characters reporting a clean run. It now
+  releases the match and keeps the driver alive.
+- Two engine tests were asserting the OPPOSITE of their intent: both drove the
+  producer without feeding remote actuals, so their engine was BLOCKED, where
+  running ahead is required.
+- `as2_stress.cfg` was opened by relative path, so forcing only armed when the
+  process CWD happened to be the game folder.
+- The GUI had no forced-rollback control at all, only misprediction reporting —
+  which is why driving it from the panel produced "rollbacks on misprediction
+  and nothing else".
+
+### Wrong turns, and what disproved them
+
+- Excluding the whole +0x1A4 window AND +0x7C4 from restore: desynced live at
+  frame 58. +0x7C4 is simulation state (Entity_UpdateHitReaction). Lesson:
+  "digest-masked" is strictly weaker than "sim-free".
+- "Effects age at render cadence": disproved — Effect_Update is called from
+  sub_4C9B50, the main simulation update.
+- "We don't suppress render during replay like EfzRevival/qoh99": disproved by
+  measurement — Match_RenderPlayers runs during_replay=0 live=60 while 2371
+  game ticks/s replay.
+
+### New capabilities
+
+- **Link emulator** (src/net/link_emulator.cpp): one-way latency, jitter and
+  loss applied to EVERY inbound transport event in the worker, so gameplay,
+  frontend, pregame and session traffic all see the same link. Monotonic
+  release (jitter never reorders — we sit above ENet's reliability layer);
+  loss only on unreliable packets (a reliable drop above ENet is
+  unrecoverable); overflow released early and COUNTED. 83 unit checks.
+- **TimeProbe was never initialised.** TimeProbe_Init() was defined and never
+  called, so s_initialized stayed false and no probe was ever sent — every
+  session in this project's history ran the delay policy on its ENet fallback
+  with rtt_p90=0, rtt_p95=0, jitter95=0. That is why the emulator first showed
+  RTT=6 ms while demonstrably holding packets. With it initialised, 75 ms
+  one-way measures as RTT=150.0 ms through the same mechanism a real link uses.
+- **HUD honesty**: PING now shows the delay policy's measurement (what the
+  netcode reacts to) rather than ENet's internal estimate; a
+  `FORCE:<depth>/<cfg> @<Hz>` badge; a real forced-rollback control with the
+  effective depth, why it differs, and executed transactions/s.
+- **Local replay determinism self-test** (qoh99 model): CommitReplayFrame
+  compares the replayed pre-state hash against the original whenever the
+  inputs are byte-identical AND the whole replayed prefix has been identical —
+  that scoping matters, since under real prediction depth corrections are the
+  norm and the unscoped version reported ~600 false positives.
+- **Autoconnect spectator role**: role=spectator + spectate_target, so the
+  acceptance matrix runs with a spectator attached. Previously that required
+  driving the menu by hand, which means spectator streaming alongside live
+  gameplay had never been exercised by an automated run.
+
+### Two more masks that were sized by symptom, not by structure
+
+Both found while preparing the unattended acceptance run; both are the same
+trap as D3, and neither was visible to any test we own.
+
+**M1. F7h masked 14 entries of a 99-entry table.** The window was sized when a
+static divergence appeared at p1_entity+0x1A650..+0x1A68F as P2 hit 50 hp (KO
+announcer voice); 64 bytes covered the symptom. The structure: `sub_54AA00`
+fills a per-entity VOICE HANDLE TABLE at entity+0x1A658 at MODE_MATCH substate
+0 (decomp:117591-117610) with `N = dword_73DC9C[charId]` entries, N in 49..99
+across the 22 characters (decomp:14586) — so the table reaches +0x1A7E4 and
+entries 14..N-1 were hashed and unmasked. Every entry carries the
+process-global allocation serial `dword_9D0454++` (decomp:321907-321935),
+which has no reset site anywhere in the binary, so two peers whose processes
+have loaded a different NUMBER of sounds hold different VALUES for the
+identical voice. Same class as D2, and same reason it survived: two instances
+of one build share an allocation history, so same-machine testing can never
+produce it. Widened to 0x194 after a decomp-wide reader/writer scan of
+entity+[0x1A658,0x1A7E4) — by match-relative, dword-scaled and absolute forms —
+returned ONLY the filler.
+
+**M2. The superbg mask swallowed the attack-trade priority pair.**
+`Entity_CheckPriority` (sub_49ECB0, decomp:100433-100479) writes entity+1244 =
+priority and entity+1248 = 0, then takes the opponent via
+`result = *(_DWORD *)(entity + 4)` and both READS AND WRITES the opponent's
++1244/+1248 to resolve a simultaneous attack by Y-then-X position. That is
+cross-entity simulation state deciding who wins a trade, and it sat inside the
+F2 high window — so a divergence there could not be seen by the desync hash at
+all. Attribution over the whole decomp: +1244 has exactly 6 references and
++1248 exactly 2, ALL inside Entity_CheckPriority; there is no render-side
+writer. And `sub_4C47C0`, the render function the mask is named for, touches no
+literal offset in +0x4C4..+0x73B at all — the original 632-byte window was
+never justified by that function's own accesses. Only the eight verified bytes
+were unmasked; the rest stays masked rather than narrowed on speculation,
+merging the hashed gaps into one contiguous [+0x4D4,+0x4E4).
+
+The general lesson, now paid for three times: **a mask sized to make a symptom
+go away will be the wrong size.** Every mask needs a structural bound — what
+object actually lives there, how big can it get — and a reader/writer scan
+before it is trusted.
+
+### A comparison that could never match
+
+`ROLLBACK BASELINE RESTORED` reported `CHECKSUM MISMATCH` on every baseline
+restore. Not the restore-excluded byte, which was the obvious suspect: the
+capture side (`SnapshotChecksum`) combines its parts with `StateFingerprint32`
+while the live side (`ComputeMainChecksum`) still finished with `CalcCRC32`.
+When the four-lane fingerprint landed in 821e6b9, only the FIRST call in each
+function was replaced — so for every run since, the two sides had been
+comparing the outputs of two different hash functions. Both now use the same
+combine and both skip the bytes `GameSnapshot_Restore` deliberately leaves
+alone. Found by the scanner's "anything unrecognised" bucket rather than by a
+targeted search, which is the argument for having that bucket at all.

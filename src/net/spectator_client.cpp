@@ -1906,6 +1906,21 @@ bool SpectatorClient_StartConnect(const char* endpoint) {
     return true;
 }
 
+void SpectatorClient_ArmForNextMatch(const char* reason) {
+    if (!s_haveMatchState && !s_havePreMatchState) return;
+    SCLIENT_LOG(LOG_INFO, -1, "[Spectator] Arming for next match (%s): dropping MatchState latch",
+                reason ? reason : "?");
+    s_haveMatchState = false;
+    s_matchActive = false;
+    s_matchId = 0;
+    LockedMatchConfig_Clear(&s_matchConfig);
+    s_streamConfigCrc = 0;
+    s_havePreMatchState = false;
+    s_preMatchId = 0;
+    LockedMatchConfig_Clear(&s_preMatchConfig);
+    s_preMatchConfigCrc = 0;
+}
+
 void SpectatorClient_Disconnect(const char* reason) {
     if (s_peer) {
         Spectator::DisconnectPayload payload{};

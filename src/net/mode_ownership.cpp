@@ -40,7 +40,7 @@ namespace NetMenu {
     bool IsMenuActive();
     void HandleNetworkSelected();
     void HandleDisconnection(const char* reason);
-    void HandlePostMatchReturn();
+    void HandlePostMatchDirectCharsel(const char* reason);
     void RenderFrame();
     void RenderMainMenuReturnFade();
 }
@@ -275,8 +275,12 @@ static int __cdecl Hook_SetGameMode(int mode, char fade) {
             // Sanitize immediately after transition
             WriteU32(ADDR_GAME_TYPE, GAMETYPE_VS_HUMAN);
             ModeOwnership::ClearVanillaNetplayFlags();
-            // Signal PostMatch to menu controller
-            NetMenu::HandlePostMatchReturn();
+            // Straight to character select. The post-match menu used to sit
+            // here asking a question with only one useful answer; every other
+            // route is reachable from character select (hold the menu key to
+            // leave). This is also the path the menu-hold match abort takes,
+            // so a deliberate exit and a natural match end land identically.
+            NetMenu::HandlePostMatchDirectCharsel("match end route");
             return result;
         }
     }

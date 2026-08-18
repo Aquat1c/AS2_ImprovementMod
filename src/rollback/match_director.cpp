@@ -56,6 +56,7 @@
 #include "net/charsel_sync.h"
 #include "net/winscreen_sync.h"
 #include "net/pause_handler.h"
+#include "net/session_exit.h"
 #include "net/spectator_runtime.h"
 #include "net/netplay_palette_runtime.h"
 #include "patches/charsel_palette_select.h"
@@ -1145,6 +1146,7 @@ void OnlineWiring_Init() {
     Net::SetTracker_Init();
     Net::WinScreenSync_Init();
     Net::PauseHandler_Init();
+    Net::SessionExit_Init();
 
     LOG_INFO("[MatchDirector] Initialized");
     NetplayLog_Write("WIRING", -1, "MatchDirector initialized (OnlineWiring facade)");
@@ -1333,6 +1335,11 @@ void OnlineWiring_FrameUpdate() {
     if (Net::MatchLifecycle_IsMatchOwned()) {
         Net::PauseHandler_FrameUpdate();
     }
+    // SessionExit is deliberately NOT driven from here: MatchLifecycle_IsMatchOwned()
+    // is MATCH-scoped, so this site never runs at character select -- where the
+    // pause block and the quit gesture are both required. It runs from
+    // ModOnFrame instead, every frame in every mode, and gates itself on
+    // Session_IsConnected().
 
     Net::ChurnPause_FrameUpdate(
         s_gameplayActive && s_rollbackActive,

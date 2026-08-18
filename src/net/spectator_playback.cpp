@@ -641,6 +641,43 @@ static uint32_t ResolveBootstrapOrdinal(const SpectatorClientSnapshot& client) {
         : (client.pre_match_ordinal != 0 ? client.pre_match_ordinal : 1);
 }
 
+// Re-enter the next match from the WIN SCREEN using the game's own rematch
+// route, instead of driving the character- and stage-select UI again.
+//
+// A player rematch works because mode 7 re-reads the LIVE charsel globals
+// rather than the selection screen (continue_flow.cpp: "Mode 7 re-reads the
+// live charsel globals"). So the spectator can inject the next match's
+// selection straight into those globals and take the same route: win screen
+// sub 5 (STORY_SUB_EVENT_SETUP) -> 36 -> mode change. Character select and
+// stage select never run, which removes the whole forced-UI drive
+// (ForceSelectionLocked / ForceBootstrapStageGridConfirm) from every match
+// after the first.
+static bool TryWinScreenRematchReentry(const LockedMatchConfig& cfg, const char* reason) {
+    if (GetGameMode() != MODE_WINSCREEN) return false;
+
+    WriteMemory<uint32_t>(ADDR_CHARSEL_P1_CHAR_ID, (uint32_t)cfg.p1_character);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_P1_PALETTE,  cfg.p1_palette);
+    WriteMemory<uint32_t>(ADDR_CHARSEL_P2_CHAR_ID, (uint32_t)cfg.p2_character);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_P2_PALETTE,  cfg.p2_palette);
+    WriteMemory<uint8_t>(ADDR_CHARSEL_STAGE_ID,    cfg.stage_id);
+
+    ApplySpectatorMatchSettings(cfg, reason ? reason : "spectator winscreen re-entry");
+    DetVer_SetRngSeed(cfg.session_seed);
+
+    WriteMemory<uint32_t>(ADDR_MATCH_PHASE_TIMER, 0u);
+    WriteMemory<uint32_t>(ADDR_SUB_STATE, (uint32_t)STORY_SUB_EVENT_SETUP);
+    WriteMemory<uint32_t>(ADDR_SUB_STATE_TIMER, 0u);
+
+    SPLAY_LOG(-1,
+        "Win-screen re-entry (%s): injected chars=(%u,%u) palettes=(%u,%u) stage=%u "
+        "— taking the rematch route, skipping charsel/stagesel",
+        reason ? reason : "?",
+        (unsigned)cfg.p1_character, (unsigned)cfg.p2_character,
+        (unsigned)cfg.p1_palette,  (unsigned)cfg.p2_palette,
+        (unsigned)cfg.stage_id);
+    return true;
+}
+
 static void BeginLocalSpectatorLaunch(const SpectatorClientSnapshot& client) {
     NetMenu::HideForLaunch("spectator playback");
     ModeOwnership::SetPendingMenuRestore(false);
@@ -1355,12 +1392,26 @@ void SpectatorPlayback_FrameUpdate() {
             return;
         }
 
+        // Hold on the WIN SCREEN between matches. Bouncing out to the online
+        // menu tore down the whole local match context, which is why the next
+        // match had to rebuild it through the character/stage select drive.
+        // Staying here keeps that context alive so the next match can re-enter
+        // through the rematch route.
+        if (OwnsLocalSimulation() && GetGameMode() == MODE_WINSCREEN) {
+            SpectatorClient_ArmForNextMatch("match ended, holding on win screen");
+            ClearSpectatorPaletteHints();
+            TransitionState(SpectatorPlaybackState::WaitingNextMatch,
+                "Match over. Waiting for the next game.");
+            return;
+        }
+
         if (OwnsLocalSimulation()) {
             NetMenu::ShowMenuAfterExternalLaunch("Finished watching the match.");
         }
 
         ResetLocalSimulationState();
         ClearSpectatorPaletteHints();
+        SpectatorClient_ArmForNextMatch("match ended");
         TransitionState(SpectatorPlaybackState::WaitingNextMatch,
             "Waiting for the next match.");
         return;

@@ -17,6 +17,7 @@
 #include "net/match_lifecycle.h"
 #include "net/netplay_palette_runtime.h"
 #include "net/pause_handler.h"
+#include "net/session_exit.h"
 #include "net/pregame_sync.h"
 #include "net/session2.h"
 #include "net/sync_trace.h"
@@ -291,6 +292,14 @@ void PacketRouter_OnPacket(PacketType type, const void* payload, size_t payloadL
 
         case PacketType::PauseQuit:
             PauseHandler_OnRemotePauseQuit();
+            break;
+
+        case PacketType::MatchAbortToCharsel:
+            SessionExit_OnRemoteAbortToCharsel();
+            break;
+
+        case PacketType::SessionQuitGraceful:
+            SessionExit_OnRemoteQuit();
             break;
 
         default:

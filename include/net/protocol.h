@@ -83,8 +83,14 @@ enum class PacketType : uint16_t {
     CharSelFrameInput = 40, // Per-frame charsel input with redundancy
 
     // Win screen / pause
-    PauseQuit           = 42,  // Pause menu quit signal
+    PauseQuit           = 42,  // Pause menu quit signal (vanilla path, legacy)
     WinScreenFrameInput = 43,  // Mode 9 lockstep frame input with redundancy
+    // Deterministic session exit (0.7). The vanilla pause menu is blocked for
+    // the whole session; these carry the replacement gesture. Both are
+    // reliable on CHANNEL_CONTROL and zero-payload -- the ACTION is the
+    // message, so there is nothing to disagree about.
+    MatchAbortToCharsel = 44,  // menu-hold in a match: both peers -> charsel
+    SessionQuitGraceful = 45,  // menu-hold at charsel: quit the session
 
     // Palette metadata control-plane (reliable, channel 0)
     PaletteConfig      = 50,
@@ -931,6 +937,8 @@ inline const char* PacketTypeName(PacketType type) {
         case PacketType::InputStream:     return "InputStream";
         case PacketType::CharSelFrameInput:   return "CharSelFrameInput";
         case PacketType::PauseQuit:           return "PauseQuit";
+        case PacketType::MatchAbortToCharsel: return "MatchAbortToCharsel";
+        case PacketType::SessionQuitGraceful: return "SessionQuitGraceful";
         case PacketType::WinScreenFrameInput: return "WinScreenFrameInput";
         case PacketType::PaletteConfig:       return "PaletteConfig";
         case PacketType::PaletteData:         return "PaletteData";

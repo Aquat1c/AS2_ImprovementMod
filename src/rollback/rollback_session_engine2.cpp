@@ -31,6 +31,7 @@
 #include "net/session_manager.h"
 #include "net/session2.h"
 #include "net/spectator_runtime.h"
+#include "net/session_exit.h"
 #include "net/time_probe.h"
 #include "replay/replay_runtime.h"
 #include "patches/frame_scheduler.h"
@@ -318,6 +319,10 @@ void DrainConfirmSeam() {
             const int32_t gameAbs = s_frameOriginAbs + matchRel;
             Net::SpectatorRuntime_OnConfirmedFrame(matchRel, gameAbs,
                 cf.inputs[0], cf.inputs[1], cf.pre_state_hash);
+            // Same confirmed words the spectator archive gets: the exit
+            // gesture is counted here so every observer agrees on the frame.
+            Net::SessionExit_NoteConfirmedInputs(matchRel,
+                cf.inputs[0], cf.inputs[1]);
             Replay::ReplayRuntime_OnConfirmedFrame(cf.epoch, gameAbs,
                 cf.inputs[0], cf.inputs[1], cf.pre_state_hash);
         }
@@ -747,6 +752,11 @@ void RollbackSession_BeginFrame(uint16_t localInput) {
         localInput = s_injectedInput;
         s_hasInjectedInput = false;
     }
+    // The deterministic exit gesture rides the input word itself, so it is
+    // sealed, transmitted, confirmed and replayed exactly like a button. It
+    // reaches no game button slot (g_buttonMasks covers 0x0001..0x0200 only).
+    localInput |= Net::SessionExit_LocalMenuBit();
+
     s_lastLocalSample = localInput;
 
     RefreshLifecycleWindow();

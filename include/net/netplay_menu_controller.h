@@ -47,6 +47,17 @@ void HandleDisconnection(const char* reason);
 /// Called when a match ends and the game returns to post-match state.
 void HandlePostMatchReturn();
 
+/// Match ended with a live session: go STRAIGHT to character select.
+/// Replaces the post-match menu, which asked a question with only one useful
+/// answer -- every other route is now reachable from character select itself
+/// (hold the menu key there to leave).
+void HandlePostMatchDirectCharsel(const char* reason);
+
+/// Deliberate, user-initiated session quit. Tears the session down and returns
+/// to the online menu WITHOUT an error box, and suppresses the disconnect
+/// notices that the teardown itself provokes.
+void HandleGracefulSessionQuit(const char* reason);
+
 // ============================================================================
 // Queries
 // ============================================================================

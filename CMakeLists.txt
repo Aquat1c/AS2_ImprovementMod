@@ -473,6 +473,7 @@ set(NET_SOURCES
     src/net/match_lifecycle.cpp
     src/net/winscreen_sync.cpp
     src/net/pause_handler.cpp
+    src/net/session_exit.cpp
     src/net/sync_policy.cpp
     src/net/delay_policy.cpp
     src/net/player_side_mapping.cpp

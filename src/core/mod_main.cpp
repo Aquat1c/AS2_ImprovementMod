@@ -35,6 +35,7 @@
 #include "rollback/stress_hooks.h"
 #include "rollback/online_wiring.h"
 #include "net/spectator_runtime.h"
+#include "net/session_exit.h"
 #include "net/spectator_client.h"
 #include "net/spectator_playback.h"
 #include "net/netplay_palette_runtime.h"
@@ -843,6 +844,11 @@ __declspec(dllexport) void ModOnFrame() {
 
     // Run scripted input runner (injects overrides before SDL update)
     SIR_OnFrame();
+
+    // Session exit gesture + pause block: every frame, EVERY mode (gameplay,
+    // character select, loading), because a local pause stalls the peer
+    // wherever it happens. Self-gating on Session_IsConnected().
+    Net::SessionExit_FrameUpdate();
 
     Net::SpectatorRuntime_FrameUpdate();
     Net::SpectatorClient_FrameUpdate();

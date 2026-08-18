@@ -4587,8 +4587,57 @@ void HandleNetworkSelected() {
     OpenMenu();
 }
 
+// Set while a DELIBERATE quit is tearing the session down. The pregame
+// watchdog (match_setup.cpp:2202) sees the session object vanish and reports
+// "Session lost during pre-game sync" -- accurate, but it was us, and an error
+// box for an intentional action is simply wrong. Window rather than a bool
+// because several subsystems notice the teardown at their own pace.
+static DWORD s_gracefulQuitUntilMs = 0;
+
 void HandleDisconnection(const char* reason) {
+    if (s_gracefulQuitUntilMs != 0 && GetTickCount() < s_gracefulQuitUntilMs) {
+        LOG_NETPLAY(LOG_INFO,
+            "[NetMenu] Disconnect notice suppressed (deliberate quit in progress): %s",
+            reason ? reason : "?");
+        return;
+    }
     OpenDisconnectError(reason);
+}
+
+void HandleGracefulSessionQuit(const char* reason) {
+    const char* msg = reason ? reason : "Left the session.";
+    LOG_NETPLAY(LOG_INFO, "[NetMenu] Graceful session quit: %s", msg);
+    s_gracefulQuitUntilMs = GetTickCount() + 5000;
+
+    Net::MatchLifecycle_OnDisconnect(msg);
+    Net::Session_Cancel();
+
+    ModeOwnership::EnterCustomMenuContext();
+    ClearActionPrompt("graceful_quit");
+    s_activeBranch = RootBranch::DirectPlay;
+    s_phase = MenuPhase::Active;
+    s_fadeFrames = kFadeFrames;
+    s_captureInput = true;
+    s_selectedIndex = 0;
+    s_waitForNeutral = true;
+    ClearError();
+    SetStatus(msg);
+    TransitionTo(MenuState::MenuRoot, "graceful quit");
+}
+
+void HandlePostMatchDirectCharsel(const char* reason) {
+    LOG_NETPLAY(LOG_INFO,
+        "[NetMenu] Match ended (%s) — straight to character select",
+        reason ? reason : "?");
+    // RecoveryRestart, never Rematch: this is not a lockstep-derived decision.
+    // Both peers reach it unconditionally, and match_director deliberately
+    // excludes RecoveryRestart from the fail-closed intent comparison, so it
+    // cannot trip the F-7 guard the way a Rematch/CharselRestart pair can.
+    Net::TransitionBarrier_Propose(Net::NetTransitionKind::PostMatchDecision,
+                                   (uint8_t)Net::PostMatchIntentWire::RecoveryRestart, 0);
+    Net::MatchLifecycle_OnRematch();
+    Rollback::OnlineWiring_OnRematch();
+    LaunchNetplayCharSel();
 }
 
 void HandlePostMatchReturn() {
