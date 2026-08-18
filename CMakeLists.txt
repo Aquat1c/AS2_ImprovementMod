@@ -17,7 +17,7 @@
 
 cmake_minimum_required(VERSION 3.15)
 project(AS2_Rollback VERSION 0.7.0 LANGUAGES C CXX)
-set(AS2_MOD_VERSION "0.7-beta")
+set(AS2_MOD_VERSION "0.7-beta2")
 
 enable_testing()
 
@@ -242,6 +242,7 @@ set_target_properties(wsock32 PROPERTIES
 
 # Header files (for IDE visibility)
 set(CORE_HEADERS
+    include/core/anim_box.h
     include/core/as2_constants.h
     include/core/game_state.h
 )
@@ -259,6 +260,8 @@ set(PATCH_HEADERS
     include/patches/render_guard.h
     include/patches/session_pump_hook.h
     include/patches/netplay_background_run.h
+    include/patches/practice_defense_hooks.h
+    include/patches/practice_recovery_hooks.h
 )
 
 # Dead NETPLAY_HEADERS removed — old src/netplay/ code was moved to old_files/
@@ -357,6 +360,8 @@ set(TESTING_HEADERS
 
 set(TRAINING_HEADERS
     include/training/action_state_classifier.h
+    include/training/auto_block.h
+    include/training/native_recovery.h
     include/training/frame_advantage.h
     include/training/hotkey_config.h
     include/training/input_macro.h
@@ -389,6 +394,8 @@ set(PATCH_SOURCES
     src/patches/netplay_background_run.cpp
     src/patches/frame_scheduler.cpp
     src/patches/tick_hooks.cpp
+    src/patches/practice_defense_hooks.cpp
+    src/patches/practice_recovery_hooks.cpp
     src/patches/hook_installer.cpp
 )
 
@@ -493,6 +500,8 @@ set(TESTING_SOURCES
 
 set(TRAINING_SOURCES
     src/training/action_state_classifier.cpp
+    src/training/auto_block.cpp
+    src/training/native_recovery.cpp
     src/training/frame_advantage.cpp
     src/training/hotkey_config.cpp
     src/training/input_macro.cpp
@@ -700,6 +709,51 @@ add_executable(training_logic_tests
     tests/frame_advantage_classifier_tests.cpp
     src/training/action_state_classifier.cpp
 )
+
+add_executable(auto_block_tests
+    tests/auto_block_tests.cpp
+    src/training/auto_block.cpp
+    src/training/action_state_classifier.cpp
+    src/training/native_recovery.cpp
+)
+
+target_include_directories(auto_block_tests PRIVATE
+    include
+)
+
+target_compile_definitions(auto_block_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(auto_block_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME auto_block_tests COMMAND auto_block_tests)
+
+add_executable(native_recovery_tests
+    tests/native_recovery_tests.cpp
+    src/training/native_recovery.cpp
+    src/training/action_state_classifier.cpp
+)
+
+target_include_directories(native_recovery_tests PRIVATE
+    include
+)
+
+target_compile_definitions(native_recovery_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+set_target_properties(native_recovery_tests PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+add_test(NAME native_recovery_tests COMMAND native_recovery_tests)
 
 target_include_directories(training_logic_tests PRIVATE
     include

@@ -558,9 +558,21 @@
 #define HITDEF_OFF_ID           4         // DWORD — unique ID (0 = free slot)
 #define HITDEF_OFF_TYPE         8         // byte  — hitbox type
 #define HITDEF_OFF_ACTIVE       9         // byte  — invulnerability countdown (starts 1, decrements to 0)
-#define HITDEF_OFF_ACTIVE_FLAG  24        // byte  — active hitbox flag (-1 = inactive)
-#define HITDEF_OFF_DAMAGE       16        // DWORD — damage value
-#define HITDEF_OFF_ATK_LEVEL    20        // DWORD — attack level
+// Shared attack payload starts at entry+12 and mirrors the direct-entity block
+// at entity+1736: Entity_UpdateSummonHitDetection passes entry+12 to the same
+// resolvers that receive entity+1736. Offset +16 is the attack/guard mask, NOT
+// damage - the native AI threat lookup (sub_4A8C20) reads it as a mask and the
+// summon collision path bit-tests 0x1000 / 0x20000 on it. The real damage field
+// is not traced yet, so no replacement offset is claimed.
+#define HITDEF_OFF_PAYLOAD       12       // payload base (same layout as entity+1736)
+#define HITDEF_OFF_ATTACK_STATE  12       // byte  — payload+0: 0=inactive, 1=active
+#define HITDEF_OFF_ATTACK_MASK   16       // DWORD — payload+4: guard lanes + attack flags
+#define HITDEF_OFF_ATTACK_LEVEL  20       // DWORD — payload+8: attack level
+#define HITDEF_OFF_HIT_ACTIVE    24       // byte  — payload+12: active hit-data flag
+#define HITDEF_OFF_ACTIVE_FLAG   HITDEF_OFF_HIT_ACTIVE    // legacy alias
+#define HITDEF_OFF_ATK_LEVEL     HITDEF_OFF_ATTACK_LEVEL  // legacy alias
+#define HITDEF_OFF_RESULT        156      // DWORD — last contact resolution code
+#define HITDEF_OFF_RESULT_POS    160      // DWORD — packed contact position
 #define HITDEF_OFF_BLOCKSTUN    26        // WORD  — blockstun frames
 #define HITDEF_OFF_HITSTUN      28        // WORD  — hitstun frames
 #define HITDEF_OFF_KNOCKBACK    30        // WORD  — knockback force (init 10000)
@@ -611,14 +623,25 @@
 
 // Entity attack/hit state offsets (relative to entity base)
 // Set by Entity_SetAttackByte, Entity_InitHitData, Entity_SetCollisionData
+#define ENTITY_OFF_AIRBORNE      0x06C4   // +1732, BYTE — 1 = airborne; selects the air branch in sub_4A5EF0
 #define ENTITY_OFF_ATTACK_STATE  0x06C8   // +1736, BYTE — 0=inactive, 1=active attack
 #define ENTITY_OFF_ATTACK_TYPE   0x06CC   // +1740, DWORD — attack type flags
 #define ENTITY_OFF_HIT_ACTIVE    0x06D4   // +1748, BYTE — hit data active flag
 
-// Attack type flag bits (entity+1740)
-#define ATTACK_FLAG_LOW_HIT          0x00001  // Low hit type (stand vs crouch)
-#define ATTACK_FLAG_PROJ_IMMUNE      0x00800  // Projectile immunity / bypasses the defender +1932 gate in melee/summon checks
+// Attack mask bits (entity+1740 / HitDef entry+16).
+// The low three bits are guard-compatibility lanes, matched against the
+// defender's own lanes at +1940 by sub_4A5EF0 (bit 0 vs bit 0, bit 1 vs bit 1).
+// Bit 0 is the STAND lane (overhead when alone), bit 1 the CROUCH lane (low when
+// alone) - the native adaptive helper sub_4A8D00 crouches unless (mask & 3) == 1.
+#define ATTACK_GUARD_STAND           0x00001  // stand-guard lane
+#define ATTACK_GUARD_CROUCH          0x00002  // crouch-guard lane
+#define ATTACK_GUARD_AIR             0x00004  // air-guardable
+#define ATTACK_GUARD_GROUND_MASK     0x00003  // both ground lanes
+#define ATTACK_FLAG_BYPASS_DEF_1932  0x00800  // bypasses the defender +1932 gate (incoming-attack property)
+#define ATTACK_FLAG_HITDEF_NO_PLAYER 0x01000  // suppresses the HitDef-to-player hit path
+#define ATTACK_FLAG_SPECIAL_GUARD    0x02000  // ordinary guard requires defender +1940 & 0x2000
 #define ATTACK_FLAG_CONTACT_OVERRIDE 0x20000  // Bypasses box-size / overlap checks in grab, damage, hit-detection, and summon-collision paths
+#define ATTACK_FLAG_BYPASS_NATIVE_DEF 0x80000 // character-specific defense handlers reject the attack
 
 // Verified clash / max-hit block (entity+0x77C..0x79D).
 // Entity_SetClashData writes the raw clash payload used by Entity_ResolveAttackCollision.
@@ -654,16 +677,48 @@
 //          from Entity_UpdateDamageApplication) returns 8 ("no hit", skipped at 107480) when the
 //          defender has it, unless the attack carries 0x80000. This is the primary per-move
 //          strike-invuln flag (the move keeps its hurtboxes but strikes do not connect).
-//   0x2000 is checked as a direct melee-invuln gate in sub_4A5EF0.
+//   0x2000 is the SPECIAL-GUARD capability, not invulnerability: sub_4A5EF0
+//          proceeds when the attack lacks ATTACK_FLAG_SPECIAL_GUARD **or** the
+//          defender carries this bit, so it lets an otherwise unguardable attack
+//          be guarded normally.
 //   0x4000 suppresses the normal follow-through branch in sub_4A6030.
 //   0x8000 / 0x10000 are special invuln states that still require +1948.
 #define CLASH_ID_FLAG_INVINCIBLE         0x10000
 #define CLASH_ID_FLAG_SPECIAL_INVULN     0x08000
 #define MAX_HIT_FLAG_STRIKE_INVULN       0x00200
-#define MAX_HIT_FLAG_MELEE_INVULN        0x02000
+#define MAX_HIT_FLAG_SPECIAL_GUARD       0x02000
 #define MAX_HIT_FLAG_PROJECTILE_INVULN   0x04000
 #define MAX_HIT_FLAG_INVINCIBLE          0x10000
 #define MAX_HIT_FLAG_SPECIAL_INVULN      0x08000
+
+// Defender guard/defense capability bits, same DWORD (+1940). The low lanes are
+// matched against the attack mask's low lanes; the higher bits gate the
+// character-specific defense handlers dispatched ahead of ordinary guard.
+#define DEFENSE_GUARD_STAND              0x00001  // can stand-guard
+#define DEFENSE_GUARD_CROUCH             0x00002  // can crouch-guard
+#define DEFENSE_GUARD_AIR                0x00004  // native air-guard capability
+#define DEFENSE_GUARD_GROUND_MASK        0x00003  // both ground lanes
+#define DEFENSE_CAT1_UNIQUE              0x00010  // sub_4A4E40 gate (result 3)
+#define DEFENSE_CAT5_ABSOLUTE            0x00100  // sub_4A5C20 gate (result 7)
+#define DEFENSE_CAT6_DODGE               0x00200  // sub_4A5D30 gate (result 8)
+#define DEFENSE_GUARD_POINT              0x00400  // sub_4A5D80 gate (result 9)
+#define DEFENSE_SPECIAL_GUARD            0x02000  // permits guarding ATTACK_FLAG_SPECIAL_GUARD
+
+// Contact resolution codes. Every handler except ordinary guard also stores its
+// code at defender+1944; ordinary guard (10) only ever appears as the resolver
+// return value, which the caller stores at attacker+1880 (direct/grab) or
+// HitDef entry+156 (summon). Do not test +1944 for 10.
+#define CONTACT_RESULT_NONE              1
+#define CONTACT_RESULT_UNIQUE_DEFENSE    3
+#define CONTACT_RESULT_JUST_PARRY        4
+#define CONTACT_RESULT_REPEL             5
+#define CONTACT_RESULT_PUSH_AWAY         6
+#define CONTACT_RESULT_ABSOLUTE_DEFENSE  7
+#define CONTACT_RESULT_DODGE             8
+#define CONTACT_RESULT_GUARD_POINT       9
+#define CONTACT_RESULT_GUARD             10
+#define CONTACT_RESULT_HIT               11
+#define ENTITY_OFF_CONTACT_RESULT        0x0758   // +1880, DWORD - last contact result (attacker side)
 
 // Active rect / pushbox (entity-relative single rects).
 // Managed by Input_SetNextRect / Input_ApplyNextRect.
@@ -688,6 +743,28 @@
 #define ADDR_ENTITY_EFFECT_SET_PARAMS1     (GAME_BASE + 0x0C3ED0)  // sub_4C3ED0 - Effect_SetParams1
 #define ADDR_ENTITY_EFFECT_SET_PARAMS2     (GAME_BASE + 0x0C3F30)  // sub_4C3F30 - Effect_SetParams2
 #define ADDR_ENTITY_EFFECT_SLOTS_ADD       (GAME_BASE + 0x0C3FB0)  // sub_4C3FB0 - EffectSlots_Add
+
+// Collision / defense resolution chain. Each phase below scans for contacts and
+// then dispatches, in order: character-specific defense (dword_73E070 category)
+// -> generic guard point -> ordinary guard -> normal hit. All four resolvers
+// share the signature (attackerCtx, sourceObject, contactPos, facing, payload)
+// where *(attackerCtx + ENTITY_OFF_OPPONENT) is the DEFENDER entity and
+// sourceObject is 0 for direct/grab contacts or the HitDef entry base.
+#define ADDR_COLLISION_GRAB_PHASE   (GAME_BASE + 0x0A4950)  // Entity_UpdateGrabAlignment
+#define ADDR_COLLISION_DAMAGE_PHASE (GAME_BASE + 0x0A76F0)  // Entity_UpdateDamageApplication
+#define ADDR_COLLISION_SUMMON_PHASE (GAME_BASE + 0x0A8390)  // Entity_UpdateSummonHitDetection
+#define ADDR_DEFENSE_CAT1_UNIQUE    (GAME_BASE + 0x0A4E40)  // result 3
+#define ADDR_DEFENSE_CAT2_PARRY     (GAME_BASE + 0x0A50A0)  // result 4
+#define ADDR_DEFENSE_CAT3_REPEL     (GAME_BASE + 0x0A5570)  // result 5
+#define ADDR_DEFENSE_CAT4_PUSHAWAY  (GAME_BASE + 0x0A5910)  // result 6
+#define ADDR_DEFENSE_CAT5_ABSOLUTE  (GAME_BASE + 0x0A5C20)  // result 7
+#define ADDR_DEFENSE_CAT6_DODGE     (GAME_BASE + 0x0A5D30)  // result 8
+#define ADDR_DEFENSE_GUARD_POINT    (GAME_BASE + 0x0A5D80)  // result 9
+#define ADDR_DEFENSE_ORDINARY_GUARD (GAME_BASE + 0x0A5EF0)  // result 10 (auto-block hook)
+#define ADDR_DEFENSE_NORMAL_HIT     (GAME_BASE + 0x0A6710)  // result 11
+#define ADDR_DEFENSE_CATEGORY_TABLE 0x73E070                // dword_73E070[charId]
+#define ADDR_NATIVE_THREAT_MASK     (GAME_BASE + 0x0A8C20)  // sub_4A8C20 - AI threat-mask lookup
+#define ADDR_NATIVE_ADAPTIVE_GUARD  (GAME_BASE + 0x0A8D00)  // sub_4A8D00 - native stand/crouch helper
 
 // Effect types (common ones from switch in sub_4A9330)
 #define EFFECT_TYPE_STANDARD_30F    0x01  // 30 frame lifetime
@@ -820,12 +897,89 @@
 #define ENTITY_ATTACHED_FX_SLOTS_SIZE      0x0028
 #define ENTITY_RENDER_OVERLAY_FIELDS_SIZE  0x0019
 
-// Box / route-flag system offsets. The byte at +0x0676 is a candidate
-// actionability bit, but it lives inside this vanilla 24-byte flag block and
-// must stay audit-only until runtime logs prove its exact semantics.
-#define ENTITY_OFF_BOX_FLAGS 0x0674  // +1652, 24-byte vanilla per-frame flag block
-#define ENTITY_OFF_NATIVE_ACTIONABLE_CANDIDATE 0x0676 // +1654, candidate actionability bit; audit before primary use
-#define ENTITY_OFF_NATIVE_ACTIONABLE ENTITY_OFF_NATIVE_ACTIONABLE_CANDIDATE
+// Command-route timer vector, 24 bytes. NOT a flag block, and +0x0676 is NOT a
+// scalar "actionable" bit - it is simply route 2.
+//
+// Entity_ProcessCommandMatches scans route 23 down to route 0 and, for every
+// nonzero route, calls the character's dispatcher for that route. The dispatcher
+// may queue an action; the scan stops as soon as one does. So a nonzero route
+// means "the engine will consider this input branch on this tick".
+//
+// Action scripts grant routes through three writers:
+//   Input_UpdateMinValues_Group1 -> routes 0, 1, 15, 16, 22 (and clears 23)
+//   Input_UpdateMinValues_Group2 -> routes 2..14
+//   Input_UpdateMinValues_Group3 -> routes 17..21
+// Each raises a route timer to at least the supplied value, so a route byte
+// mixes state permission with short input retention. Input_Clear zeroes all 24.
+#define ENTITY_OFF_COMMAND_ROUTE_TIMERS 0x0674  // +1652 .. +1675
+#define ENTITY_COMMAND_ROUTE_COUNT      24
+
+// Route map, verified identical across all 22 character dispatchers for the
+// normals: routes 2/3/4 and 5/6/7 both run the SHARED A/B/C handlers, and they
+// split by posture, not by ground/air:
+//   route 2/3/4 -> sub_424110 / sub_424180 / sub_4241F0
+//                  airborne (+0x06C4 == 1) -> air normals   92/93/94-95
+//                  grounded, DOWN released -> stand normals 85/86/87-88
+//   route 5/6/7 -> Entity_TryAction_Light / _Medium / _Heavy
+//                  grounded, DOWN held     -> crouch normals 89/90/91
+#define ENTITY_ROUTE_A_STAND_OR_AIR  2
+#define ENTITY_ROUTE_B_STAND_OR_AIR  3
+#define ENTITY_ROUTE_C_STAND_OR_AIR  4
+#define ENTITY_ROUTE_A_CROUCH        5
+#define ENTITY_ROUTE_B_CROUCH        6
+#define ENTITY_ROUTE_C_CROUCH        7
+#define ENTITY_ROUTE_COMMAND_1       12
+#define ENTITY_ROUTE_SUPER_1         20
+#define ENTITY_ROUTE_SUPER_2         21
+#define ENTITY_ROUTE_STATE_STANDARD  22   // Entity_UpdateAction_Standard
+#define ENTITY_ROUTE_STATE_ATTACKS   23   // Entity_UpdateAction_Attacks
+
+// Pending-action slots. Entity_SetReactionState_Slot1/2 write one and clear the
+// other; neither replaces the current action, which the transition pass applies
+// later in the same tick. That ordering is why an action-ID edge is a late
+// recovery timestamp.
+#define ENTITY_OFF_PENDING_ACTION_1  0x0444  // +1092, DWORD
+#define ENTITY_OFF_PENDING_ACTION_2  0x0448  // +1096, DWORD
+#define ENTITY_OFF_ACTION_STATE_CLASS 0x0454 // +1108, DWORD - class of the action being left
+
+// Terminal neutral handoff targets.
+#define ACTION_TARGET_STAND_NEUTRAL  2
+#define ACTION_TARGET_CROUCH_NEUTRAL 7
+#define ACTION_TARGET_AIR_NEUTRAL    22
+#define ACTION_TARGET_LANDING        23
+
+// Per-entity input words. Input_SetButtonState(entity, idx) writes
+// *(WORD*)(entity + 8 + 2*idx) and mirrors idx 2<->3 when facing left, so 2/3
+// are LEFT/RIGHT. Three parallel blocks of ten words:
+//   +0x0008 current, +0x0024 previous, +0x0040 derived (just-pressed/held)
+// The route handlers read the DERIVED block for buttons (A at +0x0048 = +72)
+// and the CURRENT block for directions (DOWN at +0x000A = +10).
+#define ENTITY_OFF_INPUT_CURRENT     0x0008
+#define ENTITY_OFF_INPUT_PREVIOUS    0x0024
+#define ENTITY_OFF_INPUT_DERIVED     0x0040
+#define ENTITY_INPUT_WORD_COUNT      10
+#define ENTITY_INPUT_IDX_UP          0
+#define ENTITY_INPUT_IDX_DOWN        1
+#define ENTITY_INPUT_IDX_LEFT        2
+#define ENTITY_INPUT_IDX_RIGHT       3
+#define ENTITY_INPUT_IDX_A           4
+#define ENTITY_INPUT_IDX_B           5
+#define ENTITY_INPUT_IDX_C           6
+#define ENTITY_INPUT_IDX_D           7
+// +0x000A is the DOWN input word, not a ground/air lane: routes 5/6/7 require
+// it set (crouching normals), the grounded path of routes 2/3/4 requires it
+// clear (standing normals). Ground vs air is ENTITY_OFF_AIRBORNE.
+#define ENTITY_OFF_INPUT_DOWN        0x000A
+
+// Native Training Life/Spirit automatic-restoration gate, written by
+// sub_49DA10 and read by Match_UpdateTrainingModeSettings (0x4C8120) alongside
+// "both fighters are in action 2". It is NOT an actionability flag: action 0x81
+// sets it at startup while zeroing every route for the body of the move.
+#define ENTITY_OFF_TRAINING_RESTORE_GATE 0x00CF  // +207
+
+#define ADDR_ENTITY_PROCESS_COMMAND_MATCHES (GAME_BASE + 0x0BEA20)
+#define ADDR_MATCH_UPDATE_TRAINING_SETTINGS (GAME_BASE + 0x0C8120)
+#define ADDR_INPUT_SET_FLAGS                (GAME_BASE + 0x0BF820)  // writes +1732..+1734
 #define ENTITY_OFF_RENDER_FLASH_FLAG     0x01B4  // +436, BYTE, extra flash/afterimage draw flag
 #define ENTITY_OFF_RENDER_TINT_STATE     0x01B8  // +440, DWORD, 1 disables extra tint pass in sub_4C6B60
 #define ENTITY_OFF_RENDER_TINT_TIMER     0x01BC  // +444, DWORD
@@ -1195,6 +1349,46 @@
 #define ADDR_TRAINING_DUMMY_STATE_SETTING   0x8E93BE
 // HIBYTE(dword_8E93BC): Native damage display toggle (0=off, 1=on)
 #define ADDR_TRAINING_DAMAGE_DISPLAY        0x8E93BF
+// byte_8E93C0: Native input/command display toggle (0=off, 1=on). Gates
+// sub_4C8E20, which draws the command strip at y=352..447 in training only.
+#define ADDR_TRAINING_INPUT_DISPLAY         0x8E93C0
+// byte_8E93EA: pause-menu cursor row, 0..10. Wraps 0 <-> 10. Reset to 0 on
+// match init (sub_4C92B0) and whenever the menu is left.
+#define ADDR_PAUSE_MENU_CURSOR              0x8E93EA
+#define PAUSE_MENU_ROW_COUNT                11
+#define PAUSE_MENU_ROW_HEALTH_REGEN         0
+#define PAUSE_MENU_ROW_METER_LEVEL          1
+#define PAUSE_MENU_ROW_CPU                  2
+#define PAUSE_MENU_ROW_AIR_TECH             3
+#define PAUSE_MENU_ROW_GROUND_TECH          4
+#define PAUSE_MENU_ROW_BLOCK_TYPE           5
+#define PAUSE_MENU_ROW_DUMMY_STATE          6
+#define PAUSE_MENU_ROW_DAMAGE_DISPLAY       7
+#define PAUSE_MENU_ROW_INPUT_DISPLAY        8
+#define PAUSE_MENU_ROW_RESTART              9   // handler returns 1
+#define PAUSE_MENU_ROW_EXIT                 10  // handler returns 2
+
+// Pause menu (MODE_MATCH substate 4). sub_4CA120 owns the substate: it calls the
+// input handler, redraws the whole match scene, then draws the menu overlay, and
+// finally maps the handler's return code onto the substate change.
+//   0   -> resume (substate back to 3)
+//   1   -> row 9 action
+//   2   -> row 10 action
+//   255 -> stay open
+// Replacing input + render while leaving sub_4CA120 alone keeps the scene
+// rendering and result plumbing native.
+#define ADDR_PAUSE_MENU_SUBSTATE    (GAME_BASE + 0x0CA120)  // sub_4CA120 - substate 4 handler
+#define ADDR_PAUSE_MENU_INPUT       (GAME_BASE + 0x0C8250)  // sub_4C8250 - cursor + value adjust
+#define ADDR_PAUSE_MENU_RENDER      (GAME_BASE + 0x0C8870)  // sub_4C8870 - dim + 11 rows
+#define ADDR_TRAINING_INPUT_DISPLAY_RENDER (GAME_BASE + 0x0C8E20)  // sub_4C8E20 - command strip
+// Vanilla pause-menu geometry: label column x 64..319, value column x 320..447,
+// row i spans y = 64 + 32*i .. 95 + 32*i. Selected rows tint red, disabled rows
+// draw at half brightness.
+#define PAUSE_MENU_LABEL_X      64
+#define PAUSE_MENU_VALUE_X      320
+#define PAUSE_MENU_RIGHT        447
+#define PAUSE_MENU_FIRST_ROW_Y  64
+#define PAUSE_MENU_ROW_PITCH    32
 
 // BYTE1(dword_8E93EC) — Number of rounds option (0..2, wins required = value + 1)
 // The game copies this into LOBYTE(dword_816470) when constructing match

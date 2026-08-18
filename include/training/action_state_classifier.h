@@ -12,27 +12,33 @@ enum class ActionableContext : uint8_t {
     DebugOnly,
 };
 
+// Where a recovery observation came from. Only NativePreCommand is a production
+// source; the rest exist to compare against it in the logs.
 enum class ActionabilitySource : uint8_t {
     LegacyActionId,
     CandidateNativeFlag,
     HybridValidated,
-    // State-class rule derived from the engine's own action-ID boundaries:
-    // actionId < 85 (not performing an attack move) and not a forced-lock /
-    // extended-recovery state. Catches every movement/neutral recovery state
-    // instead of a hand-enumerated subset. See action_state_classifier.cpp.
+    // Action-ID range rule. Retained for audit comparison only: the engine has
+    // attack handlers below action 85 (CharAction_0x2A..0x2E are 42..46), so an
+    // ID range cannot decide whether a fighter is committed.
     StateClass,
+    // Command-route vector observed at Entity_ProcessCommandMatches entry.
+    NativePreCommand,
 };
 
-// True when the action-state ID denotes the character is performing an attack
-// move (the CharAction_* handler range). Confirmed engine boundary: states
-// 0..84 are reaction/movement/neutral; 85+ are attack moves.
-bool IsAttackMoveState(uint32_t actionId);
+// True when the action ID is one of the SHARED normal/command/super actions the
+// route handlers queue: 85..98 (stand / crouch / air normals and command
+// normals) and 137..140 (supers).
+//
+// This is deliberately narrow. It is NOT "is this fighter attacking": character
+// specials live in the 34..84 range alongside the reaction and movement states,
+// so no ID range separates the two. Use the command-route vector
+// (Training::NeutralRouteOpen) for commitment.
+bool IsSharedAttackAction(uint32_t actionId);
 
-// State-class actionability: the character is in a movement/neutral state it can
-// act out of — not in an attack move, not in a forced lock or extended recovery,
-// and not in a context-excluded landing. This mirrors how the engine itself
-// classifies states rather than enumerating individual "free" action IDs.
-bool IsStateClassActionable(uint32_t actionId, bool landingExcluded);
+// Audit-only heuristic: not a forced lock, not a shared attack action, not a
+// context-excluded landing. It cannot see character specials below action 85,
+// which is exactly why it is no longer a production recovery source.
 
 struct ActionStateSample {
     uint32_t actionId = 0;
@@ -55,6 +61,8 @@ struct ActionabilityResult {
     bool landingExcluded = false;
     const char* reason = "";
 };
+
+bool IsStateClassActionable(uint32_t actionId, bool landingExcluded);
 
 bool IsProximityGuard(uint32_t actionId);
 bool IsBlockstun(uint32_t actionId);

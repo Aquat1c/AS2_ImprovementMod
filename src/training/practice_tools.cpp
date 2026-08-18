@@ -15,6 +15,7 @@
 
 #include "training/frame_advantage.h"
 #include "training/input_macro.h"
+#include "patches/practice_defense_hooks.h"
 #include "patches/memory_utils.h"
 #include "input_system.h"
 #include "as2_constants.h"
@@ -94,6 +95,12 @@ void PracticeTools_CaptureRuntimeState(PracticeToolsRuntimeState* out) {
     out->paused = g_paused;
     out->stepRequested = g_stepRequested;
     out->stepCounter = (uint32_t)g_stepCounter;
+
+    PracticeDefenseRuntimeState defense{};
+    PracticeDefense_CaptureState(&defense);
+    out->autoBlockSequence = defense.sequence;
+    out->frameGuardPlan = defense.plan;
+    out->lastProcessedSimFrame = defense.lastProcessedSimFrame;
 }
 
 bool PracticeTools_ShouldFreezeFrame() {

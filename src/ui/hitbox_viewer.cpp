@@ -28,6 +28,8 @@
 #include "mod_main.h"
 #include "memory_utils.h"
 #include "as2_constants.h"
+#include "core/anim_box.h"
+#include "training/auto_block.h"
 #include "log_window.h"
 #include "game_state.h"
 #include "rollback/rollback_session.h"
@@ -151,12 +153,8 @@ static void DrawBox(ImDrawList* dl, float l, float top, float r, float bot,
     dl->AddRect(p1, p2, outline, 0.0f, 0, 2.0f);
 }
 
-struct BoxEntry {
-    int16_t xOff;
-    int16_t yOff;
-    int16_t halfW;
-    int16_t halfH;
-};
+// One decoder, shared with the practice auto-block contact scanner.
+using BoxEntry = As2::AnimBox;
 
 struct ClashSnapshot {
     uint8_t rank;
@@ -333,7 +331,9 @@ struct HitDefSnapshot {
     uint8_t type;
     uint8_t invuln;
     uint8_t flag;
-    uint32_t damage;
+    uint8_t attackState;
+    uint32_t attackMask;
+    uint32_t attackLevel;
     const AnimFrameSnapshot* animFrame;
 };
 
@@ -402,13 +402,21 @@ static CancelRouteSnapshot BuildCancelRouteSnapshot(int playerIndex,
                                                     uint32_t actionId,
                                                     int16_t posY);
 
+// Guard lanes decoded from the live attack mask. Bit 0 is the STAND lane, so a
+// stand-only attack is the overhead and a crouch-only attack is the low.
+static const char* GroundGuardLabel(uint32_t attackMask) {
+    switch (Training::DecodeGroundGuardClass(attackMask)) {
+        case Training::GroundGuardClass::StandOnly:            return "STAND ONLY";
+        case Training::GroundGuardClass::CrouchOnly:           return "CROUCH ONLY";
+        case Training::GroundGuardClass::Either:               return "STAND/CROUCH";
+        case Training::GroundGuardClass::SpecialGuardRequired: return "SPECIAL GUARD";
+        case Training::GroundGuardClass::None:
+        default:                                              return "NO GUARD LANE";
+    }
+}
+
 static BoxEntry DecodeBoxEntry(const uint8_t* frameBytes, size_t offset) {
-    BoxEntry box{};
-    box.xOff = ReadLocalValue<int16_t>(frameBytes, offset + 0);
-    box.yOff = ReadLocalValue<int16_t>(frameBytes, offset + 2);
-    box.halfW = ReadLocalValue<int16_t>(frameBytes, offset + 4);
-    box.halfH = ReadLocalValue<int16_t>(frameBytes, offset + 6);
-    return box;
+    return As2::DecodeAnimBox(frameBytes, offset);
 }
 
 static void DecodeBoxEntries(const uint8_t* frameBytes, int frameOffset, BoxEntry* out, int count) {
@@ -512,9 +520,9 @@ static void LogAnimFrameSnapshot(const AnimFrameSnapshot& snapshot, const char* 
     LOG_INFO("[HBV] %s THROW-STATE: atkState=%u atkType=0x%05X[%s%s%s] hitActive=%u | "
              "grabBoxes reach(hit+%d)=%d catch(hurt+%d)=%d tech(ext+%d)=%d | grab=%s",
              label, atkState, atkType,
-             contactOverride                       ? "CONTACT_OVERRIDE " : "",
-             (atkType & ATTACK_FLAG_PROJ_IMMUNE)   ? "PROJ_IMMUNE "      : "",
-             (atkType & ATTACK_FLAG_LOW_HIT)       ? "LOW_HIT "          : "",
+             contactOverride                          ? "CONTACT_OVERRIDE " : "",
+             (atkType & ATTACK_FLAG_BYPASS_DEF_1932)  ? "BYPASS_1932 "      : "",
+             GroundGuardLabel(atkType),
              hitActive,
              ANIM_HITBOX_OFFSET, reachActive,
              ANIM_HURTBOX_OFFSET, catchActive,
@@ -842,7 +850,9 @@ static int BuildHitDefSnapshots(AnimFrameCache* cache,
         snapshot.type = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_TYPE);
         snapshot.invuln = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_ACTIVE);
         snapshot.flag = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_ACTIVE_FLAG);
-        snapshot.damage = ReadHitDefValue<uint32_t>(entryBytes, entryBase, HITDEF_OFF_DAMAGE);
+        snapshot.attackState = ReadHitDefValue<uint8_t>(entryBytes, entryBase, HITDEF_OFF_ATTACK_STATE);
+        snapshot.attackMask = ReadHitDefValue<uint32_t>(entryBytes, entryBase, HITDEF_OFF_ATTACK_MASK);
+        snapshot.attackLevel = ReadHitDefValue<uint32_t>(entryBytes, entryBase, HITDEF_OFF_ATTACK_LEVEL);
 
         const uintptr_t ownerEntity = (snapshot.animOwner == 0)
             ? p1EntityBase
@@ -958,8 +968,9 @@ static uint32_t GetLegacyInvincibleGateValue(const EntitySnapshot& entity) {
 }
 
 static uint32_t GetDirectInvincibleFlagBits(const EntitySnapshot& entity) {
+    // 0x2000 is deliberately absent: it is the special-guard capability that
+    // LETS an attack be guarded, not an invulnerability bit.
     return entity.maxHit.rawId & (MAX_HIT_FLAG_STRIKE_INVULN |
-                                  MAX_HIT_FLAG_MELEE_INVULN |
                                   MAX_HIT_FLAG_PROJECTILE_INVULN);
 }
 
@@ -1051,8 +1062,15 @@ static void RenderStateFlags(ImDrawList* dl,
 
     // Suppress the standalone PROJ IMMUNE label during a throw — the THROW "(pierces invuln)" tag
     // already conveys it, so we don't print two overlapping labels for the same 0x800 bit.
-    if (!throwing && (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE)) {
-        drawLabel(COL_IMMUNE, "PROJ IMMUNE");
+    if (!throwing && (entity.attackType & ATTACK_FLAG_BYPASS_DEF_1932)) {
+        drawLabel(COL_IMMUNE, "BYPASS 1932");
+    }
+
+    if (entity.attackState == 1) {
+        drawLabel(COL_HITBOX, GroundGuardLabel(entity.attackType));
+        if (entity.attackType & ATTACK_FLAG_SPECIAL_GUARD) {
+            drawLabel(COL_INVINCIBLE, "SPECIAL GUARD");
+        }
     }
 
     if (entity.attackState == 1 && entity.hitActive != 0) {
@@ -1091,7 +1109,8 @@ static void RenderHitDefs(ImDrawList* dl,
         activeCount++;
 
         if (s_logThisFrame) {
-            LOG_INFO("[HBV] HitDef[%d] id=%u owner=%u animOwner=%u type=%u invuln=%u flag=%d pos=(%d,%d) face=%d dmg=%u animIdx=%u",
+            LOG_INFO("[HBV] HitDef[%d] id=%u owner=%u animOwner=%u type=%u invuln=%u flag=%d pos=(%d,%d) "
+                     "face=%d atkState=%u mask=0x%05X[%s%s%s] level=%u animIdx=%u",
                      hitDef.index,
                      hitDef.id,
                      hitDef.owner,
@@ -1102,7 +1121,12 @@ static void RenderHitDefs(ImDrawList* dl,
                      hitDef.worldX,
                      hitDef.worldY,
                      hitDef.facing,
-                     hitDef.damage,
+                     hitDef.attackState,
+                     hitDef.attackMask,
+                     GroundGuardLabel(hitDef.attackMask),
+                     (hitDef.attackMask & ATTACK_FLAG_CONTACT_OVERRIDE) ? " CONTACT_OVERRIDE" : "",
+                     (hitDef.attackMask & ATTACK_FLAG_HITDEF_NO_PLAYER) ? " NO_PLAYER_HIT" : "",
+                     hitDef.attackLevel,
                      hitDef.summonAnimIdx);
         }
 
@@ -1294,8 +1318,11 @@ static void RenderEntityInfoPanel(const EntitySnapshot& entity) {
     text("  marker1948: %u  marker1949: %u",
          entity.maxHit.marker1948,
          entity.maxHit.marker1949);
-    if (entity.attackType & ATTACK_FLAG_PROJ_IMMUNE) {
-        textColored(infoCol, "Projectile immunity is active.");
+    if (entity.attackType & ATTACK_FLAG_BYPASS_DEF_1932) {
+        textColored(infoCol, "Attack bypasses the defender +1932 gate.");
+    }
+    if (entity.attackType & ATTACK_FLAG_BYPASS_NATIVE_DEF) {
+        textColored(infoCol, "Attack is rejected by the character-specific defense handlers.");
     }
     if (entity.attackType & ATTACK_FLAG_CONTACT_OVERRIDE) {
         ImGui::TextWrapped("Contact override is active: hit / grab checks can bypass the normal box-size and overlap tests.");

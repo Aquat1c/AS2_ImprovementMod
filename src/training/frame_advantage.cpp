@@ -1,4 +1,5 @@
 #include "training/frame_advantage.h"
+#include "training/native_recovery.h"
 
 #include "training/action_state_classifier.h"
 #include "training/practice_tools.h"
@@ -109,6 +110,16 @@ Training::ActionabilitySource s_actionabilitySource = Training::ActionabilitySou
 uint32_t s_lastLoggedActionId[2] = {};
 uint8_t  s_lastLoggedAttackState[2] = {};
 uint8_t  s_lastLoggedHitActive[2] = {};
+// Native pre-command recovery, the production source. A tick is recorded the
+// first time the engine reports a terminal neutral handoff plus an open
+// ordinary route; cancel-window route openings never touch it.
+uint32_t s_nativeFreeFrame[2] = { kFrameUnset, kFrameUnset };
+uint32_t s_nativeFreeGeneration[2] = {};
+Training::NativeRecoveryKind s_nativeKind[2] = {};
+bool s_nativeCpuUnsupported[2] = {};
+uint32_t s_lastNativeLogFrame[2] = {};
+const char* s_lastNativeReason[2] = { "", "" };
+
 uint32_t s_lastAuditActionId[2] = {};
 uint8_t  s_lastAuditNative[2] = {};
 bool     s_lastAuditMismatch[2] = {};
@@ -236,9 +247,13 @@ EntitySample ReadEntitySample(uintptr_t entityBase) {
     sample.actionId = ReadMemory<uint32_t>(entityBase + ENTITY_OFF_ACTION_ID);
     sample.actionPhase = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_PHASE);
     sample.actionFrame = ReadMemory<uint16_t>(entityBase + ENTITY_OFF_ACTION_FRAME);
-    sample.nativeActionableCandidate = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_NATIVE_ACTIONABLE);
-    for (int i = 0; i < 24; ++i) {
-        sample.routeOrBoxFlags[i] = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_BOX_FLAGS + i);
+    // Route 2 kept under its old field name for the audit log only; it is one
+    // route timer, never a scalar "actionable" bit.
+    sample.nativeActionableCandidate =
+        ReadMemory<uint8_t>(entityBase + ENTITY_OFF_COMMAND_ROUTE_TIMERS + ENTITY_ROUTE_A_STAND_OR_AIR);
+    for (int i = 0; i < ENTITY_COMMAND_ROUTE_COUNT; ++i) {
+        sample.routeOrBoxFlags[i] =
+            ReadMemory<uint8_t>(entityBase + ENTITY_OFF_COMMAND_ROUTE_TIMERS + i);
     }
     sample.attackState = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_ATTACK_STATE);
     sample.hitActive = ReadMemory<uint8_t>(entityBase + ENTITY_OFF_HIT_ACTIVE);
@@ -312,6 +327,26 @@ void AuditActionability(uint32_t simFrame, int playerIndex, const EntitySample& 
     s_lastAuditNative[playerIndex] = sample.nativeActionableCandidate;
     s_lastAuditMismatch[playerIndex] = mismatch;
     s_hasLastAudit[playerIndex] = true;
+}
+
+// A fighter's recovery tick is consumed once by whichever tracker needs it, so
+// a later interaction cannot reuse a stale timestamp from an earlier one.
+uint32_t TakeNativeFreeFrame(int player, uint32_t sinceFrame) {
+    if (player < 0 || player > 1) {
+        return kFrameUnset;
+    }
+    const uint32_t frame = s_nativeFreeFrame[player];
+    if (frame == kFrameUnset) {
+        return kFrameUnset;
+    }
+    if (sinceFrame != kFrameUnset && frame < sinceFrame) {
+        return kFrameUnset;
+    }
+    return frame;
+}
+
+bool NativeRecoveryAvailable(int player) {
+    return player >= 0 && player <= 1 && !s_nativeCpuUnsupported[player];
 }
 
 void ClearPendingAttack(PendingAttack* pending) {
@@ -543,10 +578,22 @@ void RefreshPendingAttack(uint32_t simFrame, int attackerIndex) {
         pending.attacker_actionId = attacker.curr.actionId;
     }
 
-    if (pending.simFrame_A_recover == kFrameUnset &&
+    // Native recovery is authoritative. The legacy edge is only a fallback for
+    // the CPU-controlled case, where the same routes select AI actions and a
+    // human actionability number would be a fiction.
+    const uint32_t nativeAttackerFree =
+        NativeRecoveryAvailable(attackerIndex)
+            ? TakeNativeFreeFrame(attackerIndex, pending.simFrame_attackStart)
+            : kFrameUnset;
+    const bool legacyEdge =
+        !NativeRecoveryAvailable(attackerIndex) &&
         !IsFree(attacker.prev, Training::ActionableContext::AttackerRecovery) &&
-        IsFree(attacker.curr, Training::ActionableContext::AttackerRecovery)) {
-        pending.simFrame_A_recover = simFrame;
+        IsFree(attacker.curr, Training::ActionableContext::AttackerRecovery);
+
+    if (pending.simFrame_A_recover == kFrameUnset &&
+        (nativeAttackerFree != kFrameUnset || legacyEdge)) {
+        pending.simFrame_A_recover =
+            (nativeAttackerFree != kFrameUnset) ? nativeAttackerFree : simFrame;
         if (s_actionabilityAuditLogging) {
             LOG_INFO("[FAREC] frame=%u %s role=pending-attacker act=%u phase=%u aframe=%u source=legacy native676=%u A_recover=%u",
                      simFrame,
@@ -736,10 +783,22 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
     const PlayerState& attacker = s_players[interaction.attacker];
     const PlayerState& defender = s_players[interaction.defender];
 
-    if (interaction.simFrame_A_recover == kFrameUnset &&
+    // Bounded by the contact frame: a recovery from BEFORE this interaction was
+    // promoted has already been carried across in simFrame_A_recover, so
+    // anything this tracker still needs to find must be at or after contact.
+    const uint32_t nativeAttackerFree =
+        NativeRecoveryAvailable(interaction.attacker)
+            ? TakeNativeFreeFrame(interaction.attacker, interaction.simFrame_contact)
+            : kFrameUnset;
+    const bool legacyAttackerEdge =
+        !NativeRecoveryAvailable(interaction.attacker) &&
         !IsFree(attacker.prev, Training::ActionableContext::AttackerRecovery) &&
-        IsFree(attacker.curr, Training::ActionableContext::AttackerRecovery)) {
-        interaction.simFrame_A_recover = simFrame;
+        IsFree(attacker.curr, Training::ActionableContext::AttackerRecovery);
+
+    if (interaction.simFrame_A_recover == kFrameUnset &&
+        (nativeAttackerFree != kFrameUnset || legacyAttackerEdge)) {
+        interaction.simFrame_A_recover =
+            (nativeAttackerFree != kFrameUnset) ? nativeAttackerFree : simFrame;
         interaction.lastProgressFrame = simFrame;
         if (s_actionabilityAuditLogging) {
             LOG_INFO("[FAREC] frame=%u %s role=attacker act=%u phase=%u aframe=%u source=legacy native676=%u A_recover=%u",
@@ -777,11 +836,20 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
         interaction.lastProgressFrame = simFrame;
     }
 
+    const uint32_t nativeDefenderFree =
+        NativeRecoveryAvailable(interaction.defender)
+            ? TakeNativeFreeFrame(interaction.defender, interaction.simFrame_contact)
+            : kFrameUnset;
+    const bool legacyDefenderEdge =
+        !NativeRecoveryAvailable(interaction.defender) &&
+        !IsFree(defender.prev, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked) &&
+        IsFree(defender.curr, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked);
+
     if (interaction.simFrame_D_recover == kFrameUnset &&
         !IsDefenderLocked(defender.curr.actionId) &&
-        !IsFree(defender.prev, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked) &&
-        IsFree(defender.curr, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked)) {
-        interaction.simFrame_D_recover = simFrame;
+        (nativeDefenderFree != kFrameUnset || legacyDefenderEdge)) {
+        interaction.simFrame_D_recover =
+            (nativeDefenderFree != kFrameUnset) ? nativeDefenderFree : simFrame;
         interaction.lastProgressFrame = simFrame;
         // Record the defender's free frame for gap detection. This must happen on
         // every D_recover — not just mid-string — so the gap between two hits is
@@ -842,7 +910,90 @@ void FrameAdvantage_Shutdown(void) {
     s_initialized = false;
 }
 
+void FrameAdvantage_OnPreCommandDispatch(int player,
+                                         uint32_t simFrame,
+                                         const Training::NativeRecoverySample& sample,
+                                         const Training::NativeRecoveryResult& result) {
+    if (player < 0 || player > 1 || !s_initialized) {
+        return;
+    }
+
+    s_nativeKind[player] = result.kind;
+    s_nativeCpuUnsupported[player] =
+        result.kind == Training::NativeRecoveryKind::CpuControlledUnsupported;
+
+    if (result.freeRecovery) {
+        s_nativeFreeFrame[player] = simFrame;
+        s_nativeFreeGeneration[player]++;
+    }
+
+    if (!s_actionabilityAuditLogging) {
+        return;
+    }
+
+    const bool changed = s_lastNativeReason[player] != result.reason ||
+                         s_lastNativeLogFrame[player] + 60 < simFrame;
+    if (!changed) {
+        return;
+    }
+    s_lastNativeReason[player] = result.reason;
+    s_lastNativeLogFrame[player] = simFrame;
+
+    LOG_INFO("[FAACT] f=%u %s act=%u p1=%u p2=%u target=%u air=%u down=%u cpu=%u restore=%u "
+             "r2=%u r3=%u r4=%u r5=%u r6=%u r7=%u free=%d routeOnly=%d kind=%s",
+             simFrame,
+             SideLabel((uint8_t)player),
+             sample.currentAction,
+             sample.pendingAction1,
+             sample.pendingAction2,
+             result.pendingTarget,
+             (unsigned int)sample.airborne,
+             (unsigned int)sample.downHeld,
+             (unsigned int)sample.cpuControlled,
+             (unsigned int)sample.trainingRestoreGate,
+             (unsigned int)sample.routes[2],
+             (unsigned int)sample.routes[3],
+             (unsigned int)sample.routes[4],
+             (unsigned int)sample.routes[5],
+             (unsigned int)sample.routes[6],
+             (unsigned int)sample.routes[7],
+             result.freeRecovery ? 1 : 0,
+             result.routeOpenWithoutFreeHandoff ? 1 : 0,
+             Training::NativeRecoveryKindLabel(result.kind));
+
+    if (Training::BothPendingSlotsSet(sample)) {
+        LOG_WARN("[FAACT] f=%u %s both pending slots set (p1=%u p2=%u)",
+                 simFrame, SideLabel((uint8_t)player),
+                 sample.pendingAction1, sample.pendingAction2);
+    }
+}
+
+void FrameAdvantage_OnPostCommandDispatch(int player,
+                                          uint32_t simFrame,
+                                          uint32_t pending1,
+                                          uint32_t pending2) {
+    if (player < 0 || player > 1 || !s_initialized || !s_actionabilityAuditLogging) {
+        return;
+    }
+    if (s_nativeFreeFrame[player] != simFrame) {
+        return;
+    }
+    const uint32_t after = pending1 != 0 ? pending1 : pending2;
+    if (!Training::IsTerminalNeutralTarget(after)) {
+        LOG_INFO("[FAACT] f=%u %s real input replaced the neutral handoff (now %u)",
+                 simFrame, SideLabel((uint8_t)player), after);
+    }
+}
+
 void FrameAdvantage_ResetState(void) {
+    for (int i = 0; i < 2; ++i) {
+        s_nativeFreeFrame[i] = kFrameUnset;
+        s_nativeFreeGeneration[i] = 0;
+        s_nativeKind[i] = Training::NativeRecoveryKind::Locked;
+        s_nativeCpuUnsupported[i] = false;
+        s_lastNativeLogFrame[i] = 0;
+        s_lastNativeReason[i] = "";
+    }
     ClearTrackingRuntime(true);
 }
 

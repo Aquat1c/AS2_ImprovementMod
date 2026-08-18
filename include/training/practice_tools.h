@@ -15,13 +15,21 @@
 
 #pragma once
 
+#include "training/auto_block.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
+// Auto-block decisions must survive a savestate load unchanged, so the
+// sequence generation, contact count, random roll and frame-latched lane
+// travel with the slot rather than being re-derived.
 struct PracticeToolsRuntimeState {
 	bool paused;
 	bool stepRequested;
 	uint32_t stepCounter;
+	Training::AutoBlockSequenceState autoBlockSequence;
+	Training::FrameGuardPlan frameGuardPlan;
+	uint32_t lastProcessedSimFrame;
 };
 
 // Lifecycle

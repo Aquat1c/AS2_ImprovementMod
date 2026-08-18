@@ -79,16 +79,22 @@ bool IsContactStartState(uint32_t actionId) {
     return IsBlockstun(actionId) || IsHitstun(actionId);
 }
 
-bool IsAttackMoveState(uint32_t actionId) {
-    // Engine boundary (decomp: throw/state handlers branch on actionId < 85):
-    // 0..84 are reaction/movement/neutral states, 85+ are the CharAction_*
-    // attack-move handlers.
-    return actionId >= 85;
+bool IsSharedAttackAction(uint32_t actionId) {
+    // The IDs the shared route handlers queue:
+    //   85/86/87/88 stand A/B/C, 89/90/91 crouch A/B/C,
+    //   92/93/94/95 air A/B/C,   96/97/98 command normals,
+    //   137..140    supers.
+    // Character specials are NOT here - they occupy parts of 34..84 together
+    // with the reaction and movement states, so an ID range cannot separate
+    // committed from free. That is what the command-route vector is for.
+    return (actionId >= 85 && actionId <= 98) || (actionId >= 137 && actionId <= 140);
 }
 
 bool IsStateClassActionable(uint32_t actionId, bool landingExcluded) {
-    // Performing an attack move — not actionable until it returns to a state < 85.
-    if (IsAttackMoveState(actionId)) {
+    // Audit heuristic only: it cannot see character specials below 85, so it
+    // reports free while a fighter is still committed to one.
+    // Performing a shared attack action — not actionable until it returns to a state < 85.
+    if (IsSharedAttackAction(actionId)) {
         return false;
     }
     // Forced locks: blockstun/hitstun (64,65,67,68,70,71,72,73) and
@@ -106,7 +112,9 @@ bool IsStateClassActionable(uint32_t actionId, bool landingExcluded) {
     if (landingExcluded) {
         return false;
     }
-    // Everything else < 85 is a movement/neutral state the character can act out
+    // Everything else is treated as a movement/neutral state. Blind spot:
+    // character specials land here too.
+    // Formerly: everything else < 85 is a movement/neutral state the character can act out
     // of: stand/crouch/walk/jump/air, proximity guard (63/66/69), etc. — including
     // states not present in the hand-enumerated legacy free list.
     return true;
@@ -163,6 +171,7 @@ ActionabilityResult EvaluateActionability(const ActionStateSample& sample,
             out.reason = out.actionable ? "hybrid" : "hybrid_locked";
             break;
 
+        case ActionabilitySource::NativePreCommand:
         case ActionabilitySource::StateClass:
             // Forced locks and landing exclusion were already resolved above; this
             // recomputes from the engine's state-class boundaries so any

@@ -4,6 +4,8 @@
 #include "training/frame_advantage.h"
 #include "training/hotkey_config.h"
 #include "training/input_macro.h"
+#include "training/auto_block.h"
+#include "patches/practice_defense_hooks.h"
 #include "core/mod_main.h"
 #include "rollback/savestate.h"
 #include "patches/memory_utils.h"
@@ -69,6 +71,19 @@ enum DummyBlockMode {
     DUMMY_BLOCK_RANDOM,
     DUMMY_BLOCK_ADAPTIVE,
 };
+
+// Auto-Block combo order; kept as-is so saved configs stay valid.
+static Training::BlockPolicy BlockPolicyForMode(int blockMode) {
+    switch (blockMode) {
+        case DUMMY_BLOCK_ALL:             return Training::BlockPolicy::All;
+        case DUMMY_BLOCK_FIRST_HIT:       return Training::BlockPolicy::FirstHit;
+        case DUMMY_BLOCK_AFTER_FIRST_HIT: return Training::BlockPolicy::AfterFirstHit;
+        case DUMMY_BLOCK_RANDOM:          return Training::BlockPolicy::Random;
+        case DUMMY_BLOCK_ADAPTIVE:        return Training::BlockPolicy::Adaptive;
+        case DUMMY_BLOCK_NONE:
+        default:                          return Training::BlockPolicy::Off;
+    }
+}
 
 enum DummyStanceMode {
     DUMMY_STANCE_NEUTRAL = 0,
@@ -313,9 +328,6 @@ struct ScriptRuntime {
 struct PlayerRuntime {
     PlayerSnapshot prev;
     bool hasPrev;
-    bool threatWindowActive;
-    bool randomBlockThisWindow;
-    bool contactSeenThisWindow;
     bool pendingAirTechCompletion;
     bool pendingGroundTechCompletion;
     bool neutralValid;
@@ -709,10 +721,6 @@ static bool IsActionable(const PlayerSnapshot& snapshot) {
     return IsActionableWithContext(snapshot, Training::ActionableContext::PracticeTrigger);
 }
 
-static bool IsThreatWindowFree(const PlayerSnapshot& snapshot) {
-    return IsActionableWithContext(snapshot, Training::ActionableContext::ThreatWindowEnd);
-}
-
 static bool IsBlockstun(uint32_t actionId) {
     return Training::IsBlockstun(actionId);
 }
@@ -747,11 +755,6 @@ static bool IsWakeupNoTechState(uint32_t actionId) {
 
 static bool IsGroundedAction(const PlayerSnapshot& snapshot) {
     return snapshot.y <= 0 && !IsAirTechState(snapshot.actionId);
-}
-
-static bool IsThreateningAttack(const PlayerSnapshot& snapshot) {
-    const bool hitActive = snapshot.hitActive != 0 && snapshot.hitActive != 0xFF;
-    return snapshot.attackState != 0 || hitActive;
 }
 
 static uint16_t ReadComboCount(uintptr_t entityBase) {
@@ -856,7 +859,9 @@ static PlayerSnapshot ReadPlayerSnapshot(int player) {
     snapshot.facingRaw = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_FACING);
     snapshot.facingRight = (int8_t)snapshot.facingRaw > 0;  // 1=right, -1/0xFF=left
     snapshot.actionId = ReadMemory<uint32_t>(snapshot.base + ENTITY_OFF_ACTION_ID);
-    snapshot.nativeActionable = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_NATIVE_ACTIONABLE);
+    // Route 2 (the shared stand/air A branch), retained for the audit log.
+    snapshot.nativeActionable =
+        ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_COMMAND_ROUTE_TIMERS + ENTITY_ROUTE_A_STAND_OR_AIR);
     snapshot.attackState = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_ATTACK_STATE);
     snapshot.attackFlags = ReadMemory<uint32_t>(snapshot.base + ENTITY_OFF_ATTACK_TYPE);
     snapshot.hitActive = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_HIT_ACTIVE);
@@ -914,6 +919,7 @@ static void ClearValueEditors(void) {
 static void ResetPracticeTransientRuntime(bool clearEditors) {
     ReleaseOwnedOverride(0);
     ReleaseOwnedOverride(1);
+    PracticeDefense_Reset();
     ClearPlayerRuntime();
     ClearComboTrackers();
     s_lastObservedSimFrame = kInvalidFrame;
@@ -1930,34 +1936,13 @@ static void UpdatePlayerRuntimeForFrame(uint32_t simFrame,
             runtime.neutralSinceFrame = simFrame;
         }
 
-        const bool threatNow = IsThreateningAttack(opponent);
-        if (!runtime.threatWindowActive && threatNow) {
-            runtime.threatWindowActive = true;
-            runtime.randomBlockThisWindow = DeterministicCoinFlip(simFrame, (uint32_t)(player + 1) * 17u);
-            runtime.contactSeenThisWindow = false;
-            LOG_INFO("[Practice] Threat window start: defender=%s attacker=%s frame=%u opp_act=%u atk=%u hit=%u random_block=%d",
-                     SideLabel(player),
-                     SideLabel(1 - player),
-                     simFrame,
-                     opponent.actionId,
-                     (unsigned int)opponent.attackState,
-                     (unsigned int)opponent.hitActive,
-                     runtime.randomBlockThisWindow ? 1 : 0);
-        } else if (runtime.threatWindowActive && !threatNow && IsThreatWindowFree(opponent)) {
-            LOG_INFO("[Practice] Threat window end: defender=%s attacker=%s frame=%u opp_act=%u contact_seen=%d",
-                     SideLabel(player),
-                     SideLabel(1 - player),
-                     simFrame,
-                     opponent.actionId,
-                     runtime.contactSeenThisWindow ? 1 : 0);
-            runtime.threatWindowActive = false;
-            runtime.contactSeenThisWindow = false;
-        }
+        // Pressure tracking for auto-block lives in the collision hooks now: it
+        // has to see HitDefs and contacts that land while the dummy is already
+        // in blockstun, neither of which produces an action-state edge here.
 
         if (runtime.hasPrev) {
             const bool enteredStun = !IsStunned(runtime.prev.actionId) && IsStunned(current.actionId);
             if (enteredStun) {
-                runtime.contactSeenThisWindow = true;
                 runtime.pendingAirTechCompletion = false;
                 runtime.pendingGroundTechCompletion = false;
                 LOG_INFO("[Practice] Contact seen: %s frame=%u prev_act=%u curr_act=%u",
@@ -2116,42 +2101,54 @@ static void ApplyContinuousRecovery(uint32_t simFrame,
     }
 }
 
+static void PushDefenseConfig() {
+    PracticeDefenseConfig config{};
+    config.enabled = (s_practiceConfig.dummyControlMode == DUMMY_CONTROL_MOD);
+    config.policy = BlockPolicyForMode(s_practiceConfig.blockMode);
+    config.randomPercent = 50;
+    // Native adaptive crouches unless the attack is stand-only, so crouch is the
+    // compatible default for masks that permit either lane.
+    config.preferCrouch = (s_practiceConfig.stanceMode != DUMMY_STANCE_STAND);
+    config.dummyPlayer = 1;
+    config.controlSwapActive = InputSystem_GetControlSwap();
+    config.macroOwnsDummyInput = (InputMacro_GetState() == MACRO_REPLAYING);
+    config.paused = s_paused;
+    PracticeDefense_SetConfig(config);
+}
+
+// Whether the dummy should be holding an anticipatory guard this frame. The
+// authoritative decision is made at contact time by the guard-resolver hook;
+// this only produces natural posture and a truthful input display.
+//
+// First / After First Hit key off contact GROUPS counted from real collision
+// outcomes, not from action-state edges: a second hit landing while the dummy
+// is already in blockstun produces no state edge at all.
 static bool ShouldHoldAutoBlock(const PlayerSnapshot snapshots[kPracticePlayerCount]) {
     if (InputSystem_GetControlSwap()) {
         return false;
     }
 
-    const PlayerRuntime& runtime = s_playerRuntime[1];
     const PlayerSnapshot& dummy = snapshots[1];
     const PlayerSnapshot& attacker = snapshots[0];
-    if (!dummy.valid || !attacker.valid || !runtime.threatWindowActive) {
+    if (!dummy.valid || !attacker.valid) {
         return false;
     }
-
-    switch (s_practiceConfig.blockMode) {
-        case DUMMY_BLOCK_ALL:
-        case DUMMY_BLOCK_ADAPTIVE:
-            return true;
-        case DUMMY_BLOCK_FIRST_HIT:
-            return !runtime.contactSeenThisWindow;
-        case DUMMY_BLOCK_AFTER_FIRST_HIT:
-            return runtime.contactSeenThisWindow;
-        case DUMMY_BLOCK_RANDOM:
-            return runtime.randomBlockThisWindow;
-        default:
-            return false;
-    }
+    return PracticeDefense_WantsAnticipatoryGuard();
 }
 
+// Semantic back / down-back, resolved to physical left/right from the dummy's
+// live facing here at injection time so a cross-up cannot stale it.
 static uint16_t BuildDummyBlockInput(const PlayerSnapshot& dummy,
                                      const PlayerSnapshot& attacker) {
-    uint16_t input = BackMask(dummy);
-    if (s_practiceConfig.blockMode == DUMMY_BLOCK_ADAPTIVE &&
-        attacker.y <= 0 &&
-        (attacker.attackFlags & ATTACK_FLAG_LOW_HIT) != 0) {
-        input |= INPUT_DOWN;
+    (void)attacker;
+    const Training::SemanticDirection direction = PracticeDefense_GetAnticipatoryGuard();
+    uint16_t resolved = Training::ResolveSemanticDirection(direction, dummy.facingRight);
+    if (resolved == 0) {
+        // Nothing decoded yet: plain back keeps proximity guard natural.
+        resolved = BackMask(dummy);
     }
-    return input;
+    PracticeDefense_NoteAnticipatoryFacing(dummy.facingRight ? (int8_t)1 : (int8_t)-1, true);
+    return resolved;
 }
 
 static uint16_t BuildJumpInput(const PlayerSnapshot& snapshot, int jumpMode, uint32_t simFrame) {
@@ -2680,6 +2677,71 @@ static void RenderOverviewTab(const PlayerSnapshot snapshots[kPracticePlayerCoun
     ImGui::TextDisabled("Frame %u", ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER));
 }
 
+static void RenderAutoBlockTelemetry() {
+    if (!ImGui::CollapsingHeader("Auto-Block Diagnostics")) {
+        return;
+    }
+
+    const PracticeDefenseTelemetry& t = PracticeDefense_GetTelemetry();
+    ImGui::Indent();
+
+    ImGui::Text("Plan: %s  (%s scan, %u threat%s)",
+                Training::GuardLaneLabel(t.plan.lane),
+                t.plan.exactContactScan ? "exact" : "fallback",
+                (unsigned int)t.plan.threatCount,
+                t.plan.threatCount == 1 ? "" : "s");
+    if (t.plan.lane == Training::GuardLane::Conflict) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "HIGH/LOW CONFLICT");
+    }
+    ImGui::Text("Sequence: %s  gen %u  contact groups %u  random %s",
+                t.sequence.active ? "active" : "idle",
+                (unsigned int)t.sequence.generation,
+                (unsigned int)t.sequence.resolvedContactGroups,
+                t.sequence.randomBlock ? "block" : "no-block");
+
+    if (t.hasLastContact) {
+        ImGui::Separator();
+        if (t.lastSource == Training::ThreatSource::HitDef) {
+            ImGui::Text("Threat: HitDef[%d] id %u", t.lastHitDefSlot, (unsigned int)t.lastHitDefId);
+        } else {
+            ImGui::Text("Threat: direct attack");
+        }
+        ImGui::Text("Mask: 0x%05X  %s",
+                    (unsigned int)t.lastAttackMask,
+                    Training::GroundGuardClassLabel(t.lastClass));
+        ImGui::Text("Lane: %s   eligible %s   pre-armed %s   armed at contact %s",
+                    Training::GuardLaneLabel(t.lastLane),
+                    t.lastEligible ? "yes" : "no",
+                    t.lastPrearmed ? "yes" : "no",
+                    t.lastSafetyArm ? "yes" : "no");
+        ImGui::Text("Flags: 0x%08X -> 0x%08X%s",
+                    (unsigned int)t.lastFlagsBefore,
+                    (unsigned int)t.lastFlagsTemp,
+                    t.lastNativeGuardWithoutMod ? "  (already guarding natively)" : "");
+        ImGui::Text("Facing: input %d  contact %d",
+                    (int)t.facingAtInput, (int)t.facingAtContact);
+        ImGui::Text("Result: %s (%u)",
+                    Training::ContactResolutionLabel(t.lastResult),
+                    (unsigned int)t.lastResult);
+    } else {
+        ImGui::TextDisabled("No contact resolved yet.");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("guard calls %u | lanes applied %u | conflicts %u | no-lane %u | special-guard %u",
+                        (unsigned int)t.guardHookCalls,
+                        (unsigned int)t.laneApplications,
+                        (unsigned int)t.conflictFrames,
+                        (unsigned int)t.refusedNoLane,
+                        (unsigned int)t.refusedSpecialGuard);
+    if (t.lateBlockSignatures > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                           "LATE BLOCK regressions: %u", (unsigned int)t.lateBlockSignatures);
+    }
+
+    ImGui::Unindent();
+}
+
 static void RenderOpponentTab(const PlayerSnapshot snapshots[kPracticePlayerCount]) {
     if (snapshots[1].valid) {
         ImGui::Text("Dummy: %s  Weight %u (%s)",
@@ -2741,15 +2803,30 @@ static void RenderOpponentTab(const PlayerSnapshot snapshots[kPracticePlayerCoun
         return;
     }
 
+    if (!PracticeDefense_HasOrdinaryGuardHook()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                           "Contact-time guard hook unavailable (%s).",
+                           PracticeDefense_GetInstallError());
+        ImGui::TextWrapped("Auto-block cannot guarantee the first active frame without it, "
+                           "so it stays disabled rather than blocking one frame late.");
+        ImGui::Separator();
+    }
+
     ImGui::SetNextItemWidth(180.0f);
     ImGui::Combo("Auto-Block", &s_practiceConfig.blockMode, kBlockModeLabels, IM_ARRAYSIZE(kBlockModeLabels));
     ImGui::SameLine(); HelpMarker(
+        "Guard height comes from the live attack mask on every contact, so multi-hit\n"
+        "moves that change height mid-string are followed hit by hit. One guard lane\n"
+        "is fixed per simulation frame, so a simultaneous overhead and low is reported\n"
+        "as a conflict instead of being blocked twice.\n\n"
         "None: Dummy does not block.\n"
-        "All: Blocks all attacks.\n"
-        "First Hit: Blocks only the first hit per string.\n"
-        "After First Hit: Starts blocking after getting hit.\n"
-        "Random: 50/50 per attack window.\n"
-        "Adaptive: Stand-blocks by default, crouch-blocks only grounded lows.");
+        "All: Blocks every guardable contact.\n"
+        "First Hit: Blocks only the first contact of a string.\n"
+        "After First Hit: Takes the first contact, then blocks once it can legally guard again.\n"
+        "Random: 50/50 per string, rolled deterministically.\n"
+        "Adaptive: Same as All; the lane always follows the attack.");
+
+    RenderAutoBlockTelemetry();
 
     ImGui::SetNextItemWidth(180.0f);
     ImGui::Combo("Stance", &s_practiceConfig.stanceMode, kStanceModeLabels, IM_ARRAYSIZE(kStanceModeLabels));
@@ -3163,10 +3240,21 @@ void PracticeTools_RestoreRuntimeState(const PracticeToolsRuntimeState* state) {
     s_paused = state->paused;
     s_stepRequested = state->stepRequested;
     s_stepCounter = (int)state->stepCounter;
-    LOG_INFO("[Practice] Restored runtime state: paused=%d step_requested=%d step_counter=%u",
+
+    PracticeDefenseRuntimeState defense{};
+    defense.sequence = state->autoBlockSequence;
+    defense.plan = state->frameGuardPlan;
+    defense.lastProcessedSimFrame = state->lastProcessedSimFrame;
+    PracticeDefense_RestoreState(&defense);
+
+    LOG_INFO("[Practice] Restored runtime state: paused=%d step_requested=%d step_counter=%u "
+             "seq_gen=%u seq_groups=%u seq_random=%d",
              s_paused ? 1 : 0,
              s_stepRequested ? 1 : 0,
-             (unsigned int)state->stepCounter);
+             (unsigned int)state->stepCounter,
+             (unsigned int)state->autoBlockSequence.generation,
+             (unsigned int)state->autoBlockSequence.resolvedContactGroups,
+             state->autoBlockSequence.randomBlock ? 1 : 0);
 }
 
 void PracticeTools_Init() {
@@ -3215,7 +3303,13 @@ void PracticeTools_FrameUpdate() {
 
     s_wasActive = active;
 
-    if (!active) return;
+    if (!active) {
+        PracticeDefenseConfig idle{};
+        PracticeDefense_SetConfig(idle);
+        return;
+    }
+
+    PushDefenseConfig();
 
     UpdateToasts(1.0f / 60.0f);
 

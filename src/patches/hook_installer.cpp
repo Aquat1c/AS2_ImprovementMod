@@ -3,6 +3,8 @@
 #include "patches/input_override.h"
 #include "patches/input_sync_hooks.h"
 #include "patches/tick_hooks.h"
+#include "patches/practice_defense_hooks.h"
+#include "patches/practice_recovery_hooks.h"
 #include "patches/locale_patch.h"
 #include "patches/filesystem_patch.h"
 #include "patches/palette_asset_hook.h"
@@ -414,11 +416,30 @@ bool InstallHooks() {
                  "legacy virtual-clock frame limiter (R-1 fallback)");
     }
 
+    // --- Practice contact-time defense hooks ---
+    // Installed after MH_EnableHook(MH_ALL_HOOKS) because they create and enable
+    // their own hooks. If the ordinary-guard resolver cannot be hooked, practice
+    // auto-block reports itself unavailable rather than falling back to the
+    // known-late post-render observer.
+    if (!PracticeDefense_Install()) {
+        LOG_WARN("Practice defense hooks NOT installed (%s) — first-frame-safe "
+                 "auto-block unavailable", PracticeDefense_GetInstallError());
+    }
+
+    // Pre-command-dispatch observation for frame advantage. Without it recovery
+    // falls back to the action-ID edge, which is a tick late by construction.
+    if (!PracticeRecovery_Install()) {
+        LOG_WARN("Practice recovery hook NOT installed (%s) — frame advantage "
+                 "falls back to action-ID edges", PracticeRecovery_GetInstallError());
+    }
+
     return true;
 }
 
 void RemoveHooks() {
     LOG_INFO("Removing hooks...");
+    PracticeDefense_Uninstall();
+    PracticeRecovery_Uninstall();
     FrameScheduler_Shutdown();
     NetplayBackgroundRun::Shutdown();
     ShellHotkeyPatch_Remove();
