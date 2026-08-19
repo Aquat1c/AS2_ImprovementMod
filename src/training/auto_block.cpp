@@ -421,6 +421,126 @@ void SequenceEnd(AutoBlockSequenceState& sequence) {
     sequence.randomBlock = false;
 }
 
+DefensiveResponse ResponseForCategory(int category) {
+    switch (category) {
+        case kDefenseCategoryJustParry: return DefensiveResponse::JustParry;
+        case kDefenseCategoryDodge:     return DefensiveResponse::Dodge;
+        case kDefenseCategoryRepel:     return DefensiveResponse::Repel;
+        case kDefenseCategoryUnique:    return DefensiveResponse::GuardCounter;
+        // Push-away needs no command at all - guarding with 100 meter is the
+        // whole input - so ordinary guard already produces it.
+        case kDefenseCategoryPushAway:  return DefensiveResponse::NormalGuard;
+        default:                        return DefensiveResponse::NormalGuard;
+    }
+}
+
+bool ResponseSupportedByCategory(DefensiveResponse response, int category) {
+    switch (response) {
+        case DefensiveResponse::JustParry: return category == kDefenseCategoryJustParry;
+        case DefensiveResponse::Dodge:     return category == kDefenseCategoryDodge;
+        case DefensiveResponse::Repel:     return category == kDefenseCategoryRepel;
+        case DefensiveResponse::GuardCounter: return category == kDefenseCategoryUnique;
+        case DefensiveResponse::CharacterNative:
+        case DefensiveResponse::NormalGuard:
+        default:                           return true;
+    }
+}
+
+const char* DefensiveResponseLabel(DefensiveResponse response) {
+    switch (response) {
+        case DefensiveResponse::CharacterNative: return "character_native";
+        case DefensiveResponse::JustParry:       return "just_parry";
+        case DefensiveResponse::Dodge:           return "dodge";
+        case DefensiveResponse::Repel:           return "repel";
+        case DefensiveResponse::GuardCounter:    return "guard_counter";
+        case DefensiveResponse::NormalGuard:
+        default:                                 return "guard_only";
+    }
+}
+
+bool DodgeWindowOpen(uint32_t actionId, uint16_t meter) {
+    if (meter < kDodgeMeterCost) {
+        return false;
+    }
+    // Crouch blockstun 67/68, air blockstun 70/71 - the only cases
+    // Entity_UpdateAction_Standard routes to the dodge actions.
+    return actionId == 67 || actionId == 68 || actionId == 70 || actionId == 71;
+}
+
+bool ParryWantsRelease(ParryInputState& state, uint8_t windowByte, bool threatArmed) {
+    if (!threatArmed) {
+        state.releasedLastFrame = false;
+        return false;
+    }
+
+    // A window already counting down does not need re-arming; holding BACK
+    // through it is what keeps +1974 set for the lane check.
+    if (windowByte != 0xFFu) {
+        state.releasedLastFrame = false;
+        return false;
+    }
+
+    // Idle window: one frame without BACK, then the next press is the edge
+    // Entity_CheckHitState is looking for. Releasing twice in a row would just
+    // drop the guard, so alternate.
+    if (state.releasedLastFrame) {
+        state.releasedLastFrame = false;
+        return false;
+    }
+    state.releasedLastFrame = true;
+    return true;
+}
+
+DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
+                                      const DefenseDriveSample& sample,
+                                      DefenseDriveState& state) {
+    if (!sample.threatArmed) {
+        state = DefenseDriveState{};
+        return DefenseInputKind::None;
+    }
+
+    switch (response) {
+        case DefensiveResponse::JustParry:
+            return ParryWantsRelease(state.parry, sample.parryWindow, true)
+                       ? DefenseInputKind::ReleaseGuard
+                       : DefenseInputKind::None;
+
+        case DefensiveResponse::Dodge:
+            return DodgeWindowOpen(sample.actionId, sample.meter)
+                       ? DefenseInputKind::DodgePress
+                       : DefenseInputKind::None;
+
+        case DefensiveResponse::Repel:
+            // Entity_CheckGuardState only arms from neutral, so the tap has to
+            // be preceded by a frame with no direction at all. Nothing to do
+            // while a reaction is already armed - it lasts 24 frames.
+            if (sample.reactionState != kReactionIdle) {
+                state.tapPhase = false;
+                return DefenseInputKind::None;
+            }
+            state.tapPhase = !state.tapPhase;
+            return state.tapPhase ? DefenseInputKind::ReleaseGuard
+                                  : DefenseInputKind::ForwardTap;
+
+        case DefensiveResponse::GuardCounter:
+            // 6D moves the character forward, which is the opposite of holding
+            // guard - so it has to be one press per threat rather than a held
+            // direction, or the dummy would simply never block. The guide lists
+            // it as "6D or 4D; air OK", and the engine has the airborne branch,
+            // so height is its business, not ours.
+            if (state.counterFired || !sample.actionable) {
+                return DefenseInputKind::None;
+            }
+            state.counterFired = true;
+            return DefenseInputKind::CounterForward;
+
+        case DefensiveResponse::CharacterNative:
+        case DefensiveResponse::NormalGuard:
+        default:
+            return DefenseInputKind::None;
+    }
+}
+
 SemanticDirection SemanticGuardForLane(GuardLane lane, bool defenderAirborne) {
     if (defenderAirborne) {
         return lane == GuardLane::Air ? SemanticDirection::AirBack : SemanticDirection::Neutral;

@@ -18,7 +18,9 @@
 
 static const char* kHotkeyConfigFilename = "as2_practice_hotkeys.cfg";
 static const uint32_t kHotkeyConfigMagic = 0x48325341u;   // "AS2H"
-static const uint32_t kHotkeyConfigVersion = 1u;
+// 2 added the savestate rows; a version mismatch drops the old file rather than
+// reading a shorter binding array into a longer one.
+static const uint32_t kHotkeyConfigVersion = 2u;
 
 struct HotkeyConfigHeader {
     uint32_t magic;
@@ -30,6 +32,8 @@ static const KeyBinding_t kDefaultBindings[HOTKEY_COUNT] = {
     { SDL_SCANCODE_F7,  -1, -1, 0 },  // HOTKEY_PAUSE_TOGGLE
     { SDL_SCANCODE_F8,  -1, -1, 0 },  // HOTKEY_FRAME_STEP
     { SDL_SCANCODE_F9,  -1, -1, 0 },  // HOTKEY_CONTROL_SWAP
+    { SDL_SCANCODE_F5,  -1, -1, 0 },  // HOTKEY_STATE_SAVE
+    { SDL_SCANCODE_F6,  -1, -1, 0 },  // HOTKEY_STATE_LOAD
     { SDL_SCANCODE_1,   -1, -1, 0 },  // HOTKEY_POSITION_LOAD
     { SDL_SCANCODE_2,   -1, -1, 0 },  // HOTKEY_POSITION_SAVE
     { SDL_SCANCODE_F10, -1, -1, 0 },  // HOTKEY_MACRO_RECORD
@@ -42,11 +46,29 @@ static const char* kActionNames[HOTKEY_COUNT] = {
     "Pause Toggle",
     "Frame Step",
     "Control Swap",
+    "Save State",
+    "Load State",
     "Position Load",
     "Position Save",
     "Macro Record",
     "Macro Play/Stop",
     "Macro Slot Next",
+};
+
+// Savestates are offered in arcade and versus as well, so gating them on
+// training would take away keys that already work there.
+static const bool kActionPracticeOnly[HOTKEY_COUNT] = {
+    true,   // HOTKEY_HITBOX_TOGGLE
+    true,   // HOTKEY_PAUSE_TOGGLE
+    true,   // HOTKEY_FRAME_STEP
+    true,   // HOTKEY_CONTROL_SWAP
+    false,  // HOTKEY_STATE_SAVE
+    false,  // HOTKEY_STATE_LOAD
+    true,   // HOTKEY_POSITION_LOAD
+    true,   // HOTKEY_POSITION_SAVE
+    true,   // HOTKEY_MACRO_RECORD
+    true,   // HOTKEY_MACRO_PLAY
+    true,   // HOTKEY_MACRO_SLOT_NEXT
 };
 
 static const char* kControlActionNames[INPUT_ACTION_COUNT] = {
@@ -424,27 +446,62 @@ void HotkeyConfig_GetBindingDisplayName(HotkeyAction action, char* out, int outS
     InputSystem_GetBindingDisplayName(&s_bindings[action], out, outSize);
 }
 
+void HotkeyConfig_FormatLabel(char* out, int outSize, const char* text,
+                              HotkeyAction action) {
+    if (!out || outSize <= 0) {
+        return;
+    }
+    if (!text) {
+        text = "";
+    }
+
+    char bound[64] = {};
+    HotkeyConfig_GetBindingDisplayName(action, bound, (int)sizeof(bound));
+    if (bound[0]) {
+        snprintf(out, outSize, "%s (%s)", text, bound);
+    } else {
+        snprintf(out, outSize, "%s", text);
+    }
+}
+
 const char* HotkeyConfig_ActionName(HotkeyAction action) {
     if (action < 0 || action >= HOTKEY_COUNT) return "?";
     return kActionNames[action];
 }
 
-bool HotkeyConfig_IsSuppressed(void) {
-    return !PracticeTools_IsPracticeModeActive() ||
-           !IsGameWindowFocused() ||
+// Applies to every action: the window is not ours, a binding capture owns the
+// keyboard, or a text field is taking the keystrokes.
+static bool IsInputUnavailable(void) {
+    return !IsGameWindowFocused() ||
            InputSystem_IsBindingActive() ||
            IsImGuiKeyboardEntryActive();
+}
+
+static bool IsActionSuppressed(int action) {
+    if (IsInputUnavailable()) {
+        return true;
+    }
+    return kActionPracticeOnly[action] && !PracticeTools_IsPracticeModeActive();
+}
+
+bool HotkeyConfig_ActionIsPracticeOnly(HotkeyAction action) {
+    if (action < 0 || action >= HOTKEY_COUNT) {
+        return true;
+    }
+    return kActionPracticeOnly[action];
+}
+
+bool HotkeyConfig_IsSuppressed(void) {
+    return !PracticeTools_IsPracticeModeActive() || IsInputUnavailable();
 }
 
 void HotkeyConfig_Update(void) {
     if (!s_initialized) return;
 
-    const bool suppressed = HotkeyConfig_IsSuppressed();
-
     for (int i = 0; i < HOTKEY_COUNT; i++) {
         const bool down = BindingHasAnyComponent(&s_bindings[i]) &&
                           InputSystem_IsBindingDown(0, &s_bindings[i]);
-        if (suppressed) {
+        if (IsActionSuppressed(i)) {
             s_prevDown[i] = down;
             s_currDown[i] = down;
             continue;
@@ -458,8 +515,83 @@ void HotkeyConfig_Update(void) {
 bool HotkeyConfig_JustPressed(HotkeyAction action) {
     if (action < 0 || action >= HOTKEY_COUNT) return false;
     if (s_rebindAction >= 0) return false;
-    if (HotkeyConfig_IsSuppressed()) return false;
+    if (IsActionSuppressed(action)) return false;
     return s_currDown[action] && !s_prevDown[action];
+}
+
+// ============================================================================
+// Rebinding for the in-game settings page
+// ============================================================================
+
+void HotkeyConfig_BeginRebind(HotkeyAction action) {
+    if (!s_initialized || action < 0 || action >= HOTKEY_COUNT) {
+        return;
+    }
+    if (InputSystem_IsBindingActive()) {
+        InputSystem_CancelBinding();
+    }
+    // Player and button are ignored - the capture result is read back rather
+    // than written into the player's control set.
+    InputSystem_StartBinding(0, 0);
+    s_rebindAction = (int)action;
+}
+
+int HotkeyConfig_PollRebind(void) {
+    if (s_rebindAction < 0) {
+        return -1;
+    }
+    if (!InputSystem_IsBindingActive()) {
+        s_rebindAction = -1;
+        return -1;
+    }
+
+    KeyBinding_t captured = {};
+    int source = -1;
+    if (!InputSystem_FinishBinding(&captured, &source)) {
+        return 0;
+    }
+
+    // Keyboard and pad halves are held at once, so a capture replaces only the
+    // half it came from.
+    if (source == 0) {
+        s_bindings[s_rebindAction].keyboard_key = captured.keyboard_key;
+    } else {
+        s_bindings[s_rebindAction].gamepad_button = captured.gamepad_button;
+        s_bindings[s_rebindAction].gamepad_axis = captured.gamepad_axis;
+        s_bindings[s_rebindAction].axis_direction = captured.axis_direction;
+    }
+    SaveConfig(kHotkeyConfigFilename);
+    s_rebindAction = -1;
+    return 1;
+}
+
+void HotkeyConfig_CancelRebind(void) {
+    if (InputSystem_IsBindingActive()) {
+        InputSystem_CancelBinding();
+    }
+    s_rebindAction = -1;
+}
+
+bool HotkeyConfig_IsRebinding(void) {
+    return s_rebindAction >= 0;
+}
+
+int HotkeyConfig_RebindAction(void) {
+    return s_rebindAction;
+}
+
+void HotkeyConfig_ClearBinding(HotkeyAction action) {
+    if (action < 0 || action >= HOTKEY_COUNT) {
+        return;
+    }
+    ResetBinding(&s_bindings[action]);
+    SaveConfig(kHotkeyConfigFilename);
+}
+
+void HotkeyConfig_ResetDefaults(void) {
+    HotkeyConfig_CancelRebind();
+    ResetToDefaults();
+    SaveConfig(kHotkeyConfigFilename);
 }
 
 // ============================================================================

@@ -89,6 +89,88 @@ enum class BlockPolicy : uint8_t {
     Random,
 };
 
+// What the dummy should attempt instead of, or as well as, an ordinary guard.
+// Only responses whose LEGAL input path is traced end to end appear here; the
+// rest would be a lie until their per-character command arming is mapped.
+enum class DefensiveResponse : uint8_t {
+    NormalGuard = 0,
+    // Matches whatever dword_73E070 gives this character, so one setting covers
+    // the whole roster instead of asking the player which mechanic they have.
+    CharacterNative,
+    // Re-arms the native parry window by releasing and re-pressing BACK, which
+    // is the only thing Entity_CheckHitState accepts. Category 2 only.
+    JustParry,
+    // D out of blockstun with 500 meter. Category 6 only.
+    Dodge,
+    // Tap FORWARD from neutral to arm the hit-reaction window. Category 3 only.
+    Repel,
+    // 6D (or 4D) - the guide lists it as "6D or 4D; air OK". Category 1 only.
+    GuardCounter,
+    Count,
+};
+
+// Defence categories from dword_73E070, confirmed against the guide's own table.
+constexpr int kDefenseCategoryUnique = 1;
+constexpr int kDefenseCategoryRepel = 3;
+// Repel arms from Entity_CheckGuardState: a FORWARD tap taken from neutral sets
+// a 24-frame reaction window at +1990. +1980 == -1 means nothing is armed.
+constexpr int32_t kReactionIdle = -1;
+constexpr int kDefenseCategoryPushAway = 4;
+constexpr int kDefenseCategoryAbsolute = 5;
+constexpr int kDefenseCategoryDodge = 6;
+
+// Which response a category can actually perform on legal input today.
+DefensiveResponse ResponseForCategory(int category);
+bool ResponseSupportedByCategory(DefensiveResponse response, int category);
+const char* DefensiveResponseLabel(DefensiveResponse response);
+
+// Drives the parry re-arm. The window byte is the engine's own state, so the
+// cadence follows it rather than a guessed decay rate: whenever the window
+// reads idle we owe a fresh edge, which means one frame without BACK.
+struct ParryInputState {
+    bool releasedLastFrame = false;
+};
+
+// Returns true when this frame must NOT hold BACK, so the next one lands as a
+// fresh press. windowByte is the live +1965.
+bool ParryWantsRelease(ParryInputState& state, uint8_t windowByte, bool threatArmed);
+
+// What the dummy should press this frame to attempt its defensive mechanic.
+// Every one of these is an input a player could make; nothing here writes state.
+enum class DefenseInputKind : uint8_t {
+    None = 0,        // hold the ordinary guard
+    ReleaseGuard,    // no direction, so the next frame's press is a fresh edge
+    ForwardTap,      // repel arm: FORWARD from neutral
+    DodgePress,      // D + BACK out of blockstun
+    CounterForward,  // D + FORWARD, the category-1 guard counter
+};
+
+struct DefenseDriveSample {
+    uint8_t parryWindow = 0xFF;   // +1965, 0xFF = idle
+    int32_t reactionState = -1;   // +1980, -1 = no reaction armed
+    uint32_t actionId = 0;
+    uint16_t meter = 0;
+    bool airborne = false;
+    bool threatArmed = false;
+    bool actionable = false;      // engine would accept an ordinary input now
+};
+
+struct DefenseDriveState {
+    ParryInputState parry{};
+    bool tapPhase = false;        // alternates the neutral / press frames
+    bool counterFired = false;    // one counter per threat, not a held direction
+};
+
+DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
+                                      const DefenseDriveSample& sample,
+                                      DefenseDriveState& state);
+
+// Dodge is a guard cancel: D during blockstun with the meter to pay for it.
+// Entity_UpdateAction_Standard only offers it from actions 67/68 (crouch) and
+// 70/71 (air) blockstun, so pressing it anywhere else is wasted.
+constexpr uint16_t kDodgeMeterCost = 500;
+bool DodgeWindowOpen(uint32_t actionId, uint16_t meter);
+
 // Held as a semantic direction and resolved to physical left/right as late as
 // possible, so a side change between input and contact cannot stale the guard.
 enum class SemanticDirection : uint8_t {
@@ -168,6 +250,10 @@ struct FrameContactOutcome {
     bool temporaryLaneApplied = false;
     bool nativeGuardWithoutMod = false;
 };
+
+// dword_73E070[charId]: 1 unique, 2 just-parry, 3 repel, 4 push-away,
+// 5 absolute defense, 6 dodge. 0 means the character has no category handler.
+constexpr int kDefenseCategoryJustParry = 2;
 
 struct DefenderGuardState {
     bool practiceAdvancedModeActive = false;

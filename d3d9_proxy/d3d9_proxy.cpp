@@ -1328,12 +1328,24 @@ static ImFont* g_netplayHudFonts[3] = {};
 // the same family instead of the game's built-in bitmap font.
 static ImFont* g_menuFont = nullptr;
 
+// Second bake of the same face for the pause menu, which matches the vanilla
+// glyph size. ImFontConfig::SizePixels maps ascent-descent, not the em: for
+// Shippori Mincho Bold (ascent 1160, descent -288, capHeight 737 per 1000 upem)
+// caps = 0.509 * SizePixels, so vanilla's 25 px caps need ~49. Upscaling the
+// 19 px atlas that far is a blur, and a 49 px CJK atlas would need 4096x4096 -
+// so this one carries Latin + Cyrillic only and fits in 1024x1024. Strings with
+// CJK fall back to g_menuFont.
+static ImFont* g_menuFontLarge = nullptr;
+static ImVector<ImWchar> g_menuLargeGlyphRanges;
+constexpr float kMenuFontLargeSize = 49.0f;
+
 // Text the mod queued this frame, in the game's 640x480 space. ImGui's
 // DisplaySize is already native, so these coordinates need no mapping.
 struct QueuedMenuText {
     float x, y;
     float size;   // 0 = the font's own size
     ImU32 color;
+    bool  hasHighCodepoint;   // anything above U+024F: keep it on the CJK atlas
     char  text[192];
 };
 static QueuedMenuText g_menuTextQueue[256];
@@ -1400,6 +1412,18 @@ static void ConfigureOverlayFonts(ImGuiIO& io) {
                             mdata, (int)msize, 19.0f, &menuConfig, glyphRanges);
                         ProxyLog("[IMGUI] Menu font (Shippori Mincho Bold): %s",
                                  g_menuFont ? "loaded" : "FAILED");
+
+                        ImFontGlyphRangesBuilder largeBuilder;
+                        largeBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+                        largeBuilder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+                        g_menuLargeGlyphRanges.clear();
+                        largeBuilder.BuildRanges(&g_menuLargeGlyphRanges);
+                        g_menuFontLarge = io.Fonts->AddFontFromMemoryTTF(
+                            mdata, (int)msize, kMenuFontLargeSize, &menuConfig,
+                            g_menuLargeGlyphRanges.Data);
+                        ProxyLog("[IMGUI] Menu font large (%.0f px, Latin+Cyrillic): %s",
+                                 kMenuFontLargeSize,
+                                 g_menuFontLarge ? "loaded" : "FAILED");
                     }
                 }
             }
@@ -4240,11 +4264,17 @@ void RenderImGui() {
     // coordinate space, using the Mincho face that matches the vanilla labels.
     if (g_menuTextCount > 0) {
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
-        ImFont* font = g_menuFont ? g_menuFont : ImGui::GetFont();
+        ImFont* baseFont = g_menuFont ? g_menuFont : ImGui::GetFont();
         const float size = g_menuFont ? g_menuFont->FontSize : ImGui::GetFontSize();
         for (int i = 0; i < g_menuTextCount; ++i) {
             const QueuedMenuText& q = g_menuTextQueue[i];
             const float drawSize = q.size > 0.0f ? q.size : size;
+            // The large atlas only carries Latin + Cyrillic, so anything with a
+            // high codepoint (a Japanese nickname) stays on the full-range one.
+            ImFont* font = baseFont;
+            if (g_menuFontLarge && drawSize >= 40.0f && !q.hasHighCodepoint) {
+                font = g_menuFontLarge;
+            }
             // A soft dark edge, the way the vanilla labels are drawn.
             const ImU32 shadow = IM_COL32(20, 20, 20, (int)(q.color >> IM_COL32_A_SHIFT & 0xFF));
             dl->AddText(font, drawSize, ImVec2(q.x + 1.0f, q.y + 1.0f), shadow, q.text);
@@ -6644,6 +6674,44 @@ void AS2Proxy_DrawMenuText(float x, float y, unsigned int abgr, const char* utf8
     q.size = size;
     q.color = (ImU32)abgr;
     strncpy_s(q.text, utf8, _TRUNCATE);
+
+    // A UTF-8 lead byte of 0xC0..0xCB covers U+0000..U+02FF, which is every
+    // glyph the large Latin+Cyrillic atlas has; anything longer or higher is
+    // outside it.
+    q.hasHighCodepoint = false;
+    for (const unsigned char* c = (const unsigned char*)q.text; *c; ++c) {
+        if (*c >= 0xCCu) {
+            q.hasHighCodepoint = true;
+            break;
+        }
+    }
+}
+
+// Advance width of a string at a given size, in the game's 640x480 space, using
+// the same atlas the draw call would pick. The mod needs it to lay out anything
+// that is not a fixed column - a tab strip, a centred caption - without
+// duplicating the font metrics on its side.
+extern "C" __declspec(dllexport)
+float AS2Proxy_MeasureMenuText(const char* utf8, float size) {
+    if (!utf8 || !utf8[0]) {
+        return 0.0f;
+    }
+    bool high = false;
+    for (const unsigned char* c = (const unsigned char*)utf8; *c; ++c) {
+        if (*c >= 0xCCu) {
+            high = true;
+            break;
+        }
+    }
+    ImFont* font = g_menuFont;
+    if (g_menuFontLarge && size >= 40.0f && !high) {
+        font = g_menuFontLarge;
+    }
+    if (!font) {
+        return 0.0f;
+    }
+    const float drawSize = size > 0.0f ? size : font->FontSize;
+    return font->CalcTextSizeA(drawSize, FLT_MAX, 0.0f, utf8).x;
 }
 
 // Lets the mod fall back to the game's own renderer when the face is missing.

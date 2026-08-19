@@ -238,11 +238,13 @@ static std::string Utf8ToGameText(const char* text) {
 // The proxy hosts ImGui and the Mincho face that matches the vanilla labels.
 // Its coordinate space is already the game's 640x480, so positions pass through
 // unchanged. Resolved once; if it is missing we keep using the game's renderer.
-typedef void (*ProxyDrawMenuText_t)(float, float, unsigned int, const char*, float);
-typedef int  (*ProxyMenuFontReady_t)();
+typedef void  (*ProxyDrawMenuText_t)(float, float, unsigned int, const char*, float);
+typedef int   (*ProxyMenuFontReady_t)();
+typedef float (*ProxyMeasureMenuText_t)(const char*, float);
 
-static ProxyDrawMenuText_t  s_proxyDrawMenuText = nullptr;
-static bool                 s_proxyMenuTextResolved = false;
+static ProxyDrawMenuText_t     s_proxyDrawMenuText = nullptr;
+static ProxyMeasureMenuText_t  s_proxyMeasureMenuText = nullptr;
+static bool                    s_proxyMenuTextResolved = false;
 
 static ProxyDrawMenuText_t ResolveProxyMenuText() {
     if (s_proxyMenuTextResolved) {
@@ -260,6 +262,8 @@ static ProxyDrawMenuText_t ResolveProxyMenuText() {
     }
     s_proxyDrawMenuText =
         (ProxyDrawMenuText_t)GetProcAddress(proxy, "AS2Proxy_DrawMenuText");
+    s_proxyMeasureMenuText =
+        (ProxyMeasureMenuText_t)GetProcAddress(proxy, "AS2Proxy_MeasureMenuText");
     return s_proxyDrawMenuText;
 }
 
@@ -1398,6 +1402,15 @@ void MenuDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* tex
     GameDrawText(x, y, r, g, b, "%s", text ? text : "");
 }
 
+float MenuMeasureText(const char* text, float size) {
+    ResolveProxyMenuText();
+    if (s_proxyMeasureMenuText && text) {
+        return s_proxyMeasureMenuText(text, size);
+    }
+    // The game's own renderer is a fixed-cell font; approximate at half the size.
+    return text ? (float)strlen(text) * size * 0.5f : 0.0f;
+}
+
 void MenuDrawTextSized(int x, int y, uint8_t r, uint8_t g, uint8_t b, float size, const char* text) {
     const float prev = s_menuTextSize;
     s_menuTextSize = size > 0.0f ? size : kNetplayTextSize;
@@ -1463,7 +1476,8 @@ void Render(const NetMenu::MenuSnapshot* snap) {
          snap->settings_category == NetMenu::SettingsCategory::GameVoice  ||
          snap->settings_category == NetMenu::SettingsCategory::GameRoot   ||
          snap->settings_category == NetMenu::SettingsCategory::GameKeys   ||
-         snap->settings_category == NetMenu::SettingsCategory::GameSystem)) {
+         snap->settings_category == NetMenu::SettingsCategory::GameSystem  ||
+         snap->settings_category == NetMenu::SettingsCategory::GameHotkeys)) {
         if (snap->settings_category == NetMenu::SettingsCategory::GameVoice) {
             NetMenu::GameSettingsVoice_RenderScreen(snap->selected_index, alpha);
         } else if (snap->settings_category == NetMenu::SettingsCategory::GameRoot) {
@@ -1472,6 +1486,8 @@ void Render(const NetMenu::MenuSnapshot* snap) {
             NetMenu::GameSettingsKeys_RenderScreen(snap->selected_index, alpha);
         } else if (snap->settings_category == NetMenu::SettingsCategory::GameSystem) {
             NetMenu::GameSettingsSystem_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameHotkeys) {
+            NetMenu::GameSettingsHotkeys_RenderScreen(snap->selected_index, alpha);
         } else {
             NetMenu::GameSettingsMenu_RenderScreen(snap->selected_index, alpha);
         }

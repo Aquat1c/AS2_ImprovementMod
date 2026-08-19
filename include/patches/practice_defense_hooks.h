@@ -30,6 +30,7 @@ struct PracticeDefenseConfig {
     Training::BlockPolicy policy = Training::BlockPolicy::Off;
     int randomPercent = 50;
     bool preferCrouch = true;           // posture chosen for masks that allow either
+    Training::DefensiveResponse response = Training::DefensiveResponse::NormalGuard;
     int dummyPlayer = 1;
     bool controlSwapActive = false;
     bool macroOwnsDummyInput = false;
@@ -98,6 +99,15 @@ uint32_t PracticeDefense_GetAnticipatoryMask();
 // already be holding guard, before geometry connects.
 bool PracticeDefense_WantsAnticipatoryGuard();
 void PracticeDefense_NoteAnticipatoryFacing(int8_t facing, bool prearmed);
+
+// True when this frame must drop BACK so the next press re-arms the native
+// parry window. Only ever true under DefensiveResponse::JustParry.
+// What the dummy should press this frame to attempt its defensive mechanic.
+// DefenseInputKind::None means "just hold the ordinary guard".
+Training::DefenseInputKind PracticeDefense_DefenseInput();
+// The dummy's defence category from dword_73E070, so the menu can say when the
+// selected character simply has no parry.
+int PracticeDefense_DummyDefenseCategory();
 
 const PracticeDefenseTelemetry& PracticeDefense_GetTelemetry();
 

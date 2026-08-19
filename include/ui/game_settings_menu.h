@@ -70,6 +70,8 @@ int  GameSettingsSystem_RowCount();
 void GameSettingsSystem_RenderScreen(uint32_t selectedIndex, uint8_t alpha);
 bool GameSettingsSystem_Adjust(int row, bool left, bool right,
                                char* outStatus, size_t outStatusSize);
+// True for the row that leads into the practice hotkey rebinder.
+bool GameSettingsSystem_RowOpensSubPage(int row);
 void GameSettingsRoot_RenderScreen(uint32_t selectedIndex, uint8_t alpha);
 
 // Hands the player to one of the native option sub-screens (the viewers we do
@@ -85,6 +87,19 @@ bool GameSettingsKeys_Confirm(int row, bool* outClose, char* outStatus, size_t o
 // that input.
 bool GameSettingsKeys_CaptureActive();
 void GameSettingsKeys_CancelCapture();
+
+// Practice hotkeys: the keys the mod itself owns (freeze, step, savestates,
+// macros), which were compiled in until now. Same capture flow as key config,
+// one column because they are not per-player.
+int  GameSettingsHotkeys_RowCount();
+void GameSettingsHotkeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha);
+// Left/right unbinds rather than editing a value.
+bool GameSettingsHotkeys_Adjust(int row, bool left, bool right,
+                                char* outStatus, size_t outStatusSize);
+bool GameSettingsHotkeys_Confirm(int row, bool* outClose,
+                                 char* outStatus, size_t outStatusSize);
+bool GameSettingsHotkeys_CaptureActive();
+void GameSettingsHotkeys_CancelCapture();
 
 void GameSettingsMenu_RequestNativeSubstate(int substate);
 void GameSettingsMenu_FrameUpdate();

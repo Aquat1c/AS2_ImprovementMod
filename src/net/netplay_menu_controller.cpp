@@ -3115,6 +3115,7 @@ static int ItemCount(MenuState st) {
                 case SettingsCategory::Diagnostics:  return 2; // Debug logging, Back
                 case SettingsCategory::GameRoot:     return GameSettingsRoot_RowCount();
                 case SettingsCategory::GameKeys:     return GameSettingsKeys_RowCount();
+                case SettingsCategory::GameHotkeys:  return GameSettingsHotkeys_RowCount();
                 case SettingsCategory::GameSystem:   return GameSettingsSystem_RowCount();
                 case SettingsCategory::GameGeneral:  return GameSettingsMenu_RowCount();
                 case SettingsCategory::GameVoice:    return GameSettingsVoice_RowCount();
@@ -3167,6 +3168,7 @@ static int SettingGlobalId() {
             }
         case SettingsCategory::GameRoot:
         case SettingsCategory::GameKeys:
+        case SettingsCategory::GameHotkeys:
             return -1; // every row is an action
         case SettingsCategory::GameSystem:
             // 60 + row; the trailing entry is Back.
@@ -3839,9 +3841,10 @@ static void HandleNavigationInput() {
 
     // While a rebind is capturing, every key belongs to the capture, not to us.
     // ESC gets the player out of it.
-    if (GameSettingsKeys_CaptureActive()) {
+    if (GameSettingsKeys_CaptureActive() || GameSettingsHotkeys_CaptureActive()) {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
             GameSettingsKeys_CancelCapture();
+            GameSettingsHotkeys_CancelCapture();
             SetStatus("Rebind canceled.");
         }
         return;
@@ -3865,6 +3868,12 @@ static void HandleNavigationInput() {
             if (s_settingsCategory == SettingsCategory::GameKeys) {
                 char msg[96];
                 if (GameSettingsKeys_Adjust(left, right, msg, sizeof(msg)) && msg[0]) {
+                    SetStatus("%s", msg);
+                }
+            } else if (s_settingsCategory == SettingsCategory::GameHotkeys) {
+                char msg[96];
+                if (GameSettingsHotkeys_Adjust((int)s_selectedIndex, left, right,
+                                               msg, sizeof(msg)) && msg[0]) {
                     SetStatus("%s", msg);
                 }
             } else if (gid >= 20 && gid < 40) {
@@ -4311,6 +4320,27 @@ static void ActivateCurrentSelection() {
                 }
                 break;
             }
+            if (s_settingsCategory == SettingsCategory::GameHotkeys) {
+                bool close = false;
+                char msg[96];
+                GameSettingsHotkeys_Confirm((int)s_selectedIndex, &close, msg, sizeof(msg));
+                if (msg[0]) {
+                    SetStatus("%s", msg);
+                }
+                if (close) {
+                    s_settingsCategory = SettingsCategory::GameSystem;
+                    s_selectedIndex = 0;
+                    TransitionTo(MenuState::SettingsEntry, "back from practice hotkeys");
+                }
+                break;
+            }
+            if (s_settingsCategory == SettingsCategory::GameSystem &&
+                GameSettingsSystem_RowOpensSubPage((int)s_selectedIndex)) {
+                s_settingsCategory = SettingsCategory::GameHotkeys;
+                s_selectedIndex = 0;
+                TransitionTo(MenuState::SettingsEntry, "open practice hotkeys");
+                break;
+            }
             if (s_settingsCategory == SettingsCategory::GameRoot) {
                 switch ((int)s_selectedIndex) {
                     case kGameRootGeneral:
@@ -4368,7 +4398,8 @@ static void ActivateCurrentSelection() {
                 BeginTextEdit(TextEditField::SpectatorPort, portBuf, "Enter the watch port (1-65535).");
             } else if (gid == -1) {
                 s_selectedIndex = 0;
-                if (s_settingsCategory == SettingsCategory::GameGeneral) {
+                if (s_settingsCategory == SettingsCategory::GameGeneral ||
+                    s_settingsCategory == SettingsCategory::GameSystem) {
                     s_settingsCategory = SettingsCategory::GameRoot;
                     TransitionTo(MenuState::SettingsEntry, "back to settings categories");
                 } else if (s_settingsFromTitle ||

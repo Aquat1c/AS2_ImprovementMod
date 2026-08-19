@@ -1,5 +1,7 @@
 #include "ui/game_settings_menu.h"
 
+#include "training/hotkey_config.h"
+
 #include <windows.h>
 #include <stdio.h>
 #include <wchar.h>
@@ -576,6 +578,178 @@ bool GameSettingsKeys_Confirm(int row, bool* outClose, char* outStatus, size_t o
 }
 
 // ============================================================================
+// Practice hotkeys — the same shape as key config, one column instead of two
+// ============================================================================
+
+namespace {
+
+constexpr int kHkRowReset = HOTKEY_COUNT;
+constexpr int kHkRowBack  = HOTKEY_COUNT + 1;
+
+constexpr int kHkRowPitch    = 22;   // same tight pitch the key config uses
+constexpr int kHkPanelRight  = 520;
+constexpr int kHkLabelX      = 32;
+constexpr int kHkValueX      = 232;
+constexpr int kHkScopeX      = 404;
+
+// Confirm is itself a bound button, so opening a capture with it would let the
+// capture swallow that same press. Same fix as the key config.
+int s_hkCaptureRow = -1;
+int s_hkCaptureArm = 0;
+
+} // namespace
+
+int GameSettingsHotkeys_RowCount() {
+    return HOTKEY_COUNT + 2;
+}
+
+bool GameSettingsHotkeys_CaptureActive() {
+    return HotkeyConfig_IsRebinding();
+}
+
+void GameSettingsHotkeys_CancelCapture() {
+    HotkeyConfig_CancelRebind();
+    s_hkCaptureRow = -1;
+    s_hkCaptureArm = 0;
+}
+
+void GameSettingsHotkeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
+    const int rows = GameSettingsHotkeys_RowCount();
+    const int panelBottom = RowTop(rows, kHkRowPitch) + 30;
+
+    MenuSetBlend(1, (uint8_t)(alpha / 2));
+    MenuFillRect(kPanelLeft, kPanelTop, kHkPanelRight, panelBottom, 0, 0, 0);
+    MenuFillRect(kPanelLeft, kPanelTop, kHkPanelRight, panelBottom, 0, 0, 0);
+    MenuSetBlend(1, alpha);
+
+    MenuDrawTextSized(kHkLabelX, kHeaderY, kInkBright, kInkBright, kInkBright,
+                      kSettingsTextSize, "PRACTICE HOTKEYS");
+
+    const int selTop = RowTop((int)selectedIndex, kHkRowPitch);
+    MenuSetBlend(2, (uint8_t)(alpha / 2));
+    MenuFillRect(kHkLabelX - 8, selTop, kHkPanelRight - 16,
+                 selTop + kHkRowPitch - 2, 255, 0, 0);
+    MenuSetBlend(1, alpha);
+
+    for (int i = 0; i < HOTKEY_COUNT; ++i) {
+        const HotkeyAction action = (HotkeyAction)i;
+        const int y = RowTop(i, kHkRowPitch) + 3;
+        MenuDrawTextSized(kHkLabelX, y, kInk, kInk, kInk, kKeyTextSize,
+                          HotkeyConfig_ActionName(action));
+
+        if (s_hkCaptureRow == i && HotkeyConfig_IsRebinding()) {
+            MenuDrawTextSized(kHkValueX, y, kInkBright, kInkBright, kInkBright,
+                              kKeyTextSize, "press...");
+            continue;
+        }
+
+        char bound[64] = {};
+        HotkeyConfig_GetBindingDisplayName(action, bound, (int)sizeof(bound));
+        const bool unbound = (bound[0] == '\0');
+        const uint8_t ink = unbound ? kInkFaint : kInk;
+        MenuDrawTextSized(kHkValueX, y, ink, ink, ink, kKeyTextSize,
+                          unbound ? "---" : bound);
+
+        // Savestates work in arcade and versus too; everything else needs
+        // training, and saying so beats letting a key look broken elsewhere.
+        if (!HotkeyConfig_ActionIsPracticeOnly(action)) {
+            MenuDrawTextSized(kHkScopeX, y, kInkDim, kInkDim, kInkDim,
+                              kKeyPadSize, "any mode");
+        }
+    }
+
+    MenuDrawTextSized(kHkLabelX, RowTop(kHkRowReset, kHkRowPitch) + 3,
+                      kInk, kInk, kInk, kSettingsTextSize, "Reset to defaults");
+    MenuDrawTextSized(kHkLabelX, RowTop(kHkRowBack, kHkRowPitch) + 3,
+                      kInk, kInk, kInk, kSettingsTextSize, "Back");
+
+    const int footY = RowTop(rows, kHkRowPitch) + 6;
+    if (HotkeyConfig_IsRebinding()) {
+        MenuDrawTextSized(kHkLabelX, footY, kInkBright, kInkBright, kInkBright,
+                          kSettingsTextSize,
+                          "Press any key or pad button. ESC cancels.");
+    } else {
+        MenuDrawTextSized(kHkLabelX, footY, kInkDim, kInkDim, kInkDim,
+                          kSettingsTextSize,
+                          "A rebinds, Left/Right unbinds.");
+    }
+}
+
+bool GameSettingsHotkeys_Adjust(int row, bool left, bool right,
+                                char* outStatus, size_t outStatusSize) {
+    if (outStatus && outStatusSize) {
+        outStatus[0] = '\0';
+    }
+    if (row < 0 || row >= HOTKEY_COUNT || (!left && !right)) {
+        return false;
+    }
+
+    const HotkeyAction action = (HotkeyAction)row;
+    HotkeyConfig_ClearBinding(action);
+    if (outStatus && outStatusSize) {
+        _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "%s unbound",
+                    HotkeyConfig_ActionName(action));
+    }
+    return true;
+}
+
+bool GameSettingsHotkeys_Confirm(int row, bool* outClose,
+                                 char* outStatus, size_t outStatusSize) {
+    if (outClose) {
+        *outClose = false;
+    }
+    if (outStatus && outStatusSize) {
+        outStatus[0] = '\0';
+    }
+
+    if (row >= 0 && row < HOTKEY_COUNT) {
+        const HotkeyAction action = (HotkeyAction)row;
+        s_hkCaptureRow = row;
+        s_hkCaptureArm = kCaptureArmFrames;
+        HotkeyConfig_BeginRebind(action);
+        if (outStatus && outStatusSize) {
+            _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "Press a key for %s",
+                        HotkeyConfig_ActionName(action));
+        }
+        return true;
+    }
+
+    if (row == kHkRowReset) {
+        HotkeyConfig_ResetDefaults();
+        s_hkCaptureRow = -1;
+        s_hkCaptureArm = 0;
+        if (outStatus && outStatusSize) {
+            _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
+                        "Hotkeys reset to defaults");
+        }
+        return true;
+    }
+
+    if (outClose) {
+        *outClose = true;
+    }
+    return true;
+}
+
+namespace {
+
+void GameSettingsHotkeys_FrameUpdate() {
+    if (s_hkCaptureRow < 0) {
+        return;
+    }
+    if (s_hkCaptureArm > 0) {
+        --s_hkCaptureArm;
+        return;
+    }
+    if (HotkeyConfig_PollRebind() != 0) {
+        LOG_NETPLAY(LOG_INFO, "[GameSettings] rebound hotkey %d", s_hkCaptureRow);
+        s_hkCaptureRow = -1;
+    }
+}
+
+} // namespace
+
+// ============================================================================
 // System settings — the overlay-only toggles, minus anything practice related
 // ============================================================================
 
@@ -588,6 +762,7 @@ enum SystemRow : int {
     kSysBackgroundInput,
     kSysControlSwap,
     kSysDebugCapture,
+    kSysPracticeKeys,
     kSysBack,
     kSysCount,
 };
@@ -639,6 +814,7 @@ const SystemRowDef kSystemRows[kSysCount] = {
     { "Background Input", "keep playing unfocused" },
     { "Swap P1/P2",       "trade control sides"    },
     { "Debug Capture",    "log the game's output"  },
+    { "Practice Hotkeys", "rebind mod keys"        },
     { "Back",             "settings"               },
 };
 
@@ -661,6 +837,10 @@ int GameSettingsSystem_RowCount() {
     return kSysCount;
 }
 
+bool GameSettingsSystem_RowOpensSubPage(int row) {
+    return row == kSysPracticeKeys;
+}
+
 void GameSettingsSystem_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     DrawPanel(kSysCount + 1, alpha);
     MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright,
@@ -671,7 +851,7 @@ void GameSettingsSystem_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
         const int y = RowText(i, kRowPitch);
         MenuDrawTextSized(kLabelX, y, kInk, kInk, kInk, kSettingsTextSize,
                           kSystemRows[i].name);
-        if (i == kSysBack) {
+        if (i == kSysBack || i == kSysPracticeKeys) {
             MenuDrawTextSized(kValueX, y, kInkDim, kInkDim, kInkDim,
                               kSettingsTextSize, kSystemRows[i].hint);
             continue;
@@ -697,7 +877,7 @@ bool GameSettingsSystem_Adjust(int row, bool left, bool right,
     if (outStatus && outStatusSize) {
         outStatus[0] = '\0';
     }
-    if (row < 0 || row >= kSysBack || (!left && !right)) {
+    if (row < 0 || row >= kSysPracticeKeys || (!left && !right)) {
         return false;
     }
 
@@ -821,6 +1001,8 @@ void GameSettingsMenu_RequestNativeSubstate(int substate) {
 }
 
 void GameSettingsMenu_FrameUpdate() {
+    GameSettingsHotkeys_FrameUpdate();
+
     // Poll every frame while waiting: FinishBinding reports the capture once,
     // and only then.
     if (s_captureRow >= 0) {

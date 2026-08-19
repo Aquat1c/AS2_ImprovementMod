@@ -53,6 +53,9 @@ uint32_t g_phaseEpoch = 1;
 uint32_t g_planEpoch = 0;
 uint32_t g_lastProcessedSimFrame = 0;
 
+DefenseDriveState g_defenseDrive{};
+DefenseInputKind g_defenseInput = DefenseInputKind::None;
+
 SemanticDirection g_anticipatoryGuard = SemanticDirection::Neutral;
 uint32_t g_anticipatoryMask = 0;
 int8_t g_facingAtInput = 0;
@@ -455,6 +458,25 @@ void BuildFramePlan() {
     const uint32_t anticipatedOrdinal = g_sequence.active ? g_sequence.resolvedContactGroups : 0;
     const bool policyWould = g_config.policy != BlockPolicy::Off &&
                              PolicyWantsBlock(g_config.policy, g_sequence, anticipatedOrdinal);
+
+    const int category = PracticeDefense_DummyDefenseCategory();
+    DefensiveResponse response = g_config.response;
+    if (response == DefensiveResponse::CharacterNative) {
+        response = ResponseForCategory(category);
+    }
+    if (!ResponseSupportedByCategory(response, category)) {
+        response = DefensiveResponse::NormalGuard;
+    }
+
+    DefenseDriveSample drive{};
+    drive.parryWindow = ReadMemory<uint8_t>(dummy + ENTITY_OFF_PARRY_WINDOW);
+    drive.reactionState = (int32_t)ReadMemory<uint32_t>(dummy + ENTITY_OFF_HIT_REACTION_STATE);
+    drive.actionId = defenderState.actionId;
+    drive.meter = ReadMemory<uint16_t>(dummy + ENTITY_OFF_METER);
+    drive.airborne = airborne;
+    drive.threatArmed = g_scannedCount > 0;
+    drive.actionable = CanAutoGuardAtContact(defenderState);
+    g_defenseInput = EvaluateDefenseInput(response, drive, g_defenseDrive);
 
     if (policyWould && CanAutoGuardAtContact(defenderState)) {
         if (g_plan.laneLatched) {
@@ -874,6 +896,18 @@ const PracticeDefenseTelemetry& PracticeDefense_GetTelemetry() {
     return g_telemetry;
 }
 
+DefenseInputKind PracticeDefense_DefenseInput() {
+    return g_defenseInput;
+}
+
+int PracticeDefense_DummyDefenseCategory() {
+    const uint32_t charId = ReadCharacterId(DummyEntity());
+    if (charId >= 22) {
+        return 0;
+    }
+    return (int)ReadMemory<uint32_t>(ADDR_DEFENSE_CATEGORY_TABLE + charId * 4);
+}
+
 bool PracticeDefense_SequenceActive() {
     return g_sequence.active;
 }
@@ -893,6 +927,8 @@ void PracticeDefense_Reset() {
     g_lastProcessedSimFrame = 0;
     g_anticipatoryGuard = SemanticDirection::Neutral;
     g_anticipatoryMask = 0;
+    g_defenseDrive = DefenseDriveState{};
+    g_defenseInput = DefenseInputKind::None;
     g_facingAtInput = 0;
     g_inputPrearmed = false;
     g_lastHitThreatId = 0;

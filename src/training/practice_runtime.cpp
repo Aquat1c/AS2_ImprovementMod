@@ -5,6 +5,7 @@
 #include "training/hotkey_config.h"
 #include "training/input_macro.h"
 #include "training/auto_block.h"
+#include "training/character_moves.h"
 #include "patches/practice_defense_hooks.h"
 #include "core/mod_main.h"
 #include "rollback/savestate.h"
@@ -46,6 +47,8 @@ static const int kGuardGaugeMax = 10000;
 static const int kSyntheticChargeFrames = 30;
 static const int kJumpHoldFrames = 3;
 static const int kTriggerCount = 5;
+// Defensive response for the mod-driven dummy; see kDefensiveResponseLabels.
+static int g_defensiveResponse = 0;
 static const uint32_t kInvalidFrame = 0xFFFFFFFFu;
 static const int16_t kStageCenterX = 8000;
 static const int kTrainingNeutralAction = 22;
@@ -1283,7 +1286,15 @@ static bool IsPositionSetBlockedByMatchState(void) {
         return true;
     }
 
-    if (GetGameMode() != MODE_MATCH || GetSubstate() != MATCH_SUB_GAMEPLAY) {
+    // The pause menu is substate 4, and every position tool it offers was
+    // silently returning false because of this check. Pausing is only reachable
+    // from gameplay and freezes the simulation, so it is a safe context; the
+    // intro / transition guards below are what actually protect the write.
+    if (GetGameMode() != MODE_MATCH) {
+        return true;
+    }
+    const uint32_t substate = GetSubstate();
+    if (substate != MATCH_SUB_GAMEPLAY && substate != MATCH_SUB_PAUSE) {
         return true;
     }
 
@@ -2109,6 +2120,8 @@ static void PushDefenseConfig() {
     // Native adaptive crouches unless the attack is stand-only, so crouch is the
     // compatible default for masks that permit either lane.
     config.preferCrouch = (s_practiceConfig.stanceMode != DUMMY_STANCE_STAND);
+    config.response = (Training::DefensiveResponse)ClampInt(
+        g_defensiveResponse, 0, (int)Training::DefensiveResponse::Count - 1);
     config.dummyPlayer = 1;
     config.controlSwapActive = InputSystem_GetControlSwap();
     config.macroOwnsDummyInput = (InputMacro_GetState() == MACRO_REPLAYING);
@@ -2141,6 +2154,32 @@ static bool ShouldHoldAutoBlock(const PlayerSnapshot snapshots[kPracticePlayerCo
 static uint16_t BuildDummyBlockInput(const PlayerSnapshot& dummy,
                                      const PlayerSnapshot& attacker) {
     (void)attacker;
+    // One frame without BACK so the next press is the fresh edge the native
+    // parry window arms on. Without this the dummy holds guard forever and can
+    // never parry, which is exactly how the engine is meant to behave.
+    // Every defensive mechanic is driven by an input a player could make; the
+    // engine decides whether it takes.
+    const int8_t facing = dummy.facingRight ? (int8_t)1 : (int8_t)-1;
+    switch (PracticeDefense_DefenseInput()) {
+        case Training::DefenseInputKind::ReleaseGuard:
+            // One frame with no direction, so the next press is a fresh edge.
+            PracticeDefense_NoteAnticipatoryFacing(facing, false);
+            return 0;
+        case Training::DefenseInputKind::ForwardTap:
+            PracticeDefense_NoteAnticipatoryFacing(facing, true);
+            return ForwardMask(dummy);
+        case Training::DefenseInputKind::DodgePress:
+            // BACK keeps the back-dodge variant rather than the forward one.
+            PracticeDefense_NoteAnticipatoryFacing(facing, true);
+            return (uint16_t)(BackMask(dummy) | INPUT_D);
+        case Training::DefenseInputKind::CounterForward:
+            PracticeDefense_NoteAnticipatoryFacing(facing, true);
+            return (uint16_t)(ForwardMask(dummy) | INPUT_D);
+        case Training::DefenseInputKind::None:
+        default:
+            break;
+    }
+
     const Training::SemanticDirection direction = PracticeDefense_GetAnticipatoryGuard();
     uint16_t resolved = Training::ResolveSemanticDirection(direction, dummy.facingRight);
     if (resolved == 0) {
@@ -2304,6 +2343,16 @@ static uint16_t ComputeAutomationInput(int player,
 
 static void ApplyAutomationOverrides(uint32_t simFrame,
                                      const PlayerSnapshot snapshots[kPracticePlayerCount]) {
+    // The pause menu reads both pads, and an active override replaces
+    // g_inputState[p].current wholesale - so auto-block holding back or a macro
+    // playing back would drive the menu cursor. The simulation is frozen in
+    // this substate anyway, so the automation has nothing to do.
+    if (GetSubstate() == MATCH_SUB_PAUSE) {
+        ReleaseOwnedOverride(0);
+        ReleaseOwnedOverride(1);
+        return;
+    }
+
     for (int player = 0; player < kPracticePlayerCount; ++player) {
         if (player == 1 && InputMacro_GetState() == MACRO_REPLAYING) {
             ReleaseOwnedOverride(player);
@@ -2548,13 +2597,20 @@ static void RenderOverviewTab(const PlayerSnapshot snapshots[kPracticePlayerCoun
                             p1DownBinding);
     FormatPositionPresetHint(positionHint, sizeof(positionHint));
 
+    // Keys are rebindable, so the labels read the live binding instead of the
+    // defaults they used to hard-code.
+    char pauseLabel[48], stepLabel[48], swapLabel[48];
+    HotkeyConfig_FormatLabel(pauseLabel, sizeof(pauseLabel), "Paused", HOTKEY_PAUSE_TOGGLE);
+    HotkeyConfig_FormatLabel(stepLabel, sizeof(stepLabel), "Step", HOTKEY_FRAME_STEP);
+    HotkeyConfig_FormatLabel(swapLabel, sizeof(swapLabel), "Control P2", HOTKEY_CONTROL_SWAP);
+
     bool paused = s_paused;
-    if (ImGui::Checkbox("Paused (F7)", &paused)) {
+    if (ImGui::Checkbox(pauseLabel, &paused)) {
         PracticeTools_SetPaused(paused);
     }
 
     ImGui::SameLine();
-    if (ImGui::Button("Step (F8)") && s_paused && !s_stepRequested) {
+    if (ImGui::Button(stepLabel) && s_paused && !s_stepRequested) {
         s_stepRequested = true;
         s_stepCounter++;
     }
@@ -2565,7 +2621,7 @@ static void RenderOverviewTab(const PlayerSnapshot snapshots[kPracticePlayerCoun
     }
 
     bool swapped = InputSystem_GetControlSwap();
-    if (ImGui::Checkbox("Control P2 (F9)", &swapped)) {
+    if (ImGui::Checkbox(swapLabel, &swapped)) {
         PracticeTools_ApplyControlSwapState(swapped);
     }
     ImGui::SameLine();
@@ -3231,15 +3287,648 @@ static void RenderComboOverlayPanel(ImDrawList* dl,
 
 } // namespace
 
+// ============================================================================
+// Settings bridge for the pause menu
+// ============================================================================
+// The menu renders rows; every range, label table and side effect stays here so
+// the two surfaces can never disagree about what a setting means.
+
+namespace {
+
+struct SettingDesc {
+    const char* label;
+    const char* const* values;
+    int valueCount;
+    // Native settings live in game memory, mod settings in s_practiceConfig.
+    uintptr_t nativeAddress;
+};
+
+int ClampCycle(int value, int count, int delta) {
+    if (count <= 1) {
+        return 0;
+    }
+    int next = (value + delta) % count;
+    if (next < 0) {
+        next += count;
+    }
+    return next;
+}
+
+const char* const kOnOffLabels[] = { "Off", "On" };
+
+// Only responses with a traced legal-input path. Everything else the engine
+// supports needs per-character command arming that is not mapped yet.
+const char* const kDefensiveResponseLabels[] = {
+    "Guard Only", "Native", "Just Parry", "Dodge", "Repel", "Counter",
+};
+
+// Recovery delay and jump cadence are stepped through presets rather than typed:
+// a d-pad is a bad number editor, and the exact values stay in the ImGui panel.
+const int kDelayPresets[] = { 0, 5, 10, 20, 40 };
+const char* const kDelayLabels[] = { "0 f", "5 f", "10 f", "20 f", "40 f" };
+const int kCadencePresets[] = { 10, 20, 30, 45, 60 };
+const char* const kCadenceLabels[] = { "10 f", "20 f", "30 f", "45 f", "60 f" };
+const int kWakeBufferPresets[] = { 0, 1, 3, 5, 8 };
+const char* const kWakeBufferLabels[] = { "0 f", "1 f", "3 f", "5 f", "8 f" };
+
+int PresetIndex(const int* presets, int count, int value) {
+    for (int i = 0; i < count; ++i) {
+        if (presets[i] == value) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+// Which trigger slot the popup is editing. Menu-local, so it lives with the
+// rest of the bridge rather than in the shared config.
+int g_menuTriggerSlot = 0;
+
+int TriggerRowIndex(int setting) {
+    return setting - PRACTICE_SET_TRIGGER_1;
+}
+
+bool IsTriggerRow(int setting) {
+    return setting >= PRACTICE_SET_TRIGGER_1 && setting <= PRACTICE_SET_TRIGGER_5;
+}
+
+TriggerConfig& MenuTrigger() {
+    return s_practiceConfig.triggers[ClampInt(g_menuTriggerSlot, 0, kTriggerCount - 1)];
+}
+
+// The full names read well in a wide ImGui panel but overflow a 256 px column.
+const char* const kShortTriggerLabels[] = {
+    "Block", "Wakeup", "Hitstun", "Air Tech", "Ground Tech",
+};
+
+} // namespace
+
+int PracticeSetting_Get(int setting) {
+    switch (setting) {
+        case PRACTICE_SET_DUMMY_BACKEND:  return s_practiceConfig.dummyControlMode;
+        case PRACTICE_SET_BLOCK_MODE:     return s_practiceConfig.blockMode;
+        case PRACTICE_SET_STANCE:         return s_practiceConfig.stanceMode;
+        case PRACTICE_SET_JUMP_MODE:      return s_practiceConfig.jumpMode;
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: return g_defensiveResponse;
+        case PRACTICE_SET_JUMP_CADENCE:
+            return PresetIndex(kCadencePresets, (int)(sizeof(kCadencePresets) / sizeof(int)),
+                               s_practiceConfig.jumpCadenceFrames);
+
+        case PRACTICE_SET_NATIVE_CPU:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE, 1);
+        case PRACTICE_SET_NATIVE_AIR_TECH:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_AIR_TECH_SETTING, 4);
+        case PRACTICE_SET_NATIVE_GROUND_TECH:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_GROUND_TECH_SETTING, 3);
+        case PRACTICE_SET_NATIVE_BLOCK_TYPE:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_BLOCK_TYPE_SETTING, 2);
+        case PRACTICE_SET_NATIVE_DUMMY_STATE:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_DUMMY_STATE_SETTING, 3);
+        case PRACTICE_SET_HEALTH_REGEN:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_HEALTH_REGEN_SETTING, 10);
+        case PRACTICE_SET_METER_LEVEL:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_METER_LEVEL_SETTING, 9);
+        case PRACTICE_SET_INPUT_DISPLAY:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_INPUT_DISPLAY, 1);
+        case PRACTICE_SET_DAMAGE_DISPLAY:
+            return ReadNativeTrainingSetting(ADDR_TRAINING_DAMAGE_DISPLAY, 1);
+
+        case PRACTICE_SET_RECOVERY_HP:    return s_practiceConfig.recovery[1].hpMode;
+        case PRACTICE_SET_RECOVERY_METER: return s_practiceConfig.recovery[1].meterMode;
+        case PRACTICE_SET_RECOVERY_GUARD: return s_practiceConfig.recovery[1].guardMode;
+        case PRACTICE_SET_RECOVERY_BOTH_NEUTRAL:
+            return s_practiceConfig.recoveryRequireBothNeutral ? 1 : 0;
+        case PRACTICE_SET_RECOVERY_DELAY:
+            return PresetIndex(kDelayPresets, (int)(sizeof(kDelayPresets) / sizeof(int)),
+                               s_practiceConfig.recoveryDelayFrames);
+        case PRACTICE_SET_RECOVERY_HP_VALUE:    return s_practiceConfig.recovery[1].hpCustom;
+        case PRACTICE_SET_RECOVERY_METER_VALUE: return s_practiceConfig.recovery[1].meterCustom;
+        case PRACTICE_SET_RECOVERY_GUARD_VALUE: return s_practiceConfig.recovery[1].guardCustom;
+
+        case PRACTICE_SET_TRIGGERS_ENABLED: return s_practiceConfig.triggerMasterEnabled ? 1 : 0;
+        case PRACTICE_SET_TRIGGER_TARGET:   return s_practiceConfig.triggerTarget;
+        case PRACTICE_SET_TRIGGER_RANDOM:   return s_practiceConfig.triggerRandomize ? 1 : 0;
+        case PRACTICE_SET_WAKE_BUFFER:
+            return PresetIndex(kWakeBufferPresets, (int)(sizeof(kWakeBufferPresets) / sizeof(int)),
+                               s_practiceConfig.wakeBufferFrames);
+
+        case PRACTICE_SET_TRIGGER_BUTTON:  return MenuTrigger().actionButton;
+        case PRACTICE_SET_TRIGGER_DELAY:
+            return PresetIndex(kDelayPresets, (int)(sizeof(kDelayPresets) / sizeof(int)),
+                               MenuTrigger().delayFrames);
+
+        case PRACTICE_SET_HITBOXES:        return HitboxViewer_IsEnabled() ? 1 : 0;
+        case PRACTICE_SET_COMBO_OVERLAY:   return s_practiceConfig.comboOverlayEnabled ? 1 : 0;
+        case PRACTICE_SET_FRAME_ADVANTAGE: return FrameAdvantage_IsEnabled() ? 1 : 0;
+        case PRACTICE_SET_CONTROL_SWAP:    return PracticeTools_IsControlSwapped() ? 1 : 0;
+        case PRACTICE_SET_MACRO_SLOT:      return InputMacro_GetCurrentSlot();
+        case PRACTICE_SET_PAUSED:          return PracticeTools_IsPaused() ? 1 : 0;
+
+        default:
+            if (IsTriggerRow(setting)) {
+                return s_practiceConfig.triggers[TriggerRowIndex(setting)].enabled ? 1 : 0;
+            }
+            return 0;
+    }
+}
+
+static int PracticeSetting_ValueCount(int setting) {
+    switch (setting) {
+        case PRACTICE_SET_DUMMY_BACKEND:  return IM_ARRAYSIZE(kDummyControlModeLabels);
+        case PRACTICE_SET_BLOCK_MODE:     return IM_ARRAYSIZE(kBlockModeLabels);
+        case PRACTICE_SET_STANCE:         return IM_ARRAYSIZE(kStanceModeLabels);
+        case PRACTICE_SET_JUMP_MODE:      return IM_ARRAYSIZE(kJumpModeLabels);
+        case PRACTICE_SET_JUMP_CADENCE:   return (int)(sizeof(kCadencePresets) / sizeof(int));
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: return IM_ARRAYSIZE(kDefensiveResponseLabels);
+        case PRACTICE_SET_NATIVE_CPU:     return IM_ARRAYSIZE(kNativeCpuLabels);
+        case PRACTICE_SET_NATIVE_AIR_TECH:     return IM_ARRAYSIZE(kNativeAirTechLabels);
+        case PRACTICE_SET_NATIVE_GROUND_TECH:  return IM_ARRAYSIZE(kNativeGroundTechLabels);
+        case PRACTICE_SET_NATIVE_BLOCK_TYPE:   return IM_ARRAYSIZE(kNativeBlockTypeLabels);
+        case PRACTICE_SET_NATIVE_DUMMY_STATE:  return IM_ARRAYSIZE(kNativeDummyStateLabels);
+        case PRACTICE_SET_HEALTH_REGEN:   return IM_ARRAYSIZE(kNativeHealthLabels);
+        case PRACTICE_SET_METER_LEVEL:    return IM_ARRAYSIZE(kNativeMeterLabels);
+        case PRACTICE_SET_RECOVERY_HP:    return IM_ARRAYSIZE(kRecoveryHpLabels);
+        case PRACTICE_SET_RECOVERY_METER: return IM_ARRAYSIZE(kRecoveryMeterLabels);
+        case PRACTICE_SET_RECOVERY_GUARD: return IM_ARRAYSIZE(kRecoveryGuardLabels);
+        case PRACTICE_SET_RECOVERY_DELAY: return (int)(sizeof(kDelayPresets) / sizeof(int));
+        case PRACTICE_SET_TRIGGER_TARGET: return IM_ARRAYSIZE(kTriggerTargetLabels);
+        case PRACTICE_SET_WAKE_BUFFER:    return (int)(sizeof(kWakeBufferPresets) / sizeof(int));
+        case PRACTICE_SET_TRIGGER_BUTTON: return IM_ARRAYSIZE(kScriptButtonLabels);
+        case PRACTICE_SET_TRIGGER_DELAY:  return (int)(sizeof(kDelayPresets) / sizeof(int));
+        case PRACTICE_SET_MACRO_SLOT:     return MACRO_MAX_SLOTS;
+        default:                          return 2;   // on/off
+    }
+}
+
+void PracticeSetting_Cycle(int setting, int delta) {
+    if (delta == 0 || !PracticeSetting_Enabled(setting)) {
+        return;
+    }
+    const int count = PracticeSetting_ValueCount(setting);
+    const int next = ClampCycle(PracticeSetting_Get(setting), count, delta);
+
+    switch (setting) {
+        case PRACTICE_SET_DUMMY_BACKEND:  s_practiceConfig.dummyControlMode = next; break;
+        case PRACTICE_SET_BLOCK_MODE:     s_practiceConfig.blockMode = next; break;
+        case PRACTICE_SET_STANCE:         s_practiceConfig.stanceMode = next; break;
+        case PRACTICE_SET_JUMP_MODE:      s_practiceConfig.jumpMode = next; break;
+        case PRACTICE_SET_JUMP_CADENCE:   s_practiceConfig.jumpCadenceFrames = kCadencePresets[next]; break;
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: g_defensiveResponse = next; break;
+
+        case PRACTICE_SET_NATIVE_CPU:
+            WriteNativeTrainingSetting(ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE, next, 1, "cpu"); break;
+        case PRACTICE_SET_NATIVE_AIR_TECH:
+            WriteNativeTrainingSetting(ADDR_TRAINING_AIR_TECH_SETTING, next, 4, "air_tech"); break;
+        case PRACTICE_SET_NATIVE_GROUND_TECH:
+            WriteNativeTrainingSetting(ADDR_TRAINING_GROUND_TECH_SETTING, next, 3, "ground_tech"); break;
+        case PRACTICE_SET_NATIVE_BLOCK_TYPE:
+            WriteNativeTrainingSetting(ADDR_TRAINING_BLOCK_TYPE_SETTING, next, 2, "block_type"); break;
+        case PRACTICE_SET_NATIVE_DUMMY_STATE:
+            WriteNativeTrainingSetting(ADDR_TRAINING_DUMMY_STATE_SETTING, next, 3, "dummy_state"); break;
+        case PRACTICE_SET_HEALTH_REGEN:
+            WriteNativeTrainingSetting(ADDR_TRAINING_HEALTH_REGEN_SETTING, next, 10, "health_regen"); break;
+        case PRACTICE_SET_METER_LEVEL:
+            WriteNativeTrainingSetting(ADDR_TRAINING_METER_LEVEL_SETTING, next, 9, "meter_level"); break;
+        case PRACTICE_SET_INPUT_DISPLAY:
+            WriteNativeTrainingSetting(ADDR_TRAINING_INPUT_DISPLAY, next, 1, "input_display"); break;
+        case PRACTICE_SET_DAMAGE_DISPLAY:
+            WriteNativeTrainingSetting(ADDR_TRAINING_DAMAGE_DISPLAY, next, 1, "damage_display"); break;
+
+        // Recovery applies to both sides from this menu; the per-player split
+        // stays in the ImGui panel.
+        case PRACTICE_SET_RECOVERY_HP:
+            for (int p = 0; p < kPracticePlayerCount; ++p) s_practiceConfig.recovery[p].hpMode = next;
+            break;
+        case PRACTICE_SET_RECOVERY_METER:
+            for (int p = 0; p < kPracticePlayerCount; ++p) s_practiceConfig.recovery[p].meterMode = next;
+            break;
+        case PRACTICE_SET_RECOVERY_GUARD:
+            for (int p = 0; p < kPracticePlayerCount; ++p) s_practiceConfig.recovery[p].guardMode = next;
+            break;
+        case PRACTICE_SET_RECOVERY_BOTH_NEUTRAL:
+            s_practiceConfig.recoveryRequireBothNeutral = (next != 0); break;
+        case PRACTICE_SET_RECOVERY_DELAY:
+            s_practiceConfig.recoveryDelayFrames = kDelayPresets[next]; break;
+
+        case PRACTICE_SET_TRIGGERS_ENABLED:
+            s_practiceConfig.triggerMasterEnabled = (next != 0); break;
+        case PRACTICE_SET_TRIGGER_TARGET: s_practiceConfig.triggerTarget = next; break;
+        case PRACTICE_SET_TRIGGER_RANDOM: s_practiceConfig.triggerRandomize = (next != 0); break;
+        case PRACTICE_SET_WAKE_BUFFER:
+            s_practiceConfig.wakeBufferFrames = kWakeBufferPresets[next]; break;
+
+        case PRACTICE_SET_TRIGGER_BUTTON:  MenuTrigger().actionButton = next; break;
+        case PRACTICE_SET_TRIGGER_DELAY:   MenuTrigger().delayFrames = kDelayPresets[next]; break;
+
+        case PRACTICE_SET_HITBOXES:        HitboxViewer_SetEnabled(next != 0); break;
+        case PRACTICE_SET_COMBO_OVERLAY:   s_practiceConfig.comboOverlayEnabled = (next != 0); break;
+        case PRACTICE_SET_FRAME_ADVANTAGE: FrameAdvantage_SetEnabled(next != 0); break;
+        case PRACTICE_SET_CONTROL_SWAP:    PracticeTools_ApplyControlSwapState(next != 0); break;
+        case PRACTICE_SET_MACRO_SLOT:
+            // InputMacro_NextSlot refuses to move while recording or replaying,
+            // so this must be bounded - a while-until-equal spins the game
+            // thread forever the moment the macro system declines.
+            for (int guard = 0; guard < MACRO_MAX_SLOTS; ++guard) {
+                if (InputMacro_GetCurrentSlot() == next) {
+                    break;
+                }
+                const int before = InputMacro_GetCurrentSlot();
+                InputMacro_NextSlot();
+                if (InputMacro_GetCurrentSlot() == before) {
+                    break;   // declined; leave the slot where it is
+                }
+            }
+            break;
+        case PRACTICE_SET_PAUSED:          PracticeTools_SetPaused(next != 0); break;
+
+        // Numeric rows step by a useful increment when cycled; typing is the
+        // precise path.
+        case PRACTICE_SET_RECOVERY_HP_VALUE:
+        case PRACTICE_SET_RECOVERY_METER_VALUE:
+        case PRACTICE_SET_RECOVERY_GUARD_VALUE: {
+            const int step = (setting == PRACTICE_SET_RECOVERY_HP_VALUE) ? 100 : 500;
+            PracticeSetting_SetNumeric(setting, PracticeSetting_Get(setting) + delta * step);
+            break;
+        }
+
+        default:
+            if (IsTriggerRow(setting)) {
+                s_practiceConfig.triggers[TriggerRowIndex(setting)].enabled = (next != 0);
+            }
+            break;
+    }
+}
+
+const char* PracticeSetting_Label(int setting) {
+    switch (setting) {
+        case PRACTICE_SET_DUMMY_BACKEND:  return "Backend";
+        case PRACTICE_SET_BLOCK_MODE:     return "Auto-Block";
+        case PRACTICE_SET_STANCE:         return "Stance";
+        case PRACTICE_SET_JUMP_MODE:      return "Auto-Jump";
+        case PRACTICE_SET_JUMP_CADENCE:   return "Jump Rate";
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: return "Defense";
+        case PRACTICE_SET_NATIVE_CPU:     return "CPU";
+        case PRACTICE_SET_NATIVE_AIR_TECH:    return "Air Tech";
+        case PRACTICE_SET_NATIVE_GROUND_TECH: return "Ground Tech";
+        case PRACTICE_SET_NATIVE_BLOCK_TYPE:  return "Guard";
+        case PRACTICE_SET_NATIVE_DUMMY_STATE: return "State";
+        case PRACTICE_SET_RECOVERY_HP:    return "Health";
+        case PRACTICE_SET_RECOVERY_METER: return "Meter";
+        case PRACTICE_SET_RECOVERY_GUARD: return "Guard";
+        case PRACTICE_SET_RECOVERY_BOTH_NEUTRAL: return "Both Neutral";
+        case PRACTICE_SET_RECOVERY_DELAY: return "Delay";
+        case PRACTICE_SET_TRIGGERS_ENABLED: return "Triggers";
+        case PRACTICE_SET_TRIGGER_TARGET:   return "Target";
+        case PRACTICE_SET_TRIGGER_RANDOM:   return "Random Skip";
+        case PRACTICE_SET_WAKE_BUFFER:      return "Wake Buffer";
+        case PRACTICE_SET_HITBOXES:         return "Hitboxes";
+        case PRACTICE_SET_COMBO_OVERLAY:    return "Combo";
+        case PRACTICE_SET_INPUT_DISPLAY:    return "Inputs";
+        case PRACTICE_SET_DAMAGE_DISPLAY:   return "Damage";
+        case PRACTICE_SET_FRAME_ADVANTAGE:  return "Frame Adv";
+        case PRACTICE_SET_HEALTH_REGEN:     return "Regen";
+        case PRACTICE_SET_METER_LEVEL:      return "Meter Level";
+        case PRACTICE_SET_TRIGGER_BUTTON:   return "Button";
+        case PRACTICE_SET_TRIGGER_DELAY:    return "Delay";
+        case PRACTICE_SET_CONTROL_SWAP:     return "Control P2";
+        case PRACTICE_SET_MACRO_SLOT:       return "Macro Slot";
+        case PRACTICE_SET_PAUSED:           return "Freeze";
+        case PRACTICE_SET_RECOVERY_HP_VALUE:    return "HP Value";
+        case PRACTICE_SET_RECOVERY_METER_VALUE: return "Meter Value";
+        case PRACTICE_SET_RECOVERY_GUARD_VALUE: return "Guard Value";
+        default:
+            if (IsTriggerRow(setting)) {
+                return kShortTriggerLabels[TriggerRowIndex(setting)];
+            }
+            return "?";
+    }
+}
+
+const char* PracticeSetting_ValueText(int setting) {
+    const int value = PracticeSetting_Get(setting);
+    const int count = PracticeSetting_ValueCount(setting);
+    const int idx = (value >= 0 && value < count) ? value : 0;
+
+    switch (setting) {
+        case PRACTICE_SET_DUMMY_BACKEND:  return kDummyControlModeLabels[idx];
+        case PRACTICE_SET_BLOCK_MODE:     return kBlockModeLabels[idx];
+        case PRACTICE_SET_STANCE:         return kStanceModeLabels[idx];
+        case PRACTICE_SET_JUMP_MODE:      return kJumpModeLabels[idx];
+        case PRACTICE_SET_JUMP_CADENCE:   return kCadenceLabels[idx];
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: return kDefensiveResponseLabels[idx];
+        case PRACTICE_SET_NATIVE_CPU:     return kNativeCpuLabels[idx];
+        case PRACTICE_SET_NATIVE_AIR_TECH:    return kNativeAirTechLabels[idx];
+        case PRACTICE_SET_NATIVE_GROUND_TECH: return kNativeGroundTechLabels[idx];
+        case PRACTICE_SET_NATIVE_BLOCK_TYPE:  return kNativeBlockTypeLabels[idx];
+        case PRACTICE_SET_NATIVE_DUMMY_STATE: return kNativeDummyStateLabels[idx];
+        case PRACTICE_SET_HEALTH_REGEN:   return kNativeHealthLabels[idx];
+        case PRACTICE_SET_METER_LEVEL:    return kNativeMeterLabels[idx];
+        case PRACTICE_SET_RECOVERY_HP:    return kRecoveryHpLabels[idx];
+        case PRACTICE_SET_RECOVERY_METER: return kRecoveryMeterLabels[idx];
+        case PRACTICE_SET_RECOVERY_GUARD: return kRecoveryGuardLabels[idx];
+        case PRACTICE_SET_RECOVERY_DELAY: return kDelayLabels[idx];
+        case PRACTICE_SET_TRIGGER_TARGET: return kTriggerTargetLabels[idx];
+        case PRACTICE_SET_WAKE_BUFFER:    return kWakeBufferLabels[idx];
+        case PRACTICE_SET_TRIGGER_BUTTON: return kScriptButtonLabels[idx];
+        case PRACTICE_SET_TRIGGER_DELAY:  return kDelayLabels[idx];
+        case PRACTICE_SET_RECOVERY_HP_VALUE:
+        case PRACTICE_SET_RECOVERY_METER_VALUE:
+        case PRACTICE_SET_RECOVERY_GUARD_VALUE: {
+            static char numText[24];
+            snprintf(numText, sizeof(numText), "%d", PracticeSetting_Get(setting));
+            return numText;
+        }
+        case PRACTICE_SET_MACRO_SLOT: {
+            static char slotText[24];
+            snprintf(slotText, sizeof(slotText), "%d%s", idx + 1,
+                     InputMacro_SlotHasData(idx) ? " *" : "");
+            return slotText;
+        }
+        default:
+            // A trigger row shows its configured action, so the whole set reads
+            // at a glance without opening anything.
+            if (IsTriggerRow(setting)) {
+                return PracticeTrigger_Summary(TriggerRowIndex(setting));
+            }
+            return kOnOffLabels[idx != 0 ? 1 : 0];
+    }
+}
+
+bool PracticeSetting_Enabled(int setting) {
+    const bool advanced = s_practiceConfig.dummyControlMode == DUMMY_CONTROL_MOD;
+    const bool cpuOn = ReadNativeTrainingSetting(ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE, 1) != 0;
+
+    switch (setting) {
+        case PRACTICE_SET_BLOCK_MODE:
+        case PRACTICE_SET_STANCE:
+        case PRACTICE_SET_JUMP_MODE:
+            return advanced;
+        case PRACTICE_SET_JUMP_CADENCE:
+            return advanced && s_practiceConfig.jumpMode != DUMMY_JUMP_DISABLED;
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: {
+            // Live only where the mod can actually drive the mechanic; on the
+            // rest the row would promise something that never happens.
+            const int cat = PracticeDefense_DummyDefenseCategory();
+            return advanced && (cat == Training::kDefenseCategoryJustParry ||
+                                cat == Training::kDefenseCategoryDodge ||
+                                cat == Training::kDefenseCategoryRepel ||
+                                cat == Training::kDefenseCategoryUnique);
+        }
+
+        // The vanilla menu greys these while CPU is on; keep that.
+        case PRACTICE_SET_NATIVE_AIR_TECH:
+        case PRACTICE_SET_NATIVE_GROUND_TECH:
+        case PRACTICE_SET_NATIVE_BLOCK_TYPE:
+        case PRACTICE_SET_NATIVE_DUMMY_STATE:
+            return !advanced && !cpuOn;
+
+        case PRACTICE_SET_TRIGGER_TARGET:
+        case PRACTICE_SET_TRIGGER_RANDOM:
+        case PRACTICE_SET_WAKE_BUFFER:
+            return s_practiceConfig.triggerMasterEnabled;
+
+        // The action fields only mean anything once the slot itself is on.
+        case PRACTICE_SET_TRIGGER_BUTTON:
+        case PRACTICE_SET_TRIGGER_DELAY:
+            return s_practiceConfig.triggerMasterEnabled && MenuTrigger().enabled;
+
+        // A custom value is only meaningful while its mode is set to Custom.
+        case PRACTICE_SET_RECOVERY_HP_VALUE:
+            return s_practiceConfig.recovery[1].hpMode == RECOVERY_HP_CUSTOM;
+        case PRACTICE_SET_RECOVERY_METER_VALUE:
+            return s_practiceConfig.recovery[1].meterMode == RECOVERY_METER_CUSTOM;
+        case PRACTICE_SET_RECOVERY_GUARD_VALUE:
+            return s_practiceConfig.recovery[1].guardMode == RECOVERY_GUARD_CUSTOM;
+
+        default:
+            if (IsTriggerRow(setting)) {
+                return s_practiceConfig.triggerMasterEnabled;
+            }
+            return true;
+    }
+}
+
+bool PracticeSetting_IsNumeric(int setting) {
+    return setting == PRACTICE_SET_RECOVERY_HP_VALUE ||
+           setting == PRACTICE_SET_RECOVERY_METER_VALUE ||
+           setting == PRACTICE_SET_RECOVERY_GUARD_VALUE;
+}
+
+int PracticeSetting_NumericMin(int setting) {
+    (void)setting;
+    return 0;
+}
+
+int PracticeSetting_NumericMax(int setting) {
+    switch (setting) {
+        case PRACTICE_SET_RECOVERY_HP_VALUE: {
+            const PlayerSnapshot snapshot = ReadPlayerSnapshot(1);
+            return snapshot.valid ? GetEditableHpCap(snapshot) : 10000;
+        }
+        case PRACTICE_SET_RECOVERY_METER_VALUE: return kMeterMax;
+        case PRACTICE_SET_RECOVERY_GUARD_VALUE: return kGuardGaugeMax;
+        default:                                return 0;
+    }
+}
+
+void PracticeSetting_SetNumeric(int setting, int value) {
+    const int clamped = ClampInt(value,
+                                 PracticeSetting_NumericMin(setting),
+                                 PracticeSetting_NumericMax(setting));
+    // Applied to both sides, matching how the mode rows behave from this menu.
+    for (int p = 0; p < kPracticePlayerCount; ++p) {
+        switch (setting) {
+            case PRACTICE_SET_RECOVERY_HP_VALUE:    s_practiceConfig.recovery[p].hpCustom = clamped; break;
+            case PRACTICE_SET_RECOVERY_METER_VALUE: s_practiceConfig.recovery[p].meterCustom = clamped; break;
+            case PRACTICE_SET_RECOVERY_GUARD_VALUE: s_practiceConfig.recovery[p].guardCustom = clamped; break;
+            default: break;
+        }
+    }
+}
+
+int PracticeTrigger_Count() {
+    return kTriggerCount;
+}
+
+void PracticeTrigger_SelectSlot(int slot) {
+    g_menuTriggerSlot = ClampInt(slot, 0, kTriggerCount - 1);
+}
+
+int PracticeTrigger_SelectedSlot() {
+    return g_menuTriggerSlot;
+}
+
+const char* PracticeTrigger_Name(int slot) {
+    return kShortTriggerLabels[ClampInt(slot, 0, kTriggerCount - 1)];
+}
+
+namespace {
+
+// P2 is the dummy, so its character decides which movelist the picker offers.
+const Training::CharacterMoveList* DummyMoveList() {
+    const PlayerSnapshot dummy = ReadPlayerSnapshot(1);
+    if (!dummy.valid || dummy.charId >= (uint32_t)Training::kCharacterMoveListCount) {
+        return nullptr;
+    }
+    return &Training::kCharacterMoveLists[dummy.charId];
+}
+
+} // namespace
+
+const char* PracticeTrigger_Summary(int slot) {
+    const TriggerConfig& cfg = s_practiceConfig.triggers[ClampInt(slot, 0, kTriggerCount - 1)];
+    if (!cfg.enabled) {
+        return "";
+    }
+
+    static char text[48];
+    const int motion = ClampInt(cfg.actionKind, 0, IM_ARRAYSIZE(kScriptActionLabels) - 1);
+    const int button = ClampInt(cfg.actionButton, 0, IM_ARRAYSIZE(kScriptButtonLabels) - 1);
+    if (motion == 0) {
+        return "No action";
+    }
+    // Prefer the guide's notation so the row matches what the picker showed.
+    const Training::CharacterMoveList* list = DummyMoveList();
+    if (list && list->moves) {
+        for (int i = 0; i < list->count; ++i) {
+            if (list->moves[i].motion == motion && list->moves[i].button == button) {
+                return list->moves[i].notation;
+            }
+        }
+    }
+    snprintf(text, sizeof(text), "%s+%s",
+             kScriptActionLabels[motion], kScriptButtonLabels[button]);
+    return text;
+}
+
+int PracticeTrigger_MoveCount() {
+    const Training::CharacterMoveList* list = DummyMoveList();
+    return (list && list->moves) ? list->count : 0;
+}
+
+const char* PracticeTrigger_MoveLabel(int index) {
+    const Training::CharacterMoveList* list = DummyMoveList();
+    if (!list || !list->moves || index < 0 || index >= list->count) {
+        return "?";
+    }
+    // The guide's own notation, so "66A" instead of a "Dash Forward A" that
+    // does not fit the column.
+    return list->moves[index].notation;
+}
+
+int PracticeTrigger_SelectedMove() {
+    const Training::CharacterMoveList* list = DummyMoveList();
+    if (!list || !list->moves) {
+        return -1;
+    }
+    const TriggerConfig& cfg = MenuTrigger();
+    for (int i = 0; i < list->count; ++i) {
+        if (list->moves[i].motion == cfg.actionKind &&
+            list->moves[i].button == cfg.actionButton) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void PracticeTrigger_SelectMove(int index) {
+    const Training::CharacterMoveList* list = DummyMoveList();
+    if (!list || !list->moves || index < 0 || index >= list->count) {
+        return;
+    }
+    MenuTrigger().actionKind = list->moves[index].motion;
+    MenuTrigger().actionButton = list->moves[index].button;
+}
+
+const char* PracticeDummy_DefenceName() {
+    const Training::CharacterMoveList* list = DummyMoveList();
+    return (list && list->defenceName) ? list->defenceName : "";
+}
+
+int PracticeTrigger_MotionCount() {
+    return IM_ARRAYSIZE(kScriptActionLabels);
+}
+
+const char* PracticeTrigger_MotionLabel(int motion) {
+    return kScriptActionLabels[ClampInt(motion, 0, IM_ARRAYSIZE(kScriptActionLabels) - 1)];
+}
+
+int PracticeTrigger_GetMotion() {
+    return MenuTrigger().actionKind;
+}
+
+void PracticeTrigger_SetMotion(int motion) {
+    MenuTrigger().actionKind = ClampInt(motion, 0, IM_ARRAYSIZE(kScriptActionLabels) - 1);
+}
+
+const char* PracticeAction_Invoke(int action) {
+    switch (action) {
+        case PRACTICE_ACT_ROUND_RESET:
+            return TryLoadRoundStartReset("pause_menu") ? "Round start restored"
+                                                       : "No round-start autosave";
+        case PRACTICE_ACT_SWAP_SIDES: {
+            PlayerSnapshot snapshots[kPracticePlayerCount] = {
+                ReadPlayerSnapshot(0),
+                ReadPlayerSnapshot(1),
+            };
+            SwapPlayerPositions(snapshots);
+            return "Positions swapped";
+        }
+        case PRACTICE_ACT_POSITION_MID:
+            return ApplyPositionPreset(kMidScreenPositionPreset) ? "Mid screen" : "Unavailable";
+        case PRACTICE_ACT_POSITION_CORNER:
+            return ApplyPositionPreset(kRightCornerPositionPreset) ? "Corner" : "Unavailable";
+        case PRACTICE_ACT_SAVE_STATE:
+            return Savestate_Save() ? "State saved" : "Save failed";
+        case PRACTICE_ACT_LOAD_STATE:
+            return Savestate_Load() ? "State loaded" : "Load failed";
+        case PRACTICE_ACT_SAVE_POSITION: {
+            PlayerSnapshot snapshots[kPracticePlayerCount] = {
+                ReadPlayerSnapshot(0),
+                ReadPlayerSnapshot(1),
+            };
+            return SavePositionSnapshot(snapshots) ? "Position saved" : "Unavailable";
+        }
+        case PRACTICE_ACT_LOAD_POSITION:
+            return LoadPositionSnapshot() ? "Position restored" : "No saved position";
+        case PRACTICE_ACT_MACRO_RECORD:
+            InputMacro_ToggleRecord();
+            return InputMacro_GetState() == MACRO_IDLE ? "Recording stopped" : "Recording";
+        case PRACTICE_ACT_MACRO_PLAY:
+            InputMacro_TogglePlay();
+            return InputMacro_GetState() == MACRO_REPLAYING ? "Playing" : "Playback stopped";
+        case PRACTICE_ACT_POSITION_ROUND_START:
+            return ApplyPositionPreset(kRoundStartPositionPreset) ? "Round start" : "Unavailable";
+        case PRACTICE_ACT_FRAME_STEP:
+            // Only meaningful while frozen, and the step lands once the menu
+            // closes and the simulation ticks again.
+            if (!s_paused) {
+                return "Freeze first";
+            }
+            if (!s_stepRequested) {
+                s_stepRequested = true;
+                s_stepCounter++;
+            }
+            return "Step queued";
+        case PRACTICE_ACT_TITLE_SCREEN:
+            QueuePracticeExitRoute(kMatchRouteTitle, "pause menu");
+            return "Returning to title";
+        default:
+            return nullptr;
+    }
+}
+
 void PracticeTools_RestoreRuntimeState(const PracticeToolsRuntimeState* state) {
     if (!state) {
         return;
     }
 
     ResetPracticeTransientRuntime(false);
-    s_paused = state->paused;
-    s_stepRequested = state->stepRequested;
-    s_stepCounter = (int)state->stepCounter;
+    // Freeze is the player's view state, not part of the simulation being
+    // restored: loading while frozen has to stay frozen so the state can be
+    // stepped into. A step queued before the load is stale, so it is dropped.
+    s_stepRequested = false;
+    s_stepCounter = 0;
 
     PracticeDefenseRuntimeState defense{};
     defense.sequence = state->autoBlockSequence;
@@ -3247,11 +3936,11 @@ void PracticeTools_RestoreRuntimeState(const PracticeToolsRuntimeState* state) {
     defense.lastProcessedSimFrame = state->lastProcessedSimFrame;
     PracticeDefense_RestoreState(&defense);
 
-    LOG_INFO("[Practice] Restored runtime state: paused=%d step_requested=%d step_counter=%u "
+    LOG_INFO("[Practice] Restored runtime state: paused=%d (kept) step_requested=%d step_counter=%u "
              "seq_gen=%u seq_groups=%u seq_random=%d",
              s_paused ? 1 : 0,
              s_stepRequested ? 1 : 0,
-             (unsigned int)state->stepCounter,
+             (unsigned int)s_stepCounter,
              (unsigned int)state->autoBlockSequence.generation,
              (unsigned int)state->autoBlockSequence.resolvedContactGroups,
              state->autoBlockSequence.randomBlock ? 1 : 0);
@@ -3289,8 +3978,8 @@ void PracticeTools_Shutdown() {
 void PracticeTools_FrameUpdate() {
     if (!s_initialized) return;
 
+    // Hotkey edges are refreshed in ModOnFrame, ahead of every consumer.
     const bool active = IsPracticeModeNow();
-    HotkeyConfig_Update();
 
     if (s_wasActive && !active) {
         ResetPracticeState();

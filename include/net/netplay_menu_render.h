@@ -19,5 +19,7 @@ void MenuFillRect(int l, int t, int r, int b, uint8_t cr, uint8_t cg, uint8_t cb
 void MenuDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* text);
 // size 0 keeps the default; the settings screens use larger rows than netplay.
 void MenuDrawTextSized(int x, int y, uint8_t r, uint8_t g, uint8_t b, float size, const char* text);
+// Advance width in the game's 640x480 space, from the atlas the draw would use.
+float MenuMeasureText(const char* text, float size);
 
 } // namespace NetMenu

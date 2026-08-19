@@ -58,6 +58,7 @@
 #include "net/player_side_mapping.h"
 #include "replay/replay_runtime.h"
 #include "testing/scripted_input_runner.h"
+#include "training/hotkey_config.h"
 #include "training/practice_tools.h"
 #include "imgui.h"
 #include <math.h>
@@ -639,7 +640,10 @@ static void DeferredInit() {
 
     LOG_INFO("========================================");
     LOG_INFO("Initialization complete!");
-    LOG_INFO("Hotkeys: F1=Menu  F4=Hitbox  F5=SaveState  F6=LoadState  F7=Pause  F8=Step  F9=Swap");
+    // Defaults only - every one of these is rebindable in Settings > System >
+    // Practice Hotkeys, so the log says where to look rather than pretending.
+    LOG_INFO("Hotkeys (defaults): F1=Menu  F4=Hitbox  F5=SaveState  F6=LoadState  "
+             "F7=Pause  F8=Step  F9=Swap  -- rebind in Settings > System");
     LOG_INFO("========================================");
     LogWindow_SetForceFlush(false);
     LogWindow_Flush();
@@ -841,7 +845,10 @@ __declspec(dllexport) void ModOnFrame() {
     PaletteAssetHook_FrameUpdate();
     Net::CharSelPaletteSelect_FrameUpdate();
 
-    // Process savestate hotkeys (F5 save, F6 load)
+    // One edge update per frame, before anything reads a hotkey.
+    HotkeyConfig_Update();
+
+    // Process savestate hotkeys (F5 save, F6 load by default)
     Savestate_ProcessHotkeys();
 
     // Process practice mode hotkeys and state

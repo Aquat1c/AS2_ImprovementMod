@@ -703,6 +703,70 @@
 #define DEFENSE_CAT6_DODGE               0x00200  // sub_4A5D30 gate (result 8)
 #define DEFENSE_GUARD_POINT              0x00400  // sub_4A5D80 gate (result 9)
 #define DEFENSE_SPECIAL_GUARD            0x02000  // permits guarding ATTACK_FLAG_SPECIAL_GUARD
+#define DEFENSE_JUST_PARRY               0x00020  // sub_4A50A0 capability path (result 4)
+#define DEFENSE_REPEL                    0x00040  // sub_4A5570 capability path (result 5)
+
+// How an action grants those bits: the six-argument form of the max-hit setter
+// (0x49E8F0). The decomp labels several call sites Entity_SetCollisionData /
+// Entity_SetClashData, but a six-argument call lands here and its LAST argument
+// is the +1940 mask - which is why literals like 0x23 / 0x43 / 0x103 / 0x403
+// appear at the call sites.
+//
+//   Entity_UpdateMaxHitData(entity, lanesA, lanesB, lanesC, aux, MASK)
+//
+// Actions observed granting a capability (action-ID switch, not reaction code):
+#define ACTION_CAT1_UNIQUE_A     30   // 0x1E, extends via route 22 on D + FORWARD
+#define ACTION_CAT1_UNIQUE_AIR   32   // 0x20, same with the airborne Y gate
+#define ACTION_ABSOLUTE_DEF_GND  49   // 0x31, granted 0x103
+#define ACTION_ABSOLUTE_DEF_AIR  52   // 0x34
+#define ACTION_DODGE_GND_A       59   // 0x3B, granted 0x200
+#define ACTION_DODGE_GND_B       60   // 0x3C, the BACK-held variant
+#define ACTION_DODGE_AIR_A       61   // 0x3D
+#define ACTION_DODGE_AIR_B       62   // 0x3E
+#define ACTION_GUARD_POINT       135  // 0x87, granted 0x403
+
+// Just-parry / repel are NOT actions: sub_49EED0 reaction codes 2..4 and 5..7
+// are the follow-through states, and the entry is the timer path below.
+
+// --- Just-parry window (defender-relative) --------------------------------
+// Entity_CheckHitState (0x424AF0) arms the window when the BACK input is FRESHLY
+// pressed and the window is idle (0xFF):
+//     blockstun actions 64/65/67/68/70/71 -> 5 frames
+//     actions 34..39                      -> 6 frames
+//     anything else                       -> 7 frames
+// sub_4A50A0 then needs a live window plus +1949 == 1, with +1974 (BACK held)
+// and +1973 (DOWN held) selecting the lane. A continuous hold never arms it -
+// the fresh edge is the whole mechanic.
+#define ENTITY_OFF_PARRY_WINDOW      0x07AD  // +1965, BYTE, 0xFF = idle, else frames left
+#define ENTITY_OFF_PARRY_KIND        0x07B0  // +1968, DWORD, 1/2/3 by originating state
+#define ENTITY_OFF_PARRY_STANCE      0x07B5  // +1973, BYTE, 1 = DOWN held (crouch parry)
+#define ENTITY_OFF_PARRY_GUARD_HELD  0x07B6  // +1974, BYTE, 1 = BACK held
+#define ENTITY_OFF_HIT_REACTION_KIND 0x07C5  // +1989, BYTE, repel's non-capability path
+#define ENTITY_OFF_HIT_REACTION_STATE 0x07BC // +1980, DWORD, -1 = no reaction armed
+#define ENTITY_OFF_HIT_REACTION_TIMER 0x07C6 // +1990, BYTE, 24-frame repel window
+#define PARRY_WINDOW_IDLE            0xFF
+
+// --- Per-entity input words, slots 10..13 --------------------------------
+// Input_ProcessRawInput derives four extra slots after the ten buttons:
+//     10 FORWARD, 11 BACK (both facing-relative), 12 NEUTRAL, 13 B+C
+// so BACK is +8 + 2*11 = +30 current, +36 + 2*11 = +58 previous,
+// +64 + 2*11 = +86 derived/just-pressed.
+#define ENTITY_INPUT_IDX_FORWARD     10
+#define ENTITY_INPUT_IDX_BACK        11
+#define ENTITY_INPUT_IDX_NEUTRAL     12
+#define ENTITY_INPUT_IDX_BC          13
+#define ENTITY_OFF_INPUT_BACK        0x001E  // +30, current
+#define ENTITY_OFF_INPUT_BACK_EDGE   0x0056  // +86, just-pressed
+
+// Guard-cancel options out of blockstun, from Entity_UpdateAction_Standard
+// (route 22) keyed on the current blockstun action:
+//   category 5 + resource byte +823  -> action 49 / 52 (Absolute Defense)
+//   category 6 + meter >= 500 + D    -> action 59/60 / 61/62 (Dodge)
+#define ENTITY_OFF_DEFENSE_RESOURCE  0x0337  // +823, BYTE, category-5 stock
+#define DODGE_METER_COST             500
+#define PUSH_AWAY_METER_MIN          100     // sub_4A5910 gate, category 4
+#define ADDR_ENTITY_CHECK_HIT_STATE  (GAME_BASE + 0x024AF0)  // arms the parry window
+#define ADDR_DEFENSE_REACTION_DISPATCH (GAME_BASE + 0x09EED0) // sub_49EED0
 
 // Contact resolution codes. Every handler except ordinary guard also stores its
 // code at defender+1944; ordinary guard (10) only ever appears as the resolver

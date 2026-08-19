@@ -271,6 +271,7 @@ set(UI_HEADERS
     include/ui/mod_menu.h
     include/ui/hitbox_viewer.h
     include/ui/palette_editor.h
+    include/ui/pause_menu.h
 )
 
 set(INPUT_HEADERS
@@ -361,6 +362,7 @@ set(TESTING_HEADERS
 set(TRAINING_HEADERS
     include/training/action_state_classifier.h
     include/training/auto_block.h
+    include/training/character_moves.h
     include/training/native_recovery.h
     include/training/frame_advantage.h
     include/training/hotkey_config.h
@@ -405,6 +407,7 @@ set(UI_SOURCES
     src/ui/log_window.cpp
     src/ui/mod_menu.cpp
     src/ui/palette_editor.cpp
+    src/ui/pause_menu.cpp
     src/ui/menu_utils.cpp
     src/ui/hitbox_viewer.cpp
     src/ui/netplay_hud.cpp

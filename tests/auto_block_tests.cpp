@@ -378,7 +378,164 @@ static void TestSimultaneousScenarios() {
     TEST_CHECK(!PlanAcceptsAttack(plan, 0x2, 0), "conflict frame blocks nothing, either lane");
 }
 
+// --- Just-parry re-arm ---------------------------------------------------
+
+static void TestParryRearm() {
+    ParryInputState st{};
+
+    // No threat: never drop guard.
+    TEST_CHECK(!ParryWantsRelease(st, 0xFF, false), "idle window but no threat -> hold");
+
+    // Threat armed and the window is idle: owe a fresh edge, so release once.
+    TEST_CHECK(ParryWantsRelease(st, 0xFF, true), "idle window + threat -> release");
+    // Never twice running, or the dummy would simply stop guarding.
+    TEST_CHECK(!ParryWantsRelease(st, 0xFF, true), "release never repeats back to back");
+    TEST_CHECK(ParryWantsRelease(st, 0xFF, true), "and alternates so the edge keeps coming");
+
+    // A live window needs BACK held, not released - that is what keeps +1974 set.
+    ParryInputState live{};
+    for (uint8_t frames = 1; frames <= 7; ++frames) {
+        TEST_CHECK(!ParryWantsRelease(live, frames, true),
+                   "a counting window is never interrupted");
+    }
+
+    // Losing the threat resets the cycle so the next string starts clean.
+    ParryInputState reset{};
+    ParryWantsRelease(reset, 0xFF, true);
+    TEST_CHECK(!ParryWantsRelease(reset, 0xFF, false), "no threat -> hold");
+    TEST_CHECK(ParryWantsRelease(reset, 0xFF, true), "cycle restarts on the next threat");
+}
+
+static void TestDefensiveResponses() {
+    // The category map, cross-checked against the guide's own defence table.
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryJustParry) == DefensiveResponse::JustParry,
+               "category 2 -> just parry");
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryDodge) == DefensiveResponse::Dodge,
+               "category 6 -> dodge");
+    // Push-away needs no command, so ordinary guard already produces it.
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryPushAway) == DefensiveResponse::NormalGuard,
+               "category 4 needs no extra input");
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryAbsolute) == DefensiveResponse::NormalGuard,
+               "category 5 has no driven response yet");
+
+    TEST_CHECK(ResponseSupportedByCategory(DefensiveResponse::JustParry, 2), "parry on cat 2");
+    TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::JustParry, 6), "no parry on cat 6");
+    TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::Dodge, 2), "no dodge on cat 2");
+    TEST_CHECK(ResponseSupportedByCategory(DefensiveResponse::NormalGuard, 0),
+               "guard-only always applies");
+}
+
+static DefenseDriveSample Drive(bool threat = true) {
+    DefenseDriveSample d{};
+    d.threatArmed = threat;
+    d.actionable = true;
+    d.parryWindow = 0xFF;
+    d.reactionState = kReactionIdle;
+    return d;
+}
+
+static void TestRepelDrive() {
+    DefenseDriveState st{};
+    DefenseDriveSample d = Drive();
+
+    // Entity_CheckGuardState only arms from neutral, so the tap has to be
+    // preceded by a frame with no direction at all.
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, d, st) ==
+               DefenseInputKind::ReleaseGuard, "repel clears the direction first");
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, d, st) ==
+               DefenseInputKind::ForwardTap, "then taps forward");
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, d, st) ==
+               DefenseInputKind::ReleaseGuard, "and returns to neutral to re-arm");
+
+    // A reaction is already armed for 24 frames; tapping again achieves nothing.
+    d.reactionState = 5;
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, d, st) ==
+               DefenseInputKind::None, "armed reaction is left alone");
+
+    // No threat at all resets the cycle.
+    DefenseDriveSample idle = Drive(false);
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, idle, st) ==
+               DefenseInputKind::None, "no threat, no input");
+}
+
+static void TestGuardCounterDrive() {
+    DefenseDriveState st{};
+    DefenseDriveSample d = Drive();
+
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::GuardCounter, d, st) ==
+               DefenseInputKind::CounterForward, "category 1 presses 6D");
+
+    // 6D holds FORWARD, so repeating it would mean never guarding again: one
+    // press per threat, then back to the ordinary guard.
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::GuardCounter, d, st) ==
+               DefenseInputKind::None, "the counter does not repeat while held");
+
+    // The guide says "air OK" and the engine has the airborne branch, so height
+    // is the engine's business.
+    DefenseDriveState air{};
+    DefenseDriveSample da = Drive();
+    da.airborne = true;
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::GuardCounter, da, air) ==
+               DefenseInputKind::CounterForward, "airborne counter is allowed");
+
+    // Pressing it mid-move is thrown away, so do not.
+    DefenseDriveState busy{};
+    DefenseDriveSample db = Drive();
+    db.actionable = false;
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::GuardCounter, db, busy) ==
+               DefenseInputKind::None, "not actionable, no press");
+
+    // A new threat re-arms it.
+    DefenseDriveState again{};
+    EvaluateDefenseInput(DefensiveResponse::GuardCounter, d, again);
+    EvaluateDefenseInput(DefensiveResponse::GuardCounter, Drive(false), again);
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::GuardCounter, d, again) ==
+               DefenseInputKind::CounterForward, "next threat gets its own counter");
+}
+
+static void TestDriveRouting() {
+    DefenseDriveState st{};
+    DefenseDriveSample d = Drive();
+    d.actionId = 67;
+    d.meter = 900;
+
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, d, st) ==
+               DefenseInputKind::DodgePress, "dodge presses D from blockstun");
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::NormalGuard, d, st) ==
+               DefenseInputKind::None, "guard only never adds an input");
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::JustParry, d, st) ==
+               DefenseInputKind::ReleaseGuard, "parry drops the direction to re-arm");
+
+    // Category mapping now covers every response the mod can drive.
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryRepel) == DefensiveResponse::Repel,
+               "category 3 -> repel");
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryUnique) == DefensiveResponse::GuardCounter,
+               "category 1 -> guard counter");
+    TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::Repel, 6), "no repel on cat 6");
+    TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::GuardCounter, 3),
+               "no counter on cat 3");
+}
+
+static void TestDodgeWindow() {
+    // Only the blockstun states route 22 actually offers the cancel from.
+    TEST_CHECK(DodgeWindowOpen(67, 500), "crouch blockstun opens the dodge");
+    TEST_CHECK(DodgeWindowOpen(68, 900), "crouch blockstun, spare meter");
+    TEST_CHECK(DodgeWindowOpen(70, 500), "air blockstun opens it");
+    TEST_CHECK(DodgeWindowOpen(71, 500), "air blockstun, second state");
+
+    TEST_CHECK(!DodgeWindowOpen(64, 900), "stand blockstun is not routed to dodge");
+    TEST_CHECK(!DodgeWindowOpen(2, 900), "neutral is not a guard cancel");
+    TEST_CHECK(!DodgeWindowOpen(67, 499), "one short of the cost is still no");
+    TEST_CHECK(!DodgeWindowOpen(67, 0), "no meter, no dodge");
+}
+
 int main() {
+    TestParryRearm();
+    TestDefensiveResponses();
+    TestDodgeWindow();
+    TestRepelDrive();
+    TestGuardCounterDrive();
+    TestDriveRouting();
     TestGroundMaskDecoder();
     TestLaneIntersection();
     TestAirPlan();

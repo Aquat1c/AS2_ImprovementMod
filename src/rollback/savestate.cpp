@@ -30,6 +30,7 @@
 #include "rollback/block_digest.h"
 #include "rollback/rollback_session.h"
 #include "training/frame_advantage.h"
+#include "training/hotkey_config.h"
 #include "training/input_macro.h"
 #include "training/practice_tools.h"
 #include "net/session_manager.h"
@@ -70,10 +71,6 @@ static SavestateSlot g_roundStartSlot;
 static SavestateSlot g_rollbackBaselineSlot;
 static bool g_offlineMatchContextActive = false;
 static bool g_roundStartAutosaveArmed = false;
-
-// Edge detection for F5/F6
-static bool g_f5WasDown = false;
-static bool g_f6WasDown = false;
 
 // ============================================================================
 // File Logging (integrates with determinism log directory)
@@ -220,6 +217,14 @@ static bool CapturePracticeSavestateSlot(SavestateSlot* slot,
         return false;
     }
 
+    // A slot captured from the pause menu must restore to GAMEPLAY, not back
+    // into the menu. Resuming writes substate 3 with a zero timer, so record
+    // exactly what a resume would have produced.
+    if (slot->snapshot.substate == MATCH_SUB_PAUSE) {
+        slot->snapshot.substate = MATCH_SUB_GAMEPLAY;
+        slot->snapshot.substate_timer = 0;
+    }
+
     slot->fpu_cw = CaptureX87CW();
     slot->fpu_mxcsr = CaptureMXCSR();
 
@@ -288,7 +293,9 @@ static bool RestorePracticeSavestateSlot(const SavestateSlot* slot,
                  postFrame,
                  postChecksum,
                  postRng,
-                 slot->practice_runtime.paused ? 1 : 0,
+                 // Live, not the slot's: a load keeps whatever freeze the
+                 // player is holding rather than restoring the saved one.
+                 PracticeTools_IsPaused() ? 1 : 0,
                  slot->practice_runtime.stepCounter);
     } else {
         LOG_ERROR("[Savestate] LOADED %s with CHECKSUM MISMATCH! expected=0x%08X got=0x%08X",
@@ -346,9 +353,18 @@ static bool IsOfflineMatchContextActive() {
            !IsOnlineOwnedContext();
 }
 
+// The pause menu freezes the simulation and is only reachable from gameplay, so
+// it is a valid save/load context. Kept separate from IsInPlayableMatchGameplay
+// so netplay baselines and the rollback paths keep their stricter definition.
+static bool IsPracticePauseSavestateContext() {
+    return GetGameMode() == MODE_MATCH &&
+           GetSubstate() == MATCH_SUB_PAUSE &&
+           GetGameType() == GAMETYPE_TRAINING;
+}
+
 static bool IsOfflinePlayableSavestateContext() {
     return IsOfflineMatchContextActive() &&
-           IsInPlayableMatchGameplay();
+           (IsInPlayableMatchGameplay() || IsPracticePauseSavestateContext());
 }
 
 static bool IsRollbackBaselineContext() {
@@ -406,8 +422,6 @@ void Savestate_Init() {
     ClearRollbackBaselineSlot("init");
     g_offlineMatchContextActive = false;
     g_roundStartAutosaveArmed = false;
-    g_f5WasDown = false;
-    g_f6WasDown = false;
     LOG_INFO("[Savestate] Initialized (main region: 0x%08X, %u bytes / %u KB)",
              ADDR_MATCH_BASE,
              (unsigned)Rollback::GAME_SNAPSHOT_MAIN_SIZE,
@@ -617,17 +631,15 @@ void Savestate_ClearRollbackBaseline(const char* reason) {
 void Savestate_ProcessHotkeys() {
     UpdateSavestateContext();
 
-    bool f5Down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
-    bool f6Down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-
+    // Edges are consumed either way, so a press made where saving is not
+    // allowed cannot fire the moment it becomes allowed.
+    const bool save = HotkeyConfig_JustPressed(HOTKEY_STATE_SAVE);
+    const bool load = HotkeyConfig_JustPressed(HOTKEY_STATE_LOAD);
     if (!Savestate_CanSaveLoad()) {
-        g_f5WasDown = f5Down;
-        g_f6WasDown = f6Down;
         return;
     }
 
-    // F5: Save (on key-down edge)
-    if (f5Down && !g_f5WasDown) {
+    if (save) {
         if (Savestate_Save()) {
             char buf[64];
             snprintf(buf, sizeof(buf), "State Saved (F%d)", g_manualSlot.info.frame);
@@ -637,8 +649,7 @@ void Savestate_ProcessHotkeys() {
         }
     }
 
-    // F6: Load (on key-down edge)
-    if (f6Down && !g_f6WasDown) {
+    if (load) {
         if (Savestate_Load()) {
             char buf[64];
             snprintf(buf, sizeof(buf), "State Loaded (F%d)", g_manualSlot.info.frame);
@@ -647,9 +658,6 @@ void Savestate_ProcessHotkeys() {
             PracticeTools_Toast("Load Failed", 0xFF6464FF);  // red
         }
     }
-
-    g_f5WasDown = f5Down;
-    g_f6WasDown = f6Down;
 }
 
 // ============================================================================
@@ -660,7 +668,17 @@ void Savestate_RenderImGui() {
     const SavestateInfo* info = &g_manualSlot.info;
     const SavestateInfo* roundStartInfo = &g_roundStartSlot.info;
 
-    ImGui::Text("Offline Savestate (Auto-save + F5/F6)");
+    // Keys are rebindable, so these read the live binding rather than the
+    // defaults they used to hard-code.
+    char saveLabel[64], loadLabel[64], saveKey[48], loadKey[48];
+    HotkeyConfig_FormatLabel(saveLabel, sizeof(saveLabel), "Save State", HOTKEY_STATE_SAVE);
+    HotkeyConfig_FormatLabel(loadLabel, sizeof(loadLabel), "Load State", HOTKEY_STATE_LOAD);
+    HotkeyConfig_GetBindingDisplayName(HOTKEY_STATE_SAVE, saveKey, (int)sizeof(saveKey));
+    HotkeyConfig_GetBindingDisplayName(HOTKEY_STATE_LOAD, loadKey, (int)sizeof(loadKey));
+
+    ImGui::Text("Offline Savestate (auto-save, %s / %s)",
+                saveKey[0] ? saveKey : "unbound",
+                loadKey[0] ? loadKey : "unbound");
     ImGui::Separator();
 
     if (info->valid) {
@@ -703,17 +721,17 @@ void Savestate_RenderImGui() {
 
     // Manual buttons (in addition to hotkeys)
     if (canSaveLoad) {
-        if (ImGui::Button("Save State (F5)")) {
+        if (ImGui::Button(saveLabel)) {
             Savestate_Save();
         }
         ImGui::SameLine();
         if (info->valid) {
-            if (ImGui::Button("Load State (F6)")) {
+            if (ImGui::Button(loadLabel)) {
                 Savestate_Load();
             }
         } else {
             ImGui::BeginDisabled();
-            ImGui::Button("Load State (F6)");
+            ImGui::Button(loadLabel);
             ImGui::EndDisabled();
         }
         ImGui::SameLine();

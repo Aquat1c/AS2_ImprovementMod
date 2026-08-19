@@ -15,6 +15,7 @@
 #include "patches/netplay_background_run.h"
 #include "patches/shell_hotkey_patch.h"
 #include "ui/netplay_hud_vanilla.h"
+#include "ui/pause_menu.h"
 #include "replay/replay_runtime.h"
 #include "rollback/rollback_audio.h"
 #include "rollback/rollback_combo_fx.h"
@@ -433,6 +434,14 @@ bool InstallHooks() {
                  "falls back to action-ID edges", PracticeRecovery_GetInstallError());
     }
 
+    // Mod-owned in-match pause menu. Only the vanilla input handler and its
+    // renderer are replaced; the substate handler keeps the scene redraw and
+    // the resume / character-select / exit plumbing.
+    if (!PauseMenu_Install()) {
+        LOG_WARN("Pause menu NOT installed (%s) — the vanilla Japanese menu stays",
+                 PauseMenu_GetInstallError());
+    }
+
     return true;
 }
 
@@ -440,6 +449,7 @@ void RemoveHooks() {
     LOG_INFO("Removing hooks...");
     PracticeDefense_Uninstall();
     PracticeRecovery_Uninstall();
+    PauseMenu_Uninstall();
     FrameScheduler_Shutdown();
     NetplayBackgroundRun::Shutdown();
     ShellHotkeyPatch_Remove();

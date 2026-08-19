@@ -92,6 +92,7 @@ enum class SettingsCategory : uint32_t {
     GameRoot,
     GameKeys,
     GameSystem,
+    GameHotkeys,
 };
 
 // ============================================================================
