@@ -3132,38 +3132,90 @@ static int ItemCount(MenuState st) {
     }
 }
 
-// Map (category, local index) -> original flat setting index (0-15)
-// Returns -1 for "Back" items or invalid
+// Setting ids, one disjoint 100-wide block per category.
+//
+// These used to be a single flat run, and the ranges overlapped: Appearance
+// held 17..23 while GameGeneral was 20 + row, so the adjust handler's
+// "gid >= 20 && gid < 40" branch swallowed four Appearance rows and drove
+// Difficulty / Rounds / Simple Effects / Battle Recording instead. GameVoice
+// (40 + index, 24 rows) reached 62 and collided with GameSystem's 60 + row the
+// same way. Both were silent - the rows looked dead while writing somebody
+// else's settings.
+//
+// A block per category makes that arithmetically impossible: no page has 100
+// rows, so no id can land in another page's block. SettingIdBlocksAreDisjoint()
+// checks it at startup rather than trusting the comment.
+namespace SettingIds {
+constexpr int kBlock = 100;
+constexpr int kIdentity     = 1 * kBlock;   // 100..
+constexpr int kEndpoint     = 2 * kBlock;   // 200..
+constexpr int kSessionMatch = 3 * kBlock;   // 300..
+constexpr int kDiagnostics  = 4 * kBlock;   // 400..
+constexpr int kAppearance   = 5 * kBlock;   // 500..
+constexpr int kGameGeneral  = 6 * kBlock;   // 600..
+constexpr int kGameVoice    = 7 * kBlock;   // 700..
+constexpr int kGameSystem   = 8 * kBlock;   // 800..
+}  // namespace SettingIds
+
+// The blocks are only safe while every page stays under kBlock rows. The voice
+// page is the one that grows - it is one row per character - so this is checked
+// at startup rather than reasoned about.
+static bool SettingIdBlocksAreDisjoint() {
+    struct Page { const char* name; int base; int rows; };
+    const Page pages[] = {
+        {"Identity",     SettingIds::kIdentity,     4},
+        {"Endpoint",     SettingIds::kEndpoint,     8},
+        {"SessionMatch", SettingIds::kSessionMatch, 4},
+        {"Diagnostics",  SettingIds::kDiagnostics,  2},
+        {"Appearance",   SettingIds::kAppearance,   8},
+        {"GameGeneral",  SettingIds::kGameGeneral,  GameSettingsMenu_RowCount()},
+        {"GameVoice",    SettingIds::kGameVoice,    GameSettingsVoice_RowCount()},
+        {"GameSystem",   SettingIds::kGameSystem,   GameSettingsSystem_RowCount()},
+    };
+    bool ok = true;
+    for (const Page& page : pages) {
+        if (page.rows > SettingIds::kBlock) {
+            LOG_ERROR("[NetMenu] setting-id block overflow: %s has %d rows in a "
+                      "%d-wide block - its ids now reach into the next page",
+                      page.name, page.rows, SettingIds::kBlock);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// Map (category, local index) -> a setting id in that category's block.
+// Returns -1 for "Back" items or invalid.
 static int SettingGlobalId() {
     if (s_state != MenuState::SettingsEntry) return -1;
     switch (s_settingsCategory) {
         case SettingsCategory::Identity:
             switch (s_selectedIndex) {
-                case 0: return 0;   // Display Name
-                case 1: return 1;   // Input Delay
-                case 2: return 2;   // Max Rollback
+                case 0: return SettingIds::kIdentity + 0;  // Display Name
+                case 1: return SettingIds::kIdentity + 1;  // Input Delay
+                case 2: return SettingIds::kIdentity + 2;  // Max Rollback
                 default: return -1; // Back
             }
         case SettingsCategory::Appearance:
             switch (s_selectedIndex) {
-                case 0: return 17;  // Trail color
-                case 1: return 18;  // Text color
-                case 2: return 19;  // Score color
-                case 3: return 20;  // Trail length
-                case 4: return 21;  // Vertical position
-                case 5: return 22;  // Font size
-                case 6: return 23;  // Render mode
+                case 0: return SettingIds::kAppearance + 0;  // Trail color
+                case 1: return SettingIds::kAppearance + 1;  // Text color
+                case 2: return SettingIds::kAppearance + 2;  // Score color
+                case 3: return SettingIds::kAppearance + 3;  // Trail length
+                case 4: return SettingIds::kAppearance + 4;  // Vertical position
+                case 5: return SettingIds::kAppearance + 5;  // Font size
+                case 6: return SettingIds::kAppearance + 6;  // Render mode
                 default: return -1; // Back
             }
         case SettingsCategory::Endpoint:
             switch (s_selectedIndex) {
-                case 0: return 4;   // Route
-                case 1: return 5;   // UPnP
-                case 2: return 6;   // STUN
-                case 3: return 7;   // UDP Hole Punch
-                case 4: return 8;   // Allow IPv6
-                case 5: return 9;   // Punch Relay
-                case 6: return 10;  // STUN Server
+                case 0: return SettingIds::kEndpoint + 0;  // Route
+                case 1: return SettingIds::kEndpoint + 1;  // UPnP
+                case 2: return SettingIds::kEndpoint + 2;  // STUN
+                case 3: return SettingIds::kEndpoint + 3;  // UDP Hole Punch
+                case 4: return SettingIds::kEndpoint + 4;  // Allow IPv6
+                case 5: return SettingIds::kEndpoint + 5;  // Punch Relay
+                case 6: return SettingIds::kEndpoint + 6;  // STUN Server
                 default: return -1; // Back
             }
         case SettingsCategory::GameRoot:
@@ -3171,27 +3223,30 @@ static int SettingGlobalId() {
         case SettingsCategory::GameHotkeys:
             return -1; // every row is an action
         case SettingsCategory::GameSystem:
-            // 60 + row; the trailing entry is Back.
+            // kGameSystem + row; the trailing entry is Back. Derive the row
+            // index back out with the same constant - the old hardcoded offsets
+            // survived the move to 100-wide blocks and silently broke every
+            // adjust on this page.
             return ((int)s_selectedIndex < GameSettingsSystem_RowCount() - 1)
-                ? (int)(60 + s_selectedIndex) : -1;
+                ? (int)(SettingIds::kGameSystem + s_selectedIndex) : -1;
         case SettingsCategory::GameGeneral:
-            // 20 + visible row; the trailing entry is Back.
+            // kGameGeneral + visible row; the trailing entry is Back.
             return ((int)s_selectedIndex < GameSettingsMenu_RowCount() - 1)
-                ? (int)(20 + s_selectedIndex) : -1;
+                ? (int)(SettingIds::kGameGeneral + s_selectedIndex) : -1;
         case SettingsCategory::GameVoice:
-            // 40 + character index; the trailing entry is Back.
+            // kGameVoice + character index; the trailing entry is Back.
             return ((int)s_selectedIndex < GameSettingsVoice_RowCount() - 1)
-                ? (int)(40 + s_selectedIndex) : -1;
+                ? (int)(SettingIds::kGameVoice + s_selectedIndex) : -1;
         case SettingsCategory::SessionMatch:
             switch (s_selectedIndex) {
-                case 0: return 11;  // Watchers
-                case 1: return 13;  // Sync Palettes
-                case 2: return 14;  // Preview Remote
+                case 0: return SettingIds::kSessionMatch + 0;  // Watchers
+                case 1: return SettingIds::kSessionMatch + 1;  // Sync Palettes
+                case 2: return SettingIds::kSessionMatch + 2;  // Preview Remote
                 default: return -1; // Back
             }
         case SettingsCategory::Diagnostics:
             switch (s_selectedIndex) {
-                case 0: return 15;  // Debug Logging
+                case 0: return SettingIds::kDiagnostics + 0;  // Debug Logging
                 default: return -1; // Back
             }
         default: return -1;
@@ -3876,31 +3931,38 @@ static void HandleNavigationInput() {
                                                msg, sizeof(msg)) && msg[0]) {
                     SetStatus("%s", msg);
                 }
-            } else if (gid >= 20 && gid < 40) {
+            // Each of these three is the adjust entry point for one page, so
+            // it is gated on that page being open. Routing on the flat id alone
+            // let Appearance's ids 20..23 fall into the GameGeneral range and
+            // silently drive Difficulty / Rounds / Simple Effects / Battle
+            // Recording instead - and left this category's own handlers below
+            // as dead code.
+            } else if (s_settingsCategory == SettingsCategory::GameGeneral &&
+                       gid >= 600 && gid < 700) {
                 char msg[96];
-                if (GameSettingsMenu_Adjust(gid - 20, left, right, msg, sizeof(msg))) {
+                if (GameSettingsMenu_Adjust(gid - SettingIds::kGameGeneral, left, right, msg, sizeof(msg))) {
                     changed = true;
                 }
                 if (msg[0]) {
                     SetStatus("%s", msg);
                 }
-            } else if (gid >= 60) {
+            } else if (s_settingsCategory == SettingsCategory::GameSystem && gid >= 800) {
                 char msg[96];
-                if (GameSettingsSystem_Adjust(gid - 60, left, right, msg, sizeof(msg))) {
+                if (GameSettingsSystem_Adjust(gid - SettingIds::kGameSystem, left, right, msg, sizeof(msg))) {
                     changed = true;
                 }
                 if (msg[0]) {
                     SetStatus("%s", msg);
                 }
-            } else if (gid >= 40) {
+            } else if (s_settingsCategory == SettingsCategory::GameVoice && gid >= 700) {
                 char msg[96];
-                if (GameSettingsVoice_Adjust(gid - 40, left, right, msg, sizeof(msg))) {
+                if (GameSettingsVoice_Adjust(gid - SettingIds::kGameVoice, left, right, msg, sizeof(msg))) {
                     changed = true;
                 }
                 if (msg[0]) {
                     SetStatus("%s", msg);
                 }
-            } else if (gid == 1) {
+            } else if (gid == 101) {
                 if (left && s_preferredDelay > 0) {
                     s_preferredDelay--;
                     changed = true;
@@ -3912,7 +3974,7 @@ static void HandleNavigationInput() {
                     Net::DelayPolicy_SetConfiguredDelay(s_preferredDelay);
                     SetStatus("Input delay: %d frame%s", s_preferredDelay, s_preferredDelay == 1 ? "" : "s");
                 }
-            } else if (gid == 2) {
+            } else if (gid == 102) {
                 if (left && s_rollbackBudget > Net::ROLLBACK_BUDGET_MIN) {
                     s_rollbackBudget--;
                     changed = true;
@@ -3936,7 +3998,7 @@ static void HandleNavigationInput() {
                     Net::DelayPolicy_SetRollbackToleranceK(s_rollbackTolerance);
                     SetStatus("Stability bias: %d", s_rollbackTolerance);
                 }
-            } else if (gid == 4) {
+            } else if (gid == 200) {
                 int mode = (int)s_connectPreference;
                 if (left) {
                     mode--;
@@ -3955,42 +4017,42 @@ static void HandleNavigationInput() {
                     s_connectPreference = (Net::ConnectPreference)mode;
                     SetStatus("Connection route: %s", FriendlyConnectPreferenceLabel(s_connectPreference));
                 }
-            } else if (gid == 5) {
+            } else if (gid == 201) {
                 s_upnpEnabled = !s_upnpEnabled;
                 changed = true;
                 natChanged = true;
                 SetStatus("UPnP: %s", EnabledStateLabel(s_upnpEnabled));
-            } else if (gid == 6) {
+            } else if (gid == 202) {
                 s_stunEnabled = !s_stunEnabled;
                 changed = true;
                 natChanged = true;
                 SetStatus("STUN: %s", EnabledStateLabel(s_stunEnabled));
-            } else if (gid == 7) {
+            } else if (gid == 203) {
                 s_holePunchEnabled = !s_holePunchEnabled;
                 changed = true;
                 natChanged = true;
                 SetStatus("UDP hole punch: %s", EnabledStateLabel(s_holePunchEnabled));
-            } else if (gid == 8) {
+            } else if (gid == 204) {
                 s_allowIPv6Endpoint = !s_allowIPv6Endpoint;
                 changed = true;
                 natChanged = true;
                 SetStatus("IPv6 addresses: %s", EnabledStateLabel(s_allowIPv6Endpoint));
-            } else if (gid == 11) {
+            } else if (gid == 300) {
                 s_spectatorsEnabled = !s_spectatorsEnabled;
                 changed = true;
                 spectatorChanged = true;
                 SetStatus("Allow watchers: %s", EnabledStateLabel(s_spectatorsEnabled));
-            } else if (gid == 13) {
+            } else if (gid == 301) {
                 s_paletteSyncEnabled = !s_paletteSyncEnabled;
                 changed = true;
                 paletteChanged = true;
                 SetStatus("Palette sync: %s", EnabledStateLabel(s_paletteSyncEnabled));
-            } else if (gid == 14) {
+            } else if (gid == 302) {
                 s_remotePalettePreviewEnabled = !s_remotePalettePreviewEnabled;
                 changed = true;
                 paletteChanged = true;
                 SetStatus("Remote palette preview: %s", EnabledStateLabel(s_remotePalettePreviewEnabled));
-            } else if (gid == 15) {
+            } else if (gid == 400) {
                 s_debugLoggingEnabled = GetVerboseLogging();
                 s_debugLoggingEnabled = !s_debugLoggingEnabled;
                 changed = true;
@@ -4006,33 +4068,33 @@ static void HandleNavigationInput() {
                     s_gameplayDelayMode == Net::GameplayDelayMode::SharedSafe
                         ? "Shared max"
                         : "Per-player");
-            } else if (gid == 17) {
+            } else if (gid == 500) {
                 NetplayHudStyle::CycleTrailPreset(left ? -1 : 1);
                 changed = true;
                 SetStatus("Bar color: %s", NetplayHudStyle::GetTrailPresetLabel());
-            } else if (gid == 18) {
+            } else if (gid == 501) {
                 NetplayHudStyle::CycleTextPreset(left ? -1 : 1);
                 changed = true;
                 SetStatus("Text color: %s", NetplayHudStyle::GetTextPresetLabel());
-            } else if (gid == 19) {
+            } else if (gid == 502) {
                 NetplayHudStyle::CycleScorePreset(left ? -1 : 1);
                 changed = true;
                 SetStatus("Score color: %s", NetplayHudStyle::GetScorePresetLabel());
-            } else if (gid == 20) {
+            } else if (gid == 503) {
                 NetplayHudStyle::AdjustTrailLength(left ? -16 : 16);
                 changed = true;
                 NetplayHudStyle::Settings hudStyle{};
                 NetplayHudStyle::GetLocal(&hudStyle);
                 SetStatus("Bar extend: %u px", hudStyle.trail_length_px);
-            } else if (gid == 21) {
+            } else if (gid == 504) {
                 NetplayHudStyle::CycleVerticalPosition(left ? -1 : 1);
                 changed = true;
                 SetStatus("Name position: %s", NetplayHudStyle::GetVerticalPositionLabel());
-            } else if (gid == 22) {
+            } else if (gid == 505) {
                 NetplayHudStyle::CycleFontSize(left ? -1 : 1);
                 changed = true;
                 SetStatus("Font size: %s", NetplayHudStyle::GetFontSizeLabel());
-            } else if (gid == 23) {
+            } else if (gid == 506) {
                 NetplayHudStyle::CycleRenderMode(left ? -1 : 1);
                 changed = true;
                 SetStatus("Render mode: %s", NetplayHudStyle::GetRenderModeLabel());
@@ -4050,7 +4112,7 @@ static void HandleNavigationInput() {
                 if (paletteChanged) {
                     ApplyPaletteSettingsToRuntime("settings navigation");
                 }
-                if (gid == 15) {
+                if (gid == 400) {
                     ApplyDebugLoggingSetting("settings navigation");
                 }
                 SaveSettings();
@@ -4386,11 +4448,11 @@ static void ActivateCurrentSelection() {
                 TransitionTo(MenuState::SettingsEntry, "back from voice volume page");
                 break;
             }
-            if (gid == 0) {
+            if (gid == 100) {
                 BeginTextEdit(TextEditField::Nickname, s_localNickname, "Enter your display name.");
-            } else if (gid == 9) {
+            } else if (gid == 205) {
                 BeginTextEdit(TextEditField::RelayEndpoint, s_relayEndpoint, "Enter the punch relay as host:port or [ipv6]:port.");
-            } else if (gid == 10) {
+            } else if (gid == 206) {
                 BeginTextEdit(TextEditField::StunEndpoint, s_stunEndpoint, "Enter the STUN server as host:port or [ipv6]:port.");
             } else if (gid == 12) {
                 char portBuf[8];
@@ -4579,23 +4641,46 @@ static void HandleBackNavigation() {
             s_selectedIndex = 0;
             // The game settings pages are their own stack; only the netplay
             // categories belong to the online menu.
-            if (s_settingsCategory == SettingsCategory::GameKeys) {
-                s_settingsCategory = SettingsCategory::GameRoot;
-                TransitionTo(MenuState::SettingsEntry, "back from key settings");
-            } else if (s_settingsCategory == SettingsCategory::GameVoice) {
-                s_settingsCategory = SettingsCategory::GameGeneral;
-                TransitionTo(MenuState::SettingsEntry, "back from voice volume");
-            } else if (s_settingsCategory == SettingsCategory::GameSystem) {
-                s_settingsCategory = SettingsCategory::GameRoot;
-                TransitionTo(MenuState::SettingsEntry, "back from system settings");
-            } else if (s_settingsCategory == SettingsCategory::GameGeneral) {
-                s_settingsCategory = SettingsCategory::GameRoot;
-                TransitionTo(MenuState::SettingsEntry, "back to settings categories");
-            } else if (s_settingsCategory == SettingsCategory::GameRoot) {
-                s_settingsFromTitle = false;
-                BeginClose("back from game settings");
-            } else {
-                TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
+            //
+            // Written as a switch over every category rather than an if-chain
+            // with a catch-all: GameHotkeys was missing from the chain, so B on
+            // the practice hotkeys page fell through to the netplay category
+            // menu instead of returning to System. A switch with no default
+            // makes the compiler name the next category that gets added.
+            switch (s_settingsCategory) {
+                case SettingsCategory::GameKeys:
+                    s_settingsCategory = SettingsCategory::GameRoot;
+                    TransitionTo(MenuState::SettingsEntry, "back from key settings");
+                    break;
+                case SettingsCategory::GameHotkeys:
+                    // Opened from System, so it goes back to System - the same
+                    // place its own Back row returns to.
+                    s_settingsCategory = SettingsCategory::GameSystem;
+                    TransitionTo(MenuState::SettingsEntry, "back from practice hotkeys");
+                    break;
+                case SettingsCategory::GameVoice:
+                    s_settingsCategory = SettingsCategory::GameGeneral;
+                    TransitionTo(MenuState::SettingsEntry, "back from voice volume");
+                    break;
+                case SettingsCategory::GameSystem:
+                    s_settingsCategory = SettingsCategory::GameRoot;
+                    TransitionTo(MenuState::SettingsEntry, "back from system settings");
+                    break;
+                case SettingsCategory::GameGeneral:
+                    s_settingsCategory = SettingsCategory::GameRoot;
+                    TransitionTo(MenuState::SettingsEntry, "back to settings categories");
+                    break;
+                case SettingsCategory::GameRoot:
+                    s_settingsFromTitle = false;
+                    BeginClose("back from game settings");
+                    break;
+                case SettingsCategory::Identity:
+                case SettingsCategory::Appearance:
+                case SettingsCategory::Endpoint:
+                case SettingsCategory::SessionMatch:
+                case SettingsCategory::Diagnostics:
+                    TransitionTo(MenuState::SettingsCategoryMenu, "back from settings page");
+                    break;
             }
             break;
         case MenuState::Connecting:
@@ -4647,6 +4732,9 @@ void CacheAutoConnectFile() {
 
 void Init() {
     if (s_initialized) return;
+    // Cheap, once, and it names the offending page - which is what the silent
+    // Appearance/GameGeneral overlap cost a while to find by hand.
+    SettingIdBlocksAreDisjoint();
     s_state = MenuState::Inactive;
     s_phase = MenuPhase::Hidden;
     s_fadeFrames = 0;

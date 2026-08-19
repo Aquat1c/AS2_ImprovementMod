@@ -427,9 +427,8 @@ DefensiveResponse ResponseForCategory(int category) {
         case kDefenseCategoryDodge:     return DefensiveResponse::Dodge;
         case kDefenseCategoryRepel:     return DefensiveResponse::Repel;
         case kDefenseCategoryUnique:    return DefensiveResponse::GuardCounter;
-        // Push-away needs no command at all - guarding with 100 meter is the
-        // whole input - so ordinary guard already produces it.
-        case kDefenseCategoryPushAway:  return DefensiveResponse::NormalGuard;
+        case kDefenseCategoryPushAway:  return DefensiveResponse::PushAwayPerfect;
+        case kDefenseCategoryAbsolute:  return DefensiveResponse::AbsoluteDefence;
         default:                        return DefensiveResponse::NormalGuard;
     }
 }
@@ -440,6 +439,11 @@ bool ResponseSupportedByCategory(DefensiveResponse response, int category) {
         case DefensiveResponse::Dodge:     return category == kDefenseCategoryDodge;
         case DefensiveResponse::Repel:     return category == kDefenseCategoryRepel;
         case DefensiveResponse::GuardCounter: return category == kDefenseCategoryUnique;
+        case DefensiveResponse::PushAwayPerfect:
+        case DefensiveResponse::PushAwayMetered:
+            return category == kDefenseCategoryPushAway;
+        case DefensiveResponse::AbsoluteDefence:
+            return category == kDefenseCategoryAbsolute;
         case DefensiveResponse::CharacterNative:
         case DefensiveResponse::NormalGuard:
         default:                           return true;
@@ -453,6 +457,9 @@ const char* DefensiveResponseLabel(DefensiveResponse response) {
         case DefensiveResponse::Dodge:           return "dodge";
         case DefensiveResponse::Repel:           return "repel";
         case DefensiveResponse::GuardCounter:    return "guard_counter";
+        case DefensiveResponse::PushAwayPerfect: return "push_away_perfect";
+        case DefensiveResponse::PushAwayMetered: return "push_away_metered";
+        case DefensiveResponse::AbsoluteDefence: return "absolute_defence";
         case DefensiveResponse::NormalGuard:
         default:                                 return "guard_only";
     }
@@ -462,9 +469,61 @@ bool DodgeWindowOpen(uint32_t actionId, uint16_t meter) {
     if (meter < kDodgeMeterCost) {
         return false;
     }
-    // Crouch blockstun 67/68, air blockstun 70/71 - the only cases
-    // Entity_UpdateAction_Standard routes to the dodge actions.
-    return actionId == 67 || actionId == 68 || actionId == 70 || actionId == 71;
+    // Entity_UpdateAction_Attacks offers the dodge from *all six* blockstun
+    // actions: stand 64/65 and crouch 67/68 both route to 59/60, air 70/71 to
+    // 61/62. An earlier pass listed only the last four, so a dummy blocking
+    // standing up never even tried.
+    return actionId == 64 || actionId == 65 ||
+           actionId == 67 || actionId == 68 ||
+           actionId == 70 || actionId == 71;
+}
+
+bool ResponseRequiresBlockstun(DefensiveResponse response) {
+    switch (response) {
+        // Guard cancels: the action switch that offers them is keyed on the
+        // blockstun states.
+        case DefensiveResponse::Dodge:
+        case DefensiveResponse::PushAwayPerfect:
+        case DefensiveResponse::PushAwayMetered:
+            return true;
+        // 214D is performed from neutral, before the pressure - it arms a state
+        // rather than cancelling out of one - so it does not imply blocking.
+        case DefensiveResponse::AbsoluteDefence:
+            return false;
+        // Parry arms on a fresh BACK press from any state - the window is only
+        // shorter out of blockstun. Repel arms from neutral, so blocking would
+        // actively prevent it. The category-1 counter has no action gate at all.
+        default:
+            return false;
+    }
+}
+
+bool PushAwayFreeWindow(uint32_t actionId) {
+    switch (actionId) {
+        case 64: case 65:
+        case 67: case 68:
+        case 70: case 71:
+        case 44: case 46: case 48:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool PushAwayWindowOpen(uint32_t actionId, uint16_t meter) {
+    // Entity_CheckAirTech arms on either branch, and they are an either/or, not
+    // an and: a fresh press inside one of these actions is the free variant,
+    // and 100 meter covers every other state. Requiring both was stricter than
+    // the engine.
+    switch (actionId) {
+        case 64: case 65:
+        case 67: case 68:
+        case 70: case 71:
+        case 44: case 46: case 48:
+            return true;
+        default:
+            return meter >= kPushAwayMeterCost;
+    }
 }
 
 bool ParryWantsRelease(ParryInputState& state, uint8_t windowByte, bool threatArmed) {
@@ -494,7 +553,18 @@ bool ParryWantsRelease(ParryInputState& state, uint8_t windowByte, bool threatAr
 DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                                       const DefenseDriveSample& sample,
                                       DefenseDriveState& state) {
-    if (!sample.threatArmed) {
+    // A guard cancel is driven by the dummy's own state, not by an incoming
+    // attack: once blockstun is entered the window is open whether or not the
+    // attacker is still active. Requiring a live threat is what made dodge and
+    // push-away fire only inside a long blockstring - the one case where the
+    // next hit happens to be armed while the previous one still holds the
+    // dummy. On a single hit the threat is already gone by the frame blockstun
+    // begins, so the window opened and closed with the driver switched off.
+    //
+    // Parry and repel do need it: both arm a window *before* the hit, so they
+    // have to know one is coming.
+    const bool blockstunDriven = ResponseRequiresBlockstun(response);
+    if (!sample.threatArmed && !blockstunDriven) {
         state = DefenseDriveState{};
         return DefenseInputKind::None;
     }
@@ -510,6 +580,34 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                        ? DefenseInputKind::DodgePress
                        : DefenseInputKind::None;
 
+        case DefensiveResponse::PushAwayPerfect:
+            // Physically the same press as the dodge - BACK + D - because the
+            // engine routes one input by category rather than by button.
+            //
+            // Timing is the whole difference between the two variants. The free
+            // one needs the D press taken as a *fresh edge* inside blockstun; a
+            // D already held from before contact reads 0 at +78 there and drops
+            // to the branch that charges 100 meter. So D is never pressed
+            // outside an accepting action - which is what leaves it released
+            // when blockstun begins - and it alternates while inside one, so a
+            // press that did not take can edge again on the next frame.
+            if (!PushAwayFreeWindow(sample.actionId)) {
+                state.pushPhase = false;
+                return DefenseInputKind::None;
+            }
+            state.pushPhase = !state.pushPhase;
+            return state.pushPhase ? DefenseInputKind::DodgePress
+                                   : DefenseInputKind::None;
+
+        case DefensiveResponse::PushAwayMetered:
+            // The untimed press: D simply held. Inside blockstun that makes
+            // +78 read 0, which is exactly what sends Entity_CheckAirTech to
+            // its "or 100 meter" arm, so this is the paid variant by
+            // construction rather than by accident.
+            return PushAwayWindowOpen(sample.actionId, sample.meter)
+                       ? DefenseInputKind::DodgePress
+                       : DefenseInputKind::None;
+
         case DefensiveResponse::Repel:
             // Entity_CheckGuardState only arms from neutral, so the tap has to
             // be preceded by a frame with no direction at all. Nothing to do
@@ -519,8 +617,15 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                 return DefenseInputKind::None;
             }
             state.tapPhase = !state.tapPhase;
-            return state.tapPhase ? DefenseInputKind::ReleaseGuard
-                                  : DefenseInputKind::ForwardTap;
+            if (state.tapPhase) {
+                return DefenseInputKind::ReleaseGuard;
+            }
+            // Entity_CheckGuardState has both arms: a forward edge from neutral
+            // sets reaction 5 (7 airborne), a down edge sets 6. A crouch-only
+            // attack is a low, and only the down edge parries it.
+            return sample.threatClass == GroundGuardClass::CrouchOnly
+                       ? DefenseInputKind::DownTap
+                       : DefenseInputKind::ForwardTap;
 
         case DefensiveResponse::GuardCounter:
             // 6D moves the character forward, which is the opposite of holding
@@ -533,6 +638,23 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
             }
             state.counterFired = true;
             return DefenseInputKind::CounterForward;
+
+        case DefensiveResponse::AbsoluteDefence:
+            // 214D arms the state; once +823 is up the engine does the rest, so
+            // there is nothing to feed until it drops again. Keep walking a
+            // motion already in progress even if that happens mid-way.
+            if (state.armStep >= 0) {
+                if (++state.armStep >= kGuardStateMotionFrames) {
+                    state.armStep = -1;
+                }
+                return state.armStep >= 0 ? DefenseInputKind::ArmGuardState
+                                          : DefenseInputKind::None;
+            }
+            if (sample.guardStateArmed || !sample.actionable) {
+                return DefenseInputKind::None;
+            }
+            state.armStep = 0;
+            return DefenseInputKind::ArmGuardState;
 
         case DefensiveResponse::CharacterNative:
         case DefensiveResponse::NormalGuard:

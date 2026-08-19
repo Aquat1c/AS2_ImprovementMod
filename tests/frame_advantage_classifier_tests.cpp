@@ -1,4 +1,5 @@
 #include "training/action_state_classifier.h"
+#include "training/frame_advantage_math.h"
 
 #include <cstdio>
 
@@ -102,12 +103,68 @@ static void TestNativeCandidateAuditOnly() {
     TEST_CHECK(!forcedNative.actionable, "forced locks override native candidate");
 }
 
+// The +124 readings: a projectile's pending attack keeps the attacker's own
+// recovery frame, then a contact 66 frames later subtracts it.
+void TestAttackerRecoveryClamp() {
+    using namespace Training;
+
+    TEST_CHECK(EffectiveAttackerRecovery(8149, 8215) == 8215,
+               "recovery predating contact clamps to contact");
+    TEST_CHECK(ComputeFrameAdvantage(8149, 8273, 8215) == 58,
+               "clamped advantage measures from contact, not from flight start");
+
+    TEST_CHECK(EffectiveAttackerRecovery(120, 100) == 120,
+               "an ordinary recovery after contact is left alone");
+    TEST_CHECK(ComputeFrameAdvantage(120, 125, 100) == 5,
+               "ordinary blockstring advantage is unchanged");
+    TEST_CHECK(ComputeFrameAdvantage(130, 125, 100) == -5,
+               "negative advantage is unchanged");
+
+    TEST_CHECK(EffectiveAttackerRecovery(100, 100) == 100,
+               "recovery on the contact frame is not clamped away");
+    TEST_CHECK(EffectiveAttackerRecovery(kFrameAdvantageUnset, 100) == kFrameAdvantageUnset,
+               "unset recovery stays unset");
+    TEST_CHECK(EffectiveAttackerRecovery(80, kFrameAdvantageUnset) == 80,
+               "unset contact cannot clamp");
+}
+
+void TestGapBeforeContact() {
+    using namespace Training;
+
+    TEST_CHECK(GapBeforeContact(100, 103, 60) == 3, "three actionable frames is a 3f gap");
+    TEST_CHECK(GapBeforeContact(100, 101, 60) == 1, "a one-frame gap is reportable");
+    TEST_CHECK(GapBeforeContact(100, 100, 60) == 0, "contact on the free frame is a true blockstring");
+    TEST_CHECK(GapBeforeContact(100, 160, 60) == 60, "a gap exactly at the limit still counts");
+    TEST_CHECK(GapBeforeContact(100, 161, 60) == 0, "past the limit is a new engagement, not a gap");
+    TEST_CHECK(GapBeforeContact(kFrameAdvantageUnset, 120, 60) == 0, "no recorded free frame means no gap");
+    TEST_CHECK(GapBeforeContact(120, 100, 60) == 0, "contact before the free frame is not a gap");
+}
+
+// The ordering rule. A gap must never appear after, beside, or appended to an
+// advantage number: if one is on screen it is dropped outright, not queued.
+void TestGapOrderingRule() {
+    using namespace Training;
+
+    TEST_CHECK(GapShouldPublish(3, false), "a real gap takes a free slot");
+    TEST_CHECK(!GapShouldPublish(3, true), "a gap is dropped while a number is on screen");
+    TEST_CHECK(!GapShouldPublish(0, false), "a zero gap is a blockstring and is never published");
+    TEST_CHECK(!GapShouldPublish(0, true), "a zero gap stays unpublished either way");
+
+    // Suppression, not deferral: the same gap does not become publishable once
+    // the number expires, because it was discarded at the contact.
+    TEST_CHECK(GapShouldPublish(3, false) && !GapShouldPublish(3, true),
+               "publishability is decided at the contact, from the slot state then");
+}
+
 int main() {
     TestLegacyFreeActions();
     TestLandingPolicy();
     TestProximityGuardPolicy();
     TestForcedLocksAndContactStates();
     TestNativeCandidateAuditOnly();
+    TestAttackerRecoveryClamp();
+    TestGapBeforeContact();
+    TestGapOrderingRule();
 
     if (g_failures) {
         std::printf("frame_advantage_classifier_tests: %d/%d checks failed\n", g_failures, g_checks);

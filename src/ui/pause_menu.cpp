@@ -43,7 +43,10 @@ constexpr int kResultStay = 255;
 constexpr int kTabY = 64;
 constexpr int kRowFirstY = 96;
 constexpr int kRowPitch = 32;
-constexpr int kRowCount = 10;          // y 96 .. 384
+constexpr int kRowCount = 10;          // visible rows, y 96 .. 384
+// A page may hold more than fits; the extra scroll into view rather than being
+// silently dropped, which would have cost the HUD page its Back row.
+constexpr int kRowMax = 20;
 constexpr int kLabelX = 64;
 constexpr int kValueX = 320;
 constexpr int kHintY = 424;
@@ -73,6 +76,10 @@ constexpr int kRowBandTop = 92;
 constexpr int kRowBandBottom = 412;
 constexpr int kHintBandTop = 412;
 constexpr int kHintBandBottom = 446;
+
+int ClampInt(int value, int lo, int hi) {
+    return value < lo ? lo : (value > hi ? hi : value);
+}
 
 // ImGui anchors AddText at the top of the line box, which for this face sits
 // (ascent - capHeight) / (ascent - descent) = 0.2921 of the size above the cap
@@ -110,12 +117,13 @@ enum Page : int {
     kPageTabCount,
     // Reached from a row, not from the strip, so it is not a tab.
     kPageRecoveryAdvanced = kPageTabCount,
+    kPageHud,
     kPageCount,
 };
 
 const char* const kPageNames[kPageCount] = {
     "Dummy", "Recovery", "Triggers", "Display", "Match", "State", "Exit",
-    "Auto-Recovery",
+    "Auto-Recovery", "HUD",
 };
 
 enum RowKind : uint8_t {
@@ -171,12 +179,17 @@ bool g_numericPrevKeyDown[256] = {};
 
 // --- Menu state ----------------------------------------------------------
 int g_page = kPageDummy;
+// First visible row on a page longer than the window.
+int g_rowScroll = 0;
 // 0 is the tab strip, 1..count are the rows, so the whole menu is one cursor
 // and the strip is reachable with nothing but a d-pad.
 int g_cursor = 1;
 bool g_wasActiveLastFrame = false;
 char g_hint[96] = {};
 int g_hintFrames = 0;
+// Last status serial this menu has shown, so an unchanged message is not
+// re-raised every frame and does not keep resetting its own timer.
+uint32_t g_statusSerial = 0;
 int g_pendingResult = kResultStay;
 
 // --- Row construction ----------------------------------------------------
@@ -198,7 +211,7 @@ int BuildRows(int page, Row* out, int cap) {
             push(kRowSetting, PRACTICE_SET_NATIVE_CPU, nullptr);
             push(kRowSetting, PRACTICE_SET_CONTROL_SWAP, nullptr);
             if (PracticeSetting_Get(PRACTICE_SET_DUMMY_BACKEND) == 0) {
-                // Advanced Mod: the mod's own dummy logic.
+                // Mod: the mod's own dummy logic.
                 push(kRowSetting, PRACTICE_SET_BLOCK_MODE, nullptr);
                 push(kRowSetting, PRACTICE_SET_DEFENSIVE_RESPONSE, nullptr);
                 push(kRowSetting, PRACTICE_SET_STANCE, nullptr);
@@ -242,12 +255,21 @@ int BuildRows(int page, Row* out, int cap) {
                 push(kRowSetting, PRACTICE_SET_TRIGGER_1 + t, nullptr);
             }
             break;
+        case kPageHud:
+            // One row per element, in HudElement order. Ten plus Back is one
+            // more than the window shows, so the page scrolls.
+            for (int e = 0; e < HUD_ELEM_COUNT; ++e) {
+                push(kRowSetting, PRACTICE_SET_HUD_FIRST + e, nullptr);
+            }
+            push(kRowBack, kPageDisplay, "Back");
+            break;
         case kPageDisplay:
             push(kRowSetting, PRACTICE_SET_HITBOXES, nullptr);
             push(kRowSetting, PRACTICE_SET_COMBO_OVERLAY, nullptr);
             push(kRowSetting, PRACTICE_SET_INPUT_DISPLAY, nullptr);
             push(kRowSetting, PRACTICE_SET_DAMAGE_DISPLAY, nullptr);
             push(kRowSetting, PRACTICE_SET_FRAME_ADVANTAGE, nullptr);
+            push(kRowSubPage, kPageHud, "HUD...");
             break;
         case kPageMatch:
             push(kRowAction, PRACTICE_ACT_POSITION_MID, "Mid Screen");
@@ -273,8 +295,9 @@ int BuildRows(int page, Row* out, int cap) {
             // (sub_4CA120 sets match+10 = 3 for game type 5), so name it so.
             push(kRowAction, -2,
                  GetGameType() == GAMETYPE_REPLAY ? "Replay List" : "Character Select");
+            // Title Screen removed: its route is the buggy one, and Exit Match
+            // reaches the same place reliably.
             push(kRowAction, -3, "Exit Match");
-            push(kRowAction, PRACTICE_ACT_TITLE_SCREEN, "Title Screen");
             break;
         default:
             break;
@@ -373,7 +396,12 @@ void RenderRow(int index, const Row& row, bool selected) {
         return;
     }
 
-    DrawTextClipped(kLabelX, y, ink, kRowTextSize, label, kLabelWidth);
+    // Action and Back rows draw nothing in the value column, so their label owns
+    // the whole line instead of stopping at the label/value split - which is
+    // what was truncating "Character Select" with half the row still empty.
+    const bool hasValueColumn = (row.kind == kRowSetting || row.kind == kRowSubPage);
+    DrawTextClipped(kLabelX, y, ink, kRowTextSize, label,
+                    hasValueColumn ? kLabelWidth : (kValueRight - kLabelX));
 
     if (row.kind == kRowSetting) {
         if (g_numericEditing && g_numericSetting == row.id) {
@@ -400,7 +428,8 @@ void RenderTabs(bool focused) {
         }
         const int width = (int)(NetMenu::MenuMeasureText(kPageNames[p], kTabTextSize) + 0.5f);
         const bool current = (p == g_page) ||
-                             (g_page == kPageRecoveryAdvanced && p == kPageRecovery);
+                             (g_page == kPageRecoveryAdvanced && p == kPageRecovery) ||
+                             (g_page == kPageHud && p == kPageDisplay);
         if (current) {
             // An underline carries the selection when the strip is unfocused,
             // so the tab is still readable while the cursor is down in the rows.
@@ -414,6 +443,22 @@ void RenderTabs(bool focused) {
                                      : kInkDisabled;
         DrawText(x, kTabY, ink, kTabTextSize, kPageNames[p]);
         x += width + kTabGap;
+    }
+}
+
+// Small arrows when a page holds more rows than the window shows, so the player
+// can tell there is more rather than assuming the list ends.
+void RenderScrollMarks(int first, int count) {
+    if (count <= kRowCount) {
+        return;
+    }
+    const uint8_t dim[3] = { 176, 176, 176 };
+    if (first > 0) {
+        DrawText(kValueRight + 4, kRowFirstY, dim, kHintTextSize, "^");
+    }
+    if (first + kRowCount < count) {
+        DrawText(kValueRight + 4, kRowFirstY + kRowPitch * (kRowCount - 1),
+                 dim, kHintTextSize, "v");
     }
 }
 
@@ -553,11 +598,14 @@ void RenderMenu() {
 
     RenderTabs(g_cursor == 0);
 
-    Row rows[kRowCount];
-    const int count = BuildRows(g_page, rows, kRowCount);
-    for (int i = 0; i < count; ++i) {
-        RenderRow(i, rows[i], (i + 1) == g_cursor);
+    Row rows[kRowMax];
+    const int count = BuildRows(g_page, rows, kRowMax);
+    const int first = ClampInt(g_rowScroll, 0, count > kRowCount ? count - kRowCount : 0);
+    const int shown = (count - first) < kRowCount ? (count - first) : kRowCount;
+    for (int i = 0; i < shown; ++i) {
+        RenderRow(i, rows[first + i], (first + i + 1) == g_cursor);
     }
+    RenderScrollMarks(first, count);
     RenderHint();
 }
 
@@ -691,6 +739,10 @@ int ConfirmRow(const Row& row) {
             if (row.id == -2) return kResultCharSelect;
             if (row.id == -3) return kResultExitMatch;
             SetHint(PracticeAction_Invoke(row.id));
+            // Several actions also raise a toast. For a row the player pressed
+            // here, the action's own return is the message worth showing, so
+            // consume the serial rather than letting it overwrite next frame.
+            PracticeTools_LatestStatus(&g_statusSerial);
             return kResultStay;
         default:
             return kResultStay;
@@ -764,6 +816,17 @@ int UpdateMenu() {
         --g_hintFrames;
     }
 
+    // Status messages raised outside the menu land on the same line. Polled
+    // before input so a row's own result, set below, still wins for that frame.
+    uint32_t serial = 0;
+    const char* status = PracticeTools_LatestStatus(&serial);
+    if (serial != g_statusSerial) {
+        g_statusSerial = serial;
+        if (status && status[0]) {
+            SetHint(status);
+        }
+    }
+
     if (UpdateNumericEdit()) {
         return kResultStay;
     }
@@ -772,8 +835,8 @@ int UpdateMenu() {
         return kResultStay;
     }
 
-    Row rows[kRowCount];
-    int count = BuildRows(g_page, rows, kRowCount);
+    Row rows[kRowMax];
+    int count = BuildRows(g_page, rows, kRowMax);
 
     // Cursor 0 is the tab strip; 1..count are the rows. Up from the first row
     // reaches the strip with nothing but a d-pad, so no shoulder button has to
@@ -792,6 +855,21 @@ int UpdateMenu() {
         g_cursor = (g_cursor + 1) % entries;
     }
 
+    // Follow the cursor with the window, one row at a time, and pin it to the
+    // top whenever the whole page fits.
+    const int maxScroll = (count > kRowCount) ? (count - kRowCount) : 0;
+    if (g_cursor == 0) {
+        g_rowScroll = 0;
+    } else {
+        const int row = g_cursor - 1;
+        if (row < g_rowScroll) {
+            g_rowScroll = row;
+        } else if (row >= g_rowScroll + kRowCount) {
+            g_rowScroll = row - kRowCount + 1;
+        }
+    }
+    g_rowScroll = ClampInt(g_rowScroll, 0, maxScroll);
+
     const int hDelta = JustPressed(INPUT_RIGHT) ? 1 : (JustPressed(INPUT_LEFT) ? -1 : 0);
     if (hDelta != 0) {
         if (g_cursor == 0) {
@@ -806,7 +884,7 @@ int UpdateMenu() {
 
     // A value change can reshape the list (the Dummy tab swaps its lower half
     // with the backend), so re-read before acting on the cursor.
-    count = BuildRows(g_page, rows, kRowCount);
+    count = BuildRows(g_page, rows, kRowMax);
     if (g_cursor > count) {
         g_cursor = count;
     }
@@ -850,9 +928,13 @@ void OnMenuOpened() {
         g_page = FirstAvailablePage();
     }
     g_cursor = 1;
+    g_rowScroll = 0;
     g_popupOpen = false;
     EndNumericEdit(false);
     SetHint(nullptr);
+    // Adopt the current serial without showing it: opening the menu is not the
+    // moment to replay whatever was last toasted before it opened.
+    PracticeTools_LatestStatus(&g_statusSerial);
     g_pendingResult = kResultStay;
 }
 
@@ -952,6 +1034,7 @@ bool PauseMenu_IsActive() {
 void PauseMenu_Reset() {
     g_page = kPageDummy;
     g_cursor = 1;
+    g_rowScroll = 0;
     g_popupOpen = false;
     g_popupCursor = 0;
     g_numericEditing = false;

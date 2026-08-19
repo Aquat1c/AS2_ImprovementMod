@@ -38,6 +38,7 @@
 #include "net/netplay_menu_controller.h"
 #include "net/session2.h"
 #include "net/set_tracker.h"
+#include "replay/replay_runtime.h"
 #include "net/pregame_sync.h"
 #include "net/frontend_input_sync.h"
 #include "net/session_manager.h"
@@ -1516,6 +1517,8 @@ void OnlineWiring_OnDisconnect(const char* reason) {
 
     // Reset set tracker on session end
     Net::SetTracker_Reset();
+    // A replay set folder is one connected session, so this is where it closes.
+    Replay::ReplayRuntime_OnNetplaySessionEnd(reason ? reason : "disconnect");
     ResetStartupBarrierState("disconnect");
 
     Net::ConnectionStats stats{};

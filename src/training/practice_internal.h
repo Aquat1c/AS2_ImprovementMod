@@ -19,6 +19,9 @@ struct Toast {
     ImU32 color;
 };
 
+extern uint32_t g_toastSerial;
+extern char g_latestToast[64];
+
 extern bool g_initialized;
 extern bool g_paused;
 extern bool g_stepRequested;

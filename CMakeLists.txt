@@ -378,6 +378,7 @@ set(REPLAY_HEADERS
 set(CORE_SOURCES
     src/core/mod_main.cpp
     src/core/game_console.cpp
+    src/core/local_rematch.cpp
 )
 
 set(PATCH_SOURCES
@@ -396,6 +397,7 @@ set(PATCH_SOURCES
     src/patches/netplay_background_run.cpp
     src/patches/frame_scheduler.cpp
     src/patches/tick_hooks.cpp
+    src/patches/hud_toggle.cpp
     src/patches/practice_defense_hooks.cpp
     src/patches/practice_recovery_hooks.cpp
     src/patches/hook_installer.cpp

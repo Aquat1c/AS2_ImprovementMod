@@ -23,6 +23,7 @@
 #include "net/player_side_mapping.h"
 #include "patches/charsel_palette_select.h"
 #include "patches/charsel_select_actions.h"
+#include "core/local_rematch.h"
 #include "core/game_state.h"
 #include "replay/replay_runtime.h"
 #include "rollback/rollback_session.h"

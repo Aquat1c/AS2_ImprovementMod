@@ -7,11 +7,14 @@
  */
 
 #include "mod_main.h"
+#include "core/local_rematch.h"
 #include "input_system.h"
 #include "log_window.h"
 #include "mod_menu.h"
 #include "hitbox_viewer.h"
+#include "ui/mod_menu.h"
 #include "ui/netplay_hud.h"
+#include "ui/pause_menu.h"
 #include "ui/netplay_hud_style.h"
 #include "game_console.h"
 #include "patches/memory_utils.h"
@@ -534,6 +537,10 @@ static void DeferredInit() {
     LogInitStep("ContinueFlow_Init", "BEGIN");
     Net::ContinueFlow_Init();
     LogInitStep("ContinueFlow_Init", "END");
+
+    LogInitStep("LocalRematch_Init", "BEGIN");
+    LocalRematch::Init();
+    LogInitStep("LocalRematch_Init", "END");
     LogInitStep("NetplayPaletteRuntime_Init", "BEGIN");
     Net::NetplayPaletteRuntime_Init();
     LogInitStep("NetplayPaletteRuntime_Init", "END");
@@ -745,6 +752,7 @@ __declspec(dllexport) void ModShutdown() {
         PaletteAssetHook_Shutdown();
         Net::NetplayPaletteRuntime_Shutdown();
         Net::ContinueFlow_Shutdown();
+        LocalRematch::Shutdown();
         Net::TransitionBarrier_Shutdown();
         Net::ConnectionSupervisor_Shutdown();
         Net::Session_Shutdown();
@@ -847,6 +855,30 @@ __declspec(dllexport) void ModOnFrame() {
 
     // One edge update per frame, before anything reads a hotkey.
     HotkeyConfig_Update();
+
+    // Overlay hide is not practice-gated, so it is polled here rather than in
+    // PracticeTools_FrameUpdate. Purely local presentation: nothing it touches
+    // is simulated or sent, so it cannot desync a session.
+    //
+    // Skipped while a menu owns input. The default key is Backspace, which is
+    // also P1 SELECT, and SELECT is "back" in the netplay menu and the pause
+    // menu — backing out of a screen would otherwise silently flip the HUD off
+    // with nothing on screen to show it happened.
+    if (HotkeyConfig_JustPressed(HOTKEY_OVERLAY_TOGGLE) &&
+        !NetMenu::ConsumesGameInput() &&
+        !PauseMenu_IsActive() &&
+        !ModMenu_IsOpen()) {
+        NetplayHud_ToggleHidden();
+        // One key, both overlays - the netplay HUD and the replay playback HUD
+        // are the two things the mod paints over a match, and wanting a clean
+        // screen means wanting both gone. Driven from the netplay flag so the
+        // two cannot end up disagreeing.
+        Replay::ReplayRuntime_SetHudVisible(!NetplayHud_IsHidden());
+    }
+
+    // Offline continue-screen rematch. Self-gated to a local versus match with
+    // no session, so it is inert during netplay and everywhere else.
+    LocalRematch::FrameUpdate();
 
     // Process savestate hotkeys (F5 save, F6 load by default)
     Savestate_ProcessHotkeys();

@@ -1335,6 +1335,15 @@ static ImFont* g_menuFont = nullptr;
 // 19 px atlas that far is a blur, and a 49 px CJK atlas would need 4096x4096 -
 // so this one carries Latin + Cyrillic only and fits in 1024x1024. Strings with
 // CJK fall back to g_menuFont.
+// Cyrillic only: merging the Latin block too would let the fallback face
+// override Shippori's own Latin, which is the shape the menu was tuned to.
+static const ImWchar kMenuCyrillicRanges[] = {
+    0x0400, 0x052F,   // Cyrillic + Supplement
+    0x2DE0, 0x2DFF,   // Cyrillic Extended-A
+    0xA640, 0xA69F,   // Cyrillic Extended-B
+    0,
+};
+
 static ImFont* g_menuFontLarge = nullptr;
 static ImVector<ImWchar> g_menuLargeGlyphRanges;
 constexpr float kMenuFontLargeSize = 49.0f;
@@ -1413,15 +1422,39 @@ static void ConfigureOverlayFonts(ImGuiIO& io) {
                         ProxyLog("[IMGUI] Menu font (Shippori Mincho Bold): %s",
                                  g_menuFont ? "loaded" : "FAILED");
 
+                        // Shippori Mincho Bold has no Cyrillic at all - its cmap
+                        // simply has no segment covering U+0400..U+04FF - so
+                        // asking it for those ranges yielded an atlas with none
+                        // of them and every Cyrillic name rendered as blanks.
+                        // The overlay face (Noto Sans CJK JP) does have the
+                        // block, so it is merged in rather than swapping the
+                        // whole menu over to a face with the wrong weight.
+                        if (g_menuFont) {
+                            ImFontConfig mergeConfig = menuConfig;
+                            mergeConfig.MergeMode = true;
+                            io.Fonts->AddFontFromMemoryTTF(
+                                const_cast<void*>(embeddedFont), (int)embeddedFontSize,
+                                19.0f, &mergeConfig, kMenuCyrillicRanges);
+                            ProxyLog("[IMGUI] Menu font: merged Cyrillic from the overlay face");
+                        }
+
                         ImFontGlyphRangesBuilder largeBuilder;
                         largeBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-                        largeBuilder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
                         g_menuLargeGlyphRanges.clear();
                         largeBuilder.BuildRanges(&g_menuLargeGlyphRanges);
                         g_menuFontLarge = io.Fonts->AddFontFromMemoryTTF(
                             mdata, (int)msize, kMenuFontLargeSize, &menuConfig,
                             g_menuLargeGlyphRanges.Data);
-                        ProxyLog("[IMGUI] Menu font large (%.0f px, Latin+Cyrillic): %s",
+                        // Same story at the large size: the Latin comes from
+                        // Shippori, the Cyrillic has to come from Noto.
+                        if (g_menuFontLarge) {
+                            ImFontConfig mergeConfig = menuConfig;
+                            mergeConfig.MergeMode = true;
+                            io.Fonts->AddFontFromMemoryTTF(
+                                const_cast<void*>(embeddedFont), (int)embeddedFontSize,
+                                kMenuFontLargeSize, &mergeConfig, kMenuCyrillicRanges);
+                        }
+                        ProxyLog("[IMGUI] Menu font large (%.0f px, Latin + merged Cyrillic): %s",
                                  kMenuFontLargeSize,
                                  g_menuFontLarge ? "loaded" : "FAILED");
                     }
@@ -6675,12 +6708,13 @@ void AS2Proxy_DrawMenuText(float x, float y, unsigned int abgr, const char* utf8
     q.color = (ImU32)abgr;
     strncpy_s(q.text, utf8, _TRUNCATE);
 
-    // A UTF-8 lead byte of 0xC0..0xCB covers U+0000..U+02FF, which is every
-    // glyph the large Latin+Cyrillic atlas has; anything longer or higher is
-    // outside it.
+    // The large atlas covers Latin (U+0000..U+02FF, lead bytes up to 0xCB) and,
+    // since the merge above, Cyrillic (U+0400..U+04FF, lead bytes 0xD0..0xD3).
+    // The old cut at 0xCC excluded exactly the Cyrillic it was meant to admit,
+    // so Cyrillic never reached the atlas that could draw it.
     q.hasHighCodepoint = false;
     for (const unsigned char* c = (const unsigned char*)q.text; *c; ++c) {
-        if (*c >= 0xCCu) {
+        if (*c >= 0xD4u) {
             q.hasHighCodepoint = true;
             break;
         }

@@ -24,13 +24,14 @@ static const CharacterMove kMoves_0[] = {  // Rance
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
     {  4, 1, "6B" },
+    { 30, 1, "3B" },
     {  7, 0, "623A" },
     {  7, 1, "623B" },
     {  7, 2, "623C" },
@@ -43,6 +44,9 @@ static const CharacterMove kMoves_0[] = {  // Rance
     {  9, 0, "421A" },
     {  9, 1, "421B" },
     {  9, 2, "421C" },
+    { 22, 0, "63214A" },
+    { 22, 1, "63214B" },
+    { 22, 2, "63214C" },
     { 12, 3, "22D" },
 };
 static const CharacterMove kMoves_1[] = {  // Hatsune
@@ -55,9 +59,10 @@ static const CharacterMove kMoves_1[] = {  // Hatsune
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
+    { 30, 2, "j.3C" },
     {  6, 0, "236A" },
     {  6, 1, "236B" },
     {  6, 2, "236C" },
@@ -70,6 +75,7 @@ static const CharacterMove kMoves_1[] = {  // Hatsune
     { 12, 0, "22A" },
     { 12, 1, "22B" },
     { 12, 2, "22C" },
+    { 22, 2, "63214C" },
     {  5, 3, "4D" },
     {  4, 3, "6D" },
     {  6, 3, "236D" },
@@ -81,9 +87,9 @@ static const CharacterMove kMoves_2[] = {  // Patton
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
@@ -94,9 +100,13 @@ static const CharacterMove kMoves_2[] = {  // Patton
     {  7, 0, "623A" },
     {  7, 1, "623B" },
     {  7, 2, "623C" },
+    { 26, 0, "360A" },
+    { 26, 1, "360B" },
+    { 26, 2, "360C" },
     {  9, 0, "421A" },
     {  9, 1, "421B" },
     {  9, 2, "421C" },
+    { 23, 2, "236236C" },
     { 12, 3, "22D" },
 };
 static const CharacterMove kMoves_3[] = {  // Seed
@@ -106,9 +116,9 @@ static const CharacterMove kMoves_3[] = {  // Seed
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
@@ -117,12 +127,18 @@ static const CharacterMove kMoves_3[] = {  // Seed
     {  6, 0, "236A" },
     {  6, 1, "236B" },
     {  6, 2, "236C" },
+    { 27, 0, "2369A" },
+    { 27, 1, "2369B" },
+    { 27, 2, "2369C" },
     {  7, 0, "623A" },
     {  7, 1, "623B" },
     {  7, 2, "623C" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
     {  8, 0, "214A" },
+    { 22, 0, "63214A" },
+    { 22, 1, "63214B" },
+    { 25, 2, "632146C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_4[] = {  // Raysen
@@ -132,9 +148,9 @@ static const CharacterMove kMoves_4[] = {  // Raysen
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
@@ -150,6 +166,7 @@ static const CharacterMove kMoves_4[] = {  // Raysen
     {  8, 0, "214A" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
+    { 23, 2, "236236C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_5[] = {  // Aria
@@ -159,23 +176,28 @@ static const CharacterMove kMoves_5[] = {  // Aria
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
     {  4, 0, "6A" },
     {  4, 1, "6B" },
+    { 30, 2, "3C" },
     {  6, 0, "236A" },
     {  6, 1, "236B" },
     {  6, 2, "236C" },
     { 13, 0, "41236A" },
     { 13, 1, "41236B" },
     { 13, 2, "41236C" },
+    { 22, 0, "63214A" },
+    { 22, 1, "63214B" },
+    { 22, 2, "63214C" },
     {  8, 0, "214A" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
+    { 23, 2, "236236C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_6[] = {  // Maria
@@ -185,9 +207,9 @@ static const CharacterMove kMoves_6[] = {  // Maria
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
@@ -204,6 +226,9 @@ static const CharacterMove kMoves_6[] = {  // Maria
     {  8, 0, "214A" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
+    { 22, 0, "63214A" },
+    { 22, 1, "63214B" },
+    { 22, 2, "63214C" },
     { 13, 2, "41236C" },
     { 12, 3, "22D" },
 };
@@ -214,12 +239,13 @@ static const CharacterMove kMoves_7[] = {  // Shizuka
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
+    { 30, 1, "j.3B" },
     {  4, 2, "j.6C" },
     {  6, 0, "236A" },
     {  6, 1, "236B" },
@@ -233,6 +259,9 @@ static const CharacterMove kMoves_7[] = {  // Shizuka
     {  8, 0, "214A" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
+    { 23, 0, "236236A" },
+    { 23, 1, "236236B" },
+    { 23, 2, "236236C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_8[] = {  // Fanel
@@ -245,9 +274,9 @@ static const CharacterMove kMoves_8[] = {  // Fanel
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  4, 0, "6A" },
     {  4, 2, "6C" },
     {  6, 0, "236A" },
@@ -256,9 +285,13 @@ static const CharacterMove kMoves_8[] = {  // Fanel
     {  8, 0, "214A" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
+    { 22, 0, "63214A" },
+    { 22, 1, "63214B" },
+    { 22, 2, "63214C" },
     { 13, 0, "j.41236A" },
     { 13, 1, "j.41236B" },
     { 13, 2, "j.41236C" },
+    { 23, 2, "236236C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_9[] = {  // Miki
@@ -268,17 +301,26 @@ static const CharacterMove kMoves_9[] = {  // Miki
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
-    {  7, 2, "623C" },
+    {  6, 0, "236A" },
+    {  6, 1, "236B" },
     {  6, 2, "236C" },
+    {  7, 0, "623A" },
+    {  7, 1, "623B" },
+    {  7, 2, "623C" },
     {  8, 0, "214A" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
+    { 13, 0, "41236A" },
+    { 13, 1, "41236B" },
+    { 13, 2, "41236C" },
+    { 22, 2, "63214C" },
+    { 12, 3, "22D" },
 };
 static const CharacterMove kMoves_10[] = {  // Menad
     {  1, 0, "5A" },
@@ -287,9 +329,9 @@ static const CharacterMove kMoves_10[] = {  // Menad
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
@@ -306,6 +348,7 @@ static const CharacterMove kMoves_10[] = {  // Menad
     {  9, 0, "421A" },
     {  9, 1, "421B" },
     {  9, 2, "421C" },
+    { 22, 2, "63214C" },
     { 12, 3, "22D" },
 };
 static const CharacterMove kMoves_11[] = {  // Hanny King
@@ -315,9 +358,9 @@ static const CharacterMove kMoves_11[] = {  // Hanny King
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
@@ -349,10 +392,11 @@ static const CharacterMove kMoves_12[] = {  // Satsu
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  4, 2, "6C" },
+    { 31, 2, "1C" },
     {  5, 2, "j.4C" },
     {  6, 0, "236A" },
     {  6, 1, "236B" },
@@ -363,6 +407,10 @@ static const CharacterMove kMoves_12[] = {  // Satsu
     {  9, 0, "421A" },
     {  9, 1, "421B" },
     {  9, 2, "421C" },
+    { 22, 0, "63214A" },
+    { 22, 1, "63214B" },
+    { 22, 2, "63214C" },
+    { 23, 2, "236236C" },
     { 12, 3, "22D" },
 };
 static const CharacterMove kMoves_13[] = {  // Tiger Joe
@@ -372,14 +420,15 @@ static const CharacterMove kMoves_13[] = {  // Tiger Joe
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
     {  4, 0, "6A" },
     {  4, 1, "6B" },
+    { 30, 2, "3C" },
     {  6, 0, "236A" },
     {  6, 1, "236B" },
     {  6, 2, "236C" },
@@ -392,6 +441,7 @@ static const CharacterMove kMoves_13[] = {  // Tiger Joe
     {  9, 0, "421A" },
     {  9, 1, "421B" },
     {  9, 2, "421C" },
+    { 22, 2, "63214C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_14[] = {  // Escalayer
@@ -404,9 +454,9 @@ static const CharacterMove kMoves_14[] = {  // Escalayer
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  4, 0, "6A" },
     {  4, 1, "6B" },
     {  6, 0, "236A" },
@@ -421,6 +471,7 @@ static const CharacterMove kMoves_14[] = {  // Escalayer
     {  8, 0, "214A" },
     {  8, 1, "214B" },
     {  8, 2, "214C" },
+    { 23, 2, "236236C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_15[] = {  // Makutsudo
@@ -430,9 +481,9 @@ static const CharacterMove kMoves_15[] = {  // Makutsudo
     {  2, 0, "2A" },
     {  2, 1, "2B" },
     {  2, 2, "2C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
@@ -446,6 +497,9 @@ static const CharacterMove kMoves_15[] = {  // Makutsudo
     {  7, 0, "623A" },
     {  7, 1, "623B" },
     {  7, 2, "623C" },
+    { 22, 0, "63214A" },
+    { 22, 1, "63214B" },
+    { 22, 2, "63214C" },
     { 17, 0, "[4]6A" },
     { 17, 1, "[4]6B" },
     { 17, 2, "[4]6C" },
@@ -461,9 +515,11 @@ static const CharacterMove kMoves_16[] = {  // Alietta
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
+    { 30, 1, "3B" },
+    { 30, 2, "3C" },
     {  6, 0, "236A" },
     {  6, 1, "236B" },
     {  6, 2, "236C" },
@@ -476,6 +532,7 @@ static const CharacterMove kMoves_16[] = {  // Alietta
     {  9, 0, "421A" },
     {  9, 1, "421B" },
     {  9, 2, "421C" },
+    { 22, 2, "63214C" },
     {  8, 3, "214D" },
 };
 static const CharacterMove kMoves_17[] = {  // Nalzgis
@@ -504,6 +561,7 @@ static const CharacterMove kMoves_17[] = {  // Nalzgis
     {  8, 0, "j.214A" },
     {  8, 1, "j.214B" },
     {  8, 2, "j.214C" },
+    { 28, 2, "21416C" },
     {  6, 3, "j.236D" },
 };
 static const CharacterMove kMoves_18[] = {  // Demon Rance
@@ -516,10 +574,11 @@ static const CharacterMove kMoves_18[] = {  // Demon Rance
     {  3, 0, "j.A" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
-    { 20, 0, "66A" },
-    { 20, 1, "66B" },
-    { 20, 2, "66C" },
+    { 29, 0, "66A" },
+    { 29, 1, "66B" },
+    { 29, 2, "66C" },
     {  4, 1, "6B" },
+    { 30, 1, "3B" },
     {  7, 0, "623A" },
     {  7, 1, "623B" },
     {  7, 2, "623C" },
@@ -532,6 +591,7 @@ static const CharacterMove kMoves_18[] = {  // Demon Rance
     {  9, 0, "421A" },
     {  9, 1, "421B" },
     {  9, 2, "421C" },
+    { 22, 2, "63214C" },
     {  6, 3, "236D" },
 };
 static const CharacterMove kMoves_19[] = {  // Little Princess
@@ -539,7 +599,7 @@ static const CharacterMove kMoves_19[] = {  // Little Princess
     {  1, 1, "5B" },
     {  1, 2, "5C" },
     {  2, 2, "2C" },
-    { 20, 2, "66C" },
+    { 29, 2, "66C" },
     {  3, 1, "j.B" },
     {  3, 2, "j.C" },
     {  6, 0, "236A" },
@@ -554,12 +614,13 @@ static const CharacterMove kMoves_19[] = {  // Little Princess
     { 13, 0, "41236A" },
     { 13, 1, "41236B" },
     { 13, 2, "41236C" },
+    { 22, 2, "63214C" },
     { 12, 3, "22D" },
     {  2, 0, "2A" },
 };
 static const CharacterMove kMoves_20[] = {  // TADA
     {  2, 2, "2C" },
-    { 20, 2, "66C" },
+    { 29, 2, "66C" },
     {  2, 1, "j.2B" },
     {  6, 0, "236A" },
     {  6, 1, "236B" },
@@ -590,26 +651,26 @@ struct CharacterMoveList {
 };
 
 static const CharacterMoveList kCharacterMoveLists[] = {
-    { kMoves_0, 26, 3, "Attack Parry / Repel" },   // 0 Rance
-    { kMoves_1, 27, 6, "Dodge" },   // 1 Hatsune
-    { kMoves_2, 23, 3, "Attack Parry / Repel" },   // 2 Patton
-    { kMoves_3, 24, 2, "Parry by guarding just before impact" },   // 3 Seed
-    { kMoves_4, 25, 6, "Dodge" },   // 4 Raysen
-    { kMoves_5, 24, 3, "Attack Parry / Repel" },   // 5 Aria
-    { kMoves_6, 27, 5, "Absolute Defense" },   // 6 Maria
-    { kMoves_7, 26, 4, "Push-away while guarding" },   // 7 Shizuka
-    { kMoves_8, 24, 2, "Parry by guarding just before impact" },   // 8 Fanel
-    { kMoves_9, 17, 5, "Absolute Defense" },   // 9 Miki
-    { kMoves_10, 26, 4, "Push-away while guarding" },   // 10 Menad
+    { kMoves_0, 30, 3, "Attack Parry / Repel" },   // 0 Rance
+    { kMoves_1, 29, 6, "Dodge" },   // 1 Hatsune
+    { kMoves_2, 27, 3, "Attack Parry / Repel" },   // 2 Patton
+    { kMoves_3, 30, 2, "Parry by guarding just before impact" },   // 3 Seed
+    { kMoves_4, 26, 6, "Dodge" },   // 4 Raysen
+    { kMoves_5, 29, 3, "Attack Parry / Repel" },   // 5 Aria
+    { kMoves_6, 30, 5, "Absolute Defense" },   // 6 Maria
+    { kMoves_7, 30, 4, "Push-away while guarding" },   // 7 Shizuka
+    { kMoves_8, 28, 2, "Parry by guarding just before impact" },   // 8 Fanel
+    { kMoves_9, 26, 5, "Absolute Defense" },   // 9 Miki
+    { kMoves_10, 27, 4, "Push-away while guarding" },   // 10 Menad
     { kMoves_11, 29, 5, "Absolute Defense" },   // 11 Hanny King
-    { kMoves_12, 24, 6, "Dodge" },   // 12 Satsu
-    { kMoves_13, 27, 3, "Attack Parry / Repel" },   // 13 Tiger Joe
-    { kMoves_14, 27, 4, "Push-away while guarding" },   // 14 Escalayer
-    { kMoves_15, 26, 5, "Absolute Defense" },   // 15 Makutsudo
-    { kMoves_16, 25, 4, "Push-away while guarding" },   // 16 Alietta
-    { kMoves_17, 26, 1, "Defensive movement / guard counter" },   // 17 Nalzgis
-    { kMoves_18, 26, 0, "" },   // 18 Demon Rance
-    { kMoves_19, 21, 0, "" },   // 19 Little Princess
+    { kMoves_12, 29, 6, "Dodge" },   // 12 Satsu
+    { kMoves_13, 29, 3, "Attack Parry / Repel" },   // 13 Tiger Joe
+    { kMoves_14, 28, 4, "Push-away while guarding" },   // 14 Escalayer
+    { kMoves_15, 29, 5, "Absolute Defense" },   // 15 Makutsudo
+    { kMoves_16, 28, 4, "Push-away while guarding" },   // 16 Alietta
+    { kMoves_17, 27, 1, "Defensive movement / guard counter" },   // 17 Nalzgis
+    { kMoves_18, 28, 0, "" },   // 18 Demon Rance
+    { kMoves_19, 22, 0, "" },   // 19 Little Princess
     { kMoves_20, 20, 0, "" },   // 20 TADA
     { nullptr, 0, 0, "" },   // 21 Nalzgis (Boss) (no parsed moves)
 };
@@ -618,6 +679,6 @@ constexpr int kCharacterMoveListCount =
     (int)(sizeof(kCharacterMoveLists) / sizeof(kCharacterMoveLists[0]));
 
 // The pause menu sizes its picker grid against this.
-constexpr int kCharacterMoveMaxCount = 29;
+constexpr int kCharacterMoveMaxCount = 30;
 
 } // namespace Training

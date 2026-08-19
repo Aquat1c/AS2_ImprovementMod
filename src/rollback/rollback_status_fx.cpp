@@ -1,4 +1,6 @@
 #include "rollback/rollback_status_fx.h"
+#include "patches/hud_toggle.h"
+#include "log_window.h"
 
 #include "core/as2_constants.h"
 #include "patches/memory_utils.h"
@@ -662,6 +664,19 @@ char __cdecl Hook_Effect_Enqueue(int effect_id, char type, int16_t x, int16_t y)
     const uint16_t slotBefore = active ? (uint16_t)ReadMemory<uint32_t>(ADDR_EFFECT_INDEX) : 0;
 
     const char result = g_origEffectEnqueue(effect_id, type, x, y);
+
+    // Every effect spawned during a super cut-in, session or not. The cut-in's
+    // own backdrop is an effect, so if it is missing this either names its id
+    // or shows it was never enqueued at all - which separates "the mod dropped
+    // it" from "the game never asked for it".
+    if (HudToggle_IsCutInActive()) {
+        static uint32_t s_cutInFxLogs = 0;
+        if (s_cutInFxLogs < 200u) {
+            ++s_cutInFxLogs;
+            LOG_INFO("[CutIn] effect spawned during cut-in: id=%d type=%u x=%d y=%d result=%d",
+                     effect_id, (unsigned)(uint8_t)type, (int)x, (int)y, (int)result);
+        }
+    }
 
     if (!active) {
         if (monitored) {

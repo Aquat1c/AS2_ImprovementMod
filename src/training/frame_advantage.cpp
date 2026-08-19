@@ -1,4 +1,5 @@
 #include "training/frame_advantage.h"
+#include "training/frame_advantage_math.h"
 #include "training/native_recovery.h"
 
 #include "training/action_state_classifier.h"
@@ -20,8 +21,12 @@ constexpr uint32_t kFrameUnset = UINT32_MAX;
 constexpr uint32_t kPendingTimeoutFrames = 180;
 constexpr uint32_t kInteractionTimeoutFrames = 300;
 constexpr uint32_t kTradeWindowFrames = 1;
-constexpr uint32_t kOverlayDisplayFrames = 180;
-constexpr uint32_t kGapDisplayFrames = 30;
+// Tuning taken from qoh99's FrameAdvantageTracker, which this readout now
+// mirrors. The lifetimes are load-bearing, not cosmetic: the gap is suppressed
+// whenever a number is still on screen, so a longer readout lifetime silently
+// hides more gaps.
+constexpr uint32_t kOverlayDisplayFrames = 60;
+constexpr uint32_t kGapDisplayFrames = 20;
 constexpr uint32_t kGapMaxFrames = 60;
 constexpr size_t kHistoryCapacity = 20;
 
@@ -74,6 +79,12 @@ struct Interaction {
     uint32_t lastProgressFrame = kFrameUnset;
     bool defenderLaunched = false;
     bool defenderWasAirLocked = false;
+    // Frames the defender was actionable between the previous exchange and this
+    // contact. A property of the contact it PRECEDES, not of the one before it,
+    // which is what lets it be decided before this exchange has measured
+    // anything. Kept here for the history panel and the logs; the overlay is
+    // driven by the separate gap readout, which is published at the contact.
+    uint32_t gapBeforeContact = 0;
 };
 
 struct HistoryEntry {
@@ -83,14 +94,7 @@ struct HistoryEntry {
     uint32_t simFrame_contact = 0;
     InteractionResult result = InteractionResult::Blocked;
     int32_t frameAdvantage = 0;
-};
-
-struct GapDisplay {
-    bool active = false;
-    uint32_t untilFrame = kFrameUnset;
-    uint32_t gapFrames = 0;
-    uint8_t attacker = 0;
-    uint8_t defender = 1;
+    uint32_t gapBeforeContact = 0;
 };
 
 bool s_initialized = false;
@@ -114,7 +118,6 @@ uint8_t  s_lastLoggedHitActive[2] = {};
 // first time the engine reports a terminal neutral handoff plus an open
 // ordinary route; cancel-window route openings never touch it.
 uint32_t s_nativeFreeFrame[2] = { kFrameUnset, kFrameUnset };
-uint32_t s_nativeFreeGeneration[2] = {};
 Training::NativeRecoveryKind s_nativeKind[2] = {};
 bool s_nativeCpuUnsupported[2] = {};
 uint32_t s_lastNativeLogFrame[2] = {};
@@ -127,8 +130,11 @@ bool     s_hasLastAudit[2] = {};
 PlayerState s_players[2]{};
 PendingAttack s_pending[2]{};
 Interaction s_active[2]{};
-GapDisplay s_gapDisplay{};
 uint32_t s_resultDisplayUntilFrame = kFrameUnset;
+// The gap owns the readout slot outright for its own short lifetime. It is
+// never appended to a number, and it is never published while a number is up.
+uint32_t s_gapDisplayUntilFrame = kFrameUnset;
+uint32_t s_gapDisplayFrames = 0;
 uint32_t s_lastSimFrame = kFrameUnset;
 uint32_t s_lastDefenderFreeFrame[2] = {kFrameUnset, kFrameUnset};
 std::array<HistoryEntry, kHistoryCapacity> s_history{};
@@ -329,9 +335,12 @@ void AuditActionability(uint32_t simFrame, int playerIndex, const EntitySample& 
     s_hasLastAudit[playerIndex] = true;
 }
 
-// A fighter's recovery tick is consumed once by whichever tracker needs it, so
-// a later interaction cannot reuse a stale timestamp from an earlier one.
-uint32_t TakeNativeFreeFrame(int player, uint32_t sinceFrame) {
+// A latch, not a queue: s_nativeFreeFrame holds the most recent recovery tick
+// and is never cleared here, so sinceFrame is the only thing keeping an older
+// interaction's timestamp out. That bound is not tight enough on its own — a
+// pending attack armed before the recovery still latches it — which is why
+// CompleteInteraction clamps anything that predates contact.
+uint32_t LatestNativeFreeFrameSince(int player, uint32_t sinceFrame) {
     if (player < 0 || player > 1) {
         return kFrameUnset;
     }
@@ -363,58 +372,62 @@ void ClearInteraction(Interaction* interaction) {
     *interaction = Interaction{};
 }
 
-void ClearGapDisplay() {
-    s_gapDisplay = GapDisplay{};
-}
-
 void ClearResultDisplay() {
     s_resultDisplayUntilFrame = kFrameUnset;
 }
 
-void ClearVisibleOverlayState() {
-    ClearGapDisplay();
-    ClearResultDisplay();
+void ClearGapDisplay() {
+    s_gapDisplayUntilFrame = kFrameUnset;
+    s_gapDisplayFrames = 0;
 }
 
-void PublishGapDisplay(uint32_t simFrame, int attackerIndex, int defenderIndex) {
-    // Always clear a stale gap — new contact invalidates the previous one.
-    // Do NOT clear the FA result here: if the gap is too large or absent, the
-    // previous FA result should remain visible until the new interaction completes.
+void ClearVisibleOverlayState() {
+    ClearResultDisplay();
     ClearGapDisplay();
+}
 
+// Is a completed advantage number on screen right now?
+bool ResultReadoutLive() {
+    return s_resultDisplayUntilFrame != kFrameUnset &&
+           s_lastSimFrame != kFrameUnset &&
+           s_lastSimFrame < s_resultDisplayUntilFrame;
+}
+
+bool GapReadoutLive() {
+    return s_gapDisplayUntilFrame != kFrameUnset &&
+           s_lastSimFrame != kFrameUnset &&
+           s_lastSimFrame < s_gapDisplayUntilFrame;
+}
+
+// Discard a gap candidate without measuring it. A trade is not a blockstring.
+void DropGapCandidates() {
+    s_lastDefenderFreeFrame[0] = kFrameUnset;
+    s_lastDefenderFreeFrame[1] = kFrameUnset;
+}
+
+// Measures the actionable window the defender had before this contact.
+uint32_t ConsumeGapBeforeContact(uint32_t simFrame, int attackerIndex, int defenderIndex) {
     if (defenderIndex < 0 || defenderIndex >= 2) {
-        return;
+        return 0;
     }
 
     const uint32_t defenderFreeFrame = s_lastDefenderFreeFrame[defenderIndex];
     s_lastDefenderFreeFrame[defenderIndex] = kFrameUnset;
 
-    if (defenderFreeFrame == kFrameUnset || simFrame <= defenderFreeFrame) {
-        return;
-    }
-
-    const uint32_t gapFrames = simFrame - defenderFreeFrame;
-    if (gapFrames == 0 || gapFrames > kGapMaxFrames) {
-        if (s_debugLogging && gapFrames > 0) {
+    const uint32_t gapFrames =
+        Training::GapBeforeContact(defenderFreeFrame, simFrame, kGapMaxFrames);
+    if (gapFrames == 0) {
+        if (s_debugLogging && defenderFreeFrame != kFrameUnset && simFrame > defenderFreeFrame) {
             LOG_INFO("[FA] GAP ignored: %s->%s gap=%u (max=%u free=%u contact=%u)",
                      SideLabel((uint8_t)attackerIndex),
                      SideLabel((uint8_t)defenderIndex),
-                     gapFrames,
+                     simFrame - defenderFreeFrame,
                      kGapMaxFrames,
                      defenderFreeFrame,
                      simFrame);
         }
-        return;
+        return 0;
     }
-
-    // A real gap is about to be shown — clear the FA result so the gap takes the slot.
-    ClearResultDisplay();
-
-    s_gapDisplay.active = true;
-    s_gapDisplay.untilFrame = simFrame + kGapDisplayFrames;
-    s_gapDisplay.gapFrames = gapFrames;
-    s_gapDisplay.attacker = (uint8_t)attackerIndex;
-    s_gapDisplay.defender = (uint8_t)defenderIndex;
 
     LOG_INFO("[FA] GAP: %s->%s gap=%u (free=%u contact=%u)",
              SideLabel((uint8_t)attackerIndex),
@@ -422,6 +435,33 @@ void PublishGapDisplay(uint32_t simFrame, int attackerIndex, int defenderIndex) 
              gapFrames,
              defenderFreeFrame,
              simFrame);
+    return gapFrames;
+}
+
+// The ordering rule, as a suppression rather than a deferral.
+//
+// A gap is discovered the instant the next attack connects, which is always
+// after the previous exchange's advantage has been published. Showing it then
+// makes it read as a correction to that number, and appending it puts two
+// measurements of different things in one line. So: if a number is still on
+// screen, the gap is dropped outright. It is only worth anything in the moment,
+// and the moment already belongs to something else.
+//
+// When the slot IS free, the previous episode never completed - the attacker
+// had not recovered when the defender did, so there is no number for that
+// exchange and the gap is the only thing that describes it. That is the case
+// this readout exists for.
+void PublishGapDisplay(uint32_t simFrame, uint32_t gapFrames) {
+    const bool resultLive = ResultReadoutLive();
+    if (!Training::GapShouldPublish(gapFrames, resultLive)) {
+        if (s_debugLogging && gapFrames != 0) {
+            LOG_INFO("[FA] GAP suppressed: gap=%u, a result is still on screen until %u",
+                     gapFrames, s_resultDisplayUntilFrame);
+        }
+        return;
+    }
+    s_gapDisplayFrames = gapFrames;
+    s_gapDisplayUntilFrame = simFrame + kGapDisplayFrames;
 }
 
 void ClearTrackingRuntime(bool clearHistory) {
@@ -457,6 +497,7 @@ void PushHistory(const Interaction& interaction) {
     slot.simFrame_contact = interaction.simFrame_contact;
     slot.result = interaction.result;
     slot.frameAdvantage = interaction.frameAdvantage;
+    slot.gapBeforeContact = interaction.gapBeforeContact;
 
     s_historyHead = (s_historyHead + 1) % kHistoryCapacity;
     if (s_historyCount < kHistoryCapacity) {
@@ -542,7 +583,9 @@ void RefreshPendingAttack(uint32_t simFrame, int attackerIndex) {
         (!pending.active || pending.attacker_actionId != attacker.curr.actionId);
 
     if (shouldStartPending) {
-        ClearVisibleOverlayState();
+        // The last result stays up. Wiping it here blanked the readout the
+        // moment the attacker started their next move, so a blockstring
+        // flickered between three states instead of holding one.
         pending = PendingAttack{};
         pending.active = true;
         pending.simFrame_attackStart = simFrame;
@@ -583,7 +626,7 @@ void RefreshPendingAttack(uint32_t simFrame, int attackerIndex) {
     // human actionability number would be a fiction.
     const uint32_t nativeAttackerFree =
         NativeRecoveryAvailable(attackerIndex)
-            ? TakeNativeFreeFrame(attackerIndex, pending.simFrame_attackStart)
+            ? LatestNativeFreeFrameSince(attackerIndex, pending.simFrame_attackStart)
             : kFrameUnset;
     const bool legacyEdge =
         !NativeRecoveryAvailable(attackerIndex) &&
@@ -622,7 +665,10 @@ void RefreshPendingAttack(uint32_t simFrame, int attackerIndex) {
     }
 }
 
-void PromotePendingAttackToInteraction(uint32_t simFrame, int attackerIndex, int defenderIndex) {
+void PromotePendingAttackToInteraction(uint32_t simFrame,
+                                       int attackerIndex,
+                                       int defenderIndex,
+                                       uint32_t gapBeforeContact) {
     PendingAttack& pending = s_pending[attackerIndex];
     Interaction& interaction = s_active[attackerIndex];
     const PlayerState& defender = s_players[defenderIndex];
@@ -647,6 +693,7 @@ void PromotePendingAttackToInteraction(uint32_t simFrame, int attackerIndex, int
     interaction.result = IsBlockstun(defender.curr.actionId) ? InteractionResult::Blocked : InteractionResult::Hit;
     interaction.lastProgressFrame = simFrame;
     interaction.defenderWasAirLocked = IsAirLockedAction(defender.curr.actionId);
+    interaction.gapBeforeContact = gapBeforeContact;
 
     if (s_debugLogging) {
         LOG_INFO("[FA] PROMOTED %s->%s: frame=%u actionId=%u def_act=%u result=%s A_recover=%s hitSeen=%d",
@@ -704,7 +751,12 @@ void ProcessContactEdges(uint32_t simFrame) {
             s_lastDefenderFreeFrame[defenderIndex] = existing.simFrame_D_recover;
         }
 
-        PublishGapDisplay(simFrame, attackerIndex, defenderIndex);
+        // Decided here, at the contact, before this exchange has measured
+        // anything — which is what keeps a gap from ever attaching itself to a
+        // number that has already been published.
+        const uint32_t gapBefore =
+            ConsumeGapBeforeContact(simFrame, attackerIndex, defenderIndex);
+        PublishGapDisplay(simFrame, gapBefore);
 
         if (existing.active) {
             if (pending.active && pending.attacker_actionId != existing.attacker_actionId) {
@@ -717,7 +769,7 @@ void ProcessContactEdges(uint32_t simFrame) {
                              simFrame);
                 }
                 ClearInteraction(&existing);
-                PromotePendingAttackToInteraction(simFrame, attackerIndex, defenderIndex);
+                PromotePendingAttackToInteraction(simFrame, attackerIndex, defenderIndex, gapBefore);
                 continue;
             }
 
@@ -733,10 +785,15 @@ void ProcessContactEdges(uint32_t simFrame) {
             existing.defenderLaunched = false;
             existing.defenderWasAirLocked = existing.defenderWasAirLocked || IsAirLockedAction(defender.curr.actionId);
             existing.lastProgressFrame = simFrame;
+            // Multi-hit re-contact normally has no gap; only overwrite when one
+            // was actually measured, so hit 1's gap survives to completion.
+            if (gapBefore > 0) {
+                existing.gapBeforeContact = gapBefore;
+            }
             continue;
         }
 
-        PromotePendingAttackToInteraction(simFrame, attackerIndex, defenderIndex);
+        PromotePendingAttackToInteraction(simFrame, attackerIndex, defenderIndex, gapBefore);
     }
 
     if (s_active[0].active && s_active[1].active) {
@@ -744,6 +801,12 @@ void ProcessContactEdges(uint32_t simFrame) {
         if (diff <= kTradeWindowFrames) {
             s_active[0].result = InteractionResult::Trade;
             s_active[1].result = InteractionResult::Trade;
+            // Both sides swung: whatever window preceded this was not a hole in
+            // one player's pressure, so no gap is owed for it.
+            s_active[0].gapBeforeContact = 0;
+            s_active[1].gapBeforeContact = 0;
+            ClearGapDisplay();
+            DropGapCandidates();
         }
     }
 }
@@ -753,7 +816,23 @@ void CompleteInteraction(Interaction* interaction) {
         return;
     }
 
-    interaction->frameAdvantage = (int32_t)interaction->simFrame_D_recover - (int32_t)interaction->simFrame_A_recover;
+    // An attacker cannot be freer than free. A recovery timestamp that predates
+    // contact belongs to a lingering hitbox (projectile, or a pending attack
+    // promoted long after its move ended), and subtracting it reports the whole
+    // flight time as advantage — the +124 readings. As of contact the attacker
+    // is already actionable, so contact is their effective recovery frame.
+    const uint32_t effectiveARecover = Training::EffectiveAttackerRecovery(
+        interaction->simFrame_A_recover, interaction->simFrame_contact);
+    if (s_debugLogging && effectiveARecover != interaction->simFrame_A_recover) {
+        LOG_INFO("[FA] %s->%s A_recover=%u predates contact=%u; clamped",
+                 SideLabel(interaction->attacker), SideLabel(interaction->defender),
+                 interaction->simFrame_A_recover, interaction->simFrame_contact);
+    }
+
+    interaction->frameAdvantage = Training::ComputeFrameAdvantage(
+        interaction->simFrame_A_recover,
+        interaction->simFrame_D_recover,
+        interaction->simFrame_contact);
     s_resultDisplayUntilFrame = interaction->simFrame_D_recover + kOverlayDisplayFrames;
 
     if (interaction->defenderLaunched && s_debugLogging) {
@@ -762,12 +841,14 @@ void CompleteInteraction(Interaction* interaction) {
                  SideLabel(interaction->defender));
     }
 
-    LOG_INFO("[FA] COMPLETE: %s->%s %s adv=%+d src=%s (A_recover=%u D_recover=%u contact=%u actionId=%u)",
+    LOG_INFO("[FA] COMPLETE: %s->%s %s adv=%+d gap=%u src=%s (A_recover=%u eff_A=%u D_recover=%u contact=%u actionId=%u)",
              SideLabel(interaction->attacker), SideLabel(interaction->defender),
              ResultLabel(interaction->result),
              interaction->frameAdvantage,
+             interaction->gapBeforeContact,
              ActionabilitySourceName(s_actionabilitySource),
-             interaction->simFrame_A_recover, interaction->simFrame_D_recover,
+             interaction->simFrame_A_recover, effectiveARecover,
+             interaction->simFrame_D_recover,
              interaction->simFrame_contact, interaction->attacker_actionId);
 
     PushHistory(*interaction);
@@ -788,7 +869,7 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
     // anything this tracker still needs to find must be at or after contact.
     const uint32_t nativeAttackerFree =
         NativeRecoveryAvailable(interaction.attacker)
-            ? TakeNativeFreeFrame(interaction.attacker, interaction.simFrame_contact)
+            ? LatestNativeFreeFrameSince(interaction.attacker, interaction.simFrame_contact)
             : kFrameUnset;
     const bool legacyAttackerEdge =
         !NativeRecoveryAvailable(interaction.attacker) &&
@@ -838,14 +919,21 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
 
     const uint32_t nativeDefenderFree =
         NativeRecoveryAvailable(interaction.defender)
-            ? TakeNativeFreeFrame(interaction.defender, interaction.simFrame_contact)
+            ? LatestNativeFreeFrameSince(interaction.defender, interaction.simFrame_contact)
             : kFrameUnset;
     const bool legacyDefenderEdge =
         !NativeRecoveryAvailable(interaction.defender) &&
         !IsFree(defender.prev, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked) &&
         IsFree(defender.curr, Training::ActionableContext::DefenderRecovery, interaction.defenderWasAirLocked);
 
+    // Strictly after contact. The defender was free on the contact frame — that
+    // is why they got hit — so counting it would complete the exchange on the
+    // spot with a meaningless number.
+    const bool defenderReadyAfterContact =
+        interaction.simFrame_contact == kFrameUnset || simFrame > interaction.simFrame_contact;
+
     if (interaction.simFrame_D_recover == kFrameUnset &&
+        defenderReadyAfterContact &&
         !IsDefenderLocked(defender.curr.actionId) &&
         (nativeDefenderFree != kFrameUnset || legacyDefenderEdge)) {
         interaction.simFrame_D_recover =
@@ -854,8 +942,8 @@ void AdvanceInteraction(uint32_t simFrame, int attackerIndex) {
         // Record the defender's free frame for gap detection. This must happen on
         // every D_recover — not just mid-string — so the gap between two hits is
         // still measurable when the previous interaction completes (both sides
-        // recover) before the next contact. The next contact's PublishGapDisplay
-        // consumes this; kGapMaxFrames filters out stale (non-string) values.
+        // recover) before the next contact. ConsumeGapBeforeContact takes it at
+        // the next contact; kGapMaxFrames filters out stale (non-string) values.
         s_lastDefenderFreeFrame[interaction.defender] = simFrame;
         if (s_actionabilityAuditLogging) {
             LOG_INFO("[FAREC] frame=%u %s role=defender act=%u phase=%u aframe=%u source=legacy native676=%u D_recover=%u airLocked=%d",
@@ -924,7 +1012,7 @@ void FrameAdvantage_OnPreCommandDispatch(int player,
 
     if (result.freeRecovery) {
         s_nativeFreeFrame[player] = simFrame;
-        s_nativeFreeGeneration[player]++;
+
     }
 
     if (!s_actionabilityAuditLogging) {
@@ -988,7 +1076,7 @@ void FrameAdvantage_OnPostCommandDispatch(int player,
 void FrameAdvantage_ResetState(void) {
     for (int i = 0; i < 2; ++i) {
         s_nativeFreeFrame[i] = kFrameUnset;
-        s_nativeFreeGeneration[i] = 0;
+
         s_nativeKind[i] = Training::NativeRecoveryKind::Locked;
         s_nativeCpuUnsupported[i] = false;
         s_lastNativeLogFrame[i] = 0;
@@ -1014,7 +1102,10 @@ void FrameAdvantage_CancelCalculation(void) {
     for (Interaction& interaction : s_active) {
         interaction = Interaction{};
     }
-    ClearGapDisplay();
+    // Also drop the visible result. Savestate load calls this, and the frame
+    // counter rewinds with it, so a leftover untilFrame in the old timeline
+    // pinned a number from a future that no longer exists.
+    ClearVisibleOverlayState();
     s_lastDefenderFreeFrame[0] = kFrameUnset;
     s_lastDefenderFreeFrame[1] = kFrameUnset;
 }
@@ -1036,14 +1127,10 @@ bool FrameAdvantage_HasVisibleOverlay(void) {
         return false;
     }
 
-    if (s_gapDisplay.active) {
+    if (GapReadoutLive()) {
         return true;
     }
-
-    return s_historyCount > 0 &&
-           s_resultDisplayUntilFrame != kFrameUnset &&
-           s_lastSimFrame != kFrameUnset &&
-           s_lastSimFrame < s_resultDisplayUntilFrame;
+    return s_historyCount > 0 && ResultReadoutLive();
 }
 
 void FrameAdvantage_OnFrameAdvanced(uint32_t simFrame) {
@@ -1053,13 +1140,14 @@ void FrameAdvantage_OnFrameAdvanced(uint32_t simFrame) {
 
     s_lastSimFrame = simFrame;
 
+    // Both lifetimes are aged here, off admitted simulation frames, so a paused
+    // or menu-held frame never consumes a readout. They age independently: the
+    // gap routinely expires while its own exchange is still being measured.
     if (s_resultDisplayUntilFrame != kFrameUnset && simFrame >= s_resultDisplayUntilFrame) {
         ClearResultDisplay();
     }
 
-    if (s_gapDisplay.active &&
-        s_gapDisplay.untilFrame != kFrameUnset &&
-        simFrame >= s_gapDisplay.untilFrame) {
+    if (s_gapDisplayUntilFrame != kFrameUnset && simFrame >= s_gapDisplayUntilFrame) {
         ClearGapDisplay();
     }
 
@@ -1103,11 +1191,9 @@ void FrameAdvantage_RenderOverlay(void) {
         return;
     }
 
-    if (!s_gapDisplay.active &&
-        (s_historyCount == 0 ||
-         s_resultDisplayUntilFrame == kFrameUnset ||
-         s_lastSimFrame == kFrameUnset ||
-         s_lastSimFrame >= s_resultDisplayUntilFrame)) {
+    const bool gapLive = GapReadoutLive();
+    const bool resultLive = s_historyCount > 0 && ResultReadoutLive();
+    if (!gapLive && !resultLive) {
         return;
     }
 
@@ -1118,37 +1204,35 @@ void FrameAdvantage_RenderOverlay(void) {
         return;
     }
 
+    char buf[48];
+    ImU32 color = kNeutralColor;
+
+    // One slot, one value. A live gap owns it on its own for its short
+    // lifetime: it is the hole you were about to be hit through, it only means
+    // anything in the moment, and it is never appended to a number. It could
+    // not be fighting a number for the slot anyway - a gap detected while one
+    // was on screen was dropped at the contact rather than queued.
+    if (gapLive) {
+        snprintf(buf, sizeof(buf), "Gap %u", s_gapDisplayFrames);
+        color = kGapColor;
+    } else {
+        const HistoryEntry* entry = GetHistoryEntryNewest(0);
+        if (!entry) {
+            return;
+        }
+        if (entry->result == InteractionResult::Trade) {
+            snprintf(buf, sizeof(buf), "Trade");
+        } else {
+            snprintf(buf, sizeof(buf), "%s %+d %s",
+                     SideLabel(entry->attacker),
+                     entry->frameAdvantage,
+                     entry->result == InteractionResult::Blocked ? "block" : "hit");
+            color = AdvantageColor(entry->frameAdvantage);
+        }
+    }
+
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
-
-    if (s_gapDisplay.active) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "Gap %u", s_gapDisplay.gapFrames);
-
-        const ImVec2 textSize = ImGui::CalcTextSize(buf);
-        const float x = (displaySize.x - textSize.x) * 0.5f;
-        const float y = displaySize.y - kOverlayBottomOffset;
-
-        dl->AddRectFilled(
-            ImVec2(x - kOverlayPadding, y - 2.0f),
-            ImVec2(x + textSize.x + kOverlayPadding, y + textSize.y + 2.0f),
-            kOverlayBg, 4.0f);
-        dl->AddText(ImVec2(x, y), kGapColor, buf);
-        return;
-    }
-
-    // Show only the most recent result as "Px +/-Y"
-    const HistoryEntry* entry = GetHistoryEntryNewest(0);
-    if (!entry) {
-        return;
-    }
-
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%s %+d", SideLabel(entry->attacker), entry->frameAdvantage);
-
-    const ImU32 textColor = AdvantageColor(entry->frameAdvantage);
     const ImVec2 textSize = ImGui::CalcTextSize(buf);
-
-    // Center horizontally, above the meter bars at bottom of screen
     const float x = (displaySize.x - textSize.x) * 0.5f;
     const float y = displaySize.y - kOverlayBottomOffset;
 
@@ -1156,7 +1240,7 @@ void FrameAdvantage_RenderOverlay(void) {
         ImVec2(x - kOverlayPadding, y - 2.0f),
         ImVec2(x + textSize.x + kOverlayPadding, y + textSize.y + 2.0f),
         kOverlayBg, 4.0f);
-    dl->AddText(ImVec2(x, y), textColor, buf);
+    dl->AddText(ImVec2(x, y), color, buf);
 }
 
 void FrameAdvantage_RenderImGui(void) {
@@ -1198,16 +1282,15 @@ void FrameAdvantage_RenderImGui(void) {
 
         const HistoryEntry* entry = GetHistoryEntryNewest(0);
         if (entry) {
-            ImGui::Text("Last: %s %+d (%s)", SideLabel(entry->attacker),
-                        entry->frameAdvantage, ResultLabel(entry->result));
+            if (entry->gapBeforeContact > 0) {
+                ImGui::Text("Last: gap %u -> %s %+d (%s)",
+                            entry->gapBeforeContact, SideLabel(entry->attacker),
+                            entry->frameAdvantage, ResultLabel(entry->result));
+            } else {
+                ImGui::Text("Last: %s %+d (%s)", SideLabel(entry->attacker),
+                            entry->frameAdvantage, ResultLabel(entry->result));
+            }
         }
-    }
-
-    if (s_enabled && s_gapDisplay.active) {
-        ImGui::Text("Gap: %u (%s->%s)",
-                    s_gapDisplay.gapFrames,
-                    SideLabel(s_gapDisplay.attacker),
-                    SideLabel(s_gapDisplay.defender));
     }
 
     // Live tracking state display
@@ -1245,7 +1328,8 @@ void FrameAdvantage_RenderImGui(void) {
                             (ia.simFrame_A_recover == kFrameUnset) ? "unset" : "set",
                             (ia.simFrame_D_recover == kFrameUnset) ? "unset" : "set",
                             ia.defenderLaunched ? 1 : 0);
-                ImGui::Text("    airLocked=%d", ia.defenderWasAirLocked ? 1 : 0);
+                ImGui::Text("    airLocked=%d gapBefore=%u",
+                            ia.defenderWasAirLocked ? 1 : 0, ia.gapBeforeContact);
             }
         }
 
@@ -1253,14 +1337,6 @@ void FrameAdvantage_RenderImGui(void) {
             if (s_lastDefenderFreeFrame[i] != kFrameUnset) {
                 ImGui::Text("  %s LastFree=%u", SideLabel((uint8_t)i), s_lastDefenderFreeFrame[i]);
             }
-        }
-
-        if (s_gapDisplay.active) {
-            ImGui::Text("  ActiveGap: %s->%s gap=%u until=%u",
-                        SideLabel(s_gapDisplay.attacker),
-                        SideLabel(s_gapDisplay.defender),
-                        s_gapDisplay.gapFrames,
-                        s_gapDisplay.untilFrame);
         }
     }
 }

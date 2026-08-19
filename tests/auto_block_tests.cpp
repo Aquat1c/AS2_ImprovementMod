@@ -412,11 +412,281 @@ static void TestDefensiveResponses() {
                "category 2 -> just parry");
     TEST_CHECK(ResponseForCategory(kDefenseCategoryDodge) == DefensiveResponse::Dodge,
                "category 6 -> dodge");
-    // Push-away needs no command, so ordinary guard already produces it.
-    TEST_CHECK(ResponseForCategory(kDefenseCategoryPushAway) == DefensiveResponse::NormalGuard,
-               "category 4 needs no extra input");
-    TEST_CHECK(ResponseForCategory(kDefenseCategoryAbsolute) == DefensiveResponse::NormalGuard,
-               "category 5 has no driven response yet");
+    // Push-away is guard + D, not automatic: Entity_CheckAirTech gates both of
+    // its arming branches on D being held.
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryPushAway) == DefensiveResponse::PushAwayPerfect,
+               "category 4 -> push-away");
+    TEST_CHECK(ResponseSupportedByCategory(DefensiveResponse::PushAwayPerfect,
+                                           kDefenseCategoryPushAway),
+               "push-away is offered on category 4");
+    TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::PushAwayPerfect,
+                                            kDefenseCategoryDodge),
+               "push-away is refused on a dodge character");
+    // Absolute defence has no input - +823 is a static capability flag, proved
+    // by scanning as2.exe: nine reads of [base+337h], zero writes. It still
+    // gets its own response, because it is reached only from blockstun, so
+    // selecting it is what guarantees the dummy is blocking at all.
+    TEST_CHECK(ResponseForCategory(kDefenseCategoryAbsolute) ==
+                   DefensiveResponse::AbsoluteDefence,
+               "category 5 -> absolute defence");
+    {
+        // The category-3 parry is 6 against high and mid but 2 against low, and
+        // Entity_CheckGuardState arms a different reaction for each. Driving
+        // only the forward one left a low unparryable.
+        DefenseDriveState st{};
+        DefenseDriveSample sm{};
+        sm.threatArmed = true;
+        sm.reactionState = kReactionIdle;
+
+        auto tapFor = [&](GroundGuardClass cls) {
+            st = DefenseDriveState{};
+            sm.threatClass = cls;
+            // The first frame is always the neutral one that makes the next
+            // press a fresh edge; the second carries the direction.
+            EvaluateDefenseInput(DefensiveResponse::Repel, sm, st);
+            return EvaluateDefenseInput(DefensiveResponse::Repel, sm, st);
+        };
+
+        TEST_CHECK(tapFor(GroundGuardClass::CrouchOnly) == DefenseInputKind::DownTap,
+                   "a low is parried with 2");
+        TEST_CHECK(tapFor(GroundGuardClass::StandOnly) == DefenseInputKind::ForwardTap,
+                   "an overhead is parried with 6");
+        TEST_CHECK(tapFor(GroundGuardClass::Either) == DefenseInputKind::ForwardTap,
+                   "a mid is parried with 6");
+        TEST_CHECK(tapFor(GroundGuardClass::None) == DefenseInputKind::ForwardTap,
+                   "an undecoded threat falls back to 6");
+
+        // Either way the neutral frame still comes first, or the press is not
+        // an edge and Entity_CheckGuardState ignores it.
+        st = DefenseDriveState{};
+        sm.threatClass = GroundGuardClass::CrouchOnly;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, sm, st) ==
+                       DefenseInputKind::ReleaseGuard,
+                   "the low parry still releases first");
+    }
+
+    {
+        // Both push-block branches are selectable, and they differ only in
+        // whether the D press is an edge. The timed one refuses to press
+        // outside blockstun so the edge lands there; the untimed one holds D,
+        // which is what makes +78 read 0 and takes the paid arm.
+        DefenseDriveState st{};
+        DefenseDriveSample sm{};
+        sm.threatArmed = true;
+        sm.actionId = 22;
+        sm.meter = 999;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayMetered, sm, st) ==
+                       DefenseInputKind::DodgePress,
+                   "the metered variant presses outside blockstun");
+        st = DefenseDriveState{};
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sm, st) ==
+                       DefenseInputKind::None,
+                   "the timed variant does not");
+
+        // Held, not alternating - that is the whole point of the paid branch.
+        st = DefenseDriveState{};
+        sm.actionId = 67;
+        for (int i = 0; i < 3; ++i) {
+            TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayMetered, sm, st) ==
+                           DefenseInputKind::DodgePress,
+                       "the metered variant holds D rather than edging");
+        }
+
+        sm.meter = 0;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayMetered, sm, st) ==
+                       DefenseInputKind::DodgePress,
+                   "in blockstun it still presses with no meter");
+        sm.actionId = 22;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayMetered, sm, st) ==
+                       DefenseInputKind::None,
+                   "but not outside it once the bar is empty");
+
+        // Both belong to category 4 and nothing else.
+        TEST_CHECK(ResponseSupportedByCategory(DefensiveResponse::PushAwayMetered,
+                                               kDefenseCategoryPushAway),
+                   "the metered variant is offered on category 4");
+        TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::PushAwayMetered,
+                                                kDefenseCategoryRepel),
+                   "and nowhere else");
+        TEST_CHECK(ResponseForCategory(kDefenseCategoryPushAway) ==
+                       DefensiveResponse::PushAwayPerfect,
+                   "Native picks the free one");
+    }
+
+    // 214D arms a state from neutral rather than cancelling out of blockstun,
+    // so unlike the dodge it does not imply that the dummy is blocking.
+    TEST_CHECK(!ResponseRequiresBlockstun(DefensiveResponse::AbsoluteDefence),
+               "the counter guard is armed before the pressure, not during it");
+    {
+        DefenseDriveState st{};
+        DefenseDriveSample sm{};
+        sm.threatArmed = true;
+        sm.actionable = true;
+        sm.guardStateArmed = false;
+
+        // The motion is walked one frame at a time and then stops on its own.
+        for (int i = 0; i < kGuardStateMotionFrames; ++i) {
+            TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+                           DefenseInputKind::ArmGuardState,
+                       "214D motion keeps feeding while it runs");
+            TEST_CHECK(st.armStep == i, "214D motion advances one step per frame");
+        }
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+                       DefenseInputKind::None,
+                   "214D motion stops once it has been fed");
+        TEST_CHECK(st.armStep < 0, "214D motion resets when it ends");
+
+        // Nothing to do once the state is up - the engine repels on its own.
+        sm.guardStateArmed = true;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+                       DefenseInputKind::None,
+                   "no re-arm while the guard state holds");
+
+        // And nothing to do when the engine would not take an input anyway.
+        sm.guardStateArmed = false;
+        sm.actionable = false;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+                       DefenseInputKind::None,
+                   "no arming while the dummy is locked");
+    }
+
+    // The accepting action set is wider than the dodge's and the meter gate is
+    // 100 rather than 500.
+    TEST_CHECK(PushAwayWindowOpen(64, 100), "stand blockstun opens push-away");
+    TEST_CHECK(PushAwayWindowOpen(67, 100), "crouch blockstun opens it");
+    TEST_CHECK(PushAwayWindowOpen(70, 100), "air blockstun opens it");
+    TEST_CHECK(PushAwayWindowOpen(44, 100), "guard action 44 opens it");
+    TEST_CHECK(PushAwayWindowOpen(48, 999), "guard action 48, spare meter");
+    // The two arming branches are an either/or: inside an accepting action the
+    // free branch covers it, and outside one 100 meter does.
+    TEST_CHECK(PushAwayWindowOpen(64, 0), "blockstun arms push-away with no meter");
+    TEST_CHECK(PushAwayWindowOpen(22, 100), "100 meter arms it outside blockstun");
+    TEST_CHECK(!PushAwayWindowOpen(22, 99), "neutral with 99 meter arms neither branch");
+
+    // Entity_UpdateAction_Attacks offers the dodge from all six blockstun
+    // actions; leaving out standing blockstun meant it never tried from there.
+    TEST_CHECK(DodgeWindowOpen(64, 500), "stand blockstun opens the dodge");
+    TEST_CHECK(DodgeWindowOpen(65, 500), "stand blockstun, second state");
+    TEST_CHECK(!DodgeWindowOpen(22, 999), "neutral is not a dodge window");
+
+    // Which mechanics can only happen out of blockstun, and therefore imply
+    // that the dummy has to be blocking at all.
+    TEST_CHECK(ResponseRequiresBlockstun(DefensiveResponse::Dodge),
+               "dodge is a guard cancel");
+    TEST_CHECK(ResponseRequiresBlockstun(DefensiveResponse::PushAwayPerfect),
+               "push-away is a guard cancel");
+    TEST_CHECK(!ResponseRequiresBlockstun(DefensiveResponse::JustParry),
+               "parry arms from any state");
+    TEST_CHECK(!ResponseRequiresBlockstun(DefensiveResponse::Repel),
+               "repel arms from neutral, so blocking would prevent it");
+    TEST_CHECK(!ResponseRequiresBlockstun(DefensiveResponse::GuardCounter),
+               "the category-1 counter has no action gate");
+
+    {
+        // The free push block needs a fresh D edge taken inside blockstun. That
+        // only happens if D was released beforehand, so the driver must not
+        // press outside an accepting action however much meter is available.
+        DefenseDriveState st{};
+        DefenseDriveSample sm{};
+        sm.threatArmed = true;
+        sm.actionId = 22;          // neutral, closing in
+        sm.meter = 999;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sm, st) ==
+                       DefenseInputKind::None,
+                   "no D outside blockstun, however much meter there is");
+
+        // First blockstun frame: D goes down, and because it was up a moment
+        // ago the engine reads +78 as just-pressed and takes the free branch.
+        sm.actionId = 67;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sm, st) ==
+                       DefenseInputKind::DodgePress,
+                   "D lands on the first blockstun frame");
+        // Then it releases, so a press that did not take can edge again.
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sm, st) ==
+                       DefenseInputKind::None,
+                   "D releases so the next press is an edge too");
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sm, st) ==
+                       DefenseInputKind::DodgePress,
+                   "and presses again");
+
+        // Leaving blockstun rearms the sequence for the next contact.
+        sm.actionId = 22;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sm, st) ==
+                       DefenseInputKind::None,
+                   "leaving blockstun stops the press");
+        TEST_CHECK(!st.pushPhase, "and resets, so the next one starts with a press");
+        sm.actionId = 64;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sm, st) ==
+                       DefenseInputKind::DodgePress,
+                   "stand blockstun arms it as well");
+    }
+
+    {
+        // Push-away emits the same physical press as the dodge, because the
+        // engine routes one input by category rather than by button.
+        DefenseDriveState state{};
+        DefenseDriveSample sample{};
+        sample.threatArmed = true;
+        sample.actionId = 67;
+        sample.meter = 100;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sample, state) ==
+                       DefenseInputKind::DodgePress,
+                   "push-away presses guard + D");
+        // Meter is irrelevant to the driver: it goes for the free branch, which
+        // is gated on the action rather than on the bar.
+        state = DefenseDriveState{};
+        sample.meter = 0;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sample, state) ==
+                       DefenseInputKind::DodgePress,
+                   "blockstun arms push-away with no meter at all");
+        state = DefenseDriveState{};
+        sample.actionId = 22;
+        sample.meter = 999;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sample, state) ==
+                       DefenseInputKind::None,
+                   "and a full bar does not make it press outside blockstun");
+    }
+
+    {
+        // A guard cancel fires from blockstun with no attacker still active.
+        // Requiring a live threat meant dodge only came out mid-blockstring,
+        // where the next hit happened to be armed while the previous one still
+        // held the dummy; on a single hit the threat was gone by the frame
+        // blockstun began.
+        DefenseDriveState state{};
+        DefenseDriveSample sample{};
+        sample.threatArmed = false;
+        sample.actionId = 67;
+        sample.meter = 500;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, sample, state) ==
+                       DefenseInputKind::DodgePress,
+                   "dodge fires from blockstun with no threat armed");
+
+        sample.meter = 100;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::PushAwayPerfect, sample, state) ==
+                       DefenseInputKind::DodgePress,
+                   "push-away likewise");
+
+        // Neutral with no threat is still nothing: the window, not the absence
+        // of a check, is what gates them.
+        sample.actionId = 22;
+        sample.meter = 999;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, sample, state) ==
+                       DefenseInputKind::None,
+                   "no window, no dodge");
+
+        // Parry and repel arm before the hit, so they still need to know one is
+        // coming.
+        sample.threatArmed = false;
+        sample.parryWindow = 0xFF;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::JustParry, sample, state) ==
+                       DefenseInputKind::None,
+                   "parry still waits for a threat");
+        sample.reactionState = kReactionIdle;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, sample, state) ==
+                       DefenseInputKind::None,
+                   "repel still waits for a threat");
+    }
 
     TEST_CHECK(ResponseSupportedByCategory(DefensiveResponse::JustParry, 2), "parry on cat 2");
     TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::JustParry, 6), "no parry on cat 6");
@@ -523,7 +793,7 @@ static void TestDodgeWindow() {
     TEST_CHECK(DodgeWindowOpen(70, 500), "air blockstun opens it");
     TEST_CHECK(DodgeWindowOpen(71, 500), "air blockstun, second state");
 
-    TEST_CHECK(!DodgeWindowOpen(64, 900), "stand blockstun is not routed to dodge");
+    TEST_CHECK(DodgeWindowOpen(64, 900), "stand blockstun is routed to dodge too");
     TEST_CHECK(!DodgeWindowOpen(2, 900), "neutral is not a guard cancel");
     TEST_CHECK(!DodgeWindowOpen(67, 499), "one short of the cost is still no");
     TEST_CHECK(!DodgeWindowOpen(67, 0), "no meter, no dodge");

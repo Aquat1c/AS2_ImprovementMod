@@ -33,6 +33,41 @@ constexpr uintptr_t ADDR_CHARSEL_MOVE_SE = 0x816250;
 constexpr uintptr_t ADDR_CHARSEL_CONFIRM_SE = 0x816254;
 constexpr uintptr_t ADDR_CHARSEL_CANCEL_SE = 0x816258;
 constexpr uintptr_t ADDR_CHARSEL_UNLOCK_TABLE = 0x815FE8;
+// ---------------------------------------------------------------------------
+// COLOR plate geometry, all measured rather than guessed.
+//
+// sub_5BF490 draws the plate with Render_DrawSprite(panelX, 432, ...) - P1 at
+// panelX 0, P2 at 384 - from the 8-entry table at 0x816168. Those are sel.bin
+// sprites 78..85 (handle base 0x816030 + 78*4), each a 256x32 canvas. Decoding
+// them shows the visible ink is identical across all eight: x 64..184, y 10..25
+// inside the canvas.
+//
+// So on screen the words sit at x panelX+64 .. panelX+184, y 442..457, inside a
+// 256-wide panel - leaving 64px of empty plate to the left and 71px to the
+// right, which is where the arrows go.
+constexpr int kPlatePanelX[2] = { 0, 384 };
+constexpr int kPlateTopY = 432;
+constexpr int kPlateInkX0 = 64;
+constexpr int kPlateInkX1 = 184;
+constexpr int kPlateInkTopY = kPlateTopY + 10;   // 442
+
+// Left arrow is placed by its LEFT edge, not right-aligned to the ink, because
+// the game's text primitive has no measure call here. 20px of clearance holds
+// for any plausible glyph width and still leaves the arrow inside the plate.
+constexpr int kArrowLeftGap = 20;
+constexpr int kArrowRightGap = 8;
+
+// The plate art is pure greyscale: body 255,255,255 over a 101,101,101 outline.
+// The custom badge matches it so it reads as the same family of label.
+constexpr uint8_t kPlateInkR = 255, kPlateInkG = 255, kPlateInkB = 255;
+constexpr uint8_t kPlateOutline = 101;
+
+// The plate draw is gated on one byte per side, used nowhere else in sub_5BF490
+// (P1 is BYTE1 of dword_816018, P2 is byte_81601F). Clearing it across the
+// original render call skips exactly that sprite and nothing else, which is how
+// a custom badge replaces the plate instead of being painted on top of it.
+constexpr uintptr_t ADDR_CHARSEL_PLATE_GATE[2] = { 0x816019, 0x81601F };
+
 constexpr uint8_t kVisibleVanillaPaletteCount = 8;
 constexpr size_t kOptionCapacity = kVisibleVanillaPaletteCount * 2;
 constexpr uint8_t kRandomCharacterMaxGridIndex = 17;
@@ -955,20 +990,57 @@ static char CallOriginalWithFrontendButtonsStripped(CharSelSelectPlayer_t origin
     return result;
 }
 
-static void DrawTextShadowed(int x,
-                             int y,
-                             uint8_t r,
-                             uint8_t g,
-                             uint8_t b,
-                             const char* text) {
+// The plate's own look: a 101,101,101 outline under a white body. Drawn as four
+// offset passes rather than one shadow, because the art is outlined on all
+// sides and a single drop shadow reads as a different label next to it.
+static void DrawPlateStyleText(int x, int y, const char* text) {
     if (!text || !text[0]) {
         return;
     }
+    const unsigned int outline =
+        (unsigned int)s_createColor(kPlateOutline, kPlateOutline, kPlateOutline);
+    const unsigned int body = (unsigned int)s_createColor(kPlateInkR, kPlateInkG, kPlateInkB);
+    s_drawFormatString(x - 1, y, outline, (char*)"%s", (char*)text);
+    s_drawFormatString(x + 1, y, outline, (char*)"%s", (char*)text);
+    s_drawFormatString(x, y - 1, outline, (char*)"%s", (char*)text);
+    s_drawFormatString(x, y + 1, outline, (char*)"%s", (char*)text);
+    s_drawFormatString(x, y, body, (char*)"%s", (char*)text);
+}
 
-    const unsigned int shadowColor = (unsigned int)s_createColor(0, 0, 0);
-    const unsigned int textColor = (unsigned int)s_createColor(r, g, b);
-    s_drawFormatString(x + 1, y + 1, shadowColor, (char*)"%s", (char*)text);
-    s_drawFormatString(x, y, textColor, (char*)"%s", (char*)text);
+// True when the plate the game would draw is wrong for what is selected: a
+// custom palette has no COLOR-n sprite, and showing its base palette's plate
+// would name a colour the player is not looking at.
+static bool SlotShowsCustomBadge(uint8_t gameSlot, char* outLabel, size_t labelSize) {
+    if (gameSlot > 1) {
+        return false;
+    }
+    const FrontendSlotState& state = s_slotState[gameSlot];
+    if (state.phase == SlotPhase::None) {
+        return false;
+    }
+    const uint8_t enableValue =
+        ReadU8(gameSlot == 0 ? ADDR_CHARSEL_P1_ENABLE : ADDR_CHARSEL_P2_ENABLE, 0xFF);
+    if ((int8_t)enableValue == -1) {
+        return false;
+    }
+
+    PaletteOption options[kOptionCapacity] = {};
+    const int optionCount = BuildOptions(gameSlot, state.character_id, options, (int)kOptionCapacity);
+    if (optionCount <= 0) {
+        return false;
+    }
+    uint8_t optionIndex = state.display_index;
+    if (optionIndex >= optionCount) {
+        optionIndex = 0;
+    }
+    if (!options[optionIndex].use_custom) {
+        return false;
+    }
+    if (outLabel && labelSize) {
+        _snprintf_s(outLabel, labelSize, _TRUNCATE, "CUSTOM-%u",
+                    (unsigned)(options[optionIndex].base_palette + 1));
+    }
+    return true;
 }
 
 static void DrawSlotOverlay(uint8_t gameSlot) {
@@ -994,27 +1066,28 @@ static void DrawSlotOverlay(uint8_t gameSlot) {
     }
     const PaletteOption& option = options[optionIndex];
 
-    char label[64] = {};
-    if (state.phase == SlotPhase::Selecting) {
-        _snprintf_s(label,
-            sizeof(label),
-            _TRUNCATE,
-            option.use_custom ? "< CUSTOM %u >" : "< COLOR %u >",
-            (unsigned)(option.base_palette + 1));
-    } else {
-        _snprintf_s(label,
-            sizeof(label),
-            _TRUNCATE,
-            option.use_custom ? "CUSTOM %u" : "COLOR %u",
-            (unsigned)(option.base_palette + 1));
+    // The label used to be spelled out here, which put "< COLOR 1 >" next to the
+    // game's own COLOR-1 plate saying the same thing twice. The plate is the
+    // label; this only adds what the plate cannot say.
+    const int panelX = kPlatePanelX[gameSlot];
+    const int inkX0 = panelX + kPlateInkX0;
+    const int inkX1 = panelX + kPlateInkX1;
+
+    // A custom palette has no plate of its own, and the one the game would draw
+    // names the base colour rather than the custom. Hook_CharSelRenderHelper has
+    // already suppressed it, so this stands in for it, on the plate's own line.
+    if (option.use_custom) {
+        char badge[32] = {};
+        _snprintf_s(badge, sizeof(badge), _TRUNCATE, "CUSTOM-%u",
+                    (unsigned)(option.base_palette + 1));
+        DrawPlateStyleText(inkX0, kPlateInkTopY, badge);
     }
 
-    const int x = gameSlot == 0 ? 12 : 396;
-    const int y = 410;
-    const uint8_t r = option.use_custom ? 255 : 240;
-    const uint8_t g = option.use_custom ? 220 : 240;
-    const uint8_t b = option.use_custom ? 96 : 255;
-    DrawTextShadowed(x, y, r, g, b, label);
+    // Arrows only while the colour is actually being cycled.
+    if (state.phase == SlotPhase::Selecting) {
+        DrawPlateStyleText(inkX0 - kArrowLeftGap, kPlateInkTopY, "<");
+        DrawPlateStyleText(inkX1 + kArrowRightGap, kPlateInkTopY, ">");
+    }
 }
 
 static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
@@ -1255,7 +1328,34 @@ static char __cdecl Hook_CharSelSelectPlayer(uint16_t* rawInput,
 }
 
 static int __cdecl Hook_CharSelRenderHelper() {
+    // Suppress the native COLOR-n plate for any side showing a custom palette,
+    // across the original call only. Restored immediately: the byte is the
+    // "character locked, choosing colour" phase flag, and the game reads it
+    // elsewhere for more than drawing.
+    uint8_t savedGate[2] = {0, 0};
+    bool gateCleared[2] = {false, false};
+    EnsureFrontendState();
+    if (s_frontendActive) {
+        for (uint8_t slot = 0; slot < 2; ++slot) {
+            if (!SlotShowsCustomBadge(slot, nullptr, 0)) {
+                continue;
+            }
+            savedGate[slot] = ReadU8(ADDR_CHARSEL_PLATE_GATE[slot], 0);
+            if (savedGate[slot] == 1) {
+                WriteU8(ADDR_CHARSEL_PLATE_GATE[slot], 0);
+                gateCleared[slot] = true;
+            }
+        }
+    }
+
     const int result = s_originalRenderHelper();
+
+    for (uint8_t slot = 0; slot < 2; ++slot) {
+        if (gateCleared[slot]) {
+            WriteU8(ADDR_CHARSEL_PLATE_GATE[slot], savedGate[slot]);
+        }
+    }
+
     EnsureFrontendState();
     if (!s_frontendActive) {
         return result;

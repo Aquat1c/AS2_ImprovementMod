@@ -244,6 +244,17 @@
 // handle_serial_skew run: after F10a/F10b/F10c the ONLY remaining unmasked
 // differing 64-byte window was match+[7424,7488), and this dword is the one
 // thing written inside it.
+// Weather particle pool: 200 slots x 28 bytes at match+1868, seeded once by
+// Weather_Init and thereafter touched ONLY by the render phase - sub_4C47C0
+// updates it (and calls rand() doing so), sub_4C6260 / sub_4C63A0 draw it.
+// It ends at exactly 7468, where the stage image handle begins.
+//
+// Inert on every stage but Patton (stage id 2), the one stage with a weather
+// effect - which is why a render-cadence window sitting inside the hashed
+// region went unnoticed.
+#define MATCH_WEATHER_PARTICLES_OFF  0x74C                 // match+1868
+#define MATCH_WEATHER_PARTICLES_SIZE 0x15E0                // 200 * 28 = 5600
+
 #define MATCH_STAGE_IMAGE_HANDLE_OFF 0x1D2C                // match+7468, 1 handle
 #define MATCH_STAGE_IMAGE_HANDLE_SIZE 0x004
 
@@ -1445,6 +1456,16 @@
 #define ADDR_PAUSE_MENU_INPUT       (GAME_BASE + 0x0C8250)  // sub_4C8250 - cursor + value adjust
 #define ADDR_PAUSE_MENU_RENDER      (GAME_BASE + 0x0C8870)  // sub_4C8870 - dim + 11 rows
 #define ADDR_TRAINING_INPUT_DISPLAY_RENDER (GAME_BASE + 0x0C8E20)  // sub_4C8E20 - command strip
+
+// --- Match HUD ------------------------------------------------------------
+// sub_4C05B0 draws the whole HUD inline (36 quads, 15 sprites) with no
+// per-element sub-calls, so per-element hiding filters the two primitives while
+// it is on the stack - see patches/hud_toggle.h for the coordinate map. Its own
+// address is ADDR_MATCH_HUD_RENDER above; netplay_hud_vanilla owns that hook.
+#define ADDR_COMBO_DISPLAY_RENDER  (GAME_BASE + 0x0C1F90)  // sub_4C1F90 - combo/score popups
+#define ADDR_STATUS_CALLOUT_RENDER (GAME_BASE + 0x0C7F30)  // sub_4C7F30 - per-player cut-in banner
+#define ADDR_RENDER_DRAW_QUAD      (GAME_BASE + 0x1D3060)  // Render_DrawTexturedQuad
+#define ADDR_RENDER_DRAW_SPRITE    (GAME_BASE + 0x1D3130)  // Render_DrawSprite
 // Vanilla pause-menu geometry: label column x 64..319, value column x 320..447,
 // row i spans y = 64 + 32*i .. 95 + 32*i. Selected rows tint red, disabled rows
 // draw at half brightness.

@@ -68,6 +68,18 @@ constexpr MaskRange kMainDigestMasks[] = {
     // histories differ here with no gameplay meaning whatsoever.
     { (size_t)MATCH_SE_HANDLES_OFF,
       (size_t)(MATCH_SE_HANDLES_SIZE + MATCH_PER_FRAME_TEMP_SIZE) },                   // F9 + F7c
+    // F10e: the 200-slot weather particle pool (match+1868..7467). Seeded by
+    // Weather_Init at stage load, then written every RENDER frame by sub_4C47C0
+    // - which respawns particles with rand() % 640 - and read only by the two
+    // draw passes. No sim reader, exactly like the windows above, but unlike
+    // them it also perturbs nothing gameplay-side: the writes are confined to
+    // this pool.
+    //
+    // It stayed hashed because it is all zeroes on every stage except Patton
+    // (stage id 2), the one stage with weather, so a render:sim ratio that
+    // differs between peers had nothing to diverge until that stage came up.
+    { (size_t)MATCH_WEATHER_PARTICLES_OFF,
+      (size_t)MATCH_WEATHER_PARTICLES_SIZE },                                          // F10e
     // F10d: the stage background image handle (match+7468), written by
     // sub_4C3D90 and read only by Weather_Draw. Same sub_612DF0 provenance as
     // the tables above; it was the last unmasked window under a skewed run.

@@ -106,6 +106,17 @@ enum class DefensiveResponse : uint8_t {
     Repel,
     // 6D (or 4D) - the guide lists it as "6D or 4D; air OK". Category 1 only.
     GuardCounter,
+    // Guard + D, timed so the press is a fresh edge inside blockstun. That is
+    // the branch Entity_CheckAirTech takes for free. Category 4 only.
+    PushAwayPerfect,
+    // 214D - the "Warzard counter". Enables a special guard state that repels
+    // attacks; +823 is that state, and action 49 is what it produces when the
+    // opponent connects. Category 5 only.
+    AbsoluteDefence,
+    // The same mechanic on the other branch: D simply held, which makes +78
+    // read 0 inside blockstun and sends it to the "or 100 meter" arm. Weaker,
+    // but it is what an untimed press actually does. Category 4 only.
+    PushAwayMetered,
     Count,
 };
 
@@ -143,6 +154,8 @@ enum class DefenseInputKind : uint8_t {
     ForwardTap,      // repel arm: FORWARD from neutral
     DodgePress,      // D + BACK out of blockstun
     CounterForward,  // D + FORWARD, the category-1 guard counter
+    ArmGuardState,   // run 214D, the category-5 counter-guard motion
+    DownTap,         // 2 from neutral, the low half of the category-3 parry
 };
 
 struct DefenseDriveSample {
@@ -153,13 +166,24 @@ struct DefenseDriveSample {
     bool airborne = false;
     bool threatArmed = false;
     bool actionable = false;      // engine would accept an ordinary input now
+    bool guardStateArmed = false; // +823, the category-5 counter-guard flag
+    // Which lane the incoming attack demands. The category-3 parry is 6 against
+    // high and mid but 2 against low, so the driver has to know which is coming.
+    GroundGuardClass threatClass = GroundGuardClass::None;
 };
 
 struct DefenseDriveState {
     ParryInputState parry{};
     bool tapPhase = false;        // alternates the neutral / press frames
+    bool pushPhase = false;       // alternates the D press so each one is an edge
     bool counterFired = false;    // one counter per threat, not a held direction
+    // 214D is a motion, not a press, so the driver walks it a frame at a time.
+    int8_t armStep = -1;          // -1 idle, else the step being fed
 };
+
+// Frames in the 214D motion. Matches the game's own command table entry for it
+// (0x723480 cmd 26: 2, 1, 4 with the D gate).
+constexpr int kGuardStateMotionFrames = 3;
 
 DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                                       const DefenseDriveSample& sample,
@@ -170,6 +194,25 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
 // 70/71 (air) blockstun, so pressing it anywhere else is wasted.
 constexpr uint16_t kDodgeMeterCost = 500;
 bool DodgeWindowOpen(uint32_t actionId, uint16_t meter);
+
+// True for mechanics the engine only offers *out of blockstun*, so a dummy that
+// is not blocking can never perform them however hard it presses. Selecting one
+// therefore has to imply guarding.
+bool ResponseRequiresBlockstun(DefensiveResponse response);
+
+// Push-away is armed by Entity_CheckAirTech (0x424C90), reached only from the
+// four category-4 characters. It needs BACK held *and* D held; a fresh D press
+// inside blockstun arms it outright, and otherwise 100 meter does. So it is not
+// input-free - it is guard + D, the same shape as the dodge with a cheaper gate
+// and a wider set of accepting actions.
+constexpr uint16_t kPushAwayMeterCost = 100;
+bool PushAwayWindowOpen(uint32_t actionId, uint16_t meter);
+
+// The free half of that: the actions whose *fresh* D press arms push-away
+// without paying. Entity_CheckAirTech takes the free branch only when +78 reads
+// just-pressed inside one of these, so a D held from before contact reads 0
+// there and silently drops to the 100-meter branch instead.
+bool PushAwayFreeWindow(uint32_t actionId);
 
 // Held as a semantic direction and resolved to physical left/right as late as
 // possible, so a side change between input and contact cannot stale the guard.

@@ -63,7 +63,10 @@ constexpr size_t kReplaySelectDisplayBytes = ADDR_REPLAY_HEADER_BASE - ADDR_REPL
 constexpr int32_t kCoarseCheckpointInterval = 600;
 constexpr int32_t kSeekFramesPerHotkey = 60;
 constexpr int32_t kTakeoverCountdownFrames = 60;
-constexpr int32_t kReplayBrowserPageSize = 8;  // matches the rows the browser draws
+// The scroll clamp and the draw loop must agree or the selection can sit
+// outside the drawn rows. 7 since the folder summary took a row's worth of
+// height above the list.
+constexpr int32_t kReplayBrowserPageSize = 7;
 constexpr float kSeekScale = 16.0f;
 constexpr float kSpeedSteps[] = {0.5f, 1.0f, 1.25f, 1.5f, 2.0f, 4.0f};
 
@@ -291,7 +294,6 @@ static uint32_t s_verifyHashChecks = 0;
 
 static fs::path s_netplaySetFolder;
 static std::string s_netplaySetKey;
-static int s_netplaySetLastTotalMatches = 0;
 
 static uint32_t ReadU32(const uint8_t* data);
 static std::string WideToUtf8(const std::wstring& text);
@@ -304,6 +306,7 @@ static bool ExitReplayPlaybackToReplayMenu(const char* reason);
 static void RenderReplayBrowserHud();
 static bool ReadReplayMetadata(const fs::path& path, ReplayFileMetadata* outMetadata);
 static bool ShouldRenameNetplayReplaySave(const Net::SessionSnapshot& session);
+static bool WriteNetplayNamesIntoHeader(const fs::path& replayPath);
 static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
                                        const ReplayFileMetadata& metadata,
                                        fs::path* outRenamedPath);
@@ -957,6 +960,9 @@ static char __cdecl Hook_ReplaySave(int matchBase) {
     if (shouldRenameNetplayReplay) {
         ReplayFileMetadata metadata{};
         if (ReadReplayMetadata(replayPath, &metadata) && metadata.valid) {
+            // Before the rename, so the path is still the one just written.
+            WriteNetplayNamesIntoHeader(replayPath);
+
             fs::path processedPath = replayPath;
             if (RenameReplaySaveForNetplay(replayPath, metadata, &processedPath)) {
                 fs::path movedPath;
@@ -1297,6 +1303,74 @@ static std::string BuildNetplayReplayFilename(const fs::path& replayPath,
         names.p2_nickname + "_" + p2Character + ".rep";
 }
 
+// UTF-8 in, the game's own encoding out. The inverse of GameTextToUtf8 further
+// down; both are local because the netplay menu's copies are file-static.
+static std::string Utf8ToGameText(const std::string& utf8) {
+    if (utf8.empty()) {
+        return {};
+    }
+    const int wideSize = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    if (wideSize <= 1) {
+        return utf8;
+    }
+    std::wstring wide(static_cast<size_t>(wideSize), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, wide.data(), wideSize);
+    wide.resize(static_cast<size_t>(wideSize - 1));
+
+    const int size = WideCharToMultiByte(932, 0, wide.c_str(), -1, nullptr, 0,
+                                         nullptr, nullptr);
+    if (size <= 1) {
+        return utf8;
+    }
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(932, 0, wide.c_str(), -1, result.data(), size, nullptr, nullptr);
+    result.resize(static_cast<size_t>(size - 1));
+    return result;
+}
+
+// The header has two 21-byte name fields the game fills in for its own replays
+// and leaves empty for ours, which is why the browser had to reconstruct the
+// nicknames from the filename. Writing them puts the data where it belongs: it
+// survives a rename, it needs no parsing, and the game's own replay HUD picks it
+// up because that is already where it reads the names from.
+static bool WriteNetplayNamesIntoHeader(const fs::path& replayPath) {
+    const NetplayReplayNames names = BuildNetplayReplayNames();
+    if (names.p1_nickname.empty() && names.p2_nickname.empty()) {
+        return false;
+    }
+
+    std::fstream stream(replayPath, std::ios::binary | std::ios::in | std::ios::out);
+    if (!stream) {
+        LOG_WARN("[Replay] Could not open %s to write nicknames",
+                 WideToUtf8(replayPath.wstring()).c_str());
+        return false;
+    }
+
+    // The field is fixed width and the game reads it as its own encoding, so it
+    // is converted and zero-padded rather than written as UTF-8.
+    const auto writeField = [&](size_t offset, const std::string& utf8) {
+        std::array<char, kReplayHeaderNameBytes> field{};
+        const std::string encoded = Utf8ToGameText(utf8);
+        const size_t length = (std::min)(encoded.size(), field.size() - 1u);
+        std::memcpy(field.data(), encoded.data(), length);
+        stream.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
+        stream.write(field.data(), static_cast<std::streamsize>(field.size()));
+    };
+
+    writeField(kReplayHeaderP1NameOffset, names.p1_nickname);
+    writeField(kReplayHeaderP2NameOffset, names.p2_nickname);
+    stream.flush();
+    if (!stream) {
+        LOG_WARN("[Replay] Failed writing nicknames into %s",
+                 WideToUtf8(replayPath.wstring()).c_str());
+        return false;
+    }
+
+    LOG_INFO("[Replay] Wrote nicknames into header: p1='%s' p2='%s'",
+             names.p1_nickname.c_str(), names.p2_nickname.c_str());
+    return true;
+}
+
 static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
                                        const ReplayFileMetadata& metadata,
                                        fs::path* outRenamedPath) {
@@ -1344,13 +1418,19 @@ static bool RenameReplaySaveForNetplay(const fs::path& replayPath,
     return true;
 }
 
+// Who is playing, and nothing else.
+//
+// This used to include the local game slot and the session role. Both change
+// when the two sides swap - which happens between matches of a normal set - so
+// the folder was being torn down and rebuilt mid-session. That is what produced
+// runs like 23-24-55 / 23-27-21 / 23-31-02: three folders, seven minutes, one
+// set. Characters were never in the key and must not be: a set is the people,
+// not the matchup.
 static std::string BuildNetplayReplaySetKey(const NetplayReplayNames& names) {
     char buffer[256] = {};
-    snprintf(buffer, sizeof(buffer), "%s|%s|%d|%d",
+    snprintf(buffer, sizeof(buffer), "%s|%s",
         names.p1_nickname.c_str(),
-        names.p2_nickname.c_str(),
-        Net::PlayerMapping_GetLocalGameSlot(),
-        (int)Net::Session_GetRole());
+        names.p2_nickname.c_str());
     return buffer;
 }
 
@@ -1362,7 +1442,6 @@ static void ResetNetplayReplaySetFolder(const char* reason) {
     }
     s_netplaySetFolder.clear();
     s_netplaySetKey.clear();
-    s_netplaySetLastTotalMatches = 0;
 }
 
 static bool EnsureNetplayReplaySetFolder(const fs::path& replayPath,
@@ -1374,17 +1453,15 @@ static bool EnsureNetplayReplaySetFolder(const fs::path& replayPath,
 
     const NetplayReplayNames names = BuildNetplayReplayNames();
     const std::string key = BuildNetplayReplaySetKey(names);
-    Net::SetTrackerSnapshot setSnapshot{};
-    Net::SetTracker_GetSnapshot(&setSnapshot);
 
     if (!s_netplaySetKey.empty() && s_netplaySetKey != key) {
         ResetNetplayReplaySetFolder("participant change");
     }
-    if (!s_netplaySetFolder.empty() &&
-        setSnapshot.total_matches > 0 &&
-        setSnapshot.total_matches <= s_netplaySetLastTotalMatches) {
-        ResetNetplayReplaySetFolder("set counter reset");
-    }
+    // The set-counter comparison that used to sit here also split folders
+    // mid-session. SetTracker_Reset only runs on disconnect, so a falling
+    // total_matches meant a rematch had restarted the count - a new match, not
+    // a new set. Session end is now the only thing that closes a folder, via
+    // ReplayRuntime_OnNetplaySessionEnd.
 
     std::error_code ec;
     if (!s_netplaySetFolder.empty()) {
@@ -1400,15 +1477,13 @@ static bool EnsureNetplayReplaySetFolder(const fs::path& replayPath,
     }
 
     if (s_netplaySetFolder.empty()) {
-        const std::string p1Character = SanitizeReplayFilenameComponent(
-            GetCharacterDisplayName(metadata.p1_char),
-            "P1Char");
-        const std::string p2Character = SanitizeReplayFilenameComponent(
-            GetCharacterDisplayName(metadata.p2_char),
-            "P2Char");
+        // No characters in the name. The folder holds a whole set, and the
+        // characters in it change from match to match - naming it after
+        // whichever pair happened to play first was both wrong for most of its
+        // contents and made per-session folders read as per-matchup ones. The
+        // individual replay filenames still carry the characters.
         const std::string baseName =
-            names.p1_nickname + "_" + p1Character + "_vs_" +
-            names.p2_nickname + "_" + p2Character + " - " +
+            names.p1_nickname + "_vs_" + names.p2_nickname + " - " +
             FormatReplayTimestampForFolder(replayPath);
         fs::path candidate = fs::path(L"replay") / L"netplay" / fs::path(baseName);
 
@@ -1433,7 +1508,6 @@ static bool EnsureNetplayReplaySetFolder(const fs::path& replayPath,
             WideToUtf8(s_netplaySetFolder.wstring()).c_str());
     }
 
-    s_netplaySetLastTotalMatches = setSnapshot.total_matches;
     *outFolder = s_netplaySetFolder;
     return true;
 }
@@ -2147,8 +2221,7 @@ static bool HandleMatchHotkeys() {
     const bool shiftDown = KeyDown(VK_SHIFT);
 
     if (ConsumeEdge(kHotkeyToggleHud, &s_toggleHudKeyWasDown)) {
-        s_replayHudVisible = !s_replayHudVisible;
-        LOG_INFO("[Replay] HUD %s", s_replayHudVisible ? "shown" : "hidden");
+        ReplayRuntime_SetHudVisible(!s_replayHudVisible);
     }
 
     if (ConsumeEdge(kHotkeyPause, &s_pauseKeyWasDown)) {
@@ -2681,6 +2754,68 @@ static std::string GetBrowserCurrentPathText() {
     return std::string("replay/") + NormalizeGameDisplayPath(s_browserCurrentDirectory);
 }
 
+// A read on the folder currently open.
+//
+// Deliberately NOT recursive: it describes the directory being looked at, from
+// the entries already listed, so opening a set folder summarises that set and
+// the netplay root stays silent (it holds folders, not matches).
+struct BrowserFolderSummary {
+    bool        valid = false;
+    int         replays = 0;
+    int32_t     longestFrames = 0;
+    int64_t     totalFrames = 0;
+    std::string topP1;
+    std::string topP2;
+};
+
+static std::string FormatReplayClock(int64_t frames) {
+    const int64_t seconds = frames / 60;
+    char buffer[32] = {};
+    snprintf(buffer, sizeof(buffer), "%lld:%02lld",
+             (long long)(seconds / 60), (long long)(seconds % 60));
+    return buffer;
+}
+
+static BrowserFolderSummary BuildBrowserFolderSummary() {
+    BrowserFolderSummary out{};
+    std::map<uint32_t, int> p1Counts;
+    std::map<uint32_t, int> p2Counts;
+
+    for (const ReplayBrowserEntry& entry : s_browserEntries) {
+        if (entry.type != ReplayBrowserEntryType::ReplayFile || !entry.metadata.valid) {
+            continue;
+        }
+        ++out.replays;
+        out.totalFrames += entry.metadata.frames;
+        if (entry.metadata.frames > out.longestFrames) {
+            out.longestFrames = entry.metadata.frames;
+        }
+        ++p1Counts[entry.metadata.p1_char];
+        ++p2Counts[entry.metadata.p2_char];
+    }
+
+    if (out.replays == 0) {
+        return out;
+    }
+
+    const auto topOf = [](const std::map<uint32_t, int>& counts) -> std::string {
+        const uint32_t* best = nullptr;
+        int bestCount = 0;
+        for (const auto& pair : counts) {
+            if (pair.second > bestCount) {
+                bestCount = pair.second;
+                best = &pair.first;
+            }
+        }
+        return best ? GetCharacterDisplayName(*best) : std::string();
+    };
+
+    out.topP1 = topOf(p1Counts);
+    out.topP2 = topOf(p2Counts);
+    out.valid = true;
+    return out;
+}
+
 static std::string GetBrowserEntryValueText(const ReplayBrowserEntry& entry) {
     switch (entry.type) {
         case ReplayBrowserEntryType::ParentDirectory:
@@ -2699,6 +2834,129 @@ static std::string GetBrowserEntryValueText(const ReplayBrowserEntry& entry) {
     char buffer[32] = {};
     snprintf(buffer, sizeof(buffer), "%d:%02d", seconds / 60, seconds % 60);
     return buffer;
+}
+
+// The header carries the player names in the game's own encoding, while the
+// text bridge draws UTF-8, so they have to be converted before they can be
+// shown. ASCII survives either way, which is why this only shows up once
+// somebody plays with a Japanese or Cyrillic nickname.
+static std::string GameTextToUtf8(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int wideSize = MultiByteToWideChar(932, 0, text.c_str(), -1, nullptr, 0);
+    if (wideSize <= 1) {
+        return text;
+    }
+    std::wstring wide(static_cast<size_t>(wideSize), L'\0');
+    MultiByteToWideChar(932, 0, text.c_str(), -1, wide.data(), wideSize);
+    wide.resize(static_cast<size_t>(wideSize - 1));
+
+    const int utf8Size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1,
+                                             nullptr, 0, nullptr, nullptr);
+    if (utf8Size <= 1) {
+        return text;
+    }
+    std::string result(static_cast<size_t>(utf8Size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, result.data(), utf8Size,
+                        nullptr, nullptr);
+    result.resize(static_cast<size_t>(utf8Size - 1));
+    return result;
+}
+
+// Netplay saves put the nicknames in the *filename*, not the header - nothing
+// writes the header's name fields, they are the game's own for local replays and
+// stay empty otherwise. BuildNetplayReplayFilename lays it out as
+//
+//     {yyyymmdd}_{hhmmss}_{p1nick}_{p1char}_vs_{p2nick}_{p2char}.rep
+//
+// and the character names are already known from the metadata, so each side's
+// nickname is whatever is left once its character suffix is removed.
+static bool SplitNetplayReplayNames(const std::string& stem,
+                                    const ReplayFileMetadata& metadata,
+                                    std::string* outP1,
+                                    std::string* outP2) {
+    const std::string separator = "_vs_";
+    const size_t split = stem.find(separator);
+    if (split == std::string::npos) {
+        return false;
+    }
+
+    std::string left = stem.substr(0, split);
+    std::string right = stem.substr(split + separator.size());
+
+    // Drop the leading timestamp, which is always two underscore-separated
+    // fixed-width fields.
+    size_t cursor = 0;
+    for (int field = 0; field < 2; ++field) {
+        const size_t underscore = left.find('_', cursor);
+        if (underscore == std::string::npos) {
+            return false;
+        }
+        cursor = underscore + 1;
+    }
+    left = left.substr(cursor);
+
+    const auto stripCharacter = [](std::string& text, const std::string& character) {
+        const std::string suffix = "_" + character;
+        if (text.size() > suffix.size() &&
+            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            text.resize(text.size() - suffix.size());
+            return true;
+        }
+        return false;
+    };
+
+    const std::string p1Character =
+        SanitizeReplayFilenameComponent(GetCharacterDisplayName(metadata.p1_char), "P1Char");
+    const std::string p2Character =
+        SanitizeReplayFilenameComponent(GetCharacterDisplayName(metadata.p2_char), "P2Char");
+    if (!stripCharacter(left, p1Character) || !stripCharacter(right, p2Character)) {
+        return false;
+    }
+
+    // SanitizeReplayFilenameComponent turned every space into an underscore on
+    // the way in, so turn them back for display. A nickname that genuinely
+    // contained an underscore reads with a space instead, which is a better
+    // trade than showing "Ev_Geniy".
+    const auto unsanitize = [](std::string& text) {
+        for (char& ch : text) {
+            if (ch == '_') {
+                ch = ' ';
+            }
+        }
+    };
+    unsanitize(left);
+    unsanitize(right);
+
+    *outP1 = left;
+    *outP2 = right;
+    return !left.empty() && !right.empty();
+}
+
+// "Aquatic (Fanel) vs Ev (Hatsune)". The filenames are far too long to read in
+// the list column, so the detail bar is where the matchup actually gets said.
+static std::string GetBrowserEntryDetailLine(const ReplayBrowserEntry& entry) {
+    if (entry.type != ReplayBrowserEntryType::ReplayFile || !entry.metadata.valid) {
+        return {};
+    }
+
+    std::string p1Name = GameTextToUtf8(ReplayHeaderNameForSlot(entry.metadata, 0));
+    std::string p2Name = GameTextToUtf8(ReplayHeaderNameForSlot(entry.metadata, 1));
+    if (p1Name.empty() && p2Name.empty()) {
+        SplitNetplayReplayNames(entry.full_path.stem().string(), entry.metadata,
+                                &p1Name, &p2Name);
+    }
+    const std::string p1Char = GetCharacterDisplayName(entry.metadata.p1_char);
+    const std::string p2Char = GetCharacterDisplayName(entry.metadata.p2_char);
+
+    // A replay saved outside netplay has no nicknames, so fall back to the
+    // character-only form rather than printing empty brackets.
+    if (p1Name.empty() && p2Name.empty()) {
+        return p1Char + " vs " + p2Char;
+    }
+    return (p1Name.empty() ? p1Char : p1Name + " (" + p1Char + ")") + " vs " +
+           (p2Name.empty() ? p2Char : p2Name + " (" + p2Char + ")");
 }
 
 static std::string GetBrowserEntryMatchupText(const ReplayBrowserEntry& entry) {
@@ -2725,13 +2983,19 @@ static void RenderReplayBrowserHud() {
     constexpr int kTop       = 16;
     constexpr int kRight     = 604;
     constexpr int kTextX     = 32;
-    constexpr int kMatchX    = 300;   // who fought
-    constexpr int kDateX     = 430;   // when
-    constexpr int kMetaX     = 505;   // how long
+    // Date and time were two columns, which split one value across a gap and
+    // left the date 74px wide - narrow enough that "2026-04-19 20:33:11" was
+    // clipped to "2026-04-...", i.e. the column showed no date at all. One
+    // "Date" column now carries the whole stamp to the minute, and the duration
+    // gets its own heading rather than borrowing the word "Time".
+    constexpr int kMatchX    = 244;   // who fought          (18 chars)
+    constexpr int kWhenX     = 396;   // YYYY-MM-DD HH:MM    (16 chars)
+    constexpr int kLenX      = 540;   // mm:ss
     constexpr int kBarRight  = 588;
     constexpr int kRowPitch  = 32;
-    constexpr int kFirstRow  = 108;  // room for heading, path and column titles
-    constexpr int kRowsShown = 8;  // 9 pushed the panel to the screen edge
+    constexpr int kFirstRow  = 150;  // heading, path, two summary lines, column titles
+    // Driven by the scroll page size so the two can never disagree.
+    constexpr int kRowsShown = kReplayBrowserPageSize;
 
     const int totalEntries = static_cast<int>(s_browserEntries.size());
     const bool hasSelection = s_browserSelected >= 0 && s_browserSelected < totalEntries;
@@ -2784,14 +3048,79 @@ static void RenderReplayBrowserHud() {
     GameDrawTextAt(kRight - 110, kTop + 44, kRepInkDim, kRepInkDim, kRepInkDim,
                    kRepNoteSize, counter);
 
+    // Two summary lines: the counts distributed across the panel, then the
+    // characters underneath. Distributing rather than running one long string
+    // keeps the number you are usually after - the longest match - on the
+    // panel's centre line instead of buried mid-sentence.
+    const BrowserFolderSummary summary = BuildBrowserFolderSummary();
+    if (summary.valid) {
+        const auto textWidth = [](const char* text) {
+            return (int)(GameTextCountChars(text) * (kRepNoteSize * 0.48f));
+        };
+
+        char countText[48] = {};
+        snprintf(countText, sizeof(countText), "%d replay%s",
+                 summary.replays, summary.replays == 1 ? "" : "s");
+
+        char longestText[64] = {};
+        snprintf(longestText, sizeof(longestText), "Longest Match %s",
+                 FormatReplayClock(summary.longestFrames).c_str());
+
+        char totalText[64] = {};
+        snprintf(totalText, sizeof(totalText), "Total time %s",
+                 FormatReplayClock(summary.totalFrames).c_str());
+
+        const int summaryY = kTop + 64;
+        const int centreX = (kTextX + kRight) / 2;
+
+        GameDrawTextAt(kTextX, summaryY, kRepInkDim, kRepInkDim, kRepInkDim,
+                       kRepNoteSize, countText);
+        GameDrawTextAt(centreX - textWidth(longestText) / 2, summaryY,
+                       kRepInk, kRepInk, kRepInk, kRepNoteSize, longestText);
+        GameDrawTextAt(kRight - 16 - textWidth(totalText), summaryY,
+                       kRepInkDim, kRepInkDim, kRepInkDim, kRepNoteSize, totalText);
+
+        char charsText[160] = {};
+        snprintf(charsText, sizeof(charsText),
+                 "Most played characters:   P1: %s   P2: %s",
+                 summary.topP1.c_str(), summary.topP2.c_str());
+        char clippedChars[160] = {};
+        ClipGameText(clippedChars, sizeof(clippedChars), charsText, 62);
+        GameDrawTextAt(kTextX, summaryY + 20, kRepInkFaint, kRepInkFaint,
+                       kRepInkFaint, kRepNoteSize, clippedChars);
+    }
+
     GameDrawTextAt(kTextX + 8, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
                    kRepInkFaint, kRepNoteSize, "Name");
-    GameDrawTextAt(kMatchX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
-                   kRepInkFaint, kRepNoteSize, "Matchup");
-    GameDrawTextAt(kDateX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
-                   kRepInkFaint, kRepNoteSize, "Date");
-    GameDrawTextAt(kMetaX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
-                   kRepInkFaint, kRepNoteSize, "Time");
+
+    // Matchup/Date/Length describe a replay, and folder rows leave all three
+    // blank. Heading three empty columns just labels dead space.
+    //
+    // Scoped to the VISIBLE page, not the whole directory: replay/netplay holds
+    // 44 folders and 4 loose files, so a directory-wide test kept the headings
+    // up over pages that are entirely folders. Because folders sort ahead of
+    // files, this means the headings appear exactly when the first row that has
+    // those values scrolls into view.
+    bool anyReplayRow = false;
+    for (int i = 0; i < kRowsShown; ++i) {
+        const int index = s_browserScroll + i;
+        if (index >= totalEntries) {
+            break;
+        }
+        if (s_browserEntries[index].type == ReplayBrowserEntryType::ReplayFile) {
+            anyReplayRow = true;
+            break;
+        }
+    }
+
+    if (anyReplayRow) {
+        GameDrawTextAt(kMatchX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
+                       kRepInkFaint, kRepNoteSize, "Matchup");
+        GameDrawTextAt(kWhenX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
+                       kRepInkFaint, kRepNoteSize, "Date");
+        GameDrawTextAt(kLenX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
+                       kRepInkFaint, kRepNoteSize, "Length");
+    }
 
     if (totalEntries == 0) {
         GameDrawTextAt(kTextX, kFirstRow + 6, kRepInkDim, kRepInkDim, kRepInkDim,
@@ -2812,9 +3141,59 @@ static void RenderReplayBrowserHud() {
         }
 
         const bool isFolder = entry.type != ReplayBrowserEntryType::ReplayFile;
-        char name[96] = {};
+        // A netplay filename repeats what the other three columns already show -
+        // timestamp, characters, date - so the Name column carries the one thing
+        // they do not: who played. The raw stem is kept for anything that cannot
+        // be read that way, which is every replay the game saved itself.
+        std::string shown = entry.display_name;
+        if (isFolder) {
+            // Set folders end in " - YYYY-MM-DD_HH-MM-SS". At a consistent font
+            // the row fits 56 characters and the older character-laden names run
+            // to 63, so the clock time is dropped here - it is the least useful
+            // part of a folder label, and the detail line under the list still
+            // shows the name in full.
+            const size_t stamp = shown.rfind('_');
+            if (stamp != std::string::npos && shown.size() - stamp == 9 &&
+                shown.find(" - ") != std::string::npos) {
+                shown.resize(stamp);
+            }
+        }
+        if (!isFolder) {
+            std::string p1;
+            std::string p2;
+            if (SplitNetplayReplayNames(entry.full_path.stem().string(), entry.metadata,
+                                        &p1, &p2)) {
+                shown = p1 + " vs " + p2;
+            }
+        }
+        // 20 chars is what clears the Matchup column - but only while that
+        // column is on screen. On a page with no replay rows the other three
+        // columns are not drawn, so the name owns the row and clipping it there
+        // was cropping for a neighbour that is not there.
+        //
+        // The wide figure is derived from the selection bar rather than picked:
+        // the bar runs kTextX..kBarRight and the text starts 8px inside it, so
+        // mirroring that 8px on the right is the whole usable width. Shippori
+        // advances a little under half its size on this mixed-case text, which
+        // is what the 0.48 is.
+        //
+        // Every row draws at kRepBodySize. Shrinking folder rows to buy characters
+        // was worse than the clipping it fixed: the atlas is baked at 19px, so
+        // 17 resamples down while 20 resamples up, and the two read as different
+        // typefaces on the same screen.
+        constexpr int kNameSpanPx = (kBarRight - 8) - (kTextX + 8);
+        constexpr size_t kNameCharsWide =
+            (size_t)((float)kNameSpanPx / (kRepBodySize * 0.48f));
+
+        // Per ROW, not per page. A folder fills none of Matchup/Date/Length, so
+        // its name runs the full width underneath them even when file rows on
+        // the same page still need those columns kept clear. Only a row that
+        // actually prints into them has to stop short.
+        const size_t nameChars = isFolder ? kNameCharsWide : 20u;
+        char name[128] = {};
         ClipGameText(name, sizeof(name),
-                     (isFolder ? ("[ " + entry.display_name + " ]") : entry.display_name).c_str(), 24);
+                     (isFolder ? ("[ " + entry.display_name + " ]") : shown).c_str(),
+                     nameChars);
         const uint8_t ink = isSelected ? kRepInkBright : kRepInk;
         GameDrawTextAt(kTextX + 8, rowTop + 6, ink, ink, ink, kRepBodySize, name);
 
@@ -2824,23 +3203,35 @@ static void RenderReplayBrowserHud() {
             const std::string matchup = GetBrowserEntryMatchupText(entry);
             if (!matchup.empty()) {
                 char clipped[64] = {};
-                ClipGameText(clipped, sizeof(clipped), matchup.c_str(), 16);
+                // 18 fits "Aria / Escalayer"; the column was 15 wide, which cut
+                // the second character's name off mid-word on the longer pairs.
+                ClipGameText(clipped, sizeof(clipped), matchup.c_str(), 18);
                 GameDrawTextAt(kMatchX, rowTop + 8, kRepInkDim, kRepInkDim,
                                kRepInkDim, kRepNoteSize, clipped);
             }
             if (!entry.metadata.modified_time.empty()) {
-                char when[48] = {};
-                ClipGameText(when, sizeof(when),
-                             entry.metadata.modified_time.c_str(), 11);
-                GameDrawTextAt(kDateX, rowTop + 8, kRepInkFaint, kRepInkFaint,
-                               kRepInkFaint, kRepNoteSize, when);
+                // FormatLastWriteTime gives "YYYY-MM-DD HH:MM:SS"; the seconds
+                // are the only part worth dropping, and dropping them is what
+                // makes the rest fit whole instead of being cut mid-date.
+                std::string when = entry.metadata.modified_time;
+                if (when.size() > 16) {
+                    when.resize(16);
+                }
+                GameDrawTextAt(kWhenX, rowTop + 8, kRepInkFaint, kRepInkFaint,
+                               kRepInkFaint, kRepNoteSize, when.c_str());
             }
         }
 
-        const std::string value = GetBrowserEntryValueText(entry);
-        if (!value.empty()) {
-            GameDrawTextAt(kMetaX, rowTop + 8, kRepInkDim, kRepInkDim, kRepInkDim,
-                           kRepNoteSize, value.c_str());
+        // Folders have no duration, matchup or date - the other two columns
+        // already skip them, and putting the word "Folder" under a Time heading
+        // read as data rather than as a type. The bracketed name marks them, and
+        // the detail line under the list says so in full.
+        if (!isFolder) {
+            const std::string value = GetBrowserEntryValueText(entry);
+            if (!value.empty()) {
+                GameDrawTextAt(kLenX, rowTop + 8, kRepInkDim, kRepInkDim, kRepInkDim,
+                               kRepNoteSize, value.c_str());
+            }
         }
     }
 
@@ -2852,9 +3243,9 @@ static void RenderReplayBrowserHud() {
 
         if (selected->type == ReplayBrowserEntryType::ReplayFile &&
             selected->metadata.valid) {
-            const std::string matchup = GetBrowserEntryMatchupText(*selected);
-            char line[128] = {};
-            ClipGameText(line, sizeof(line), matchup.c_str(), 40);
+            const std::string matchup = GetBrowserEntryDetailLine(*selected);
+            char line[192] = {};
+            ClipGameText(line, sizeof(line), matchup.c_str(), 44);
             GameDrawTextAt(kTextX + 8, detailTop + 4, kRepInk, kRepInk, kRepInk,
                            kRepNoteSize, line);
 
@@ -2866,6 +3257,14 @@ static void RenderReplayBrowserHud() {
             ClipGameText(clippedMeta, sizeof(clippedMeta), meta, 44);
             GameDrawTextAt(kTextX + 8, detailTop + 24, kRepInkFaint, kRepInkFaint,
                            kRepInkFaint, kRepNoteSize, clippedMeta);
+        } else if (selected->type == ReplayBrowserEntryType::Directory) {
+            // The row drops the clock time to fit; this is where it comes back.
+            char full[192] = {};
+            ClipGameText(full, sizeof(full), selected->display_name.c_str(), 60);
+            GameDrawTextAt(kTextX + 8, detailTop + 4, kRepInk, kRepInk, kRepInk,
+                           kRepNoteSize, full);
+            GameDrawTextAt(kTextX + 8, detailTop + 24, kRepInkFaint, kRepInkFaint,
+                           kRepInkFaint, kRepNoteSize, "Folder");
         } else {
             GameDrawTextAt(kTextX + 8, detailTop + 4, kRepInkDim, kRepInkDim, kRepInkDim,
                            kRepNoteSize,
@@ -2933,9 +3332,38 @@ void ReplayRuntime_Shutdown() {
     LOG_INFO("[Replay] Runtime shutdown");
 }
 
+void ReplayRuntime_SetHudVisible(bool visible) {
+    if (s_replayHudVisible == visible) {
+        return;
+    }
+    s_replayHudVisible = visible;
+    LOG_INFO("[Replay] HUD %s", visible ? "shown" : "hidden");
+}
+
+bool ReplayRuntime_IsHudVisible() {
+    return s_replayHudVisible;
+}
+
+void ReplayRuntime_OnNetplaySessionEnd(const char* reason) {
+    ResetNetplayReplaySetFolder(reason ? reason : "session end");
+}
+
 void ReplayRuntime_FrameUpdate() {
     if (!s_initialized) {
         return;
+    }
+
+    // A set folder is exactly one connected session, so it must not survive the
+    // session that opened it. OnlineWiring_OnDisconnect closes it; this closes
+    // it too, in case the session ends by a route that does not run that hook.
+    // Without it, reconnecting to the same opponent would append the next set
+    // into the previous set's folder. Only sampled while a folder is open.
+    if (!s_netplaySetFolder.empty()) {
+        Net::SessionSnapshot setSession{};
+        Net::Session_GetSnapshot(&setSession);
+        if (!setSession.active) {
+            ResetNetplayReplaySetFolder("session no longer active");
+        }
     }
 
     UpdateReplayMenuContext();

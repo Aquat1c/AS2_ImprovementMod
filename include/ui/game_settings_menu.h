@@ -13,10 +13,15 @@ namespace NetMenu {
 // Stage select and special characters are absent on purpose: the mod forces
 // both on (netplay sync and UnlockAllContent respectively), so offering them as
 // choices would be a lie.
+//
+// Simple Effects is absent for a harder reason: it is not a display option. It
+// gates sub_4C47C0, which writes particle state AND calls rand() - so a peer
+// with it on steps the shared RNG a different number of times per frame than a
+// peer with it off, and the match desyncs. It is forced to 0 in
+// game_settings_sync rather than offered, so there is no way to set it wrong.
 enum GameSettingRow : int {
     kGameRowDifficulty = 0,
     kGameRowRounds,
-    kGameRowSimpleEffects,
     kGameRowBattleRecording,
     kGameRowVoiceVolume,
     kGameRowSeVolume,

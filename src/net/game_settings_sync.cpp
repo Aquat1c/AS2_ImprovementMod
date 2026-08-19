@@ -12,8 +12,10 @@
 #include "net/game_settings_sync.h"
 
 #include "core/as2_constants.h"
+#include "core/local_rematch.h"
 #include "net/locked_match_config.h"
 #include "patches/memory_utils.h"
+#include "input_system.h"
 #include "patches/input_override.h"
 #include "patches/tick_hooks.h"
 #include "rollback/netplay_log.h"
@@ -185,9 +187,38 @@ static void WriteSettingsBlock(uintptr_t addr, const uint8_t* data, size_t size)
     }
 }
 
+// Simple Effects (0x8E93EF, byte 3 of block B) is forced off and never offered.
+//
+// It is not a display option. It gates sub_4C47C0, which writes particle state
+// and calls rand(); a peer running with it on steps the shared RNG a different
+// number of times per frame than a peer running with it off, so a mismatch is a
+// guaranteed desync rather than a cosmetic difference. Forcing one value on
+// every machine is the only way it cannot be set wrong.
+//
+// Enforced here rather than at the menu because the raw block restore is what
+// reintroduced it: a stale 1 in the ini - written by the setting-id collision
+// that briefly let Appearance rows drive this byte - was faithfully restored on
+// every launch, which is what removed the super background from the whole game.
+constexpr uintptr_t kAddrSimpleEffects = 0x8E93EF;
+
+static void ForceSimpleEffectsOff(const char* reason) {
+    const uint8_t current = ReadMemory<uint8_t>(kAddrSimpleEffects);
+    if (current == 0) {
+        return;
+    }
+    WriteMemory<uint8_t>(kAddrSimpleEffects, 0);
+    LOG_INFO("[GameSettings] Simple Effects was %u, forced to 0 (%s) - it gates "
+             "sub_4C47C0's rand() calls and would desync netplay",
+             current, reason ? reason : "?");
+}
+
 static void CopyCurrentSettingsToPersisted() {
+    ForceSimpleEffectsOff("snapshot");
     ReadSettingsBlock(kSettingsBlockAAddr, s_persistedBlockA, sizeof(s_persistedBlockA));
     ReadSettingsBlock(kSettingsBlockBAddr, s_persistedBlockB, sizeof(s_persistedBlockB));
+    // Belt and braces: even if the byte were set between the force and the read,
+    // the copy that reaches the ini is 0.
+    s_persistedBlockB[kAddrSimpleEffects - kSettingsBlockBAddr] = 0;
     s_persistedRoundOption = GameSettingsSync_ReadRoundOption();
     s_lastObservedRoundOption = s_persistedRoundOption;
 }
@@ -314,7 +345,6 @@ static void ApplyFriendlyIniOverrides() {
         int            maxValue;
     };
     static const IniByteSetting kIniBytes[] = {
-        { L"simple_effects",   0x8E93EF, 1  },
         { L"battle_recording", 0x8E93F0, 1  },
         { L"se_volume",        0x8E9409, 10 },
         { L"bgm_volume",       0x8E940A, 10 },
@@ -413,6 +443,10 @@ static bool SavePersistentSettings(const char* reason) {
         "; The 60fps cadence correction is always on and has no key.\r\n"
         "; input_guard_shell_hotkeys_ime: 1 clears vanilla Win/Alt+Shift suppression hooks\r\n"
         "input_guard_shell_hotkeys_ime=%d\r\n"
+        "; local_rematch: 1 shows the continue prompt after a local VS match\r\n"
+        "local_rematch=%d\r\n"
+        "; background_input: 1 keeps reading pads while the window is unfocused\r\n"
+        "background_input=%d\r\n"
         "\r\n"
         "[GameSettings]\r\n"
         "; difficulty: 0=easy, 1=normal, 2=hard\r\n"
@@ -436,6 +470,8 @@ static bool SavePersistentSettings(const char* reason) {
         "settings_block_a=%s\r\n"
         "settings_block_b=%s\r\n",
         inputGuard.shell_hotkeys_ime ? 1 : 0,
+        LocalRematch::IsEnabled() ? 1 : 0,
+        InputSystem_IsBackgroundInputEnabled() ? 1 : 0,
         ReadMemory<uint8_t>(kGameOptionDifficulty),
         GameSettingsSync_RoundsToWin(s_persistedRoundOption),
         ReadMemory<uint8_t>(ADDR_STAGESEL_ENABLE),
@@ -487,6 +523,16 @@ static void LoadPersistentSettingsIfReady(const char* reason) {
     if (ReadIniString(L"RawSettings", L"settings_block_b", rawB, sizeof(rawB) / sizeof(rawB[0])) &&
         ParseHexBytes(rawB, blockB, sizeof(blockB))) {
         WriteSettingsBlock(kSettingsBlockBAddr, blockB, sizeof(blockB));
+    }
+
+    ForceSimpleEffectsOff("raw block restore");
+
+    // Runtime-only was wrong for this one: it is a standing preference about the
+    // window, not a per-session choice, so losing it every launch reads as the
+    // toggle not working.
+    int backgroundInput = 0;
+    if (ReadIniInt(L"ModSettings", L"background_input", &backgroundInput)) {
+        InputSystem_SetBackgroundInputEnabled(backgroundInput != 0);
     }
 
     ApplyFriendlyIniOverrides();
@@ -603,6 +649,11 @@ void GameSettingsSync_FrameUpdate() {
     if (!s_persistentLoaded || s_sessionCached || !IsVanillaConfigLoaded()) {
         return;
     }
+
+    // The native options screen can still set it, and the game writes its own
+    // config file. Holding it at 0 here means no route - ours, the game's, or a
+    // stale file - can leave the two peers stepping rand() differently.
+    ForceSimpleEffectsOff("frame guard");
 
     if (!CurrentSettingsMatchPersisted()) {
         SavePersistentSettings("local settings changed");

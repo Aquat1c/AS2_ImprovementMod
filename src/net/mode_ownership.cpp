@@ -15,6 +15,7 @@
  */
 
 #include "net/mode_ownership.h"
+#include "core/local_rematch.h"
 #include "core/game_state.h"
 #include "core/as2_constants.h"
 #include "input/input_system.h"
@@ -262,6 +263,16 @@ static int __cdecl Hook_SetGameMode(int mode, char fade) {
         Net::ContinueFlow_ConsumeRematchLatch();
         LOG_NETPLAY(LOG_INFO,
             "[ModeOwn] Continue rematch latched — redirecting WinScreen->CharSel to PrematchIntro(7)");
+        return s_origSetGameMode ? s_origSetGameMode(MODE_PREMATCH_INTRO, 1) : 0;
+    }
+
+    // Same redirect for a local versus rematch. Separate branch on purpose:
+    // the netplay one above must not grow an offline condition.
+    if (s_interceptEnabled && sourceMode == MODE_WINSCREEN && mode == MODE_CHARSEL &&
+        LocalRematch::IsRematchLatched()) {
+        LocalRematch::ConsumeRematchLatch();
+        LOG_NETPLAY(LOG_INFO,
+            "[ModeOwn] Local rematch latched - redirecting WinScreen->CharSel to PrematchIntro(7)");
         return s_origSetGameMode ? s_origSetGameMode(MODE_PREMATCH_INTRO, 1) : 0;
     }
 

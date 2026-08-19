@@ -100,9 +100,50 @@ uintptr_t AttackerEntity() {
     return GetEntityBase(player);
 }
 
+// The mechanic the dummy would actually attempt, after mapping Native onto its
+// category and refusing anything the category cannot perform.
+DefensiveResponse EffectiveResponse(int category) {
+    DefensiveResponse response = g_config.response;
+    if (response == DefensiveResponse::CharacterNative) {
+        response = ResponseForCategory(category);
+    }
+    if (!ResponseSupportedByCategory(response, category)) {
+        response = DefensiveResponse::NormalGuard;
+    }
+    return response;
+}
+
+bool DefensiveResponseSelected() {
+    if (g_config.response == DefensiveResponse::NormalGuard) {
+        return false;
+    }
+    return EffectiveResponse(PracticeDefense_DummyDefenseCategory()) !=
+           DefensiveResponse::NormalGuard;
+}
+
+// Dodge and push-away are guard cancels: the engine only offers them out of
+// blockstun, so a dummy that never blocks can never perform them no matter what
+// it presses. Selecting one implies guarding, which is why the policy is
+// promoted rather than left Off - otherwise the setting deadlocks against
+// itself, waiting for a blockstun state that nothing will ever produce.
+BlockPolicy EffectiveBlockPolicy() {
+    if (g_config.policy != BlockPolicy::Off) {
+        return g_config.policy;
+    }
+    return ResponseRequiresBlockstun(EffectiveResponse(PracticeDefense_DummyDefenseCategory()))
+               ? BlockPolicy::All
+               : BlockPolicy::Off;
+}
+
 bool PracticeGateOpen() {
     if (!g_config.enabled) return false;
-    if (g_config.policy == BlockPolicy::Off) return false;
+    // The defensive-response driver is built in BuildFramePlan, so bailing here
+    // on the block policy alone meant the whole Defense row did nothing unless
+    // auto-block happened to be on as well. They are separate settings: a
+    // selected mechanic opens the gate on its own. Forcing a block stays gated
+    // on the policy further down (g_plan.policyWantsBlock), so nothing starts
+    // blocking that the player did not ask for.
+    if (g_config.policy == BlockPolicy::Off && !DefensiveResponseSelected()) return false;
     if (g_config.controlSwapActive) return false;
     if (GetGameType() != GAMETYPE_TRAINING) return false;
     if (GetGameMode() != MODE_MATCH) return false;
@@ -432,7 +473,7 @@ void BuildFramePlan() {
     PlanFinalize(g_plan, g_config.preferCrouch);
     g_plan.contactOrdinal = g_sequence.resolvedContactGroups;
     g_plan.policyWantsBlock =
-        g_sequence.active && PolicyWantsBlock(g_config.policy, g_sequence, g_plan.contactOrdinal);
+        g_sequence.active && PolicyWantsBlock(EffectiveBlockPolicy(), g_sequence, g_plan.contactOrdinal);
 
     if (g_plan.lane == GuardLane::Conflict) {
         g_telemetry.conflictFrames++;
@@ -456,16 +497,25 @@ void BuildFramePlan() {
     // makes the input display truthful.
     const DefenderGuardState defenderState = ReadDefenderGuardState(dummy);
     const uint32_t anticipatedOrdinal = g_sequence.active ? g_sequence.resolvedContactGroups : 0;
-    const bool policyWould = g_config.policy != BlockPolicy::Off &&
-                             PolicyWantsBlock(g_config.policy, g_sequence, anticipatedOrdinal);
+    const BlockPolicy effectivePolicy = EffectiveBlockPolicy();
+    const bool policyWould = effectivePolicy != BlockPolicy::Off &&
+                             PolicyWantsBlock(effectivePolicy, g_sequence, anticipatedOrdinal);
 
-    const int category = PracticeDefense_DummyDefenseCategory();
-    DefensiveResponse response = g_config.response;
-    if (response == DefensiveResponse::CharacterNative) {
-        response = ResponseForCategory(category);
-    }
-    if (!ResponseSupportedByCategory(response, category)) {
-        response = DefensiveResponse::NormalGuard;
+    const int dummyCategory = PracticeDefense_DummyDefenseCategory();
+    const DefensiveResponse response = EffectiveResponse(dummyCategory);
+
+    // Category 5's whole gate is the stock byte at +823, and nothing in the
+    // decompiled C ever writes it - it comes from a move script. Logging it on
+    // change is the only way to learn whether it starts armed (so the defence
+    // really is automatic) or has to be earned with the character's D special.
+    if (dummyCategory == kDefenseCategoryAbsolute) {
+        static int s_lastStock = -1;
+        const int stock = ReadMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE);
+        if (stock != s_lastStock) {
+            s_lastStock = stock;
+            LOG_INFO("[AutoBlock] absolute-defence stock +823 = %d (action=%u)",
+                     stock, (unsigned)defenderState.actionId);
+        }
     }
 
     DefenseDriveSample drive{};
@@ -476,6 +526,18 @@ void BuildFramePlan() {
     drive.airborne = airborne;
     drive.threatArmed = g_scannedCount > 0;
     drive.actionable = CanAutoGuardAtContact(defenderState);
+    drive.guardStateArmed =
+        ReadMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE) != 0;
+    // The parry direction depends on what is coming, so decode the threat the
+    // dummy would be reacting to. The latched lane is the fallback for a plan
+    // that resolved before the scan found an overlapping box.
+    if (const ScannedThreat* armed = NearestArmedThreat()) {
+        drive.threatClass = DecodeGroundGuardClass(armed->attackMask);
+    } else if (g_plan.laneLatched) {
+        drive.threatClass = (g_plan.lane == GuardLane::Crouch)
+                                ? GroundGuardClass::CrouchOnly
+                                : GroundGuardClass::Either;
+    }
     g_defenseInput = EvaluateDefenseInput(response, drive, g_defenseDrive);
 
     if (policyWould && CanAutoGuardAtContact(defenderState)) {
@@ -623,7 +685,7 @@ int __cdecl Hook_OrdinaryGuard(int attackerCtx, int sourceObject, int16_t* conta
             g_plan.contactOrdinal = g_sequence.resolvedContactGroups;
         }
         g_plan.policyWantsBlock =
-            PolicyWantsBlock(g_config.policy, g_sequence, g_plan.contactOrdinal);
+            PolicyWantsBlock(EffectiveBlockPolicy(), g_sequence, g_plan.contactOrdinal);
     }
 
     const bool compatible = PlanAcceptsAttack(g_plan, attackMask, defenderFlags);
@@ -896,8 +958,19 @@ const PracticeDefenseTelemetry& PracticeDefense_GetTelemetry() {
     return g_telemetry;
 }
 
+bool PracticeDefense_BlockForcedByResponse() {
+    return g_config.enabled &&
+           g_config.policy == BlockPolicy::Off &&
+           ResponseRequiresBlockstun(
+               EffectiveResponse(PracticeDefense_DummyDefenseCategory()));
+}
+
 DefenseInputKind PracticeDefense_DefenseInput() {
     return g_defenseInput;
+}
+
+int PracticeDefense_ArmStep() {
+    return g_defenseDrive.armStep;
 }
 
 int PracticeDefense_DummyDefenseCategory() {

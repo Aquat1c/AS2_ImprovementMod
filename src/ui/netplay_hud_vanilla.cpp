@@ -3,11 +3,13 @@
  * Optional alternative to the ImGui overlay; draws nickname bars via the game's APIs.
  */
 
+#include "patches/hud_toggle.h"
 #include "ui/netplay_hud_vanilla.h"
 
 #include "core/game_state.h"
 #include "core/mod_main.h"
 #include "ui/mod_menu.h"
+#include "ui/netplay_hud.h"
 #include "ui/netplay_hud_style.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -247,6 +249,11 @@ static bool QueryHud(MatchHudData* out) {
 }
 
 static void DrawNicknamesForMode(bool charSel) {
+    // Same hotkey as the ImGui path: this route reaches the screen through the
+    // game's own text calls, so it needs its own check.
+    if (NetplayHud_IsHidden()) {
+        return;
+    }
     MatchHudData hud{};
     if (!QueryHud(&hud)) {
         return;
@@ -361,7 +368,11 @@ static __int16 __cdecl Hook_MatchHudRender(int game, int match) {
     // never sees it. (If the game renderer itself faults the process crashes, so
     // there is no later save for an unrestored override to leak into.)
     RollbackHudSmooth_BeforeRender();
+    // Marks the window in which the training HUD filter may drop draws; this
+    // hook owns 0x4C05B0, so hud_toggle rides it rather than hooking it twice.
+    HudToggle_BeginHudRender();
     const __int16 result = s_origMatchHudRender ? s_origMatchHudRender(game, match) : 0;
+    HudToggle_EndHudRender();
     RollbackHudSmooth_AfterRender();
 
     if (NetplayHudStyle::GetRenderMode() != NetplayHudStyle::HudRenderMode::Vanilla) {

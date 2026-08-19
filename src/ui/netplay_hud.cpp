@@ -23,6 +23,7 @@
 #include "ui/netplay_hud_style.h"
 
 #include "imgui.h"
+#include "log_window.h"
 #include <algorithm>
 #include <cfloat>
 #include <cstdio>
@@ -326,7 +327,16 @@ static void DrawPlayerSideRight(ImDrawList* dl,
                      namePart);
 }
 
+// Set by the Hide Netplay Overlay hotkey. Gating here rather than at the draw
+// calls keeps HasVisibleHud() honest, so anything that lays itself out around
+// the HUD sees it as gone.
+static bool s_hudHidden = false;
+
 static bool QueryActiveHud(MatchHudData* outHud) {
+    if (s_hudHidden) {
+        return false;
+    }
+
     const uint32_t frame = AS2_GetFrameNumber();
     const uint32_t mode = GetGameMode();
     const uint32_t substate = GetSubstate();
@@ -372,6 +382,22 @@ static bool QueryActiveHud(MatchHudData* outHud) {
 
 bool NetplayHud_HasVisibleHud() {
     return QueryActiveHud(nullptr);
+}
+
+void NetplayHud_SetHidden(bool hidden) {
+    if (s_hudHidden == hidden) {
+        return;
+    }
+    s_hudHidden = hidden;
+    LOG_INFO("[NetplayHud] overlay %s", hidden ? "hidden" : "shown");
+}
+
+bool NetplayHud_IsHidden() {
+    return s_hudHidden;
+}
+
+void NetplayHud_ToggleHidden() {
+    NetplayHud_SetHidden(!s_hudHidden);
 }
 
 void NetplayHud_Render() {

@@ -3,6 +3,7 @@
 #include "patches/input_override.h"
 #include "patches/input_sync_hooks.h"
 #include "patches/tick_hooks.h"
+#include "patches/hud_toggle.h"
 #include "patches/practice_defense_hooks.h"
 #include "patches/practice_recovery_hooks.h"
 #include "patches/locale_patch.h"
@@ -426,6 +427,10 @@ bool InstallHooks() {
         LOG_WARN("Practice defense hooks NOT installed (%s) — first-frame-safe "
                  "auto-block unavailable", PracticeDefense_GetInstallError());
     }
+
+    // Per-element HUD hiding. Training-only at the filter, so a failure here
+    // costs a practice convenience and nothing else.
+    HudToggle_Install();
 
     // Pre-command-dispatch observation for frame advantage. Without it recovery
     // falls back to the action-ID edge, which is a tick late by construction.

@@ -19,6 +19,7 @@
 #include "input/input_system.h"
 #include "patches/tick_hooks.h"
 #include "core/game_console.h"
+#include "core/local_rematch.h"
 
 namespace NetMenu {
 
@@ -29,7 +30,6 @@ namespace {
 constexpr uintptr_t kAddrDifficulty      = 0x8E93EC; // +48, 0..2
 constexpr uintptr_t kAddrRounds          = 0x8E93ED; // +49, 0..2 => 1..3 wins
 constexpr uintptr_t kAddrStageSelect     = 0x8E93EE; // +50, flag
-constexpr uintptr_t kAddrSimpleEffects   = 0x8E93EF; // +51, flag
 constexpr uintptr_t kAddrBattleRecording = 0x8E93F0; // +52, flag
 constexpr uintptr_t kAddrVoiceVolumes    = 0x8E93F1; // +53, 23 entries, 0..10
 constexpr uintptr_t kAddrSeVolume        = 0x8E9409; // +76, 0..10
@@ -56,6 +56,10 @@ constexpr float kKeyTextSize      = 19.0f; // key config rows are 22px, so it st
 constexpr float kKeyPadSize       = 15.0f; // the pad half of a binding, set below the key
 constexpr float kRootLabelSize    = 26.0f; // the category page sits a step above
 constexpr float kRootHintSize     = 17.0f;
+// Footer notes are full sentences on a 351px panel (kLabelX..kPanelRight), so
+// they need a size the row labels do not: at 22 a 50-character note runs past
+// the panel edge.
+constexpr float kNoteTextSize     = 15.0f;
 // Vanilla's category screen is a step up from its settings screen: 47px glyphs
 // on 64px rows vs 17-23px on 32px. 44 keeps that hierarchy without the hint
 // column running off a 383-wide panel.
@@ -113,7 +117,6 @@ struct RowDef {
 const RowDef kRows[kGameRowMax] = {
     { kAddrDifficulty,      2,               L"difficulty",       "Difficulty"         },
     { kAddrRounds,          2,               L"round_count",      "Rounds"             },
-    { kAddrSimpleEffects,   1,               L"simple_effects",   "Simple Effects"     },
     { kAddrBattleRecording, 1,               L"battle_recording", "Battle Recording"   },
     { 0,                    0,               nullptr,             "Voice Volume"       },
     { kAddrSeVolume,        kVolumeMax,      L"se_volume",        "SE Volume"          },
@@ -278,12 +281,12 @@ void GameSettingsMenu_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     MenuDrawTextSized(kLabelX, backY, kInk, kInk, kInk, kSettingsTextSize, "Back");
 
     if (locked) {
-        MenuDrawTextSized(kLabelX, backY + kRowPitch, kInkDim, kInkDim, kInkDim, kSettingsTextSize,
+        MenuDrawTextSized(kLabelX, backY + kRowPitch, kInkDim, kInkDim, kInkDim, kNoteTextSize,
                      "Locked while an online session is active.");
     } else if (GameSettingsMenu_RowAt((int)selectedIndex) == kGameRowAiLearning) {
         // Say so rather than silently ignoring the setting online.
-        MenuDrawTextSized(kLabelX, backY + kRowPitch, kInkDim, kInkDim, kInkDim, kSettingsTextSize,
-                     "Offline only. Netplay always disables CPU learning.");
+        MenuDrawTextSized(kLabelX, backY + kRowPitch, kInkDim, kInkDim, kInkDim, kNoteTextSize,
+                     "Offline only. Netplay disables CPU learning.");
     }
 }
 
@@ -762,6 +765,7 @@ enum SystemRow : int {
     kSysBackgroundInput,
     kSysControlSwap,
     kSysDebugCapture,
+    kSysLocalRematch,
     kSysPracticeKeys,
     kSysBack,
     kSysCount,
@@ -814,6 +818,7 @@ const SystemRowDef kSystemRows[kSysCount] = {
     { "Background Input", "keep playing unfocused" },
     { "Swap P1/P2",       "trade control sides"    },
     { "Debug Capture",    "log the game's output"  },
+    { "Local Rematch",    "VS continue prompt"     },
     { "Practice Hotkeys", "rebind mod keys"        },
     { "Back",             "settings"               },
 };
@@ -827,6 +832,7 @@ bool ReadSystemRow(int row) {
         case kSysBackgroundInput: return InputSystem_IsBackgroundInputEnabled();
         case kSysControlSwap:     return InputSystem_GetControlSwap();
         case kSysDebugCapture:    return GameConsole_IsEnabled();
+        case kSysLocalRematch:    return LocalRematch::IsEnabled();
         default:                  return false;
     }
 }
@@ -936,6 +942,9 @@ bool GameSettingsSystem_Adjust(int row, bool left, bool right,
             break;
         case kSysDebugCapture:
             GameConsole_SetEnabled(next);
+            break;
+        case kSysLocalRematch:
+            LocalRematch::SetEnabled(next);
             break;
         default:
             return false;

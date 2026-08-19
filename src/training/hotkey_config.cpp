@@ -18,9 +18,10 @@
 
 static const char* kHotkeyConfigFilename = "as2_practice_hotkeys.cfg";
 static const uint32_t kHotkeyConfigMagic = 0x48325341u;   // "AS2H"
-// 2 added the savestate rows; a version mismatch drops the old file rather than
-// reading a shorter binding array into a longer one.
-static const uint32_t kHotkeyConfigVersion = 2u;
+// 2 added the savestate rows, 3 the overlay toggle, 4 moved its default to
+// Delete (and Macro Play to F3, F11 being the proxy's); a version mismatch drops the
+// old file rather than reading a shorter binding array into a longer one.
+static const uint32_t kHotkeyConfigVersion = 6u;
 
 struct HotkeyConfigHeader {
     uint32_t magic;
@@ -36,9 +37,16 @@ static const KeyBinding_t kDefaultBindings[HOTKEY_COUNT] = {
     { SDL_SCANCODE_F6,  -1, -1, 0 },  // HOTKEY_STATE_LOAD
     { SDL_SCANCODE_1,   -1, -1, 0 },  // HOTKEY_POSITION_LOAD
     { SDL_SCANCODE_2,   -1, -1, 0 },  // HOTKEY_POSITION_SAVE
-    { SDL_SCANCODE_F10, -1, -1, 0 },  // HOTKEY_MACRO_RECORD
-    { SDL_SCANCODE_DELETE, -1, -1, 0 },  // HOTKEY_MACRO_PLAY
-    { SDL_SCANCODE_F12, -1, -1, 0 },  // HOTKEY_MACRO_SLOT_NEXT
+    // The macro trio sits on O / P / ; - one reachable cluster, and all three
+    // are clear of both pads (P1 is arrows+ZXCV+AS, P2 is the numpad) and of
+    // the proxy, which takes F1 and F11 in the window proc where this config
+    // never sees them.
+    { SDL_SCANCODE_O,   -1, -1, 0 },  // HOTKEY_MACRO_RECORD
+    { SDL_SCANCODE_P,   -1, -1, 0 },  // HOTKEY_MACRO_PLAY
+    { SDL_SCANCODE_SEMICOLON, -1, -1, 0 },  // HOTKEY_MACRO_SLOT_NEXT
+    // Delete rather than Backspace: Backspace is P1's Select binding, so the
+    // toggle sat on a key the pads already use.
+    { SDL_SCANCODE_DELETE, -1, -1, 0 },  // HOTKEY_OVERLAY_TOGGLE
 };
 
 static const char* kActionNames[HOTKEY_COUNT] = {
@@ -53,6 +61,7 @@ static const char* kActionNames[HOTKEY_COUNT] = {
     "Macro Record",
     "Macro Play/Stop",
     "Macro Slot Next",
+    "Hide Netplay/Replay Overlay",
 };
 
 // Savestates are offered in arcade and versus as well, so gating them on
@@ -69,6 +78,7 @@ static const bool kActionPracticeOnly[HOTKEY_COUNT] = {
     true,   // HOTKEY_MACRO_RECORD
     true,   // HOTKEY_MACRO_PLAY
     true,   // HOTKEY_MACRO_SLOT_NEXT
+    false,  // HOTKEY_OVERLAY_TOGGLE
 };
 
 static const char* kControlActionNames[INPUT_ACTION_COUNT] = {
@@ -360,6 +370,17 @@ const char* HotkeyConfig_KeyName(int vk) {
     case VK_RETURN:   return "Enter";
     case VK_BACK:     return "Backspace";
     case VK_DELETE:   return "Delete";
+    case VK_OEM_1:    return ";";
+    case VK_OEM_2:    return "/";
+    case VK_OEM_3:    return "`";
+    case VK_OEM_4:    return "[";
+    case VK_OEM_5:    return "\\";
+    case VK_OEM_6:    return "]";
+    case VK_OEM_7:    return "'";
+    case VK_OEM_COMMA:  return ",";
+    case VK_OEM_PERIOD: return ".";
+    case VK_OEM_MINUS:  return "-";
+    case VK_OEM_PLUS:   return "=";
     case VK_INSERT:   return "Insert";
     case VK_HOME:     return "Home";
     case VK_END:      return "End";

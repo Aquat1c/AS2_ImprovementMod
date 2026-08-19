@@ -34,6 +34,11 @@ bool g_wasActive = false;
 Toast g_toasts[TOAST_MAX] = {};
 int g_toastCount = 0;
 
+// Bumped on every toast so a second display can tell a new message from the one
+// it already showed, without needing to poll the array or match on text.
+uint32_t g_toastSerial = 0;
+char g_latestToast[64] = {};
+
 void PushToast(const char* text, ImU32 color) {
     if (g_toastCount >= TOAST_MAX) {
         for (int i = 0; i < TOAST_MAX - 1; i++) {
@@ -46,6 +51,9 @@ void PushToast(const char* text, ImU32 color) {
     snprintf(toast.text, sizeof(toast.text), "%s", text);
     toast.remaining = TOAST_DURATION;
     toast.color = color;
+
+    snprintf(g_latestToast, sizeof(g_latestToast), "%s", text);
+    ++g_toastSerial;
 }
 
 void UpdateToasts(float dt) {
@@ -132,6 +140,13 @@ bool PracticeTools_IsControlSwapped() {
 
 void PracticeTools_Toast(const char* text, unsigned int color) {
     PushToast(text, (ImU32)color);
+}
+
+const char* PracticeTools_LatestStatus(uint32_t* outSerial) {
+    if (outSerial) {
+        *outSerial = PracticeInternal::g_toastSerial;
+    }
+    return PracticeInternal::g_latestToast;
 }
 
 CmdHistoryUpdate_t g_origCmdHistoryUpdate = nullptr;

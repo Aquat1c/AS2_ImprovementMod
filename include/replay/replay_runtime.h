@@ -16,8 +16,19 @@ enum class TakeoverMode : uint8_t {
 };
 
 bool ReplayRuntime_InstallHooks();
+/// Playback overlay visibility, shared with the Hide Netplay/Replay Overlay
+/// hotkey so one key clears the screen in both places. Insert still toggles it
+/// locally during playback.
+void ReplayRuntime_SetHudVisible(bool visible);
+bool ReplayRuntime_IsHudVisible();
+
 void ReplayRuntime_Init();
 void ReplayRuntime_Shutdown();
+
+/// Closes the current netplay set folder. A set is one connected session, so
+/// this is the only thing that ends one - everything else (rematches, side
+/// swaps, character changes) happens inside it.
+void ReplayRuntime_OnNetplaySessionEnd(const char* reason);
 void ReplayRuntime_FrameUpdate();
 void ReplayRuntime_RenderHUD();
 bool ReplayRuntime_HasVisibleHud();

@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "patches/hud_toggle.h"
+
 #include "training/auto_block.h"
 
 #include <stdbool.h>
@@ -121,6 +123,10 @@ enum PracticeSettingId : int {
 	PRACTICE_SET_CONTROL_SWAP,
 	PRACTICE_SET_MACRO_SLOT,
 	PRACTICE_SET_PAUSED,
+	// One row per HUD element, in HudElement order. Contiguous so the sub-page
+	// can walk them as a range.
+	PRACTICE_SET_HUD_FIRST,
+	PRACTICE_SET_HUD_LAST = PRACTICE_SET_HUD_FIRST + HUD_ELEM_COUNT - 1,
 	PRACTICE_SET_COUNT,
 };
 
@@ -155,7 +161,6 @@ enum PracticeActionId : int {
 	PRACTICE_ACT_MACRO_PLAY,
 	PRACTICE_ACT_POSITION_ROUND_START,
 	PRACTICE_ACT_FRAME_STEP,
-	PRACTICE_ACT_TITLE_SCREEN,
 	PRACTICE_ACT_COUNT,
 };
 
@@ -193,6 +198,12 @@ const char* PracticeDummy_DefenceName();
 // Push a toast notification to the in-game HUD.
 // Only visible in practice mode. Short messages, auto-fading.
 void PracticeTools_Toast(const char* text, unsigned int color);
+
+// The most recent status message, with a serial that increments per message.
+// The pause menu polls this so a toast raised outside the menu - a hotkey
+// savestate, a macro, an auto-recovery - is reported there too, rather than
+// only in the ImGui overlay the player cannot see while paused.
+const char* PracticeTools_LatestStatus(uint32_t* outSerial);
 
 // --- Command History Hook (redirects to P2 data when controls swapped) ---
 typedef char (__cdecl *CmdHistoryUpdate_t)(int16_t* matchBase);

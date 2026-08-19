@@ -25,21 +25,29 @@ ROSTER = ["Rance", "Hatsune", "Patton", "Seed", "Raysen", "Aria", "Maria",
           "Demon Rance", "Little Princess", "TADA", "Nalzgis (Boss)"]
 ALIAS = {"Makutsudou": "Makutsudo"}
 
-# Must match kScriptActionLabels in practice_runtime.cpp.
+# Must match kScriptActionLabels in practice_runtime.cpp, index for index.
 MOTIONS = ["None", "5X", "2X", "jX", "6X", "4X", "236X", "623X", "214X", "421X",
-           "624X", "412X", "22X", "41236X", "214236X", "[2]8X", "2[8]X",
-           "[4]6X", "4[6]X", "Jump", "Dash Forward", "Dash Back"]
+           "632X", "412X", "22X", "41236X", "214236X", "[2]8X", "2[8]X",
+           "[4]6X", "4[6]X", "Jump", "Dash Forward", "Dash Back",
+           "63214X", "236236X", "214214X", "632146X", "360X", "2369X",
+           "21416X", "66X", "3X", "1X"]
 
 # Motion prefix as the guide writes it -> what the trigger runner can perform.
-# Anything absent is a motion the runner has no sequence for, so offering it
-# would be a lie; those are counted and reported instead.
+# Every entry corresponds to a real command in the game's own table at 0x723480;
+# a prefix that is absent has no command behind it, so offering it would be a
+# move that never comes out. Those are counted and reported instead.
 PREFIX_TO_MOTION = {
     '': '5X', '5': '5X', '2': '2X', '6': '6X', '4': '4X',
+    '3': '3X', '1': '1X',
     '236': '236X', '623': '623X', '214': '214X', '421': '421X',
-    '624': '624X', '412': '412X', '22': '22X',
+    '632': '632X', '412': '412X', '22': '22X',
     '41236': '41236X', '214236': '214236X',
     '[2]8': '[2]8X', '2[8]': '2[8]X', '[4]6': '[4]6X', '4[6]': '4[6]X',
-    '66': 'Dash Forward', '44': 'Dash Back',
+    '63214': '63214X', '236236': '236236X', '214214': '214214X',
+    '632146': '632146X', '360': '360X', '2369': '2369X', '21416': '21416X',
+    # 66X is the dash attack (forward, neutral, forward + button). "Dash
+    # Forward" stays a movement-only trigger with no button.
+    '66': '66X', '44': 'Dash Back',
 }
 
 # Two pages in the docx are unusable: Escalayer's has no move table at all (only
@@ -100,6 +108,11 @@ THROW_PREFIX = re.compile(r'^\s*close\b', re.IGNORECASE)
 NAME_SPLIT = [re.compile(r'\((.+)\)\s*$'),
               re.compile(r'\s[-–—]\s(.+)$'),
               re.compile(r':\s*(.+)$')]
+
+# "Absolute Demon King Defense (22D): A 2-gauge mode activation." - the notation
+# is parenthesised mid-line with the description after a colon, so neither the
+# trailing-paren pattern nor the length cap would ever reach it.
+NAMED_PAREN = re.compile(r'^[^()]{1,48}\(([^()]{1,24})\)\s*[::]')
 
 
 def doc_lines():
@@ -169,7 +182,18 @@ def scan_notation(line):
 
 
 def parse_input_cell(line):
-    if len(line) > 60 or THROW_PREFIX.match(line):
+    if THROW_PREFIX.match(line):
+        return None
+
+    # Checked before the length cap: this shape carries its notation in the
+    # parentheses and its prose after, so the line is long by construction.
+    m = NAMED_PAREN.match(line)
+    if m:
+        hit = scan_notation(SHARED_BUTTON.sub(r' ', m.group(1).strip()))
+        if hit and hit[2]:
+            return hit[0], hit[1]
+
+    if len(line) > 60:
         return None
     line = SHARED_BUTTON.sub(r'\1\3 \2\3', line)
     hit = scan_notation(line)

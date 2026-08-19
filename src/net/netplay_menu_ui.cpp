@@ -425,8 +425,31 @@ static void NoteContentBottom(int y) {
     }
 }
 
+// A row past the bottom is not just invisible - it stays selectable, because
+// the cursor is driven by ItemCount rather than by what was drawn. That is how
+// the Appearance page ended up with a Back row nobody could see. Suppressing
+// the draw is right; doing it silently is not, so the first offender per page
+// says so once.
+static void ReportClippedRow(int y, const char* what) {
+    static int s_lastReported = -1;
+    if (s_lastReported == y) {
+        return;
+    }
+    s_lastReported = y;
+    LOG_WARN("[NetMenu] %s clipped at y=%d (content bottom %d) - it is still "
+             "selectable, so the page needs to be shorter",
+             what, y, kContentBottom);
+}
+
 static bool HasRowSpace(int y) {
-    return y >= kHeaderBottom && (y + 20) <= kContentBottom;
+    if (y < kHeaderBottom) {
+        return false;
+    }
+    if ((y + 20) > kContentBottom) {
+        ReportClippedRow(y, "row");
+        return false;
+    }
+    return true;
 }
 
 static bool HasInfoSpace(int y) {
@@ -976,16 +999,35 @@ static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int
         RenderSettingRow(y, "Render mode", selector, "nickname draw",
             snap->selected_index == 6, true, alpha); y += kRowStep;
 
-        RenderInfoLine(y, "Sync", "Colors sent to opponent", alpha);
-        y += kInfoStep;
-        RenderInfoLine(y, "Local", "Name position applies to both sides", alpha);
-        y += kInfoStep;
-        RenderInfoLine(y, "F1 menu", "Top drops to menu-safe row", alpha);
-        y += kInfoStep;
-        RenderInfoLine(y, "Vanilla", "Game draw; stats stay overlay", alpha);
-        y += kInfoStep;
-
+        // Back goes directly after the rows. Four fixed note lines used to sit
+        // between them, which pushed it to y=426 - past HasRowSpace - so the
+        // guard dropped it and left a row that was selectable but invisible.
         RenderRow(y, "Back", "Settings", snap->selected_index == 7, true, alpha);
+        y += kRowStep;
+
+        // The notes are per-setting annotations, so only the ones that apply to
+        // the selected row are shown. Two is the most any row needs, and two is
+        // what fits.
+        switch (snap->selected_index) {
+        case 0:
+        case 1:
+        case 2:
+            RenderInfoLine(y, "Sync", "Colors sent to opponent", alpha);
+            y += kInfoStep;
+            break;
+        case 4:
+            RenderInfoLine(y, "Local", "Name position applies to both sides", alpha);
+            y += kInfoStep;
+            RenderInfoLine(y, "F1 menu", "Top drops to menu-safe row", alpha);
+            y += kInfoStep;
+            break;
+        case 6:
+            RenderInfoLine(y, "Vanilla", "Game draw; stats stay overlay", alpha);
+            y += kInfoStep;
+            break;
+        default:
+            break;
+        }
         break;
     }
     case NetMenu::SettingsCategory::Endpoint: {

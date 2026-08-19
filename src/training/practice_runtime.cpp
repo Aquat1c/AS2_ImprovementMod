@@ -44,7 +44,10 @@ static const int kPracticePlayerCount = 2;
 static const int kPracticeRosterCount = 22;
 static const int kMeterMax = 9000;
 static const int kGuardGaugeMax = 10000;
-static const int kSyntheticChargeFrames = 30;
+// The command table's longest charge is 45 frames (0x723480 cmd 39-41, which is
+// Nalzgis's [2]8X); at 30 it never armed. The check is "held > threshold - 1",
+// so this has to clear 45 outright.
+static const int kSyntheticChargeFrames = 50;
 static const int kJumpHoldFrames = 3;
 static const int kTriggerCount = 5;
 // Defensive response for the mod-driven dummy; see kDefensiveResponseLabels.
@@ -166,6 +169,18 @@ enum ScriptActionKind {
     SCRIPT_ACTION_JUMP,
     SCRIPT_ACTION_DASH_FORWARD,
     SCRIPT_ACTION_DASH_BACKWARD,
+    // Appended, never inserted: the index is what a saved trigger stores and
+    // what character_moves.h refers to.
+    SCRIPT_ACTION_63214,
+    SCRIPT_ACTION_236236,
+    SCRIPT_ACTION_214214,
+    SCRIPT_ACTION_632146,
+    SCRIPT_ACTION_360,
+    SCRIPT_ACTION_2369,
+    SCRIPT_ACTION_21416,
+    SCRIPT_ACTION_66,
+    SCRIPT_ACTION_3,
+    SCRIPT_ACTION_1,
 };
 
 enum ScriptActionButton {
@@ -384,7 +399,6 @@ static uint32_t s_lastFiredTriggerFrame = 0;
 static const uint32_t kMatchHeaderEndRouteOffset = 10;
 static const uint8_t kMatchRouteCharSel = 1;
 static const uint8_t kMatchRouteMenu = 2;
-static const uint8_t kMatchRouteTitle = 4;
 
 static const char* kPracticeTabLabels[] = {
     "Overview",
@@ -397,8 +411,8 @@ static const char* kPracticeTabLabels[] = {
 };
 
 static const char* kDummyControlModeLabels[] = {
-    "Advanced Mod",
-    "Native Training",
+    "Mod",
+    "Vanilla",
 };
 
 static const char* kNativeHealthLabels[] = {
@@ -543,7 +557,73 @@ static const char* kScriptActionLabels[] = {
     "Jump",
     "Dash Forward",
     "Dash Back",
+    "63214X",
+    "236236X",
+    "214214X",
+    "632146X",
+    "360X",
+    "2369X",
+    "21416X",
+    "66X",
+    "3X",
+    "1X",
 };
+
+// Numpad notation, one frame per digit, with the button pressed on the last.
+// Directions are facing-relative, so 6 is toward the opponent. nullptr means the
+// kind is not a plain motion (charges hold, and jX is the button alone because
+// it relies on the dummy already being airborne).
+//
+// These are transcribed from the game's own command table at 0x723480, dumped
+// out of as2.exe - not guessed. Input_UpdateCommandStates walks 5 bytes per
+// step: required direction (exact match of the held mask), required bits,
+// forbidden bits, required button, and the frames allowed to reach the next
+// step. Directions are matched against what is held *this* frame and the
+// machine advances at most one step per frame, so one direction per frame is
+// exactly what it wants. The attack button is not part of the steps at all - it
+// is a separate gate checked against a 6-frame buffered press when the
+// direction sequence completes, which is why pressing it on the final frame
+// works.
+//
+// A step that does not match simply does not advance, so extra diagonals are
+// harmless; only the listed directions have to arrive in order and in time.
+static const char* const kScriptMotionNumpad[] = {
+    nullptr,      // None
+    "5",          // 5X   plain normals are not commands: direction + button
+    "2",          // 2X
+    nullptr,      // jX
+    "6",          // 6X
+    "4",          // 4X
+    "236",        // cmd 19-22
+    "623",        // cmd 27-29  (6, 2, then anything holding forward)
+    "214",        // cmd 23-26
+    "421",        // cmd 30-32
+    "632",        // cmd 17     (there is no 624 command in the table)
+    "412",        // cmd 18
+    "252",        // cmd 13-16  22X is down, NEUTRAL, down - not down twice
+    "41236",      // cmd 69-71
+    "214236",
+    nullptr,      // [2]8X
+    nullptr,      // 2[8]X
+    nullptr,      // [4]6X
+    nullptr,      // 4[6]X
+    nullptr,      // Jump
+    nullptr,      // Dash Forward
+    nullptr,      // Dash Back
+    "63214",      // cmd 72-74
+    "236236",     // cmd 90
+    "214214",     // cmd 91
+    "632146",     // cmd 92
+    "6248",       // cmd 46 - the four cardinals in order, which is the 360
+    "2369",       // cmd 42-44
+    "21416",      // cmd 89
+    "656",        // cmd 2-4  the dash attack: forward, neutral, forward + button
+    "3",          // 3X
+    "1",          // 1X
+};
+
+static_assert(sizeof(kScriptMotionNumpad) == sizeof(kScriptActionLabels),
+              "motion labels and their numpad sequences must stay in step");
 
 static const char* kScriptButtonLabels[] = {
     "A",
@@ -1663,24 +1743,24 @@ static int GetRecoveryGuardTarget(int player) {
     }
 }
 
+// nullptr for anything that is not a plain numpad motion.
+static const char* MotionNumpad(int actionKind) {
+    if (actionKind <= 0 ||
+        actionKind >= (int)(sizeof(kScriptMotionNumpad) / sizeof(kScriptMotionNumpad[0]))) {
+        return nullptr;
+    }
+    return kScriptMotionNumpad[actionKind];
+}
+
 static int GetActionSequenceLength(int actionKind) {
+    if (const char* numpad = MotionNumpad(actionKind)) {
+        return (int)strlen(numpad);
+    }
     switch (actionKind) {
         case SCRIPT_ACTION_NONE: return 0;
         case SCRIPT_ACTION_DASH_FORWARD:
         case SCRIPT_ACTION_DASH_BACKWARD:
             return 3;
-        case SCRIPT_ACTION_236:
-        case SCRIPT_ACTION_623:
-        case SCRIPT_ACTION_214:
-        case SCRIPT_ACTION_421:
-        case SCRIPT_ACTION_624:
-        case SCRIPT_ACTION_412:
-        case SCRIPT_ACTION_22:
-            return 3;
-        case SCRIPT_ACTION_41236:
-            return 5;
-        case SCRIPT_ACTION_214236:
-            return 6;
         case SCRIPT_ACTION_CHARGE_2_8:
         case SCRIPT_ACTION_2_HOLD_8:
         case SCRIPT_ACTION_CHARGE_4_6:
@@ -1699,54 +1779,33 @@ static uint16_t GetActionSequenceInput(const PlayerSnapshot& snapshot,
     const uint16_t forward = ForwardMask(snapshot);
     const uint16_t back = BackMask(snapshot);
 
+    // Every plain motion is its numpad string, one digit per frame, so a new
+    // command is a table entry rather than another case here.
+    if (const char* numpad = MotionNumpad(actionKind)) {
+        const int length = (int)strlen(numpad);
+        const int index = ClampInt(frameIndex, 0, length - 1);
+        uint16_t mask = 0;
+        switch (numpad[index]) {
+            case '1': mask = (uint16_t)(INPUT_DOWN | back); break;
+            case '2': mask = INPUT_DOWN; break;
+            case '3': mask = (uint16_t)(INPUT_DOWN | forward); break;
+            case '4': mask = back; break;
+            case '6': mask = forward; break;
+            case '7': mask = (uint16_t)(INPUT_UP | back); break;
+            case '8': mask = INPUT_UP; break;
+            case '9': mask = (uint16_t)(INPUT_UP | forward); break;
+            case '5':
+            default:  mask = 0; break;
+        }
+        // The button lands on the last frame, which is what makes "236" a move
+        // rather than a walk.
+        return (index == length - 1) ? (uint16_t)(mask | buttonMask) : mask;
+    }
+
     switch (actionKind) {
-        case SCRIPT_ACTION_5:
-            return buttonMask;
-        case SCRIPT_ACTION_2:
-            return INPUT_DOWN | buttonMask;
         case SCRIPT_ACTION_J:
+            // Button alone: this one assumes the dummy is already airborne.
             return buttonMask;
-        case SCRIPT_ACTION_6:
-            return forward | buttonMask;
-        case SCRIPT_ACTION_4:
-            return back | buttonMask;
-        case SCRIPT_ACTION_236:
-            return frameIndex == 0 ? INPUT_DOWN :
-                   frameIndex == 1 ? (uint16_t)(INPUT_DOWN | forward) : (uint16_t)(forward | buttonMask);
-        case SCRIPT_ACTION_623:
-            return frameIndex == 0 ? forward :
-                   frameIndex == 1 ? INPUT_DOWN : (uint16_t)(INPUT_DOWN | forward | buttonMask);
-        case SCRIPT_ACTION_214:
-            return frameIndex == 0 ? INPUT_DOWN :
-                   frameIndex == 1 ? (uint16_t)(INPUT_DOWN | back) : (uint16_t)(back | buttonMask);
-        case SCRIPT_ACTION_421:
-            return frameIndex == 0 ? back :
-                   frameIndex == 1 ? INPUT_DOWN : (uint16_t)(INPUT_DOWN | back | buttonMask);
-        case SCRIPT_ACTION_624:
-            return frameIndex == 0 ? forward :
-                   frameIndex == 1 ? INPUT_DOWN : (uint16_t)(back | buttonMask);
-        case SCRIPT_ACTION_412:
-            return frameIndex == 0 ? back :
-                   frameIndex == 1 ? (uint16_t)(INPUT_DOWN | back) : (uint16_t)(INPUT_DOWN | buttonMask);
-        case SCRIPT_ACTION_22:
-            return frameIndex == 0 ? INPUT_DOWN : (uint16_t)(INPUT_DOWN | buttonMask);
-        case SCRIPT_ACTION_41236:
-            switch (frameIndex) {
-                case 0: return back;
-                case 1: return (uint16_t)(INPUT_DOWN | back);
-                case 2: return INPUT_DOWN;
-                case 3: return (uint16_t)(INPUT_DOWN | forward);
-                default: return (uint16_t)(forward | buttonMask);
-            }
-        case SCRIPT_ACTION_214236:
-            switch (frameIndex) {
-                case 0: return INPUT_DOWN;
-                case 1: return (uint16_t)(INPUT_DOWN | back);
-                case 2: return back;
-                case 3: return INPUT_DOWN;
-                case 4: return (uint16_t)(INPUT_DOWN | forward);
-                default: return (uint16_t)(forward | buttonMask);
-            }
         case SCRIPT_ACTION_CHARGE_2_8:
         case SCRIPT_ACTION_2_HOLD_8:
             return frameIndex < kSyntheticChargeFrames ? INPUT_DOWN : (uint16_t)(INPUT_UP | buttonMask);
@@ -2146,7 +2205,12 @@ static bool ShouldHoldAutoBlock(const PlayerSnapshot snapshots[kPracticePlayerCo
     if (!dummy.valid || !attacker.valid) {
         return false;
     }
-    return PracticeDefense_WantsAnticipatoryGuard();
+    // A pending defensive mechanic has to reach the dummy even when the block
+    // policy is not asking for a guard this frame - repel and the guard counter
+    // are not guard actions at all, and gating them behind auto-block is what
+    // made the Defense row look dead.
+    return PracticeDefense_WantsAnticipatoryGuard() ||
+           PracticeDefense_DefenseInput() != Training::DefenseInputKind::None;
 }
 
 // Semantic back / down-back, resolved to physical left/right from the dummy's
@@ -2168,6 +2232,11 @@ static uint16_t BuildDummyBlockInput(const PlayerSnapshot& dummy,
         case Training::DefenseInputKind::ForwardTap:
             PracticeDefense_NoteAnticipatoryFacing(facing, true);
             return ForwardMask(dummy);
+        case Training::DefenseInputKind::DownTap:
+            // Down alone: the low arm needs the down edge with no left or right
+            // held, so a diagonal would fail the check.
+            PracticeDefense_NoteAnticipatoryFacing(facing, true);
+            return INPUT_DOWN;
         case Training::DefenseInputKind::DodgePress:
             // BACK keeps the back-dodge variant rather than the forward one.
             PracticeDefense_NoteAnticipatoryFacing(facing, true);
@@ -2175,6 +2244,15 @@ static uint16_t BuildDummyBlockInput(const PlayerSnapshot& dummy,
         case Training::DefenseInputKind::CounterForward:
             PracticeDefense_NoteAnticipatoryFacing(facing, true);
             return (uint16_t)(ForwardMask(dummy) | INPUT_D);
+        case Training::DefenseInputKind::ArmGuardState: {
+            // 214D is a motion, so it is fed a frame at a time through the same
+            // sequence builder the trigger runner uses rather than as one mask.
+            PracticeDefense_NoteAnticipatoryFacing(facing, true);
+            const int step = ClampInt(PracticeDefense_ArmStep(), 0,
+                                      Training::kGuardStateMotionFrames - 1);
+            return GetActionSequenceInput(dummy, SCRIPT_ACTION_214,
+                                          SCRIPT_BUTTON_D, step);
+        }
         case Training::DefenseInputKind::None:
         default:
             break;
@@ -2666,10 +2744,6 @@ static void RenderOverviewTab(const PlayerSnapshot snapshots[kPracticePlayerCoun
     if (ImGui::Button("Main Menu")) {
         QueuePracticeExitRoute(kMatchRouteMenu, "Main Menu");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Title Screen")) {
-        QueuePracticeExitRoute(kMatchRouteTitle, "Title Screen");
-    }
 
     ImGui::Separator();
 
@@ -2808,17 +2882,17 @@ static void RenderOpponentTab(const PlayerSnapshot snapshots[kPracticePlayerCoun
     }
 
     ImGui::SetNextItemWidth(180.0f);
-    ImGui::Combo("Dummy Backend", &s_practiceConfig.dummyControlMode,
+    ImGui::Combo("Dummy Type", &s_practiceConfig.dummyControlMode,
                  kDummyControlModeLabels,
                  IM_ARRAYSIZE(kDummyControlModeLabels));
     ImGui::SameLine();
     HelpMarker(
-        "Native Training reuses the game's own training pause-menu settings for the\n"
-        "AI-controlled side. Advanced Mod keeps the richer custom block/stance\n"
+        "Vanilla reuses the game's own training pause-menu settings for the\n"
+        "AI-controlled side. Mod keeps the richer custom block/stance\n"
         "and auto-jump logic in this menu.");
 
     if (s_practiceConfig.dummyControlMode == DUMMY_CONTROL_NATIVE) {
-        ImGui::TextDisabled("Native dummy settings follow the AI-controlled side. Control swap moves them to P1.");
+        ImGui::TextDisabled("Vanilla dummy settings follow the AI-controlled side. Control swap moves them to P1.");
         RenderNativeTrainingCombo(
             "CPU",
             ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE,
@@ -3078,7 +3152,7 @@ static void RenderOptionsTab(void) {
     const bool nativeHealthActive = ReadNativeTrainingSetting(ADDR_TRAINING_HEALTH_REGEN_SETTING, 10) != 0;
     const bool nativeMeterActive = ReadNativeTrainingSetting(ADDR_TRAINING_METER_LEVEL_SETTING, 9) != 0;
 
-    ImGui::SeparatorText("Native Training");
+    ImGui::SeparatorText("Vanilla");
     RenderNativeTrainingCombo(
         "Health Regeneration",
         ADDR_TRAINING_HEALTH_REGEN_SETTING,
@@ -3318,9 +3392,63 @@ const char* const kOnOffLabels[] = { "Off", "On" };
 
 // Only responses with a traced legal-input path. Everything else the engine
 // supports needs per-character command arming that is not mapped yet.
+// The HUD rows are one contiguous range mapping straight onto HudElement, so
+// they are handled ahead of each setting switch instead of as nine cases in
+// four different places.
+bool IsHudRow(int setting) {
+    return setting >= PRACTICE_SET_HUD_FIRST && setting <= PRACTICE_SET_HUD_LAST;
+}
+
+int HudRowElement(int setting) {
+    return setting - PRACTICE_SET_HUD_FIRST;
+}
+
 const char* const kDefensiveResponseLabels[] = {
     "Guard Only", "Native", "Just Parry", "Dodge", "Repel", "Counter",
+    "Perfect Parry", "Absolute Def", "Parry",
 };
+
+// Only what the dummy's own category can perform. dword_73E070 gives each
+// character exactly one mechanic, so the row is Guard Only / Native / that one -
+// listing the other four would offer moves the engine will never produce.
+// Categories 4 and 5 add nothing: push-away needs no input at all and absolute
+// defence has none to give.
+int DefensiveResponseOptions(int* out, int max) {
+    int count = 0;
+    if (count < max) out[count++] = (int)Training::DefensiveResponse::NormalGuard;
+    if (count < max) out[count++] = (int)Training::DefensiveResponse::CharacterNative;
+
+    // Every response the category can actually perform, not just its default:
+    // push block has two, and which one you get is a timing difference worth
+    // being able to pick.
+    const int category = PracticeDefense_DummyDefenseCategory();
+    for (int r = 0; r < (int)Training::DefensiveResponse::Count; ++r) {
+        const Training::DefensiveResponse response = (Training::DefensiveResponse)r;
+        if (response == Training::DefensiveResponse::NormalGuard ||
+            response == Training::DefensiveResponse::CharacterNative) {
+            continue;
+        }
+        if (Training::ResponseSupportedByCategory(response, category) && count < max) {
+            out[count++] = r;
+        }
+    }
+    return count;
+}
+
+constexpr int kDefensiveResponseMaxOptions = 4;
+
+// Storage stays the enum value, so a character swap cannot silently repoint the
+// setting at a different mechanic; the row just shows the nearest valid entry.
+int DefensiveResponseIndex() {
+    int options[kDefensiveResponseMaxOptions];
+    const int count = DefensiveResponseOptions(options, kDefensiveResponseMaxOptions);
+    for (int i = 0; i < count; ++i) {
+        if (options[i] == g_defensiveResponse) {
+            return i;
+        }
+    }
+    return 0;
+}
 
 // Recovery delay and jump cadence are stepped through presets rather than typed:
 // a d-pad is a bad number editor, and the exact values stay in the ImGui panel.
@@ -3364,12 +3492,16 @@ const char* const kShortTriggerLabels[] = {
 } // namespace
 
 int PracticeSetting_Get(int setting) {
+    if (IsHudRow(setting)) {
+        // Index 0 = Shown, 1 = Hidden.
+        return HudToggle_IsHidden(HudRowElement(setting)) ? 1 : 0;
+    }
     switch (setting) {
         case PRACTICE_SET_DUMMY_BACKEND:  return s_practiceConfig.dummyControlMode;
         case PRACTICE_SET_BLOCK_MODE:     return s_practiceConfig.blockMode;
         case PRACTICE_SET_STANCE:         return s_practiceConfig.stanceMode;
         case PRACTICE_SET_JUMP_MODE:      return s_practiceConfig.jumpMode;
-        case PRACTICE_SET_DEFENSIVE_RESPONSE: return g_defensiveResponse;
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: return DefensiveResponseIndex();
         case PRACTICE_SET_JUMP_CADENCE:
             return PresetIndex(kCadencePresets, (int)(sizeof(kCadencePresets) / sizeof(int)),
                                s_practiceConfig.jumpCadenceFrames);
@@ -3433,13 +3565,19 @@ int PracticeSetting_Get(int setting) {
 }
 
 static int PracticeSetting_ValueCount(int setting) {
+    if (IsHudRow(setting)) {
+        return 2;
+    }
     switch (setting) {
         case PRACTICE_SET_DUMMY_BACKEND:  return IM_ARRAYSIZE(kDummyControlModeLabels);
         case PRACTICE_SET_BLOCK_MODE:     return IM_ARRAYSIZE(kBlockModeLabels);
         case PRACTICE_SET_STANCE:         return IM_ARRAYSIZE(kStanceModeLabels);
         case PRACTICE_SET_JUMP_MODE:      return IM_ARRAYSIZE(kJumpModeLabels);
         case PRACTICE_SET_JUMP_CADENCE:   return (int)(sizeof(kCadencePresets) / sizeof(int));
-        case PRACTICE_SET_DEFENSIVE_RESPONSE: return IM_ARRAYSIZE(kDefensiveResponseLabels);
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: {
+            int options[kDefensiveResponseMaxOptions];
+            return DefensiveResponseOptions(options, kDefensiveResponseMaxOptions);
+        }
         case PRACTICE_SET_NATIVE_CPU:     return IM_ARRAYSIZE(kNativeCpuLabels);
         case PRACTICE_SET_NATIVE_AIR_TECH:     return IM_ARRAYSIZE(kNativeAirTechLabels);
         case PRACTICE_SET_NATIVE_GROUND_TECH:  return IM_ARRAYSIZE(kNativeGroundTechLabels);
@@ -3461,6 +3599,11 @@ static int PracticeSetting_ValueCount(int setting) {
 }
 
 void PracticeSetting_Cycle(int setting, int delta) {
+    if (IsHudRow(setting)) {
+        HudToggle_SetHidden(HudRowElement(setting),
+                            !HudToggle_IsHidden(HudRowElement(setting)));
+        return;
+    }
     if (delta == 0 || !PracticeSetting_Enabled(setting)) {
         return;
     }
@@ -3473,7 +3616,12 @@ void PracticeSetting_Cycle(int setting, int delta) {
         case PRACTICE_SET_STANCE:         s_practiceConfig.stanceMode = next; break;
         case PRACTICE_SET_JUMP_MODE:      s_practiceConfig.jumpMode = next; break;
         case PRACTICE_SET_JUMP_CADENCE:   s_practiceConfig.jumpCadenceFrames = kCadencePresets[next]; break;
-        case PRACTICE_SET_DEFENSIVE_RESPONSE: g_defensiveResponse = next; break;
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: {
+            int options[kDefensiveResponseMaxOptions];
+            const int count = DefensiveResponseOptions(options, kDefensiveResponseMaxOptions);
+            g_defensiveResponse = options[ClampInt(next, 0, count - 1)];
+            break;
+        }
 
         case PRACTICE_SET_NATIVE_CPU:
             WriteNativeTrainingSetting(ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE, next, 1, "cpu"); break;
@@ -3560,8 +3708,11 @@ void PracticeSetting_Cycle(int setting, int delta) {
 }
 
 const char* PracticeSetting_Label(int setting) {
+    if (IsHudRow(setting)) {
+        return HudToggle_Name(HudRowElement(setting));
+    }
     switch (setting) {
-        case PRACTICE_SET_DUMMY_BACKEND:  return "Backend";
+        case PRACTICE_SET_DUMMY_BACKEND:  return "Type";
         case PRACTICE_SET_BLOCK_MODE:     return "Auto-Block";
         case PRACTICE_SET_STANCE:         return "Stance";
         case PRACTICE_SET_JUMP_MODE:      return "Auto-Jump";
@@ -3605,17 +3756,28 @@ const char* PracticeSetting_Label(int setting) {
 }
 
 const char* PracticeSetting_ValueText(int setting) {
+    if (IsHudRow(setting)) {
+        return HudToggle_IsHidden(HudRowElement(setting)) ? "Hidden" : "Shown";
+    }
     const int value = PracticeSetting_Get(setting);
     const int count = PracticeSetting_ValueCount(setting);
     const int idx = (value >= 0 && value < count) ? value : 0;
 
     switch (setting) {
         case PRACTICE_SET_DUMMY_BACKEND:  return kDummyControlModeLabels[idx];
-        case PRACTICE_SET_BLOCK_MODE:     return kBlockModeLabels[idx];
+        case PRACTICE_SET_BLOCK_MODE:
+            // A guard cancel cannot happen without blockstun, so picking one
+            // turns blocking on underneath. Say so instead of showing "None".
+            return PracticeDefense_BlockForcedByResponse() ? "All (defense)"
+                                                           : kBlockModeLabels[idx];
         case PRACTICE_SET_STANCE:         return kStanceModeLabels[idx];
         case PRACTICE_SET_JUMP_MODE:      return kJumpModeLabels[idx];
         case PRACTICE_SET_JUMP_CADENCE:   return kCadenceLabels[idx];
-        case PRACTICE_SET_DEFENSIVE_RESPONSE: return kDefensiveResponseLabels[idx];
+        case PRACTICE_SET_DEFENSIVE_RESPONSE: {
+            int options[kDefensiveResponseMaxOptions];
+            const int count = DefensiveResponseOptions(options, kDefensiveResponseMaxOptions);
+            return kDefensiveResponseLabels[options[ClampInt(idx, 0, count - 1)]];
+        }
         case PRACTICE_SET_NATIVE_CPU:     return kNativeCpuLabels[idx];
         case PRACTICE_SET_NATIVE_AIR_TECH:    return kNativeAirTechLabels[idx];
         case PRACTICE_SET_NATIVE_GROUND_TECH: return kNativeGroundTechLabels[idx];
@@ -3672,7 +3834,9 @@ bool PracticeSetting_Enabled(int setting) {
             return advanced && (cat == Training::kDefenseCategoryJustParry ||
                                 cat == Training::kDefenseCategoryDodge ||
                                 cat == Training::kDefenseCategoryRepel ||
-                                cat == Training::kDefenseCategoryUnique);
+                                cat == Training::kDefenseCategoryUnique ||
+                                cat == Training::kDefenseCategoryPushAway ||
+                                cat == Training::kDefenseCategoryAbsolute);
         }
 
         // The vanilla menu greys these while CPU is on; keep that.
@@ -3703,6 +3867,11 @@ bool PracticeSetting_Enabled(int setting) {
         default:
             if (IsTriggerRow(setting)) {
                 return s_practiceConfig.triggerMasterEnabled;
+            }
+            if (IsHudRow(setting)) {
+                // Without the hooks behind it the row would highlight and
+                // accept input while the value never changed.
+                return HudToggle_ElementAvailable(HudRowElement(setting));
             }
             return true;
     }
@@ -3910,9 +4079,6 @@ const char* PracticeAction_Invoke(int action) {
                 s_stepCounter++;
             }
             return "Step queued";
-        case PRACTICE_ACT_TITLE_SCREEN:
-            QueuePracticeExitRoute(kMatchRouteTitle, "pause menu");
-            return "Returning to title";
         default:
             return nullptr;
     }

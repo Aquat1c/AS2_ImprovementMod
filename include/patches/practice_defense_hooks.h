@@ -105,6 +105,15 @@ void PracticeDefense_NoteAnticipatoryFacing(int8_t facing, bool prearmed);
 // What the dummy should press this frame to attempt its defensive mechanic.
 // DefenseInputKind::None means "just hold the ordinary guard".
 Training::DefenseInputKind PracticeDefense_DefenseInput();
+
+// Which frame of the 214D motion is being fed, for the injector to turn into a
+// direction. -1 when no motion is running.
+int PracticeDefense_ArmStep();
+
+// True when the selected mechanic is a guard cancel and the block policy is Off,
+// so the mod is guarding on its behalf. The Auto-Block row says so rather than
+// reporting an "Off" that is not what is happening.
+bool PracticeDefense_BlockForcedByResponse();
 // The dummy's defence category from dword_73E070, so the menu can say when the
 // selected character simply has no parry.
 int PracticeDefense_DummyDefenseCategory();
