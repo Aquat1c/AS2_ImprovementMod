@@ -319,10 +319,6 @@ static void TestEligibility() {
     crushed.guardGauge = 0;
     TEST_CHECK(!CanAutoGuardAtContact(crushed), "guard crush cannot guard");
 
-    DefenderGuardState swapped = Defender(2);
-    swapped.controlSwapActive = true;
-    TEST_CHECK(!CanAutoGuardAtContact(swapped), "control swap disables auto-block");
-
     DefenderGuardState macro = Defender(2);
     macro.macroOwnsDummyInput = true;
     TEST_CHECK(!CanAutoGuardAtContact(macro), "macro playback owns the dummy");
@@ -726,6 +722,61 @@ static void TestRepelDrive() {
     DefenseDriveSample idle = Drive(false);
     TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, idle, st) ==
                DefenseInputKind::None, "no threat, no input");
+
+    // Prediction, not observation. A hitbox that does not exist yet is exactly
+    // the case the input driver has to cover, because the repel window opens
+    // from a tap that must PRECEDE the hit.
+    DefenseDriveSample coming = Drive(false);
+    coming.recordsToAttack = 3;
+    DefenseDriveState pred{};
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, coming, pred) ==
+               DefenseInputKind::ReleaseGuard, "an attack still in startup arms the repel");
+
+    DefenseDriveSample committed = Drive(false);
+    committed.attackerCommitted = true;
+    DefenseDriveState commit{};
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, committed, commit) ==
+               DefenseInputKind::ReleaseGuard, "a committed attacker arms it too");
+}
+
+// The three window mechanics are armed through the engine's own setters, so
+// when the hooks are live the driver must produce NO input: a forward tap would
+// drop the guard and walk the dummy forward for a window that is already open.
+static void TestNativeArmSuppressesInput() {
+    TEST_CHECK(ResponseArmedByNativeHook(DefensiveResponse::JustParry), "parry is hooked");
+    TEST_CHECK(ResponseArmedByNativeHook(DefensiveResponse::Repel), "repel is hooked");
+    TEST_CHECK(ResponseArmedByNativeHook(DefensiveResponse::PushAwayPerfect),
+               "push away is hooked");
+    TEST_CHECK(!ResponseArmedByNativeHook(DefensiveResponse::Dodge),
+               "the dodge is a guard cancel, not a window");
+    TEST_CHECK(!ResponseArmedByNativeHook(DefensiveResponse::GuardCounter),
+               "the counter is a guard cancel too");
+    TEST_CHECK(!ResponseArmedByNativeHook(DefensiveResponse::AbsoluteDefence),
+               "214D is a motion the dummy still has to perform");
+
+    DefenseDriveSample d = Drive();
+    d.nativeArmActive = true;
+    DefenseDriveState st{};
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, d, st) ==
+               DefenseInputKind::None, "hooked repel needs no input");
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::JustParry, d, st) ==
+               DefenseInputKind::None, "hooked parry needs no input");
+
+    // A guard cancel is not a window, so the hook changes nothing about it.
+    DefenseDriveSample dodge = Drive();
+    dodge.nativeArmActive = true;
+    dodge.actionId = 67;
+    dodge.meter = 500;
+    DefenseDriveState ds{};
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, dodge, ds) ==
+               DefenseInputKind::DodgePress, "the dodge still presses D");
+
+    // And with the hooks unavailable the input driver has to come back.
+    DefenseDriveSample fallback = Drive();
+    fallback.nativeArmActive = false;
+    DefenseDriveState fs{};
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, fallback, fs) ==
+               DefenseInputKind::ReleaseGuard, "no hook, back to the input driver");
 }
 
 static void TestGuardCounterDrive() {
@@ -804,6 +855,7 @@ int main() {
     TestDefensiveResponses();
     TestDodgeWindow();
     TestRepelDrive();
+    TestNativeArmSuppressesInput();
     TestGuardCounterDrive();
     TestDriveRouting();
     TestGroundMaskDecoder();

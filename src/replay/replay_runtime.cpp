@@ -1,4 +1,5 @@
 #include "replay/replay_runtime.h"
+#include "training/practice_tools.h"
 #include "net/netplay_menu_render.h"
 
 #include "core/as2_constants.h"
@@ -1190,32 +1191,19 @@ static std::string FormatReplayTimestampForFolder(const fs::path& path) {
     return buffer;
 }
 
+// One roster, not a second copy of it.
+//
+// This was its own switch that stopped at 17, so every replay featuring Demon
+// Rance, Little Princess, TADA or Nalzgis Boss was filed as "Char18".."Char21".
+// It also would have been a second place to get ids 19/20 the wrong way round.
 static std::string GetCharacterDisplayName(uint32_t characterId) {
-    switch (characterId) {
-        case 0: return "Rance";
-        case 1: return "Hatsune";
-        case 2: return "Patton";
-        case 3: return "Seed";
-        case 4: return "Raysen";
-        case 5: return "Aria";
-        case 6: return "Maria";
-        case 7: return "Shizuka";
-        case 8: return "Fanel";
-        case 9: return "Miki";
-        case 10: return "Menad";
-        case 11: return "Hanny King";
-        case 12: return "Satsu";
-        case 13: return "Tiger Joe";
-        case 14: return "Escalayer";
-        case 15: return "Makutsudo";
-        case 16: return "Alietta";
-        case 17: return "Nalzgis";
-        default: {
-            char buffer[32] = {};
-            snprintf(buffer, sizeof(buffer), "Char%u", characterId);
-            return buffer;
-        }
+    const char* name = PracticeTools_CharacterName(characterId);
+    if (name && strcmp(name, "Unknown") != 0) {
+        return name;
     }
+    char buffer[32] = {};
+    snprintf(buffer, sizeof(buffer), "Char%u", characterId);
+    return buffer;
 }
 
 static std::string SanitizeReplayFilenameComponent(const std::string& text,

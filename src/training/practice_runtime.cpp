@@ -314,6 +314,7 @@ struct PlayerSnapshot {
     uint8_t hitstunDuration;
     uint16_t knockbackTimer;
     uint16_t comboCount;
+    bool airborne;
 };
 
 struct TrainingRenderState {
@@ -730,6 +731,7 @@ static const char* GetCharacterName(uint32_t charId) {
     return "Unknown";
 }
 
+
 static uint16_t GetCharacterMaxHp(uint32_t charId) {
     if (charId < kPracticeRosterCount) {
         return ReadMemory<uint16_t>(ADDR_CHARACTER_MAX_HP_TABLE + charId * sizeof(uint16_t));
@@ -836,8 +838,12 @@ static bool IsWakeupNoTechState(uint32_t actionId) {
     return Training::IsWakeupNoTech(actionId);
 }
 
+// The engine's own airborne byte, not a Y comparison. Ground level is 7599 in
+// world units - the position presets say so - so "y <= 0" was false for every
+// grounded fighter, which is why the crouch stance and the jump loop both did
+// nothing at all under mod control: their only gate never opened.
 static bool IsGroundedAction(const PlayerSnapshot& snapshot) {
-    return snapshot.y <= 0 && !IsAirTechState(snapshot.actionId);
+    return !snapshot.airborne && !IsAirTechState(snapshot.actionId);
 }
 
 static uint16_t ReadComboCount(uintptr_t entityBase) {
@@ -952,6 +958,7 @@ static PlayerSnapshot ReadPlayerSnapshot(int player) {
     snapshot.hitstunDuration = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_HITSTUN_DURATION);
     snapshot.knockbackTimer = ReadMemory<uint16_t>(snapshot.base + ENTITY_OFF_KNOCKBACK_TIMER);
     snapshot.comboCount = ReadComboCount(snapshot.base);
+    snapshot.airborne = ReadMemory<uint8_t>(snapshot.base + ENTITY_OFF_AIRBORNE) == 1;
     return snapshot;
 }
 
@@ -1661,6 +1668,19 @@ static void WriteNativeTrainingSetting(uintptr_t address,
              clampedValue);
 }
 
+// Which side the dummy is on. Control swap hands the human P2, which makes P1
+// the dummy - so the whole Dummy page, the automation input and the CPU
+// ownership have to move with it. They did not: the dummy was hardwired to P2,
+// so swapping left the mod driving nobody and the vanilla AI took the side
+// over, which is exactly the "P2 control makes P1 act like vanilla" report.
+static int DummySide(void) {
+    return InputSystem_GetControlSwap() ? 0 : 1;
+}
+
+static int HumanSide(void) {
+    return 1 - DummySide();
+}
+
 static bool HasP2DummyAutomationConfigured(void) {
     if (s_practiceConfig.dummyControlMode != DUMMY_CONTROL_MOD) {
         return false;
@@ -1672,29 +1692,31 @@ static bool HasP2DummyAutomationConfigured(void) {
 }
 
 static void ComputeDesiredCpuFlags(uint8_t* outP1Cpu, uint8_t* outP2Cpu) {
-    const bool swapped = InputSystem_GetControlSwap();
-    uint8_t p1Cpu = swapped ? 1 : 0;
-    uint8_t p2Cpu = swapped ? 0 : 1;
+    const int dummy = DummySide();
+
+    // The vanilla AI owns the dummy; the human owns the other side. Which side
+    // that is follows the swap rather than being P2 by definition.
+    uint8_t cpu[kPracticePlayerCount] = { 0, 0 };
+    cpu[dummy] = 1;
 
     if (InputMacro_GetState() == MACRO_REPLAYING) {
-        p1Cpu = 0;
-        p2Cpu = 0;
+        cpu[0] = 0;
+        cpu[1] = 0;
     } else {
-        if (!swapped && s_practiceConfig.dummyControlMode == DUMMY_CONTROL_MOD) {
-            p2Cpu = 0;
+        // Mod control means the mod's own injected input drives the dummy, so
+        // the AI has to let go of it or the two fight over the same entity.
+        if (s_practiceConfig.dummyControlMode == DUMMY_CONTROL_MOD) {
+            cpu[dummy] = 0;
         }
-
-        if (s_playerRuntime[0].script.active) {
-            p1Cpu = 0;
-        }
-
-        if (s_playerRuntime[1].script.active) {
-            p2Cpu = 0;
+        for (int player = 0; player < kPracticePlayerCount; ++player) {
+            if (s_playerRuntime[player].script.active) {
+                cpu[player] = 0;
+            }
         }
     }
 
-    if (outP1Cpu) *outP1Cpu = p1Cpu;
-    if (outP2Cpu) *outP2Cpu = p2Cpu;
+    if (outP1Cpu) *outP1Cpu = cpu[0];
+    if (outP2Cpu) *outP2Cpu = cpu[1];
 }
 
 static void WriteDesiredCpuFlags(void) {
@@ -2171,7 +2193,38 @@ static void ApplyContinuousRecovery(uint32_t simFrame,
     }
 }
 
+// The Defense row lists only what the dummy's own category can perform, so a
+// stored choice can become unreachable the moment the dummy changes character -
+// on a control swap, on a rematch with a different pick, on a side swap. Leaving
+// it stale made the row read as one mechanic while the driver silently ran
+// none. Falling back to Native keeps a mechanic selected whatever the new
+// character is.
+static void ClampDefensiveResponseToCategory(int category) {
+    const Training::DefensiveResponse current =
+        (Training::DefensiveResponse)ClampInt(g_defensiveResponse, 0,
+                                              (int)Training::DefensiveResponse::Count - 1);
+    if (Training::ResponseSupportedByCategory(current, category)) {
+        return;
+    }
+    g_defensiveResponse = (int)Training::DefensiveResponse::CharacterNative;
+    LOG_INFO("[Practice] Defense '%s' is not available to defence category %d; "
+             "falling back to '%s'",
+             Training::DefensiveResponseLabel(current),
+             category,
+             Training::DefensiveResponseLabel(Training::DefensiveResponse::CharacterNative));
+}
+
 static void PushDefenseConfig() {
+    // Re-derived every frame because the dummy can change underneath it.
+    static int s_lastDefenceCategory = -1;
+    const int defenceCategory = PracticeDefense_DummyDefenseCategory();
+    if (defenceCategory != s_lastDefenceCategory) {
+        LOG_INFO("[Practice] Dummy defence category %d -> %d (dummy=%s)",
+                 s_lastDefenceCategory, defenceCategory, SideLabel(DummySide()));
+        s_lastDefenceCategory = defenceCategory;
+        ClampDefensiveResponseToCategory(defenceCategory);
+    }
+
     PracticeDefenseConfig config{};
     config.enabled = (s_practiceConfig.dummyControlMode == DUMMY_CONTROL_MOD);
     config.policy = BlockPolicyForMode(s_practiceConfig.blockMode);
@@ -2181,8 +2234,7 @@ static void PushDefenseConfig() {
     config.preferCrouch = (s_practiceConfig.stanceMode != DUMMY_STANCE_STAND);
     config.response = (Training::DefensiveResponse)ClampInt(
         g_defensiveResponse, 0, (int)Training::DefensiveResponse::Count - 1);
-    config.dummyPlayer = 1;
-    config.controlSwapActive = InputSystem_GetControlSwap();
+    config.dummyPlayer = DummySide();
     config.macroOwnsDummyInput = (InputMacro_GetState() == MACRO_REPLAYING);
     config.paused = s_paused;
     PracticeDefense_SetConfig(config);
@@ -2196,12 +2248,8 @@ static void PushDefenseConfig() {
 // outcomes, not from action-state edges: a second hit landing while the dummy
 // is already in blockstun produces no state edge at all.
 static bool ShouldHoldAutoBlock(const PlayerSnapshot snapshots[kPracticePlayerCount]) {
-    if (InputSystem_GetControlSwap()) {
-        return false;
-    }
-
-    const PlayerSnapshot& dummy = snapshots[1];
-    const PlayerSnapshot& attacker = snapshots[0];
+    const PlayerSnapshot& dummy = snapshots[DummySide()];
+    const PlayerSnapshot& attacker = snapshots[HumanSide()];
     if (!dummy.valid || !attacker.valid) {
         return false;
     }
@@ -2261,8 +2309,13 @@ static uint16_t BuildDummyBlockInput(const PlayerSnapshot& dummy,
     const Training::SemanticDirection direction = PracticeDefense_GetAnticipatoryGuard();
     uint16_t resolved = Training::ResolveSemanticDirection(direction, dummy.facingRight);
     if (resolved == 0) {
-        // Nothing decoded yet: plain back keeps proximity guard natural.
+        // Nothing decoded yet: plain back keeps proximity guard natural - but
+        // it has to respect the stance, or a crouching dummy stands up for
+        // every frame no lane was decoded on, which is most of them.
         resolved = BackMask(dummy);
+        if (s_practiceConfig.stanceMode == DUMMY_STANCE_CROUCH) {
+            resolved |= INPUT_DOWN;
+        }
     }
     PracticeDefense_NoteAnticipatoryFacing(dummy.facingRight ? (int8_t)1 : (int8_t)-1, true);
     return resolved;
@@ -2347,7 +2400,7 @@ static uint16_t ComputeAutomationInput(int player,
         return input;
     }
 
-    if (player != 1) {
+    if (player != DummySide()) {
         return 0;
     }
 
@@ -2355,9 +2408,9 @@ static uint16_t ComputeAutomationInput(int player,
         return 0;
     }
 
-    const PlayerSnapshot& dummy = snapshots[1];
-    const PlayerSnapshot& attacker = snapshots[0];
-    PlayerRuntime& runtime = s_playerRuntime[1];
+    const PlayerSnapshot& dummy = snapshots[player];
+    const PlayerSnapshot& attacker = snapshots[1 - player];
+    PlayerRuntime& runtime = s_playerRuntime[player];
     if (!dummy.valid || !attacker.valid) {
         return 0;
     }
@@ -2367,10 +2420,7 @@ static uint16_t ComputeAutomationInput(int player,
     }
 
     if (runtime.jumpHoldFrames > 0) {
-        if (InputSystem_GetControlSwap()) {
-            runtime.jumpHoldFrames = 0;
-            runtime.jumpHoldInput = 0;
-        } else if (!IsGroundedAction(dummy) || !IsActionable(dummy)) {
+        if (!IsGroundedAction(dummy) || !IsActionable(dummy)) {
             LOG_INFO("[Practice] Dummy jump accepted: action=%u y=%d frame=%u",
                      dummy.actionId,
                      dummy.y,
@@ -2389,9 +2439,7 @@ static uint16_t ComputeAutomationInput(int player,
         }
     }
 
-    if (!InputSystem_GetControlSwap() &&
-        IsActionable(dummy) &&
-        IsGroundedAction(dummy)) {
+    if (IsActionable(dummy) && IsGroundedAction(dummy)) {
         const bool wantsJumpLoop = s_practiceConfig.stanceMode == DUMMY_STANCE_JUMP ||
                                    s_practiceConfig.jumpMode != DUMMY_JUMP_DISABLED;
         if (wantsJumpLoop && runtime.jumpCooldown <= 0) {
@@ -2410,9 +2458,7 @@ static uint16_t ComputeAutomationInput(int player,
         }
     }
 
-    if (!InputSystem_GetControlSwap() &&
-        s_practiceConfig.stanceMode == DUMMY_STANCE_CROUCH &&
-        IsGroundedAction(dummy)) {
+    if (s_practiceConfig.stanceMode == DUMMY_STANCE_CROUCH && IsGroundedAction(dummy)) {
         return INPUT_DOWN;
     }
 
@@ -2432,7 +2478,7 @@ static void ApplyAutomationOverrides(uint32_t simFrame,
     }
 
     for (int player = 0; player < kPracticePlayerCount; ++player) {
-        if (player == 1 && InputMacro_GetState() == MACRO_REPLAYING) {
+        if (player == DummySide() && InputMacro_GetState() == MACRO_REPLAYING) {
             ReleaseOwnedOverride(player);
             continue;
         }
@@ -3432,10 +3478,34 @@ int DefensiveResponseOptions(int* out, int max) {
             out[count++] = r;
         }
     }
+
+    // One line whenever the offered set changes. "The mechanic is not in the
+    // menu" and "the mechanic is in the menu and does nothing" are different
+    // bugs, and without this there is no way to tell them apart from a log.
+    static int s_lastCategory = -1;
+    static int s_lastCount = -1;
+    if (category != s_lastCategory || count != s_lastCount) {
+        s_lastCategory = category;
+        s_lastCount = count;
+        char list[192] = {};
+        size_t used = 0;
+        for (int i = 0; i < count && used + 24 < sizeof(list); ++i) {
+            used += (size_t)snprintf(list + used, sizeof(list) - used, "%s%s",
+                                     i ? ", " : "",
+                                     Training::DefensiveResponseLabel(
+                                         (Training::DefensiveResponse)out[i]));
+        }
+        LOG_INFO("[Practice] Defense options: category=%d count=%d [%s]",
+                 category, count, list);
+    }
     return count;
 }
 
-constexpr int kDefensiveResponseMaxOptions = 4;
+// Sized to the enum, not to "however many I expected". A category that gains a
+// response - push block already has two - must never be silently truncated,
+// because the symptom is a mechanic quietly missing from the menu with nothing
+// logged.
+constexpr int kDefensiveResponseMaxOptions = (int)Training::DefensiveResponse::Count;
 
 // Storage stays the enum value, so a character swap cannot silently repoint the
 // setting at a different mechanic; the row just shows the nearest valid entry.
@@ -3705,6 +3775,14 @@ void PracticeSetting_Cycle(int setting, int delta) {
             }
             break;
     }
+
+    // Every change, named, after it has been applied. "This setting does
+    // nothing" and "the menu never reached this setting" are different bugs,
+    // and without a line here they look identical in a log.
+    LOG_INFO("[Practice] Setting '%s' -> '%s' (index %d of %d)",
+             PracticeSetting_Label(setting),
+             PracticeSetting_ValueText(setting),
+             next, count);
 }
 
 const char* PracticeSetting_Label(int setting) {
@@ -4299,6 +4377,156 @@ void PracticeTools_FrameUpdate() {
     PracticeTools_SyncControlSwapState();
 }
 
+void PracticeTools_LogDiagnosticSnapshot(const char* reason) {
+    const PlayerSnapshot snapshots[kPracticePlayerCount] = {
+        ReadPlayerSnapshot(0),
+        ReadPlayerSnapshot(1),
+    };
+    const int dummy = DummySide();
+    const uint32_t simFrame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+
+    LOG_INFO("[Diag] ===== practice snapshot (%s) =====", reason ? reason : "unspecified");
+    LOG_INFO("[Diag] context: game_type=%d mode=%d substate=%d frame=%u playable=%d "
+             "practice_mode=%d paused=%d initialised=%d",
+             GetGameType(), GetGameMode(), GetSubstate(), simFrame,
+             IsInPlayableMatchGameplay() ? 1 : 0,
+             IsPracticeModeNow() ? 1 : 0,
+             s_paused ? 1 : 0,
+             s_initialized ? 1 : 0);
+
+    uint8_t expectedP1Cpu = 0;
+    uint8_t expectedP2Cpu = 1;
+    ComputeDesiredCpuFlags(&expectedP1Cpu, &expectedP2Cpu);
+    LOG_INFO("[Diag] sides: dummy=%s human=%s control_swap=%d macro_state=%d | "
+             "cpu p1=%u(want %u) p2=%u(want %u) | override p1=%d(0x%04X) p2=%d(0x%04X)",
+             SideLabel(dummy), SideLabel(1 - dummy),
+             InputSystem_GetControlSwap() ? 1 : 0,
+             (int)InputMacro_GetState(),
+             (unsigned)ReadMemory<uint8_t>(ADDR_P1_CPU_FLAG), (unsigned)expectedP1Cpu,
+             (unsigned)ReadMemory<uint8_t>(ADDR_P2_CPU_FLAG), (unsigned)expectedP2Cpu,
+             s_ownedOverrideActive[0] ? 1 : 0, (unsigned)s_lastOwnedOverrideInput[0],
+             s_ownedOverrideActive[1] ? 1 : 0, (unsigned)s_lastOwnedOverrideInput[1]);
+
+    for (int player = 0; player < kPracticePlayerCount; ++player) {
+        const PlayerSnapshot& p = snapshots[player];
+        if (!p.valid) {
+            LOG_INFO("[Diag] %s: entity unavailable", SideLabel(player));
+            continue;
+        }
+        LOG_INFO("[Diag] %s%s: char=%u(%s) action=%u(%s) hp=%u/%u meter=%u guard=%u "
+                 "x=%d y=%d facing=%s airborne=%d grounded=%d actionable=%d "
+                 "attack_state=%u hit_active=%u",
+                 SideLabel(player), player == dummy ? " [dummy]" : " [human]",
+                 (unsigned)p.charId, GetCharacterName(p.charId),
+                 (unsigned)p.actionId, Training::ActionCategory(p.actionId),
+                 (unsigned)p.hp, (unsigned)p.maxHp, (unsigned)p.meter, (unsigned)p.guardGauge,
+                 (int)p.x, (int)p.y, p.facingRight ? "right" : "left",
+                 p.airborne ? 1 : 0,
+                 IsGroundedAction(p) ? 1 : 0,
+                 IsActionable(p) ? 1 : 0,
+                 (unsigned)p.attackState, (unsigned)p.hitActive);
+        LOG_INFO("[Diag] %s defence bytes: allow1949=%u flags1940=0x%04X parry1965=0x%02X "
+                 "down1973=%u back1974=%u react1980=%d kind1989=%u timer1990=%u "
+                 "push1993=0x%02X free1994=%u pushdown1996=%u pushback1997=%u stock823=%u",
+                 SideLabel(player),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_DEFENCE_ALLOWED),
+                 (unsigned)ReadMemory<uint32_t>(p.base + ENTITY_OFF_MAX_HIT_FLAGS),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_PARRY_WINDOW),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_PARRY_STANCE),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_PARRY_GUARD_HELD),
+                 (int)ReadMemory<int32_t>(p.base + ENTITY_OFF_HIT_REACTION_STATE),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_HIT_REACTION_KIND),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_HIT_REACTION_TIMER),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_PUSH_AWAY_ARMED),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_PUSH_AWAY_FREE),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_PUSH_AWAY_DOWN),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_PUSH_AWAY_BACK),
+                 (unsigned)ReadMemory<uint8_t>(p.base + ENTITY_OFF_DEFENSE_RESOURCE));
+    }
+
+    // Hook state. "The setting does nothing" and "the hook that would have
+    // carried it out never installed" look identical from the game.
+    LOG_INFO("[Diag] hooks: defence_installed=%d ordinary_guard=%d native_arming=%d error='%s'",
+             PracticeDefense_IsInstalled() ? 1 : 0,
+             PracticeDefense_HasOrdinaryGuardHook() ? 1 : 0,
+             PracticeDefense_ArmHooksActive() ? 1 : 0,
+             PracticeDefense_GetInstallError());
+
+    const PracticeDefenseArmState& arm = PracticeDefense_GetArmState();
+    LOG_INFO("[Diag] defence: category=%d configured=%s effective=%s driver=%s gate_open=%d "
+             "| arms=%u (parry %u repel %u push %u) forced1949=%u prepared=%u "
+             "resolver_calls=%u declines=%u",
+             arm.category,
+             Training::DefensiveResponseLabel(arm.configured),
+             Training::DefensiveResponseLabel(arm.effective),
+             arm.hookDriven ? "native hook" : "input",
+             arm.gateOpen ? 1 : 0,
+             arm.arms, arm.parryArms, arm.repelArms, arm.pushAwayArms,
+             arm.defenceAllowedForced, arm.contactsPrepared,
+             arm.resolverCalls, arm.resolverDeclines);
+
+    const PracticeDefenseTelemetry& tel = PracticeDefense_GetTelemetry();
+    LOG_INFO("[Diag] contacts: total=%u guard=%u parry=%u repel=%u push=%u dodge=%u "
+             "absolute=%u counter=%u hit=%u | lane_applications=%u conflicts=%u "
+             "refused_no_lane=%u refused_special=%u late_blocks=%u",
+             tel.contactTicks,
+             tel.resultCounts[CONTACT_RESULT_GUARD],
+             tel.resultCounts[CONTACT_RESULT_JUST_PARRY],
+             tel.resultCounts[CONTACT_RESULT_REPEL],
+             tel.resultCounts[CONTACT_RESULT_PUSH_AWAY],
+             tel.resultCounts[CONTACT_RESULT_DODGE],
+             tel.resultCounts[CONTACT_RESULT_ABSOLUTE_DEFENSE],
+             tel.resultCounts[CONTACT_RESULT_UNIQUE_DEFENSE],
+             tel.resultCounts[CONTACT_RESULT_HIT],
+             tel.laneApplications, tel.conflictFrames,
+             tel.refusedNoLane, tel.refusedSpecialGuard, tel.lateBlockSignatures);
+
+    // Which defensive mechanics this dummy can be offered at all, so a missing
+    // menu entry reads as "this character has no such mechanic" rather than as
+    // a bug in the row.
+    {
+        int options[(int)Training::DefensiveResponse::Count];
+        const int count =
+            DefensiveResponseOptions(options, (int)Training::DefensiveResponse::Count);
+        char list[192] = {};
+        size_t used = 0;
+        for (int i = 0; i < count && used + 24 < sizeof(list); ++i) {
+            used += (size_t)snprintf(list + used, sizeof(list) - used, "%s%s",
+                                     i ? ", " : "",
+                                     Training::DefensiveResponseLabel(
+                                         (Training::DefensiveResponse)options[i]));
+        }
+        LOG_INFO("[Diag] defence options for this dummy: [%s]", list);
+    }
+
+    // Every setting, with exactly the label and value text the menu draws, so a
+    // report can be checked against what was actually selected.
+    for (int setting = 0; setting < PRACTICE_SET_COUNT; ++setting) {
+        const char* label = PracticeSetting_Label(setting);
+        if (!label || !label[0]) {
+            continue;
+        }
+        LOG_INFO("[Diag] setting %-22s = %-14s (raw %d%s)",
+                 label,
+                 PracticeSetting_ValueText(setting),
+                 PracticeSetting_Get(setting),
+                 PracticeSetting_Enabled(setting) ? "" : ", DISABLED");
+    }
+
+    LOG_INFO("[Diag] native training bytes: cpu=%u air_tech=%u ground_tech=%u block_type=%u "
+             "dummy_state=%u health_regen=%u meter_level=%u damage_display=%u input_display=%u",
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_DUMMY_BEHAVIOR_ENABLE),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_AIR_TECH_SETTING),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_GROUND_TECH_SETTING),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_BLOCK_TYPE_SETTING),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_DUMMY_STATE_SETTING),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_HEALTH_REGEN_SETTING),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_METER_LEVEL_SETTING),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_DAMAGE_DISPLAY),
+             (unsigned)ReadMemory<uint8_t>(ADDR_TRAINING_INPUT_DISPLAY));
+    LOG_INFO("[Diag] ===== end snapshot =====");
+}
+
 void PracticeTools_RenderImGui() {
     if (!PracticeTools_IsPracticeModeActive()) {
         ImGui::TextDisabled("Practice tools are only available in Training mode.");
@@ -4505,9 +4733,28 @@ void PracticeTools_ApplyControlSwapState(bool swapped) {
     const bool previous = InputSystem_GetControlSwap();
     InputSystem_SetControlSwap(swapped);
     if (previous != swapped) {
-        LOG_INFO("[Practice] Apply control swap state: %s -> %s",
+        // The dummy is now the other entity, so everything keyed to the old one
+        // has to go: the half-finished defence sequence, a jump being held, an
+        // override still driving the side the human just took back.
+        for (int player = 0; player < kPracticePlayerCount; ++player) {
+            s_playerRuntime[player].jumpHoldFrames = 0;
+            s_playerRuntime[player].jumpHoldInput = 0;
+            s_playerRuntime[player].jumpCooldown = 0;
+            ReleaseOwnedOverride(player);
+        }
+        PracticeDefense_Reset();
+        ClampDefensiveResponseToCategory(PracticeDefense_DummyDefenseCategory());
+
+        LOG_INFO("[Practice] Control swap %s -> %s: human=%s dummy=%s "
+                 "dummy_char=%s defence_category=%d control=%s",
                  previous ? "P2" : "P1",
-                 swapped ? "P2" : "P1");
+                 swapped ? "P2" : "P1",
+                 SideLabel(1 - DummySide()),
+                 SideLabel(DummySide()),
+                 GetCharacterName(ReadPlayerSnapshot(DummySide()).charId),
+                 PracticeDefense_DummyDefenseCategory(),
+                 kDummyControlModeLabels[ClampInt(s_practiceConfig.dummyControlMode, 0,
+                                                  IM_ARRAYSIZE(kDummyControlModeLabels) - 1)]);
     }
 
     if (IsPracticeModeNow()) {
@@ -4552,4 +4799,10 @@ bool PracticeTools_HasVisibleHud() {
 
 bool PracticeTools_ShouldRenderHudBehindMenu() {
     return ModMenu_IsOpen();
+}
+
+// Defined out here on purpose: the roster table and GetCharacterName live in
+// this file's anonymous namespace, so the exported accessor cannot.
+const char* PracticeTools_CharacterName(uint32_t charId) {
+    return GetCharacterName(charId);
 }

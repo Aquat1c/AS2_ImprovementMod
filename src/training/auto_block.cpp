@@ -306,7 +306,6 @@ bool DefenderAlreadyGuards(uint32_t attackMask, uint32_t defenderFlags, bool air
 
 bool CanAutoGuardAtContact(const DefenderGuardState& state) {
     if (!state.practiceAdvancedModeActive) return false;
-    if (state.controlSwapActive) return false;
     if (state.macroOwnsDummyInput) return false;
     if (state.guardGauge == 0) return false;
 
@@ -433,6 +432,26 @@ DefensiveResponse ResponseForCategory(int category) {
     }
 }
 
+bool ResponseArmsBeforeContact(DefensiveResponse response) {
+    // Both of these set a window that must already be open when the hit
+    // arrives, so they are driven from the attacker's commitment rather than
+    // from a live hitbox.
+    return response == DefensiveResponse::JustParry ||
+           response == DefensiveResponse::Repel;
+}
+
+bool ResponseArmedByNativeHook(DefensiveResponse response) {
+    switch (response) {
+        case DefensiveResponse::JustParry:        // Entity_CheckHitState
+        case DefensiveResponse::Repel:            // Entity_CheckGuardState
+        case DefensiveResponse::PushAwayPerfect:  // Entity_CheckAirTech
+        case DefensiveResponse::PushAwayMetered:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ResponseSupportedByCategory(DefensiveResponse response, int category) {
     switch (response) {
         case DefensiveResponse::JustParry: return category == kDefenseCategoryJustParry;
@@ -526,6 +545,19 @@ bool PushAwayWindowOpen(uint32_t actionId, uint16_t meter) {
     }
 }
 
+const char* DefenseInputKindLabel(DefenseInputKind kind) {
+    switch (kind) {
+        case DefenseInputKind::ReleaseGuard:   return "release";
+        case DefenseInputKind::ForwardTap:     return "fwd tap";
+        case DefenseInputKind::DownTap:        return "down tap";
+        case DefenseInputKind::DodgePress:     return "back+D";
+        case DefenseInputKind::CounterForward: return "fwd+D";
+        case DefenseInputKind::ArmGuardState:  return "214D";
+        case DefenseInputKind::None:
+        default:                               return "hold guard";
+    }
+}
+
 bool ParryWantsRelease(ParryInputState& state, uint8_t windowByte, bool threatArmed) {
     if (!threatArmed) {
         state.releasedLastFrame = false;
@@ -550,6 +582,10 @@ bool ParryWantsRelease(ParryInputState& state, uint8_t windowByte, bool threatAr
     return true;
 }
 
+bool ThreatIsIncoming(const DefenseDriveSample& sample) {
+    return sample.threatArmed || sample.recordsToAttack >= 0 || sample.attackerCommitted;
+}
+
 DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                                       const DefenseDriveSample& sample,
                                       DefenseDriveState& state) {
@@ -561,10 +597,26 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
     // dummy. On a single hit the threat is already gone by the frame blockstun
     // begins, so the window opened and closed with the driver switched off.
     //
-    // Parry and repel do need it: both arm a window *before* the hit, so they
-    // have to know one is coming.
+    // Parry and repel do need to know one is coming - but "coming", not
+    // "landing". They watch ThreatIsIncoming, which reads the attacker's own
+    // animation records ahead of where it has got to, rather than threatArmed
+    // (a box is live). Waiting for the box is what made repel miss: its window
+    // opens from a neutral tap and lasts 24 frames, and by the time a box
+    // exists the tap has to have happened already.
+    //
+    // None of that applies to a mechanic the native arming hook is opening
+    // directly. Its window is already set by the time the dummy could have
+    // pressed anything, and feeding the input as well would drop the guard for
+    // a frame and walk the dummy forward for no gain.
+    if (sample.nativeArmActive && ResponseArmedByNativeHook(response)) {
+        state = DefenseDriveState{};
+        return DefenseInputKind::None;
+    }
+
     const bool blockstunDriven = ResponseRequiresBlockstun(response);
-    if (!sample.threatArmed && !blockstunDriven) {
+    const bool preArmed = ResponseArmsBeforeContact(response);
+    const bool haveThreat = preArmed ? ThreatIsIncoming(sample) : sample.threatArmed;
+    if (!haveThreat && !blockstunDriven) {
         state = DefenseDriveState{};
         return DefenseInputKind::None;
     }

@@ -936,6 +936,11 @@ void OnMenuOpened() {
     // moment to replay whatever was last toasted before it opened.
     PracticeTools_LatestStatus(&g_statusSerial);
     g_pendingResult = kResultStay;
+
+    // Full state dump on every open. A report of "this setting does nothing"
+    // is only actionable next to what was actually selected, which side the
+    // dummy was, and whether the hook that would have carried it out installed.
+    PracticeTools_LogDiagnosticSnapshot("pause menu opened");
 }
 
 // --- Hooks ---------------------------------------------------------------

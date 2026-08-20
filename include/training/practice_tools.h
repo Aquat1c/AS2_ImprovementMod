@@ -130,6 +130,14 @@ enum PracticeSettingId : int {
 	PRACTICE_SET_COUNT,
 };
 
+// Dumps everything the practice tools know to the log in one block: the match
+// context, both fighters, which side the dummy is and who owns its input, the
+// hook install state, the defence arming state, and every setting with the same
+// label and value text the menu shows. Called when the pause menu opens, so a
+// report of "setting X does nothing" arrives with the whole picture attached
+// instead of having to be reconstructed from behaviour.
+void PracticeTools_LogDiagnosticSnapshot(const char* reason);
+
 int  PracticeSetting_Get(int setting);
 // Steps the value by delta, wrapping at the ends the way the vanilla rows do.
 void PracticeSetting_Cycle(int setting, int delta);
@@ -166,6 +174,13 @@ enum PracticeActionId : int {
 
 // Returns a short status string for the hint line, or nullptr.
 const char* PracticeAction_Invoke(int action);
+
+/// Roster name for a character id (0..21), or "Unknown".
+///
+/// The single source of truth. Ids 19 and 20 are Little Princess and TADA in
+/// that order - the game's own per-character dispatch and its sprite tables
+/// both agree, and getting them the wrong way round mislabels two characters.
+const char* PracticeTools_CharacterName(uint32_t charId);
 
 // --- Trigger slots -------------------------------------------------------
 // The pause menu shows one row per trigger and edits the selected one's action

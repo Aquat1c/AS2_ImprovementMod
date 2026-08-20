@@ -21,8 +21,10 @@
  */
 
 #include "training/auto_block.h"
+#include "core/as2_constants.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct PracticeDefenseConfig {
@@ -31,10 +33,49 @@ struct PracticeDefenseConfig {
     int randomPercent = 50;
     bool preferCrouch = true;           // posture chosen for masks that allow either
     Training::DefensiveResponse response = Training::DefensiveResponse::NormalGuard;
+    // 0 or 1: which entity the mod is driving. Follows the control swap.
     int dummyPlayer = 1;
-    bool controlSwapActive = false;
     bool macroOwnsDummyInput = false;
     bool paused = false;
+};
+
+// Live state of the native arming hooks. Everything here is written to the log
+// on change, so a run can be read back without having had the game in front of
+// you: what the dummy was set to, whether anything was driving it, and whether
+// the window was actually open when the hit arrived.
+struct PracticeDefenseArmState {
+    bool installed = false;
+    uint32_t arms = 0;            // windows opened since the last reset
+    uint32_t parryArms = 0;
+    uint32_t repelArms = 0;
+    uint32_t pushAwayArms = 0;
+    uint32_t defenceAllowedForced = 0;   // +1949 had to be written
+    uint32_t contactsPrepared = 0;       // window pointed at a specific contact
+    uint32_t resolverCalls = 0;          // category resolver reached the dummy
+    uint32_t resolverDeclines = 0;       // ...and returned 1
+    uint32_t lastArmFrame = 0;
+
+    // Live window bytes, sampled once per collision tick.
+    uint8_t parryWindow = PARRY_WINDOW_IDLE;
+    int32_t repelReaction = REPEL_REACTION_IDLE;
+    uint8_t repelTimer = 0;
+    uint8_t pushAwayTimer = PUSH_AWAY_TIMER_IDLE;
+    bool pushAwayFree = false;
+    uint8_t guardStock = 0;       // +823, the category-5 counter-guard stock
+
+    // What the dummy is set to do, and whether anything is driving it.
+    int category = 0;
+    Training::DefensiveResponse configured = Training::DefensiveResponse::NormalGuard;
+    Training::DefensiveResponse effective = Training::DefensiveResponse::NormalGuard;
+    bool gateOpen = false;
+    bool hookDriven = false;      // the mechanic is armed by hook, not by input
+    Training::DefenseInputKind input = Training::DefenseInputKind::None;
+
+    // Prediction, so "nothing is coming" reads differently from "it is coming
+    // and we still did nothing".
+    int16_t recordsToAttack = -1;
+    bool attackerCommitted = false;
+    bool threatArmed = false;
 };
 
 struct PracticeDefenseTelemetry {
@@ -69,6 +110,11 @@ struct PracticeDefenseTelemetry {
     uint32_t refusedNoLane = 0;
     uint32_t refusedSpecialGuard = 0;
     uint32_t lateBlockSignatures = 0;   // result 11 then 10 on the same threat
+
+    // One counter per contact resolution code (3..11), so the menu can show
+    // what the dummy actually produced rather than only what it last produced.
+    uint32_t resultCounts[12] = {};
+    uint32_t contactTicks = 0;
 };
 
 struct PracticeDefenseRuntimeState {
@@ -119,6 +165,13 @@ bool PracticeDefense_BlockForcedByResponse();
 int PracticeDefense_DummyDefenseCategory();
 
 const PracticeDefenseTelemetry& PracticeDefense_GetTelemetry();
+const PracticeDefenseArmState& PracticeDefense_GetArmState();
+
+// True when the three window mechanics are being armed through the engine's own
+// setters. False means the hooks did not install and the driver is back to
+// simulating the input, which is late by construction.
+bool PracticeDefense_ArmHooksActive();
+
 
 // Contact groups resolved so far in the live sequence: what First / After First
 // Hit must key off, because it has to see contacts that land while the dummy is

@@ -133,6 +133,17 @@ constexpr int kDefenseCategoryDodge = 6;
 // Which response a category can actually perform on legal input today.
 DefensiveResponse ResponseForCategory(int category);
 bool ResponseSupportedByCategory(DefensiveResponse response, int category);
+
+/// True for responses whose window must be open before the hit lands.
+bool ResponseArmsBeforeContact(DefensiveResponse response);
+
+// True for the three mechanics the engine arms from a per-character routine at
+// the tail of Entity_ProcessCommandMatches - just parry, repel and push away.
+// Each opens a window the defender must already hold when the hit arrives, so
+// the mod hooks that routine and arms through the engine's own setters instead
+// of simulating the input that would have opened it. Everything else here is a
+// guard CANCEL performed with live buttons, which no hook can stand in for.
+bool ResponseArmedByNativeHook(DefensiveResponse response);
 const char* DefensiveResponseLabel(DefensiveResponse response);
 
 // Drives the parry re-arm. The window byte is the engine's own state, so the
@@ -158,13 +169,29 @@ enum class DefenseInputKind : uint8_t {
     DownTap,         // 2 from neutral, the low half of the category-3 parry
 };
 
+const char* DefenseInputKindLabel(DefenseInputKind kind);
+
 struct DefenseDriveSample {
     uint8_t parryWindow = 0xFF;   // +1965, 0xFF = idle
     int32_t reactionState = -1;   // +1980, -1 = no reaction armed
     uint32_t actionId = 0;
     uint16_t meter = 0;
     bool airborne = false;
+    // An attack box is live RIGHT NOW. Correct for anything that reacts to a
+    // hit; useless for anything that has to be armed before one.
     bool threatArmed = false;
+    // Records until the attacker's own animation reaches a frame that carries
+    // an attack box, read straight out of its collision table. 0 means a box is
+    // out now, -1 that none appears inside the lookahead. This is the only
+    // signal available BEFORE the hit that says one is coming.
+    int16_t recordsToAttack = -1;
+    // The attacker's command-route vector is closed, so it is committed to
+    // something. Catches a move whose very first record already carries the box.
+    bool attackerCommitted = false;
+    // The native arming hook is opening this mechanic's window directly, so the
+    // driver must not also feed it an input - the tap would drop the guard and
+    // walk the dummy forward for nothing.
+    bool nativeArmActive = false;
     bool actionable = false;      // engine would accept an ordinary input now
     bool guardStateArmed = false; // +823, the category-5 counter-guard flag
     // Which lane the incoming attack demands. The category-3 parry is 6 against
@@ -184,6 +211,14 @@ struct DefenseDriveState {
 // Frames in the 214D motion. Matches the game's own command table entry for it
 // (0x723480 cmd 26: 2, 1, 4 with the D gate).
 constexpr int kGuardStateMotionFrames = 3;
+
+// An attack is on its way. Parry and repel both open a window AHEAD of the hit
+// (repel's is 24 frames from a neutral tap), so keying them off threatArmed - a
+// box that is already out - produced the input a frame or more too late unless
+// the move happened to have long active frames. A live box, a box the
+// attacker's own animation is about to reach, or a closed command route all
+// mean the same thing to a mechanic that has to be armed in advance.
+bool ThreatIsIncoming(const DefenseDriveSample& sample);
 
 DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                                       const DefenseDriveSample& sample,
@@ -300,7 +335,9 @@ constexpr int kDefenseCategoryJustParry = 2;
 
 struct DefenderGuardState {
     bool practiceAdvancedModeActive = false;
-    bool controlSwapActive = false;
+    // Control swap used to appear here as a refusal. It no longer does: the
+    // dummy side follows the swap, so a swapped match has a dummy the mod is
+    // driving exactly as before, just on the other entity.
     bool macroOwnsDummyInput = false;
     uint16_t guardGauge = 0;
     uint32_t actionId = 0;

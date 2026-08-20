@@ -739,23 +739,90 @@
 // Just-parry / repel are NOT actions: sub_49EED0 reaction codes 2..4 and 5..7
 // are the follow-through states, and the entry is the timer path below.
 
+// --- Native defensive-window arming --------------------------------------
+// Entity_ProcessCommandMatches (0x4BEA20) ends by dispatching on the CHARACTER
+// ID at *(entity+0) + 176 - not on the defence category - to the routine that
+// decides whether this frame's input opens the character's defensive window:
+//     0, 2, 5, 13, 18  -> Entity_CheckGuardState  (repel,      category 3)
+//     3, 8             -> Entity_CheckHitState    (just parry, category 2)
+//     7, 10, 14, 16    -> Entity_CheckAirTech     (push away,  category 4)
+//     1                -> sub_4F2840
+// Every other id reaches nothing here: dodge, absolute defence and the
+// category-1 counter are guard CANCELS resolved in Entity_UpdateAction_Standard
+// from live buttons, not windows opened ahead of the hit.
+//
+// The three window routines are the practice dummy's seam. Each opens a state
+// that must ALREADY be open when the hit lands, so a dummy that waits to see a
+// hitbox can never open it in time whatever it presses. Hooking the routine and
+// arming through the engine's own setters puts the dummy in exactly the state a
+// perfectly timed human input would have produced.
+#define ADDR_ENTITY_CHECK_HIT_STATE   (GAME_BASE + 0x024AF0)  // just-parry arm
+#define ADDR_ENTITY_CHECK_GUARD_STATE (GAME_BASE + 0x024B80)  // repel arm
+#define ADDR_ENTITY_CHECK_AIR_TECH    (GAME_BASE + 0x024C90)  // push-away arm
+#define ADDR_ENTITY_SET_HIT_STATE_1965 (GAME_BASE + 0x09EA10) // opens the parry window
+#define ADDR_ENTITY_SET_HIT_REACTION   (GAME_BASE + 0x09EA50) // opens the repel window
+#define ADDR_ENTITY_UPDATE_HIT_REACTION (GAME_BASE + 0x09EB50)// upgrades +1989 once
+#define ADDR_ENTITY_SET_HIT_FLAG_1993  (GAME_BASE + 0x09EBC0) // arms push-away
+#define ADDR_ENTITY_SET_HIT_BYTE_1949  (GAME_BASE + 0x09E990) // action permits defence
+#define ADDR_ENTITY_SET_HIT_STATE_1973 (GAME_BASE + 0x09EA30) // records DOWN / BACK held
+#define ADDR_ENTITY_SET_HIT_FLAGS_1996 (GAME_BASE + 0x09EBE0) // push-away DOWN / BACK held
+
 // --- Just-parry window (defender-relative) --------------------------------
-// Entity_CheckHitState (0x424AF0) arms the window when the BACK input is FRESHLY
-// pressed and the window is idle (0xFF):
-//     blockstun actions 64/65/67/68/70/71 -> 5 frames
-//     actions 34..39                      -> 6 frames
-//     anything else                       -> 7 frames
-// sub_4A50A0 then needs a live window plus +1949 == 1, with +1974 (BACK held)
-// and +1973 (DOWN held) selecting the lane. A continuous hold never arms it -
-// the fresh edge is the whole mechanic.
-#define ENTITY_OFF_PARRY_WINDOW      0x07AD  // +1965, BYTE, 0xFF = idle, else frames left
+// Entity_CheckHitState arms the window when BACK is FRESHLY pressed (+86 == 1)
+// and +1965 reads idle (0xFF). +1965 takes a KIND, not a frame count:
+//     blockstun actions 64/65/67/68/70/71 -> kind 5, class 3
+//     actions 34..39                      -> kind 6, class 2
+//     anything else                       -> kind 7, class 1
+// and +1972 is set to 11 alongside. sub_4A50A0 then needs a live window plus
+// +1949 == 1, with +1974 (BACK held) and +1973 (DOWN held) selecting the lane.
+// A continuous hold never arms it - the fresh edge is the whole mechanic.
+// The shared prerequisite for EVERY category's path-B resolution: the action
+// the defender is in must permit its defensive mechanic. Action handlers call
+// Entity_SetHitByte_1949(entity, 1) after Entity_ResetHitData; nothing in the
+// game ever writes 0, so an action that simply does not set it leaves the whole
+// mechanic switched off however well the window is armed. This is what made a
+// perfectly armed repel window resolve as a plain hit.
+#define ENTITY_OFF_DEFENCE_ALLOWED   0x079D  // +1949, BYTE, 1 = action permits it
+#define ENTITY_OFF_PARRY_FIRED       0x07AC  // +1964, BYTE, set by the parry resolver
+#define ENTITY_OFF_PARRY_WINDOW      0x07AD  // +1965, BYTE, 0xFF = idle, else kind 5/6/7
 #define ENTITY_OFF_PARRY_KIND        0x07B0  // +1968, DWORD, 1/2/3 by originating state
+#define ENTITY_OFF_PARRY_TIMER       0x07B4  // +1972, BYTE, set to 11 when the window opens
 #define ENTITY_OFF_PARRY_STANCE      0x07B5  // +1973, BYTE, 1 = DOWN held (crouch parry)
 #define ENTITY_OFF_PARRY_GUARD_HELD  0x07B6  // +1974, BYTE, 1 = BACK held
-#define ENTITY_OFF_HIT_REACTION_KIND 0x07C5  // +1989, BYTE, repel's non-capability path
-#define ENTITY_OFF_HIT_REACTION_STATE 0x07BC // +1980, DWORD, -1 = no reaction armed
-#define ENTITY_OFF_HIT_REACTION_TIMER 0x07C6 // +1990, BYTE, 24-frame repel window
 #define PARRY_WINDOW_IDLE            0xFF
+#define PARRY_KIND_BLOCKSTUN         5
+#define PARRY_KIND_CROUCH            6
+#define PARRY_KIND_STAND             7
+
+// --- Repel window (defender-relative) -------------------------------------
+// Entity_CheckGuardState arms it only from a tap taken out of NEUTRAL: the
+// PREVIOUS neutral word (+60) must read 1, and then FORWARD just-pressed (+84)
+// with no UP/DOWN edge gives reaction 5 (7 airborne), or DOWN just-pressed
+// (+66) with no LEFT/RIGHT edge gives reaction 6 - the low arm. Entity_
+// SetHitReaction writes the reaction at +1980 and a 24-frame window at +1990;
+// Entity_UpdateHitReaction then upgrades +1989 once, while the defender is
+// standing neutral, from the attacker's airborne flag.
+#define ENTITY_OFF_HIT_REACTION_STATE 0x07BC // +1980, DWORD, -1 = no reaction armed
+#define ENTITY_OFF_HIT_REACTION_CLASS 0x07C0 // +1984, DWORD, 1 stand / 2 crouch / 3 air
+#define ENTITY_OFF_HIT_REACTION_LATCH 0x07C4 // +1988, BYTE, 1 once +1989 was upgraded
+#define ENTITY_OFF_HIT_REACTION_KIND 0x07C5  // +1989, BYTE, repel's non-capability path
+#define ENTITY_OFF_HIT_REACTION_TIMER 0x07C6 // +1990, BYTE, 24-frame repel window
+#define REPEL_REACTION_HIGH          5       // forward tap, grounded
+#define REPEL_REACTION_LOW           6       // down tap
+#define REPEL_REACTION_AIR           7       // forward tap, airborne
+#define REPEL_REACTION_IDLE          (-1)
+
+// --- Push-away arming (defender-relative) ---------------------------------
+// Entity_CheckAirTech needs BACK held (+30) and D held (+22). With D FRESHLY
+// pressed (+78), +1995 idle and the action in the free list it arms the free
+// variant; otherwise meter > 99 arms the paid one. Entity_SetHitFlag_1993
+// writes +1993 = 1, +1994 = which variant, +1995 = 6.
+#define ENTITY_OFF_PUSH_AWAY_ARMED   0x07C9  // +1993, BYTE, 1 = armed this window
+#define ENTITY_OFF_PUSH_AWAY_FREE    0x07CA  // +1994, BYTE, 1 = free variant
+#define ENTITY_OFF_PUSH_AWAY_TIMER   0x07CB  // +1995, BYTE, 0xFF = idle, else 6
+#define ENTITY_OFF_PUSH_AWAY_DOWN    0x07CC  // +1996, BYTE, 1 = DOWN held
+#define ENTITY_OFF_PUSH_AWAY_BACK    0x07CD  // +1997, BYTE, 1 = BACK held
+#define PUSH_AWAY_TIMER_IDLE         0xFF
 
 // --- Per-entity input words, slots 10..13 --------------------------------
 // Input_ProcessRawInput derives four extra slots after the ten buttons:
@@ -776,8 +843,27 @@
 #define ENTITY_OFF_DEFENSE_RESOURCE  0x0337  // +823, BYTE, category-5 stock
 #define DODGE_METER_COST             500
 #define PUSH_AWAY_METER_MIN          100     // sub_4A5910 gate, category 4
-#define ADDR_ENTITY_CHECK_HIT_STATE  (GAME_BASE + 0x024AF0)  // arms the parry window
 #define ADDR_DEFENSE_REACTION_DISPATCH (GAME_BASE + 0x09EED0) // sub_49EED0
+
+// --- Contact-time defence resolvers, one per category ---------------------
+// The collision pass switches on dword_73E070[defender char id] and calls one
+// of these BEFORE guard point and ordinary guard. Returning 1 declines, and the
+// contact falls through to the ordinary guard and then the normal-hit handler.
+// Each takes (attackerCtx, sourceObject, contactPos, attackerFacing, payload)
+// with the defender reached through attackerCtx+4 - except the dodge, which
+// takes two arguments.
+#define ADDR_DEFENCE_RESOLVE_COUNTER   (GAME_BASE + 0x0A4E40)  // sub_4A4E40, category 1
+#define ADDR_DEFENCE_RESOLVE_PARRY     (GAME_BASE + 0x0A50A0)  // sub_4A50A0, category 2
+#define ADDR_DEFENCE_RESOLVE_REPEL     (GAME_BASE + 0x0A5570)  // sub_4A5570, category 3
+#define ADDR_DEFENCE_RESOLVE_PUSH_AWAY (GAME_BASE + 0x0A5910)  // sub_4A5910, category 4
+#define ADDR_DEFENCE_RESOLVE_ABSOLUTE  (GAME_BASE + 0x0A5C20)  // sub_4A5C20, category 5
+#define ADDR_DEFENCE_RESOLVE_DODGE     (GAME_BASE + 0x0A5D30)  // sub_4A5D30, category 6
+
+// Defender capability byte +1940, as the resolvers read it. Each category has a
+// combination that lets it fire from the guard flags alone, bypassing the
+// window path entirely.
+#define DEFENDER_FLAGS_PARRY_DIRECT  0x23
+#define DEFENDER_FLAGS_REPEL_DIRECT  0x43
 
 // Contact resolution codes. Every handler except ordinary guard also stores its
 // code at defender+1944; ordinary guard (10) only ever appears as the resolver

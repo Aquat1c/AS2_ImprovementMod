@@ -691,7 +691,7 @@ __declspec(dllexport) void ModInit(HMODULE gameModule) {
     timeBeginPeriod(1);
 
     LOG_INFO("========================================");
-    LOG_INFO("Alice Senki 2 - Mod 0.7-beta2");
+    LOG_INFO("Alice Senki 2 - Mod 0.7-beta2.01");
     LOG_INFO("Build: %s %s", __DATE__, __TIME__);
     LOG_INFO("========================================");
     LOG_INFO("Game module: 0x%p", gameModule);
