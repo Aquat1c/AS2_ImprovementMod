@@ -6,6 +6,7 @@
 #include "patches/memory_utils.h"
 #include "training/character_moves.h"
 #include "training/practice_tools.h"
+#include "ui/strings.h"
 #include "input_system.h"
 #include "as2_constants.h"
 #include "log_window.h"
@@ -121,9 +122,10 @@ enum Page : int {
     kPageCount,
 };
 
-const char* const kPageNames[kPageCount] = {
-    "Dummy", "Recovery", "Triggers", "Display", "Match", "State", "Exit",
-    "Auto-Recovery", "HUD",
+const Str kPageNames[kPageCount] = {
+    Str::Pm_TabDummy, Str::Pm_TabRecovery, Str::Pm_TabTriggers, Str::Pm_TabDisplay,
+    Str::Pm_TabMatch, Str::Pm_TabState, Str::Pm_TabExit,
+    Str::Pm_TabAutoRecovery, Str::Pm_TabHud,
 };
 
 enum RowKind : uint8_t {
@@ -143,21 +145,23 @@ struct Row {
 // 22 motions is too many to cycle through one row at a time, so opening an
 // enabled trigger drops a grid over the menu. Moving in the grid sets the
 // motion immediately - there is nothing to confirm.
-constexpr int kPopupCols = 4;
+constexpr int kPopupCols = 5;
 constexpr int kPopupLeft = 56;
 constexpr int kPopupRight = 600;
 constexpr int kPopupTop = 96;
 constexpr int kPopupBottom = 446;
-constexpr int kPopupColPitch = 130;
+constexpr int kPopupColPitch = 104;
 constexpr int kPopupGridX = 72;
 constexpr int kPopupGridY = 152;
 constexpr int kPopupRowPitch = 28;
 constexpr float kPopupTextSize = 26.0f;
 
-// The grid has to hold the longest movelist in the guide, or entries past the
-// bottom row would be unreachable.
+// The grid has to hold the longest movelist in the guide AND the whole motion
+// list, or entries past the bottom row would be unreachable - which is exactly
+// what adding two cancel routes to a 4x8 grid would have done silently.
 constexpr int kPopupGridRows = 8;
-static_assert(Training::kCharacterMoveMaxCount <= kPopupCols * kPopupGridRows,
+constexpr int kPopupGridCapacity = kPopupCols * kPopupGridRows;
+static_assert(Training::kCharacterMoveMaxCount <= kPopupGridCapacity,
               "movelist popup grid is too small for the roster");
 
 // Cursor rows past the grid: the two action fields, in order.
@@ -231,7 +235,7 @@ int BuildRows(int page, Row* out, int cap) {
             // different mechanism, so it lives one level down.
             push(kRowSetting, PRACTICE_SET_HEALTH_REGEN, nullptr);
             push(kRowSetting, PRACTICE_SET_METER_LEVEL, nullptr);
-            push(kRowSubPage, kPageRecoveryAdvanced, "Advanced...");
+            push(kRowSubPage, kPageRecoveryAdvanced, S(Str::Pm_Advanced));
             break;
         case kPageRecoveryAdvanced:
             push(kRowSetting, PRACTICE_SET_RECOVERY_HP, nullptr);
@@ -242,7 +246,7 @@ int BuildRows(int page, Row* out, int cap) {
             push(kRowSetting, PRACTICE_SET_RECOVERY_GUARD_VALUE, nullptr);
             push(kRowSetting, PRACTICE_SET_RECOVERY_BOTH_NEUTRAL, nullptr);
             push(kRowSetting, PRACTICE_SET_RECOVERY_DELAY, nullptr);
-            push(kRowBack, kPageRecovery, "Back");
+            push(kRowBack, kPageRecovery, S(Str::Common_Back));
             break;
         case kPageTriggers:
             push(kRowSetting, PRACTICE_SET_TRIGGERS_ENABLED, nullptr);
@@ -261,7 +265,7 @@ int BuildRows(int page, Row* out, int cap) {
             for (int e = 0; e < HUD_ELEM_COUNT; ++e) {
                 push(kRowSetting, PRACTICE_SET_HUD_FIRST + e, nullptr);
             }
-            push(kRowBack, kPageDisplay, "Back");
+            push(kRowBack, kPageDisplay, S(Str::Common_Back));
             break;
         case kPageDisplay:
             push(kRowSetting, PRACTICE_SET_HITBOXES, nullptr);
@@ -269,35 +273,36 @@ int BuildRows(int page, Row* out, int cap) {
             push(kRowSetting, PRACTICE_SET_INPUT_DISPLAY, nullptr);
             push(kRowSetting, PRACTICE_SET_DAMAGE_DISPLAY, nullptr);
             push(kRowSetting, PRACTICE_SET_FRAME_ADVANTAGE, nullptr);
-            push(kRowSubPage, kPageHud, "HUD...");
+            push(kRowSubPage, kPageHud, S(Str::Pm_HudPage));
             break;
         case kPageMatch:
-            push(kRowAction, PRACTICE_ACT_POSITION_MID, "Mid Screen");
-            push(kRowAction, PRACTICE_ACT_POSITION_CORNER, "Corner");
-            push(kRowAction, PRACTICE_ACT_POSITION_ROUND_START, "Round Start");
-            push(kRowAction, PRACTICE_ACT_SWAP_SIDES, "Swap Sides");
-            push(kRowAction, PRACTICE_ACT_SAVE_POSITION, "Save Position");
-            push(kRowAction, PRACTICE_ACT_LOAD_POSITION, "Load Position");
-            push(kRowAction, PRACTICE_ACT_ROUND_RESET, "Round Reset");
+            push(kRowAction, PRACTICE_ACT_POSITION_MID, S(Str::Pm_MidScreen));
+            push(kRowAction, PRACTICE_ACT_POSITION_CORNER, S(Str::Pm_Corner));
+            push(kRowAction, PRACTICE_ACT_POSITION_ROUND_START, S(Str::Pm_RoundStart));
+            push(kRowAction, PRACTICE_ACT_SWAP_SIDES, S(Str::Pm_SwapSides));
+            push(kRowAction, PRACTICE_ACT_SAVE_POSITION, S(Str::Pm_SavePosition));
+            push(kRowAction, PRACTICE_ACT_LOAD_POSITION, S(Str::Pm_LoadPosition));
+            push(kRowAction, PRACTICE_ACT_ROUND_RESET, S(Str::Pm_RoundReset));
             break;
         case kPageState:
             push(kRowSetting, PRACTICE_SET_PAUSED, nullptr);
-            push(kRowAction, PRACTICE_ACT_FRAME_STEP, "Frame Step");
+            push(kRowAction, PRACTICE_ACT_FRAME_STEP, S(Str::Pm_FrameStep));
             push(kRowSetting, PRACTICE_SET_MACRO_SLOT, nullptr);
-            push(kRowAction, PRACTICE_ACT_MACRO_RECORD, "Record Macro");
-            push(kRowAction, PRACTICE_ACT_MACRO_PLAY, "Play Macro");
-            push(kRowAction, PRACTICE_ACT_SAVE_STATE, "Save State");
-            push(kRowAction, PRACTICE_ACT_LOAD_STATE, "Load State");
+            push(kRowAction, PRACTICE_ACT_MACRO_RECORD, S(Str::Pm_RecordMacro));
+            push(kRowAction, PRACTICE_ACT_MACRO_PLAY, S(Str::Pm_PlayMacro));
+            push(kRowAction, PRACTICE_ACT_SAVE_STATE, S(Str::Pm_SaveState));
+            push(kRowAction, PRACTICE_ACT_LOAD_STATE, S(Str::Pm_LoadState));
             break;
         case kPageExit:
-            push(kRowAction, -1, "Resume");
+            push(kRowAction, -1, S(Str::Pm_Resume));
             // Vanilla routes this to the replay list during playback
             // (sub_4CA120 sets match+10 = 3 for game type 5), so name it so.
             push(kRowAction, -2,
-                 GetGameType() == GAMETYPE_REPLAY ? "Replay List" : "Character Select");
+                 GetGameType() == GAMETYPE_REPLAY ? S(Str::Pm_ReplayList)
+                                                  : S(Str::Pm_CharacterSelect));
             // Title Screen removed: its route is the buggy one, and Exit Match
             // reaches the same place reliably.
-            push(kRowAction, -3, "Exit Match");
+            push(kRowAction, -3, S(Str::Pm_ExitMatch));
             break;
         default:
             break;
@@ -380,11 +385,12 @@ void RenderRow(int index, const Row& row, bool selected) {
 
     const bool triggerRow = row.kind == kRowSetting &&
                             row.id >= PRACTICE_SET_TRIGGER_1 &&
-                            row.id <= PRACTICE_SET_TRIGGER_5;
+                            row.id <= PRACTICE_SET_TRIGGER_6;
     if (triggerRow) {
         const bool on = PracticeSetting_Get(row.id) != 0;
         DrawTextClipped(kLabelX, y, ink, kRowTextSize, label, kTrigLabelWidth);
-        DrawTextClipped(kTrigStateX, y, ink, kRowTextSize, on ? "On" : "Off", kTrigStateWidth);
+        DrawTextClipped(kTrigStateX, y, ink, kRowTextSize,
+                        on ? S(Str::Common_On) : S(Str::Common_Off), kTrigStateWidth);
         if (on) {
             // Only meaningful once it is on, and dimmer than the state so the
             // eye reads the toggle first.
@@ -426,7 +432,7 @@ void RenderTabs(bool focused) {
         if (!PageAvailable(p)) {
             continue;
         }
-        const int width = (int)(NetMenu::MenuMeasureText(kPageNames[p], kTabTextSize) + 0.5f);
+        const int width = (int)(NetMenu::MenuMeasureText(S(kPageNames[p]), kTabTextSize) + 0.5f);
         const bool current = (p == g_page) ||
                              (g_page == kPageRecoveryAdvanced && p == kPageRecovery) ||
                              (g_page == kPageHud && p == kPageDisplay);
@@ -441,7 +447,7 @@ void RenderTabs(bool focused) {
         }
         const uint8_t* ink = current ? (focused ? kInkSelected : kInkNormal)
                                      : kInkDisabled;
-        DrawText(x, kTabY, ink, kTabTextSize, kPageNames[p]);
+        DrawText(x, kTabY, ink, kTabTextSize, S(kPageNames[p]));
         x += width + kTabGap;
     }
 }
@@ -471,12 +477,10 @@ void RenderHint() {
     }
     if (g_numericEditing) {
         const uint8_t edit[3] = { 255, 224, 140 };
-        DrawText(kLabelX, kHintY, edit, kHintTextSize,
-                 "Type a value    Backspace deletes    Enter confirms    Esc cancels");
+        DrawText(kLabelX, kHintY, edit, kHintTextSize, S(Str::Pm_HintNumeric));
         return;
     }
-    DrawText(kLabelX, kHintY, dim, kHintTextSize,
-             "Up/Down move    Left/Right change tab or value    A select    START resume");
+    DrawText(kLabelX, kHintY, dim, kHintTextSize, S(Str::Pm_HintDefault));
 }
 
 void RenderBacking() {
@@ -532,6 +536,16 @@ void PopupApplyEntry(int i) {
 
 void RenderPopup() {
     const int motions = PopupEntryCount();
+    if (motions > kPopupGridCapacity) {
+        // Never silently drop the tail: an entry the cursor cannot reach is a
+        // move the player cannot pick.
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            LOG_WARN("[PauseMenu] motion popup holds %d of %d entries; the rest are "
+                     "unreachable - widen the grid", kPopupGridCapacity, motions);
+        }
+    }
     const int gridRows = (motions + kPopupCols - 1) / kPopupCols;
 
     // Dim the menu behind it hard enough that the popup reads as the only live
@@ -581,8 +595,7 @@ void RenderPopup() {
              kPopupTextSize, PracticeSetting_ValueText(PRACTICE_SET_TRIGGER_DELAY));
 
     const uint8_t dim[3] = { 176, 176, 176 };
-    DrawText(kPopupGridX, kPopupBottom - 20, dim, kHintTextSize,
-             "Move to pick the motion    Left/Right on a field changes it    B closes");
+    DrawText(kPopupGridX, kPopupBottom - 20, dim, kHintTextSize, S(Str::Pm_HintPopup));
 }
 
 void RenderMenu() {
@@ -720,7 +733,7 @@ int ConfirmRow(const Row& row) {
         case kRowSetting:
             // An enabled trigger opens its action editor; everything else just
             // advances, so a toggle needs one button rather than two.
-            if (row.id >= PRACTICE_SET_TRIGGER_1 && row.id <= PRACTICE_SET_TRIGGER_5 &&
+            if (row.id >= PRACTICE_SET_TRIGGER_1 && row.id <= PRACTICE_SET_TRIGGER_6 &&
                 PracticeSetting_Get(row.id) != 0 && PracticeSetting_Enabled(row.id)) {
                 PracticeTrigger_SelectSlot(row.id - PRACTICE_SET_TRIGGER_1);
                 const int selected = PopupSelectedEntry();

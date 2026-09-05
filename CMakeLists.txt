@@ -17,7 +17,7 @@
 
 cmake_minimum_required(VERSION 3.15)
 project(AS2_Rollback VERSION 0.7.0 LANGUAGES C CXX)
-set(AS2_MOD_VERSION "0.7-beta2.01")
+set(AS2_MOD_VERSION "0.7-beta3")
 
 enable_testing()
 
@@ -406,6 +406,7 @@ set(PATCH_SOURCES
 # Dead NETPLAY_SOURCES removed — old src/netplay/ code was moved to old_files/
 
 set(UI_SOURCES
+    src/ui/strings.cpp
     src/ui/log_window.cpp
     src/ui/mod_menu.cpp
     src/ui/palette_editor.cpp
@@ -506,6 +507,7 @@ set(TESTING_SOURCES
 set(TRAINING_SOURCES
     src/training/action_state_classifier.cpp
     src/training/auto_block.cpp
+    src/training/motion_script.cpp
     src/training/native_recovery.cpp
     src/training/frame_advantage.cpp
     src/training/hotkey_config.cpp
@@ -718,6 +720,7 @@ add_executable(training_logic_tests
 add_executable(auto_block_tests
     tests/auto_block_tests.cpp
     src/training/auto_block.cpp
+    src/training/motion_script.cpp
     src/training/action_state_classifier.cpp
     src/training/native_recovery.cpp
 )

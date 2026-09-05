@@ -1,4 +1,5 @@
 #include "patches/practice_recovery_hooks.h"
+#include "patches/practice_defense_hooks.h"
 
 #include "core/game_state.h"
 #include "core/mod_main.h"
@@ -71,6 +72,10 @@ int __cdecl Hook_ProcessCommandMatches(uint32_t* fighter) {
     const uintptr_t entityBase = reinterpret_cast<uintptr_t>(fighter);
     const int player = ResolvePlayerIndex(entityBase);
 
+    // Shared seam: the practice defence wants this exact moment too, and
+    // MinHook only allows one hook per target.
+    PracticeDefense_OnCommandMatchesEntry(entityBase);
+
     if (player >= 0 && PracticeTools_IsPracticeModeActive()) {
         const uint32_t frame = ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
         g_sample[player] = PracticeRecovery_ReadSample(entityBase);
@@ -83,6 +88,8 @@ int __cdecl Hook_ProcessCommandMatches(uint32_t* fighter) {
     const int result = g_origProcessCommandMatches
         ? g_origProcessCommandMatches(fighter)
         : 0;
+
+    PracticeDefense_OnCommandMatchesExit(entityBase);
 
     if (player >= 0 && PracticeTools_IsPracticeModeActive()) {
         // Audit only: did a real input replace the terminal handoff this tick?
@@ -126,6 +133,9 @@ bool PracticeRecovery_Install() {
     LOG_INFO("[FARecovery] hooked Entity_ProcessCommandMatches @ 0x%08X",
              (unsigned)ADDR_ENTITY_PROCESS_COMMAND_MATCHES);
     g_installed = true;
+    // This detour is the only way into that seam, so the defence arming that
+    // rides on it is live exactly when this hook is.
+    PracticeDefense_SetCounterGuardRouteAvailable(true);
     return true;
 }
 
@@ -133,6 +143,7 @@ void PracticeRecovery_Uninstall() {
     if (!g_installed) {
         return;
     }
+    PracticeDefense_SetCounterGuardRouteAvailable(false);
     MH_DisableHook(reinterpret_cast<void*>(ADDR_ENTITY_PROCESS_COMMAND_MATCHES));
     g_installed = false;
 }

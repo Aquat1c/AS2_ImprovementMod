@@ -99,7 +99,7 @@ const char* ContactResolutionLabel(uint32_t result) {
 const char* BlockPolicyLabel(BlockPolicy policy) {
     switch (policy) {
         case BlockPolicy::All:           return "all";
-        case BlockPolicy::Adaptive:      return "adaptive";
+        case BlockPolicy::StanceOnly:    return "stance_only";
         case BlockPolicy::FirstHit:      return "first_hit";
         case BlockPolicy::AfterFirstHit: return "after_first_hit";
         case BlockPolicy::Random:        return "random";
@@ -330,12 +330,22 @@ bool CanAutoGuardAtContact(const DefenderGuardState& state) {
            state.neutralRouteOpen;
 }
 
+bool PolicyAllowsLane(BlockPolicy policy, uint32_t attackMask, bool preferCrouch) {
+    if (policy != BlockPolicy::StanceOnly) {
+        return true;
+    }
+    // The stance's own lane, and only that one. An attack that does not offer
+    // it is a mixup the stance loses to, which is the whole point of the mode.
+    const uint32_t lane = preferCrouch ? kGuardLaneCrouch : kGuardLaneStand;
+    return (attackMask & lane) != 0;
+}
+
 bool PolicyWantsBlock(BlockPolicy policy,
                       const AutoBlockSequenceState& sequence,
                       uint32_t contactOrdinal) {
     switch (policy) {
         case BlockPolicy::All:
-        case BlockPolicy::Adaptive:
+        case BlockPolicy::StanceOnly:
             return true;
         case BlockPolicy::FirstHit:
             return contactOrdinal == 0;
@@ -433,11 +443,17 @@ DefensiveResponse ResponseForCategory(int category) {
 }
 
 bool ResponseArmsBeforeContact(DefensiveResponse response) {
-    // Both of these set a window that must already be open when the hit
-    // arrives, so they are driven from the attacker's commitment rather than
-    // from a live hitbox.
+    // Each of these has to be under way BEFORE the hit lands: parry and repel
+    // open a window, and the category-1 counter is a move with startup whose
+    // +1940 & 0x10 only exists while it runs. Driving any of them from a live
+    // hitbox is asking for the input one frame after it could have mattered.
     return response == DefensiveResponse::JustParry ||
-           response == DefensiveResponse::Repel;
+           response == DefensiveResponse::Repel ||
+           response == DefensiveResponse::GuardCounter ||
+           response == DefensiveResponse::GuardCounterBack ||
+           // The motion has to have matched, and the 57-frame state has to be
+           // up, before the hit it is meant to absorb.
+           response == DefensiveResponse::AbsoluteDefenceFirst;
 }
 
 bool ResponseArmedByNativeHook(DefensiveResponse response) {
@@ -446,7 +462,16 @@ bool ResponseArmedByNativeHook(DefensiveResponse response) {
         case DefensiveResponse::Repel:            // Entity_CheckGuardState
         case DefensiveResponse::PushAwayPerfect:  // Entity_CheckAirTech
         case DefensiveResponse::PushAwayMetered:
+        // The preemptive entry is armed by writing the counter-guard route
+        // byte, which is the engine's own record that command 26 matched -
+        // after that every gate and every frame of the state is the engine's.
+        case DefensiveResponse::AbsoluteDefenceFirst:
             return true;
+        // The on-block entry is deliberately NOT here. Its gate is +1940 & 0x100,
+        // which belongs to action 49/52 - lending it at the resolver would
+        // absorb every hit from every state with no action entered and no stock
+        // spent. The engine's own route is used instead: stock, blockstun,
+        // cancel.
         default:
             return false;
     }
@@ -455,13 +480,18 @@ bool ResponseArmedByNativeHook(DefensiveResponse response) {
 bool ResponseSupportedByCategory(DefensiveResponse response, int category) {
     switch (response) {
         case DefensiveResponse::JustParry: return category == kDefenseCategoryJustParry;
-        case DefensiveResponse::Dodge:     return category == kDefenseCategoryDodge;
+        case DefensiveResponse::Dodge:
+        case DefensiveResponse::DodgeForward:
+            return category == kDefenseCategoryDodge;
+        case DefensiveResponse::GuardCounterBack:
+            return category == kDefenseCategoryUnique;
         case DefensiveResponse::Repel:     return category == kDefenseCategoryRepel;
         case DefensiveResponse::GuardCounter: return category == kDefenseCategoryUnique;
         case DefensiveResponse::PushAwayPerfect:
         case DefensiveResponse::PushAwayMetered:
             return category == kDefenseCategoryPushAway;
         case DefensiveResponse::AbsoluteDefence:
+        case DefensiveResponse::AbsoluteDefenceFirst:
             return category == kDefenseCategoryAbsolute;
         case DefensiveResponse::CharacterNative:
         case DefensiveResponse::NormalGuard:
@@ -473,12 +503,15 @@ const char* DefensiveResponseLabel(DefensiveResponse response) {
     switch (response) {
         case DefensiveResponse::CharacterNative: return "character_native";
         case DefensiveResponse::JustParry:       return "just_parry";
-        case DefensiveResponse::Dodge:           return "dodge";
+        case DefensiveResponse::Dodge:           return "dodge_back";
+        case DefensiveResponse::DodgeForward:    return "dodge_forward";
+        case DefensiveResponse::GuardCounterBack: return "guard_counter_back";
         case DefensiveResponse::Repel:           return "repel";
         case DefensiveResponse::GuardCounter:    return "guard_counter";
         case DefensiveResponse::PushAwayPerfect: return "push_away_perfect";
         case DefensiveResponse::PushAwayMetered: return "push_away_metered";
-        case DefensiveResponse::AbsoluteDefence: return "absolute_defence";
+        case DefensiveResponse::AbsoluteDefence: return "absolute_defence_block";
+        case DefensiveResponse::AbsoluteDefenceFirst: return "absolute_defence_first";
         case DefensiveResponse::NormalGuard:
         default:                                 return "guard_only";
     }
@@ -497,18 +530,33 @@ bool DodgeWindowOpen(uint32_t actionId, uint16_t meter) {
            actionId == 70 || actionId == 71;
 }
 
+bool ResponseUsesBlockstunCancel(DefensiveResponse response) {
+    switch (response) {
+        case DefensiveResponse::Dodge:
+        case DefensiveResponse::DodgeForward:
+        case DefensiveResponse::PushAwayPerfect:
+        case DefensiveResponse::PushAwayMetered:
+        case DefensiveResponse::AbsoluteDefence:
+        case DefensiveResponse::AbsoluteDefenceFirst:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ResponseRequiresBlockstun(DefensiveResponse response) {
     switch (response) {
         // Guard cancels: the action switch that offers them is keyed on the
         // blockstun states.
         case DefensiveResponse::Dodge:
+        case DefensiveResponse::DodgeForward:
         case DefensiveResponse::PushAwayPerfect:
         case DefensiveResponse::PushAwayMetered:
             return true;
-        // 214D is performed from neutral, before the pressure - it arms a state
-        // rather than cancelling out of one - so it does not imply blocking.
+        // The cancel that produces action 49 is only offered from blockstun, so
+        // a dummy that never guards never reaches it however much stock it has.
         case DefensiveResponse::AbsoluteDefence:
-            return false;
+            return true;
         // Parry arms on a fresh BACK press from any state - the window is only
         // shorter out of blockstun. Repel arms from neutral, so blocking would
         // actively prevent it. The category-1 counter has no action gate at all.
@@ -552,6 +600,8 @@ const char* DefenseInputKindLabel(DefenseInputKind kind) {
         case DefenseInputKind::DownTap:        return "down tap";
         case DefenseInputKind::DodgePress:     return "back+D";
         case DefenseInputKind::CounterForward: return "fwd+D";
+        case DefenseInputKind::CounterBack:    return "back+D";
+        case DefenseInputKind::DodgeForwardPress: return "D";
         case DefenseInputKind::ArmGuardState:  return "214D";
         case DefenseInputKind::None:
         default:                               return "hold guard";
@@ -616,7 +666,12 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
     const bool blockstunDriven = ResponseRequiresBlockstun(response);
     const bool preArmed = ResponseArmsBeforeContact(response);
     const bool haveThreat = preArmed ? ThreatIsIncoming(sample) : sample.threatArmed;
-    if (!haveThreat && !blockstunDriven) {
+    // Blockstun is a reason to keep driving on its own for anything with a
+    // cancel there: the next hit of a string does not have to be detectable yet
+    // for the cancel out of THIS one to be worth attempting.
+    const bool inBlockstunCancel =
+        IsBlockstun(sample.actionId) && ResponseUsesBlockstunCancel(response);
+    if (!haveThreat && !blockstunDriven && !inBlockstunCancel) {
         state = DefenseDriveState{};
         return DefenseInputKind::None;
     }
@@ -628,9 +683,25 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                        : DefenseInputKind::None;
 
         case DefensiveResponse::Dodge:
-            return DodgeWindowOpen(sample.actionId, sample.meter)
-                       ? DefenseInputKind::DodgePress
-                       : DefenseInputKind::None;
+        case DefensiveResponse::DodgeForward: {
+            // The engine's condition is a FRESH D press (+78), so the press is
+            // alternated rather than held: if the first one does not take -
+            // the route not open yet on the frame blockstun began, say - a held
+            // D reads 0 there forever and the cancel is simply never offered.
+            if (!DodgeWindowOpen(sample.actionId, sample.meter)) {
+                state.dodgePhase = false;
+                return DefenseInputKind::None;
+            }
+            state.dodgePhase = !state.dodgePhase;
+            if (!state.dodgePhase) {
+                return DefenseInputKind::None;
+            }
+            // BACK held selects 60/62, released selects 59/61 - the roll's
+            // direction is the only difference between the two responses.
+            return response == DefensiveResponse::DodgeForward
+                       ? DefenseInputKind::DodgeForwardPress
+                       : DefenseInputKind::DodgePress;
+        }
 
         case DefensiveResponse::PushAwayPerfect:
             // Physically the same press as the dodge - BACK + D - because the
@@ -680,6 +751,7 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                        : DefenseInputKind::ForwardTap;
 
         case DefensiveResponse::GuardCounter:
+        case DefensiveResponse::GuardCounterBack:
             // 6D moves the character forward, which is the opposite of holding
             // guard - so it has to be one press per threat rather than a held
             // direction, or the dummy would simply never block. The guide lists
@@ -689,23 +761,29 @@ DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                 return DefenseInputKind::None;
             }
             state.counterFired = true;
-            return DefenseInputKind::CounterForward;
+            return response == DefensiveResponse::GuardCounterBack
+                       ? DefenseInputKind::CounterBack
+                       : DefenseInputKind::CounterForward;
 
         case DefensiveResponse::AbsoluteDefence:
-            // 214D arms the state; once +823 is up the engine does the rest, so
-            // there is nothing to feed until it drops again. Keep walking a
-            // motion already in progress even if that happens mid-way.
-            if (state.armStep >= 0) {
-                if (++state.armStep >= kGuardStateMotionFrames) {
-                    state.armStep = -1;
-                }
-                return state.armStep >= 0 ? DefenseInputKind::ArmGuardState
-                                          : DefenseInputKind::None;
-            }
-            if (sample.guardStateArmed || !sample.actionable) {
-                return DefenseInputKind::None;
-            }
-            state.armStep = 0;
+            // Nothing to press. The blockstun handlers open route 23 themselves
+            // (Input_UpdateMinValue_1675 sits in all three), so the guard-cancel
+            // offer runs every blockstun frame on its own; the only term the
+            // dummy is missing is the +823 charge, and that is supplied where
+            // the engine reads it.
+            state.armStep = -1;
+            return DefenseInputKind::None;
+
+        case DefensiveResponse::AbsoluteDefenceFirst:
+            // The other entry: sub_522F30 wants command 26 to have matched, so
+            // the motion is fed for real. It loops rather than running once -
+            // the route consumes the match whether or not a hit came, and the
+            // state it opens only lasts 57 frames. Outside a threat it would
+            // just walk the dummy backwards, so it is gated on one coming.
+            state.armStep = (state.armStep < 0 ||
+                             state.armStep + 1 >= kGuardStateMotionFrames)
+                                ? 0
+                                : (int8_t)(state.armStep + 1);
             return DefenseInputKind::ArmGuardState;
 
         case DefensiveResponse::CharacterNative:

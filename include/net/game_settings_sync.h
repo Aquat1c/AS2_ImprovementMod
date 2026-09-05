@@ -29,6 +29,9 @@ struct GameSettingsSyncSnapshot {
 };
 
 void GameSettingsSync_Init();
+// Writes the ini now. For a preference changed from a menu row that the raw
+// block change detector cannot see - the menu language, for one.
+bool GameSettingsSync_SaveLocalSettings(const char* reason);
 void GameSettingsSync_Shutdown();
 void GameSettingsSync_FrameUpdate();
 

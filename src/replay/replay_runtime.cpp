@@ -1,4 +1,5 @@
 #include "replay/replay_runtime.h"
+#include "ui/strings.h"
 #include "training/practice_tools.h"
 #include "net/netplay_menu_render.h"
 
@@ -1052,8 +1053,8 @@ static const char* TakeoverModeName(TakeoverMode mode) {
     switch (mode) {
         case TakeoverMode::P1: return "P1";
         case TakeoverMode::P2: return "P2";
-        case TakeoverMode::Both: return "BOTH";
-        default: return "NONE";
+        case TakeoverMode::Both: return S(Str::Common_Both);
+        default: return S(Str::Common_None);
     }
 }
 
@@ -1243,7 +1244,7 @@ static std::string SanitizeReplayFilenameComponent(const std::string& text,
         return sanitized;
     }
 
-    return fallback ? fallback : "Unknown";
+    return fallback ? fallback : S(Str::Common_Unknown);
 }
 
 static bool ShouldRenameNetplayReplaySave(const Net::SessionSnapshot& session) {
@@ -1264,10 +1265,10 @@ static NetplayReplayNames BuildNetplayReplayNames() {
 
     NetplayReplayNames names{};
     names.local_nickname = SanitizeReplayFilenameComponent(
-        session.local_nickname[0] ? session.local_nickname : "Local",
+        session.local_nickname[0] ? session.local_nickname : S(Str::Common_Local),
         "Local");
     names.remote_nickname = SanitizeReplayFilenameComponent(
-        session.remote_peer.nickname[0] ? session.remote_peer.nickname : "Remote",
+        session.remote_peer.nickname[0] ? session.remote_peer.nickname : S(Str::Common_Remote),
         "Remote");
 
     int localSlot = Net::PlayerMapping_GetLocalGameSlot();
@@ -1634,7 +1635,7 @@ static void ScanReplayBrowser() {
     std::error_code ec;
     if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
         s_browserCurrentDirectory.clear();
-        SetBrowserStatus("No replay directory found at replay/.");
+        SetBrowserStatus(S(Str::Rp_NoReplayDir));
         s_browserNeedsScan = false;
         return;
     }
@@ -1741,9 +1742,9 @@ static void ScanReplayBrowser() {
 
     if (!hasFolders && !hasReplays) {
         if (s_browserCurrentDirectory.empty()) {
-            SetBrowserStatus("No replay folders or files found under replay/.");
+            SetBrowserStatus(S(Str::Rp_NoReplays));
         } else {
-            SetBrowserStatus("Folder is empty. Press Esc or Backspace to return.");
+            SetBrowserStatus(S(Str::Rp_FolderEmpty));
         }
     } else {
         LOG_INFO("[Replay] Browser scanned %zu entry(s) in %s",
@@ -2265,7 +2266,7 @@ static bool HandleMatchHotkeys() {
         if (s_takeoverMode != TakeoverMode::None) {
             ExitTakeover();
         } else {
-            return ExitReplayPlaybackToReplayMenu("Exited replay playback.");
+            return ExitReplayPlaybackToReplayMenu(S(Str::Rp_ExitedPlayback));
         }
     }
 
@@ -2443,7 +2444,7 @@ static void HandleReplayMenuInput() {
         ReplayMenuInputJustPressed(INPUT_C) ||
         ReplayMenuInputJustPressed(INPUT_START)) {
         if (s_browserEntries.empty()) {
-            SetBrowserStatus("No replay folders or files are available here.");
+            SetBrowserStatus(S(Str::Rp_NoReplaysHere));
         } else {
             PlayReplayMenuSfx(ADDR_REPLAY_MENU_SFX_CONFIRM);
             const ReplayBrowserEntry& entry = s_browserEntries[s_browserSelected];
@@ -2809,7 +2810,7 @@ static std::string GetBrowserEntryValueText(const ReplayBrowserEntry& entry) {
         case ReplayBrowserEntryType::ParentDirectory:
             return "Up";
         case ReplayBrowserEntryType::Directory:
-            return "Folder";
+            return S(Str::Rp_Folder);
         case ReplayBrowserEntryType::ReplayFile:
             if (!entry.metadata.valid) {
                 return "Invalid";
@@ -3051,11 +3052,11 @@ static void RenderReplayBrowserHud() {
                  summary.replays, summary.replays == 1 ? "" : "s");
 
         char longestText[64] = {};
-        snprintf(longestText, sizeof(longestText), "Longest Match %s",
+        snprintf(longestText, sizeof(longestText), S(Str::Rp_LongestMatch),
                  FormatReplayClock(summary.longestFrames).c_str());
 
         char totalText[64] = {};
-        snprintf(totalText, sizeof(totalText), "Total time %s",
+        snprintf(totalText, sizeof(totalText), S(Str::Rp_TotalTime),
                  FormatReplayClock(summary.totalFrames).c_str());
 
         const int summaryY = kTop + 64;
@@ -3070,7 +3071,7 @@ static void RenderReplayBrowserHud() {
 
         char charsText[160] = {};
         snprintf(charsText, sizeof(charsText),
-                 "Most played characters:   P1: %s   P2: %s",
+                 S(Str::Rp_MostPlayed),
                  summary.topP1.c_str(), summary.topP2.c_str());
         char clippedChars[160] = {};
         ClipGameText(clippedChars, sizeof(clippedChars), charsText, 62);
@@ -3079,7 +3080,7 @@ static void RenderReplayBrowserHud() {
     }
 
     GameDrawTextAt(kTextX + 8, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
-                   kRepInkFaint, kRepNoteSize, "Name");
+                   kRepInkFaint, kRepNoteSize, S(Str::Rp_Name));
 
     // Matchup/Date/Length describe a replay, and folder rows leave all three
     // blank. Heading three empty columns just labels dead space.
@@ -3107,7 +3108,7 @@ static void RenderReplayBrowserHud() {
         GameDrawTextAt(kWhenX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
                        kRepInkFaint, kRepNoteSize, "Date");
         GameDrawTextAt(kLenX, kFirstRow - 20, kRepInkFaint, kRepInkFaint,
-                       kRepInkFaint, kRepNoteSize, "Length");
+                       kRepInkFaint, kRepNoteSize, S(Str::Rp_Length));
     }
 
     if (totalEntries == 0) {
@@ -3257,7 +3258,7 @@ static void RenderReplayBrowserHud() {
             GameDrawTextAt(kTextX + 8, detailTop + 4, kRepInkDim, kRepInkDim, kRepInkDim,
                            kRepNoteSize,
                            selected->type == ReplayBrowserEntryType::ParentDirectory
-                               ? "Go up one folder" : "Folder");
+                               ? S(Str::Rp_GoUpOneFolder) : S(Str::Rp_Folder));
         }
     }
 

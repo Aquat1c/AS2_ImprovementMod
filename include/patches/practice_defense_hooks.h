@@ -50,6 +50,10 @@ struct PracticeDefenseArmState {
     uint32_t repelArms = 0;
     uint32_t pushAwayArms = 0;
     uint32_t defenceAllowedForced = 0;   // +1949 had to be written
+    uint32_t absoluteStockForced = 0;    // +823 had to be granted
+    uint32_t guardCancelsOffered = 0;    // the offer queued a cancel action
+    uint32_t counterGuardRouteOpened = 0; // route 0 stated as matched
+    uint32_t lastRouteLogCount = 0;       // so the outcome logs on change only
     uint32_t contactsPrepared = 0;       // window pointed at a specific contact
     uint32_t resolverCalls = 0;          // category resolver reached the dummy
     uint32_t resolverDeclines = 0;       // ...and returned 1
@@ -171,6 +175,27 @@ const PracticeDefenseArmState& PracticeDefense_GetArmState();
 // setters. False means the hooks did not install and the driver is back to
 // simulating the input, which is late by construction.
 bool PracticeDefense_ArmHooksActive();
+
+// One-shot: true once for each frame a category resolver awarded the dummy its
+// defensive mechanic, with the contact resolution code that was awarded. This
+// is the seam a follow-up hangs off - the counter connecting, the absolute
+// defence firing - because it is the only place that knows the mechanic
+// actually resolved rather than merely being armed.
+bool PracticeDefense_ConsumeDefensiveSuccess(uint32_t* outFrame, uint32_t* outResult);
+
+// Entity_ProcessCommandMatches seam, called by whoever owns that hook.
+//
+// MinHook allows one hook per target and the frame-advantage recovery observer
+// already owns 0x4BEA20, so creating a second one there does not fail quietly -
+// it takes the address and leaves the other hook uninstalled. The preemptive
+// counter guard therefore chains off the existing detour instead: Entry runs
+// before the original, Exit after it.
+void PracticeDefense_OnCommandMatchesEntry(uintptr_t entity);
+void PracticeDefense_OnCommandMatchesExit(uintptr_t entity);
+
+// Told by the owner of that hook whether the seam is live at all. Without it
+// the preemptive counter guard has to fall back to feeding the 214D motion.
+void PracticeDefense_SetCounterGuardRouteAvailable(bool available);
 
 
 // Contact groups resolved so far in the live sequence: what First / After First

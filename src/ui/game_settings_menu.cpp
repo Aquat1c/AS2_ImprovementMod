@@ -1,4 +1,6 @@
 #include "ui/game_settings_menu.h"
+#include "ui/strings.h"
+#include "net/game_settings_sync.h"
 
 #include "training/hotkey_config.h"
 
@@ -111,18 +113,18 @@ struct RowDef {
     uintptr_t      addr;
     uint8_t        maxValue;
     const wchar_t* iniKey;
-    const char*    name;
+    Str            name;
 };
 
 const RowDef kRows[kGameRowMax] = {
-    { kAddrDifficulty,      2,               L"difficulty",       "Difficulty"         },
-    { kAddrRounds,          2,               L"round_count",      "Rounds"             },
-    { kAddrBattleRecording, 1,               L"battle_recording", "Battle Recording"   },
-    { 0,                    0,               nullptr,             "Voice Volume"       },
-    { kAddrSeVolume,        kVolumeMax,      L"se_volume",        "SE Volume"          },
-    { kAddrBgmVolume,       kVolumeMax,      L"bgm_volume",       "BGM Volume"         },
-    { kAddrSystemVoice,     kSystemVoiceMax, L"system_voice",     "System Voice"       },
-    { kAddrAiLearning,      1,               L"ai_learning",      "AI Learning"        },
+    { kAddrDifficulty,      2,               L"difficulty",       Str::Gs_Difficulty      },
+    { kAddrRounds,          2,               L"round_count",      Str::Gs_Rounds          },
+    { kAddrBattleRecording, 1,               L"battle_recording", Str::Gs_BattleRecording },
+    { 0,                    0,               nullptr,             Str::Gs_VoiceVolumeRow  },
+    { kAddrSeVolume,        kVolumeMax,      L"se_volume",        Str::Gs_SeVolume        },
+    { kAddrBgmVolume,       kVolumeMax,      L"bgm_volume",       Str::Gs_BgmVolume       },
+    { kAddrSystemVoice,     kSystemVoiceMax, L"system_voice",     Str::Gs_SystemVoice     },
+    { kAddrAiLearning,      1,               L"ai_learning",      Str::Gs_AiLearning      },
 };
 
 wchar_t s_iniPath[MAX_PATH] = {};
@@ -182,8 +184,8 @@ void ApplyVolumeSideEffect(int row, uint8_t value) {
 void FormatValue(int row, uint8_t value, char* out, size_t outSize) {
     switch (row) {
         case kGameRowDifficulty: {
-            static const char* const k[] = { "Easy", "Normal", "Hard" };
-            _snprintf_s(out, outSize, _TRUNCATE, "%s", k[value <= 2 ? value : 2]);
+            static const Str k[] = { Str::Gs_Easy, Str::Gs_NormalDifficulty, Str::Gs_Hard };
+            _snprintf_s(out, outSize, _TRUNCATE, "%s", S(k[value <= 2 ? value : 2]));
             break;
         }
         case kGameRowRounds:
@@ -252,7 +254,7 @@ void GameSettingsMenu_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
 
     // One extra row of panel so the footer note has room inside it.
     DrawPanel(rows + 1, alpha);
-    MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright, kSettingsTextSize, "SETTINGS");
+    MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright, kSettingsTextSize, S(Str::Gs_Title));
     DrawHighlight((int)selectedIndex, alpha);
 
     for (int i = 0; i < rows - 1; ++i) {
@@ -264,7 +266,7 @@ void GameSettingsMenu_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
         const int y = RowText(i, kRowPitch);
 
         const uint8_t shade = locked ? kInkFaint : kInk;
-        MenuDrawTextSized(kLabelX, y, shade, shade, shade, kSettingsTextSize, def.name);
+        MenuDrawTextSized(kLabelX, y, shade, shade, shade, kSettingsTextSize, S(def.name));
 
         char value[64];
         FormatValue(row, ReadRow(def), value, sizeof(value));
@@ -278,15 +280,15 @@ void GameSettingsMenu_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     }
 
     const int backY = RowText(rows - 1, kRowPitch);
-    MenuDrawTextSized(kLabelX, backY, kInk, kInk, kInk, kSettingsTextSize, "Back");
+    MenuDrawTextSized(kLabelX, backY, kInk, kInk, kInk, kSettingsTextSize, S(Str::Common_Back));
 
     if (locked) {
         MenuDrawTextSized(kLabelX, backY + kRowPitch, kInkDim, kInkDim, kInkDim, kNoteTextSize,
-                     "Locked while an online session is active.");
+                     S(Str::Gs_LockedOnline));
     } else if (GameSettingsMenu_RowAt((int)selectedIndex) == kGameRowAiLearning) {
         // Say so rather than silently ignoring the setting online.
         MenuDrawTextSized(kLabelX, backY + kRowPitch, kInkDim, kInkDim, kInkDim, kNoteTextSize,
-                     "Offline only. Netplay disables CPU learning.");
+                     S(Str::Gs_OfflineOnlyAi));
     }
 }
 
@@ -329,7 +331,7 @@ bool GameSettingsMenu_Adjust(int visibleIndex, bool left, bool right,
     if (GameSettingsMenu_Locked()) {
         if (outStatus && outStatusSize) {
             _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
-                        "Locked while an online session is active.");
+                        S(Str::Gs_LockedOnline));
         }
         return false;
     }
@@ -341,9 +343,9 @@ bool GameSettingsMenu_Adjust(int visibleIndex, bool left, bool right,
     if (outStatus && outStatusSize) {
         char value[64];
         FormatValue(row, next, value, sizeof(value));
-        _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "%s: %s", def.name, value);
+        _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "%s: %s", S(def.name), value);
     }
-    LOG_NETPLAY(LOG_INFO, "[GameSettings] %s = %u", def.name, (unsigned)next);
+    LOG_NETPLAY(LOG_INFO, "[GameSettings] %s = %u", Ui::SIn(def.name, Ui::Lang::English), (unsigned)next);
     return true;
 }
 
@@ -366,11 +368,20 @@ constexpr int kKeyLabelX     = 32;
 constexpr int kKeyColumnX[2] = { 240, 404 };
 constexpr int kKeyColumnWidth = 160;
 
-const char* const kKeyButtonNames[kKeyButtonCount] = {
-    "Up", "Down", "Left", "Right",
-    "A (Light)", "B (Medium)", "C (Heavy)", "D (Special)",
-    "Start", "Select", "L1", "R1", "L2", "R2",
-};
+// L1..R2 are the same in every language, so they have no table row.
+const char* KeyButtonName(int index) {
+    static const Str kNamed[] = {
+        Str::Gs_KeyUp, Str::Gs_KeyDown, Str::Gs_KeyLeft, Str::Gs_KeyRight,
+        Str::Gs_KeyA, Str::Gs_KeyB, Str::Gs_KeyC, Str::Gs_KeyD,
+        Str::Gs_KeyStart, Str::Gs_KeySelect,
+    };
+    static const char* const kRaw[] = { "L1", "R1", "L2", "R2" };
+    if (index >= 0 && index < (int)(sizeof(kNamed) / sizeof(kNamed[0]))) {
+        return S(kNamed[index]);
+    }
+    const int raw = index - (int)(sizeof(kNamed) / sizeof(kNamed[0]));
+    return (raw >= 0 && raw < 4) ? kRaw[raw] : "?";
+}
 
 int s_keyColumn = 0; // 0 = P1, 1 = P2
 int s_captureRow = -1;
@@ -441,19 +452,19 @@ void GameSettingsKeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     MenuFillRect(kPanelLeft, kPanelTop, kKeyPanelRight, panelBottom, 0, 0, 0);
     MenuSetBlend(1, alpha);
 
-    MenuDrawTextSized(kKeyLabelX, kHeaderY, kInkBright, kInkBright, kInkBright, kSettingsTextSize, "KEY SETTINGS");
+    MenuDrawTextSized(kKeyLabelX, kHeaderY, kInkBright, kInkBright, kInkBright, kSettingsTextSize, S(Str::Gs_KeySettings));
     for (int player = 0; player < 2; ++player) {
         char heading[16];
-        _snprintf_s(heading, sizeof(heading), _TRUNCATE, "PLAYER %d", player + 1);
+        _snprintf_s(heading, sizeof(heading), _TRUNCATE, S(Str::Gs_PlayerN), player + 1);
         MenuDrawTextSized(kKeyColumnX[player], kHeaderY, kInk, kInk, kInk,
                           kSettingsTextSize, heading);
 
         // Whichever pad you rebind with becomes this player's device; the
         // keyboard stays shared, so it only shows when no pad is held.
         const char* dev = InputSystem_HasGamepad(player)
-                        ? InputSystem_GetGamepadName(player) : "Keyboard";
+                        ? InputSystem_GetGamepadName(player) : S(Str::Common_Keyboard);
         char shown[64];
-        _snprintf_s(shown, sizeof(shown), _TRUNCATE, "%s", dev ? dev : "Keyboard");
+        _snprintf_s(shown, sizeof(shown), _TRUNCATE, "%s", dev ? dev : S(Str::Common_Keyboard));
         MenuDrawTextSized(kKeyColumnX[player], kHeaderY + 20, kInkDim, kInkDim,
                           kInkDim, 13.0f, shown);
     }
@@ -476,14 +487,14 @@ void GameSettingsKeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
 
     for (int i = 0; i < kKeyButtonCount; ++i) {
         const int y = RowTop(i, kKeyRowPitch) + 3;
-        MenuDrawTextSized(kKeyLabelX, y, kInk, kInk, kInk, kKeyTextSize, kKeyButtonNames[i]);
+        MenuDrawTextSized(kKeyLabelX, y, kInk, kInk, kInk, kKeyTextSize, KeyButtonName(i));
 
         for (int player = 0; player < 2; ++player) {
             const bool capturing = s_captureRow == i && s_keyColumn == player &&
                                    InputSystem_IsBindingActive();
             if (capturing) {
                 MenuDrawTextSized(kKeyColumnX[player], y, kInkBright, kInkBright,
-                                  kInkBright, kKeyTextSize, "press...");
+                                  kInkBright, kKeyTextSize, S(Str::Gs_PressAny));
                 continue;
             }
 
@@ -496,7 +507,7 @@ void GameSettingsKeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
                 char pad[48];
                 DescribePad(bind, pad, sizeof(pad));
                 // Directions are always the d-pad, so naming them adds nothing.
-                const char* text = (i < 4) ? "D-Pad" : pad;
+                const char* text = (i < 4) ? S(Str::Gs_DPad) : pad;
                 MenuDrawTextSized(kKeyColumnX[player], y, kInk, kInk, kInk,
                                   kKeyTextSize, text[0] ? text : "---");
             } else {
@@ -509,19 +520,19 @@ void GameSettingsKeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     }
 
     MenuDrawTextSized(kKeyLabelX, RowTop(kKeyRowResetP1, kKeyRowPitch) + 3,
-                 kInk, kInk, kInk, kSettingsTextSize, "Reset Player 1 to defaults");
+                 kInk, kInk, kInk, kSettingsTextSize, S(Str::Gs_ResetP1));
     MenuDrawTextSized(kKeyLabelX, RowTop(kKeyRowResetP2, kKeyRowPitch) + 3,
-                 kInk, kInk, kInk, kSettingsTextSize, "Reset Player 2 to defaults");
+                 kInk, kInk, kInk, kSettingsTextSize, S(Str::Gs_ResetP2));
     MenuDrawTextSized(kKeyLabelX, RowTop(kKeyRowBack, kKeyRowPitch) + 3,
-                 kInk, kInk, kInk, kSettingsTextSize, "Back");
+                 kInk, kInk, kInk, kSettingsTextSize, S(Str::Common_Back));
 
     const int footY = RowTop(rows, kKeyRowPitch) + 6;
     if (InputSystem_IsBindingActive()) {
         MenuDrawTextSized(kKeyLabelX, footY, kInkBright, kInkBright, kInkBright, kSettingsTextSize,
-                     "Press any key or pad button. ESC cancels.");
+                     S(Str::Gs_HintPressKey));
     } else {
         MenuDrawTextSized(kKeyLabelX, footY, kInkDim, kInkDim, kInkDim, kSettingsTextSize,
-                     "Left/Right picks the player, A rebinds.");
+                     S(Str::Gs_HintKeyColumns));
     }
 }
 
@@ -557,8 +568,8 @@ bool GameSettingsKeys_Confirm(int row, bool* outClose, char* outStatus, size_t o
         InputSystem_StartBinding(s_keyColumn, row);
         if (outStatus && outStatusSize) {
             _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
-                        "Press a key for P%d %s", s_keyColumn + 1,
-                        kKeyButtonNames[row]);
+                        S(Str::Gs_PressKeyFor), s_keyColumn + 1,
+                        KeyButtonName(row));
         }
         return true;
     }
@@ -569,7 +580,7 @@ bool GameSettingsKeys_Confirm(int row, bool* outClose, char* outStatus, size_t o
         InputSystem_SaveConfig("as2_input.cfg");
         if (outStatus && outStatusSize) {
             _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
-                        "Player %d reset to defaults", player + 1);
+                        S(Str::Gs_PlayerReset), player + 1);
         }
         return true;
     }
@@ -626,7 +637,7 @@ void GameSettingsHotkeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     MenuSetBlend(1, alpha);
 
     MenuDrawTextSized(kHkLabelX, kHeaderY, kInkBright, kInkBright, kInkBright,
-                      kSettingsTextSize, "PRACTICE HOTKEYS");
+                      kSettingsTextSize, S(Str::Gs_PracticeHotkeys));
 
     const int selTop = RowTop((int)selectedIndex, kHkRowPitch);
     MenuSetBlend(2, (uint8_t)(alpha / 2));
@@ -642,7 +653,7 @@ void GameSettingsHotkeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
 
         if (s_hkCaptureRow == i && HotkeyConfig_IsRebinding()) {
             MenuDrawTextSized(kHkValueX, y, kInkBright, kInkBright, kInkBright,
-                              kKeyTextSize, "press...");
+                              kKeyTextSize, S(Str::Gs_PressAny));
             continue;
         }
 
@@ -657,24 +668,24 @@ void GameSettingsHotkeys_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
         // training, and saying so beats letting a key look broken elsewhere.
         if (!HotkeyConfig_ActionIsPracticeOnly(action)) {
             MenuDrawTextSized(kHkScopeX, y, kInkDim, kInkDim, kInkDim,
-                              kKeyPadSize, "any mode");
+                              kKeyPadSize, S(Str::Gs_AnyMode));
         }
     }
 
     MenuDrawTextSized(kHkLabelX, RowTop(kHkRowReset, kHkRowPitch) + 3,
-                      kInk, kInk, kInk, kSettingsTextSize, "Reset to defaults");
+                      kInk, kInk, kInk, kSettingsTextSize, S(Str::Gs_ResetDefaults));
     MenuDrawTextSized(kHkLabelX, RowTop(kHkRowBack, kHkRowPitch) + 3,
-                      kInk, kInk, kInk, kSettingsTextSize, "Back");
+                      kInk, kInk, kInk, kSettingsTextSize, S(Str::Common_Back));
 
     const int footY = RowTop(rows, kHkRowPitch) + 6;
     if (HotkeyConfig_IsRebinding()) {
         MenuDrawTextSized(kHkLabelX, footY, kInkBright, kInkBright, kInkBright,
                           kSettingsTextSize,
-                          "Press any key or pad button. ESC cancels.");
+                          S(Str::Gs_HintPressKey));
     } else {
         MenuDrawTextSized(kHkLabelX, footY, kInkDim, kInkDim, kInkDim,
                           kSettingsTextSize,
-                          "A rebinds, Left/Right unbinds.");
+                          S(Str::Gs_HintHotkeys));
     }
 }
 
@@ -723,7 +734,7 @@ bool GameSettingsHotkeys_Confirm(int row, bool* outClose,
         s_hkCaptureArm = 0;
         if (outStatus && outStatusSize) {
             _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
-                        "Hotkeys reset to defaults");
+                        S(Str::Gs_HotkeysReset));
         }
         return true;
     }
@@ -766,6 +777,7 @@ enum SystemRow : int {
     kSysControlSwap,
     kSysDebugCapture,
     kSysLocalRematch,
+    kSysLanguage,
     kSysPracticeKeys,
     kSysBack,
     kSysCount,
@@ -807,21 +819,28 @@ ProxyDisplayApi& DisplayApi() {
 }
 
 struct SystemRowDef {
-    const char* name;
-    const char* hint;
+    Str name;
+    Str hint;
 };
 
 const SystemRowDef kSystemRows[kSysCount] = {
-    { "Fullscreen",       "borderless window"      },
-    { "Keep Aspect",      "4:3 letterbox"          },
-    { "Window Size",      "windowed only"          },
-    { "Background Input", "keep playing unfocused" },
-    { "Swap P1/P2",       "trade control sides"    },
-    { "Debug Capture",    "log the game's output"  },
-    { "Local Rematch",    "VS continue prompt"     },
-    { "Practice Hotkeys", "rebind mod keys"        },
-    { "Back",             "settings"               },
+    { Str::Gs_SysFullscreen,      Str::Gs_SysFullscreenHint      },
+    { Str::Gs_SysKeepAspect,      Str::Gs_SysKeepAspectHint      },
+    { Str::Gs_SysWindowSize,      Str::Gs_SysWindowSizeHint      },
+    { Str::Gs_SysBackgroundInput, Str::Gs_SysBackgroundInputHint },
+    { Str::Gs_SysSwap,            Str::Gs_SysSwapHint            },
+    { Str::Gs_SysDebugCapture,    Str::Gs_SysDebugCaptureHint    },
+    { Str::Gs_SysLocalRematch,    Str::Gs_SysLocalRematchHint    },
+    { Str::Common_Language,       Str::Common_LanguageHint       },
+    { Str::Gs_SysPracticeKeys,    Str::Gs_SysPracticeKeysHint    },
+    { Str::Common_Back,           Str::Gs_SysBackHint            },
 };
+
+// The language names are shown in themselves, whichever language is live.
+const char* LanguageName(Ui::Lang lang) {
+    return lang == Ui::Lang::Japanese ? Ui::SIn(Str::Common_LanguageJapanese, Ui::Lang::Japanese)
+                                      : Ui::SIn(Str::Common_LanguageEnglish, Ui::Lang::English);
+}
 
 bool ReadSystemRow(int row) {
     switch (row) {
@@ -850,26 +869,29 @@ bool GameSettingsSystem_RowOpensSubPage(int row) {
 void GameSettingsSystem_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     DrawPanel(kSysCount + 1, alpha);
     MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright,
-                      kSettingsTextSize, "SYSTEM");
+                      kSettingsTextSize, S(Str::Gs_System));
     DrawHighlight((int)selectedIndex, alpha);
 
     for (int i = 0; i < kSysCount; ++i) {
         const int y = RowText(i, kRowPitch);
         MenuDrawTextSized(kLabelX, y, kInk, kInk, kInk, kSettingsTextSize,
-                          kSystemRows[i].name);
+                          S(kSystemRows[i].name));
         if (i == kSysBack || i == kSysPracticeKeys) {
             MenuDrawTextSized(kValueX, y, kInkDim, kInkDim, kInkDim,
-                              kSettingsTextSize, kSystemRows[i].hint);
+                              kSettingsTextSize, S(kSystemRows[i].hint));
             continue;
         }
         char text[48];
-        if (i == kSysWindowScale) {
+        if (i == kSysLanguage) {
+            _snprintf_s(text, sizeof(text), _TRUNCATE, "< %s >",
+                        LanguageName(Ui::Strings_Language()));
+        } else if (i == kSysWindowScale) {
             const int scale = DisplayApi().available ? DisplayApi().getScale() : 1;
             _snprintf_s(text, sizeof(text), _TRUNCATE, "< %dx  %dx%d >",
                         scale, 640 * scale, 480 * scale);
         } else {
             _snprintf_s(text, sizeof(text), _TRUNCATE, "< %s >",
-                        ReadSystemRow(i) ? "On" : "Off");
+                        ReadSystemRow(i) ? S(Str::Common_On) : S(Str::Common_Off));
         }
         const bool dim = (i <= kSysWindowScale) && !DisplayApi().available;
         const uint8_t ink = dim ? kInkFaint : kInkBright;
@@ -892,7 +914,7 @@ bool GameSettingsSystem_Adjust(int row, bool left, bool right,
         if (!api.available) {
             if (outStatus && outStatusSize) {
                 _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
-                            "Display settings need the mod's d3d9 proxy.");
+                            S(Str::Gs_SysNeedsProxy));
             }
             return false;
         }
@@ -907,7 +929,7 @@ bool GameSettingsSystem_Adjust(int row, bool left, bool right,
             api.setScale(next);
             if (outStatus && outStatusSize) {
                 _snprintf_s(outStatus, outStatusSize, _TRUNCATE,
-                            "Window size: %dx (%dx%d)", next, 640 * next, 480 * next);
+                            S(Str::Gs_SysWindowSizeStatus), next, 640 * next, 480 * next);
             }
             return true;
         }
@@ -923,7 +945,22 @@ bool GameSettingsSystem_Adjust(int row, bool left, bool right,
         }
         if (outStatus && outStatusSize) {
             _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "%s: %s",
-                        kSystemRows[row].name, want ? "On" : "Off");
+                        S(kSystemRows[row].name), want ? S(Str::Common_On) : S(Str::Common_Off));
+        }
+        return true;
+    }
+
+    if (row == kSysLanguage) {
+        // Two entries, so either direction is the other one. Applied at once -
+        // every label is looked up on draw - and written to the ini now, since
+        // the change detector only watches the vanilla setting blocks.
+        const Ui::Lang lang = Ui::Strings_Language() == Ui::Lang::Japanese
+                                  ? Ui::Lang::English : Ui::Lang::Japanese;
+        Ui::Strings_SetLanguage(lang);
+        Net::GameSettingsSync_SaveLocalSettings("language changed");
+        if (outStatus && outStatusSize) {
+            _snprintf_s(outStatus, outStatusSize, _TRUNCATE, S(Str::Gs_LanguageStatus),
+                        LanguageName(lang));
         }
         return true;
     }
@@ -952,7 +989,7 @@ bool GameSettingsSystem_Adjust(int row, bool left, bool right,
 
     if (outStatus && outStatusSize) {
         _snprintf_s(outStatus, outStatusSize, _TRUNCATE, "%s: %s",
-                    kSystemRows[row].name, next ? "On" : "Off");
+                    S(kSystemRows[row].name), next ? S(Str::Common_On) : S(Str::Common_Off));
     }
     return true;
 }
@@ -962,21 +999,13 @@ int GameSettingsRoot_RowCount() {
 }
 
 void GameSettingsRoot_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
-    static const char* const kLabels[kGameRootCount] = {
-        "General Settings",
-        "System",
-        "Key Settings",
-        "Battle History",
-        "Titles",
-        "Exit Settings",
+    static const Str kLabels[kGameRootCount] = {
+        Str::Gs_RootGeneral, Str::Gs_RootSystem, Str::Gs_RootKeys,
+        Str::Gs_RootBattleHistory, Str::Gs_RootTitles, Str::Gs_RootExit,
     };
-    static const char* const kHints[kGameRootCount] = {
-        "rules and audio",
-        "mod options",
-        "controls",
-        "past results",
-        "earned titles",
-        "back to title",
+    static const Str kHints[kGameRootCount] = {
+        Str::Gs_RootGeneralHint, Str::Gs_RootSystemHint, Str::Gs_RootKeysHint,
+        Str::Gs_RootBattleHistoryHint, Str::Gs_RootTitlesHint, Str::Gs_RootExitHint,
     };
 
     const int bottom = RowTop(kGameRootCount, kRootRowPitch) + 8;
@@ -986,7 +1015,7 @@ void GameSettingsRoot_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     MenuSetBlend(1, alpha);
 
     MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright,
-                      kSettingsTextSize, "SETTINGS");
+                      kSettingsTextSize, S(Str::Gs_Title));
 
     const int selTop = RowTop((int)selectedIndex, kRootRowPitch);
     MenuSetBlend(2, (uint8_t)(alpha / 2));
@@ -996,11 +1025,11 @@ void GameSettingsRoot_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     for (int i = 0; i < kGameRootCount; ++i) {
         const int top = RowTop(i, kRootRowPitch);
         MenuDrawTextSized(kLabelX, top + 8, kInk, kInk, kInk,
-                          kRootLabelSize, kLabels[i]);
+                          kRootLabelSize, S(kLabels[i]));
         // Hint rides under the label rather than beside it, so a bigger label
         // does not push it out of the panel.
         MenuDrawTextSized(kLabelX + 10, top + 30,
-                          kInkDim, kInkDim, kInkDim, kRootHintSize, kHints[i]);
+                          kInkDim, kInkDim, kInkDim, kRootHintSize, S(kHints[i]));
     }
 }
 
@@ -1107,7 +1136,7 @@ void GameSettingsVoice_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
     const int visible = rows - scroll < kVoiceWindowRows ? rows - scroll : kVoiceWindowRows;
 
     DrawPanel(visible, alpha);
-    MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright, kSettingsTextSize, "VOICE VOLUME");
+    MenuDrawTextSized(kLabelX, kHeaderY, kInkBright, kInkBright, kInkBright, kSettingsTextSize, S(Str::Gs_VoiceVolume));
     DrawHighlight((int)selectedIndex - scroll, alpha);
 
     for (int slot = 0; slot < visible; ++slot) {
@@ -1115,7 +1144,7 @@ void GameSettingsVoice_RenderScreen(uint32_t selectedIndex, uint8_t alpha) {
         const int y = RowText(slot, kRowPitch);
 
         if (index >= kVoiceEntryCount) {
-            MenuDrawTextSized(kLabelX, y, kInk, kInk, kInk, kSettingsTextSize, "Back");
+            MenuDrawTextSized(kLabelX, y, kInk, kInk, kInk, kSettingsTextSize, S(Str::Common_Back));
             break;
         }
 

@@ -1316,7 +1316,7 @@ static void DisplayConfig_Save() {
 // If we later centralize versioning, these can move into a shared header.
 static const wchar_t* kAs2GameVersion = L"1.060B";
 static const wchar_t* kAs2ModName = L"ImprovementMod";
-static const wchar_t* kAs2ModVersion = L"0.7-beta2.01";
+static const wchar_t* kAs2ModVersion = L"0.7-beta3";
 
 static HWND g_titleWindow = nullptr;
 static bool g_titleApplied = false;
@@ -1347,6 +1347,59 @@ static const ImWchar kMenuCyrillicRanges[] = {
 static ImFont* g_menuFontLarge = nullptr;
 static ImVector<ImWchar> g_menuLargeGlyphRanges;
 constexpr float kMenuFontLargeSize = 49.0f;
+
+// The full CJK block does not fit at 49 px, but the mod's menus only ever draw
+// the strings in their own table - a few hundred distinct kanji and kana. The
+// mod hands those over as one UTF-8 blob and exactly its codepoints are baked
+// into the large face, which fits comfortably. Arriving after the atlas was
+// built triggers a rebuild before the next frame.
+static char g_menuExtraGlyphText[24 * 1024];
+static bool g_menuExtraGlyphsDirty = false;
+static bool g_overlayFontsBuilt = false;
+
+// Whether every codepoint of `utf8` has a real glyph in `font` - the decision
+// the old lead-byte heuristic was approximating. Checked at draw time, so a
+// rebuilt atlas is honoured on the very next frame.
+static bool FontCoversText(ImFont* font, const char* utf8) {
+    if (!font || !utf8) {
+        return false;
+    }
+    // Minimal UTF-8 decode; ImTextCharFromUtf8 is internal in this ImGui.
+    const unsigned char* p = (const unsigned char*)utf8;
+    while (*p) {
+        unsigned int cp = 0;
+        int extra = 0;
+        if (*p < 0x80u)        { cp = *p;          extra = 0; }
+        else if (*p < 0xC0u)   { return false; }              // stray continuation
+        else if (*p < 0xE0u)   { cp = *p & 0x1Fu;  extra = 1; }
+        else if (*p < 0xF0u)   { cp = *p & 0x0Fu;  extra = 2; }
+        else                   { cp = *p & 0x07u;  extra = 3; }
+        ++p;
+        for (int i = 0; i < extra; ++i, ++p) {
+            if ((*p & 0xC0u) != 0x80u) {
+                return false;
+            }
+            cp = (cp << 6) | (*p & 0x3Fu);
+        }
+        if (cp < 0x20u || cp > 0xFFFFu) {
+            continue;   // controls and anything past the BMP: not this atlas's job
+        }
+        if (!font->FindGlyphNoFallback((ImWchar)cp)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The face a menu string is drawn with: the large one when it is asked for AND
+// can show every character, otherwise the 19 px full-range one.
+static ImFont* PickMenuFont(const char* utf8, float size) {
+    ImFont* font = g_menuFont ? g_menuFont : ImGui::GetFont();
+    if (g_menuFontLarge && size >= 40.0f && FontCoversText(g_menuFontLarge, utf8)) {
+        font = g_menuFontLarge;
+    }
+    return font;
+}
 
 // Text the mod queued this frame, in the game's 640x480 space. ImGui's
 // DisplaySize is already native, so these coordinates need no mapping.
@@ -1440,6 +1493,10 @@ static void ConfigureOverlayFonts(ImGuiIO& io) {
 
                         ImFontGlyphRangesBuilder largeBuilder;
                         largeBuilder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+                        if (g_menuExtraGlyphText[0]) {
+                            // Only what the menus actually say, not the block.
+                            largeBuilder.AddText(g_menuExtraGlyphText);
+                        }
                         g_menuLargeGlyphRanges.clear();
                         largeBuilder.BuildRanges(&g_menuLargeGlyphRanges);
                         g_menuFontLarge = io.Fonts->AddFontFromMemoryTTF(
@@ -1454,8 +1511,9 @@ static void ConfigureOverlayFonts(ImGuiIO& io) {
                                 const_cast<void*>(embeddedFont), (int)embeddedFontSize,
                                 kMenuFontLargeSize, &mergeConfig, kMenuCyrillicRanges);
                         }
-                        ProxyLog("[IMGUI] Menu font large (%.0f px, Latin + merged Cyrillic): %s",
+                        ProxyLog("[IMGUI] Menu font large (%.0f px, Latin + merged Cyrillic%s): %s",
                                  kMenuFontLargeSize,
+                                 g_menuExtraGlyphText[0] ? " + menu-table CJK" : "",
                                  g_menuFontLarge ? "loaded" : "FAILED");
                     }
                 }
@@ -1470,6 +1528,8 @@ static void ConfigureOverlayFonts(ImGuiIO& io) {
                     g_netplayHudFonts[i] = loadedFont;
                 }
             }
+            g_overlayFontsBuilt = true;
+            g_menuExtraGlyphsDirty = false;
             return;
         }
         ProxyLog("[IMGUI] WARNING: embedded font failed to load, falling back to system fonts");
@@ -2164,7 +2224,7 @@ void InitConsole() {
         
         printf("\033[36m");
         printf("========================================\n");
-        printf("  Alice Senki 2 - Improvement Mod 0.7-beta2.01\n");
+        printf("  Alice Senki 2 - Improvement Mod 0.7-beta3\n");
         printf("  Debug Console\n");
         printf("========================================\n");
         printf("\033[0m\n");
@@ -4279,6 +4339,24 @@ void RenderImGui() {
         }
     }
 
+    // The mod's string table arrived after the atlas was built (it loads after
+    // the device does), so bake its glyphs in now, between frames. The HUD
+    // font pointers the mod holds are re-fetched per draw, not cached.
+    if (g_menuExtraGlyphsDirty && g_overlayFontsBuilt) {
+        ImGuiIO& io = ImGui::GetIO();
+        ImGui_ImplDX9_InvalidateDeviceObjects();
+        io.FontDefault = nullptr;
+        io.Fonts->Clear();
+        g_menuFont = nullptr;
+        g_menuFontLarge = nullptr;
+        for (int i = 0; i < 3; ++i) g_netplayHudFonts[i] = nullptr;
+        ConfigureOverlayFonts(io);
+        ImGui_ImplDX9_CreateDeviceObjects();
+        g_menuExtraGlyphsDirty = false;
+        ProxyLog("[IMGUI] Font atlas rebuilt for the menu string table (%u bytes of glyph text)",
+                 (unsigned)strlen(g_menuExtraGlyphText));
+    }
+
     // Start new frame
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -4297,17 +4375,13 @@ void RenderImGui() {
     // coordinate space, using the Mincho face that matches the vanilla labels.
     if (g_menuTextCount > 0) {
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
-        ImFont* baseFont = g_menuFont ? g_menuFont : ImGui::GetFont();
         const float size = g_menuFont ? g_menuFont->FontSize : ImGui::GetFontSize();
         for (int i = 0; i < g_menuTextCount; ++i) {
             const QueuedMenuText& q = g_menuTextQueue[i];
             const float drawSize = q.size > 0.0f ? q.size : size;
-            // The large atlas only carries Latin + Cyrillic, so anything with a
-            // high codepoint (a Japanese nickname) stays on the full-range one.
-            ImFont* font = baseFont;
-            if (g_menuFontLarge && drawSize >= 40.0f && !q.hasHighCodepoint) {
-                font = g_menuFontLarge;
-            }
+            // Large face when it has every glyph the string needs - which now
+            // includes the menu table's Japanese - else the full-range one.
+            ImFont* font = PickMenuFont(q.text, drawSize);
             // A soft dark edge, the way the vanilla labels are drawn.
             const ImU32 shadow = IM_COL32(20, 20, 20, (int)(q.color >> IM_COL32_A_SHIFT & 0xFF));
             dl->AddText(font, drawSize, ImVec2(q.x + 1.0f, q.y + 1.0f), shadow, q.text);
@@ -4325,7 +4399,7 @@ void RenderImGui() {
         ImGui::PushStyleColor(ImGuiCol_PopupBg,
             ImVec4(popupBg.x, popupBg.y, popupBg.z, 0.94f));
         if (ImGui::BeginMainMenuBar()) {
-            ImGui::Text("Alice Senki 2 - Improvement Mod 0.7-beta2.01");
+            ImGui::Text("Alice Senki 2 - Improvement Mod 0.7-beta3");
             ImGui::Separator();
             if (ImGui::BeginMenu("Options")) {
                 if (ImGui::MenuItem("Settings", nullptr, false, g_pModToggleMenu != nullptr)) {
@@ -6511,7 +6585,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
             InitConsole();
             
             ProxyLog("========================================");
-            ProxyLog("Alice Senki 2 - D3D9 Proxy 0.7-beta2.01");
+            ProxyLog("Alice Senki 2 - D3D9 Proxy 0.7-beta3");
             ProxyLog("Build: %s %s", __DATE__, __TIME__);
             ProxyLog("Crash handler installed!");
             ProxyLog("========================================");
@@ -6730,17 +6804,7 @@ float AS2Proxy_MeasureMenuText(const char* utf8, float size) {
     if (!utf8 || !utf8[0]) {
         return 0.0f;
     }
-    bool high = false;
-    for (const unsigned char* c = (const unsigned char*)utf8; *c; ++c) {
-        if (*c >= 0xCCu) {
-            high = true;
-            break;
-        }
-    }
-    ImFont* font = g_menuFont;
-    if (g_menuFontLarge && size >= 40.0f && !high) {
-        font = g_menuFontLarge;
-    }
+    ImFont* font = PickMenuFont(utf8, size);
     if (!font) {
         return 0.0f;
     }
@@ -6749,6 +6813,23 @@ float AS2Proxy_MeasureMenuText(const char* utf8, float size) {
 }
 
 // Lets the mod fall back to the game's own renderer when the face is missing.
+// The mod's Japanese string table, so the large menu face can carry exactly
+// the glyphs it needs. Safe to call before or after the atlas exists.
+extern "C" __declspec(dllexport)
+void AS2Proxy_SetMenuGlyphText(const char* utf8) {
+    if (!utf8) {
+        utf8 = "";
+    }
+    if (strcmp(g_menuExtraGlyphText, utf8) == 0) {
+        return;
+    }
+    strncpy_s(g_menuExtraGlyphText, utf8, _TRUNCATE);
+    g_menuExtraGlyphsDirty = true;
+    ProxyLog("[IMGUI] Menu glyph text set (%u bytes)%s",
+             (unsigned)strlen(g_menuExtraGlyphText),
+             g_overlayFontsBuilt ? "; atlas rebuild scheduled" : "");
+}
+
 extern "C" __declspec(dllexport)
 int AS2Proxy_MenuFontReady() {
     return g_menuFont != nullptr ? 1 : 0;

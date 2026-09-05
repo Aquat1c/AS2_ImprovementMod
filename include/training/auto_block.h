@@ -42,8 +42,11 @@ constexpr uint32_t kDefenderAirGuard     = 0x00004u;
 constexpr uint32_t kDefenderGuardPoint   = 0x00400u;
 constexpr uint32_t kDefenderSpecialGuard = 0x02000u;
 
-// Sequence stays alive this many quiet simulation frames before ending.
-constexpr uint32_t kSequenceQuietGrace = 2u;
+// A sequence stays alive through this many quiet simulation frames. It is the
+// blockstring-continuity window, so it decides what First Hit and After First
+// Hit consider "the same pressure": too short and every gap starts a fresh
+// sequence, which makes First Hit block the second hit as if it were the first.
+constexpr uint32_t kSequenceQuietGrace = 30u;
 
 enum class ThreatSource : uint8_t {
     DirectPlayer = 0,
@@ -82,8 +85,15 @@ enum class ContactResolution : uint8_t {
 
 enum class BlockPolicy : uint8_t {
     Off = 0,
+    // Blocks whatever the attack demands, switching lane per contact.
     All,
-    Adaptive,
+    // Blocks only what the dummy's STANCE covers, so a low against a standing
+    // dummy connects and a high against a crouching one does. This is the
+    // difference between "the dummy cannot be opened up" and "the dummy is
+    // holding one guard". It was called Adaptive and behaved as a second name
+    // for All; All keeps switching lane per contact, which is the behaviour
+    // that was already right.
+    StanceOnly,
     FirstHit,
     AfterFirstHit,
     Random,
@@ -109,14 +119,33 @@ enum class DefensiveResponse : uint8_t {
     // Guard + D, timed so the press is a fresh edge inside blockstun. That is
     // the branch Entity_CheckAirTech takes for free. Category 4 only.
     PushAwayPerfect,
-    // 214D - the "Warzard counter". Enables a special guard state that repels
-    // attacks; +823 is that state, and action 49 is what it produces when the
-    // opponent connects. Category 5 only.
+    // 214D. The guard-cancel offer only runs for a route whose COMMAND matched
+    // this frame - Entity_ProcessCommandMatches gates it on the route byte at
+    // +1675 - and command 26 is the 214D that opens route 23. The offer then
+    // consumes command 26 as it queues action 49 (52 airborne), which is what
+    // carries the +1940 & 0x100 that sub_4A5C20 requires. So the motion is the
+    // mechanic, and the +823 stock is a second gate on top of it.
+    // Category 5 only.
     AbsoluteDefence,
     // The same mechanic on the other branch: D simply held, which makes +78
     // read 0 inside blockstun and sends it to the "or 100 meter" arm. Weaker,
     // but it is what an untimed press actually does. Category 4 only.
     PushAwayMetered,
+    // The other half of the dodge. Entity_UpdateAction_Attacks picks action
+    // 60/62 when BACK is held and 59/61 when it is not, so D alone out of
+    // blockstun rolls forward instead of back. Category 6 only.
+    DodgeForward,
+    // The other half of the counter: 4D rather than 6D. The resolver only reads
+    // +1940 & 0x10, so which of the two the character performs is purely a
+    // question of which direction is held with D. Category 1 only.
+    GuardCounterBack,
+    // Absolute defence taken BEFORE the first hit instead of as a cancel out of
+    // blocking it. The engine has both entries and they share one gate, the
+    // +823 charge: sub_522F30 queues action 49 when command 26 matches with a
+    // charge in hand, and Entity_UpdateAction_Attacks queues the same action out
+    // of blockstun with no command at all. So this one performs the 214D, and
+    // AbsoluteDefence lets the blockstun cancel do it. Category 5 only.
+    AbsoluteDefenceFirst,
     Count,
 };
 
@@ -165,6 +194,8 @@ enum class DefenseInputKind : uint8_t {
     ForwardTap,      // repel arm: FORWARD from neutral
     DodgePress,      // D + BACK out of blockstun
     CounterForward,  // D + FORWARD, the category-1 guard counter
+    CounterBack,     // D + BACK, the same counter on its other side
+    DodgeForwardPress, // D with no direction, which rolls forward
     ArmGuardState,   // run 214D, the category-5 counter-guard motion
     DownTap,         // 2 from neutral, the low half of the category-3 parry
 };
@@ -193,7 +224,9 @@ struct DefenseDriveSample {
     // walk the dummy forward for nothing.
     bool nativeArmActive = false;
     bool actionable = false;      // engine would accept an ordinary input now
-    bool guardStateArmed = false; // +823, the category-5 counter-guard flag
+    // +823, the category-5 stock. It is what the engine's own blockstun cancel
+    // tests - NOT a "the state is already up" flag, which is how it was read.
+    bool counterGuardStock = false;
     // Which lane the incoming attack demands. The category-3 parry is 6 against
     // high and mid but 2 against low, so the driver has to know which is coming.
     GroundGuardClass threatClass = GroundGuardClass::None;
@@ -204,13 +237,11 @@ struct DefenseDriveState {
     bool tapPhase = false;        // alternates the neutral / press frames
     bool pushPhase = false;       // alternates the D press so each one is an edge
     bool counterFired = false;    // one counter per threat, not a held direction
-    // 214D is a motion, not a press, so the driver walks it a frame at a time.
+    bool dodgePhase = false;      // alternates the D press so each one is an edge
+    // 214D is a motion, not a press, so the driver walks it a frame at a time
+    // and loops: a command that matched a frame too early has been consumed.
     int8_t armStep = -1;          // -1 idle, else the step being fed
 };
-
-// Frames in the 214D motion. Matches the game's own command table entry for it
-// (0x723480 cmd 26: 2, 1, 4 with the D gate).
-constexpr int kGuardStateMotionFrames = 3;
 
 // An attack is on its way. Parry and repel both open a window AHEAD of the hit
 // (repel's is 24 frames from a neutral tap), so keying them off threatArmed - a
@@ -220,13 +251,19 @@ constexpr int kGuardStateMotionFrames = 3;
 // mean the same thing to a mechanic that has to be armed in advance.
 bool ThreatIsIncoming(const DefenseDriveSample& sample);
 
+// Frames in the 214D motion. Matches the game's own command table entry for
+// it (0x723480 cmd 26: 2, 1, 4 with the D gate).
+constexpr int kGuardStateMotionFrames = 3;
+
 DefenseInputKind EvaluateDefenseInput(DefensiveResponse response,
                                       const DefenseDriveSample& sample,
                                       DefenseDriveState& state);
 
 // Dodge is a guard cancel: D during blockstun with the meter to pay for it.
-// Entity_UpdateAction_Standard only offers it from actions 67/68 (crouch) and
-// 70/71 (air) blockstun, so pressing it anywhere else is wasted.
+// Entity_UpdateAction_Attacks offers it from all six blockstun states, and its
+// condition reads the DERIVED D word (+78), i.e. a fresh press - so a D simply
+// held from the frame blockstun began never re-arms if the first press did not
+// take.
 constexpr uint16_t kDodgeMeterCost = 500;
 bool DodgeWindowOpen(uint32_t actionId, uint16_t meter);
 
@@ -234,6 +271,14 @@ bool DodgeWindowOpen(uint32_t actionId, uint16_t meter);
 // is not blocking can never perform them however hard it presses. Selecting one
 // therefore has to imply guarding.
 bool ResponseRequiresBlockstun(DefensiveResponse response);
+
+// True for mechanics that HAVE a blockstun branch, whether or not they need
+// one. The driver has to keep feeding these while the dummy is in blockstun
+// even with no new threat detected, because that is where their cancel is
+// offered from. Absolute defence is the case that separates the two: 214D works
+// from neutral as well, so it must not force a guard - but it still has to be
+// fed through blockstun to reach the cancel.
+bool ResponseUsesBlockstunCancel(DefensiveResponse response);
 
 // Push-away is armed by Entity_CheckAirTech (0x424C90), reached only from the
 // four category-4 characters. It needs BACK held *and* D held; a fresh D press
@@ -415,6 +460,11 @@ bool CanAutoGuardAtContact(const DefenderGuardState& state);
 bool PolicyWantsBlock(BlockPolicy policy,
                       const AutoBlockSequenceState& sequence,
                       uint32_t contactOrdinal);
+
+// Whether this policy will cover the lane this attack demands. Only StanceOnly
+// ever says no: it holds the stance's own lane instead of switching to
+// whatever is incoming.
+bool PolicyAllowsLane(BlockPolicy policy, uint32_t attackMask, bool preferCrouch);
 
 uint32_t DeterministicSequenceRoll(uint32_t startFrame,
                                    uint32_t generation,

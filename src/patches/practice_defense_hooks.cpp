@@ -388,12 +388,40 @@ bool FrameHasAttackBox(const uint8_t* frame) {
     return false;
 }
 
+// True when the attacker's current action carries an attack payload at all.
+//
+// +1740 is the attack mask, and Entity_ResetHitData zeroes it on entry to every
+// ordinary action - stand and both walks all call it - so a non-zero mask means
+// this action is an attack. It is written when the action begins, well before
+// the box goes live, which is exactly what a mechanic that has to be armed
+// early needs. The command-route vector is NOT a substitute: walking closes it
+// too, which is what made the dummy answer a walk as though it were a hit.
+bool AttackerCommitted(uintptr_t attacker) {
+    if (!attacker) {
+        return false;
+    }
+    if (ReadMemory<uint32_t>(attacker + ENTITY_OFF_ATTACK_TYPE) != 0) {
+        return true;
+    }
+    if (ReadMemory<uint8_t>(attacker + ENTITY_OFF_ATTACK_STATE) != 0) {
+        return true;
+    }
+    return Training::IsSharedAttackAction(
+        ReadMemory<uint32_t>(attacker + ENTITY_OFF_ACTION_ID));
+}
+
 // Records until the attacker's animation reaches one that carries an attack
 // box. 0 = a box is out on the current record, -1 = none inside the lookahead.
 // Records are phases, not ticks, so a positive answer is a lower bound on the
 // frames left - which is the safe direction to be wrong in.
+//
+// The scan walks the character's collision table forward, and that table is
+// shared by every action, so records past the end of the current one belong to
+// whatever happens to sit next in the file. Scanning from a walk therefore
+// found an attack box that was never coming. It only runs once the attacker is
+// committed to an attack, which is what keeps the answer about THIS action.
 int RecordsUntilAttackBox(uintptr_t attacker) {
-    if (!attacker) {
+    if (!attacker || !AttackerCommitted(attacker)) {
         return -1;
     }
     const uint32_t animIdx = ReadMemory<uint32_t>(attacker + ENTITY_OFF_ANIM_INDEX);
@@ -435,7 +463,12 @@ typedef int      (__cdecl* UpdateHitReaction_t)(int);
 typedef uint8_t* (__cdecl* SetHitFlag1993_t)(uint8_t*, char);
 typedef char     (__cdecl* SetHitByte1949_t)(int, char);
 typedef int      (__cdecl* SetHitFlags1996_t)(int, char, char);
+typedef void     (__cdecl* UpdateActionAttacks_t)(int, uint32_t*);
 
+UpdateActionAttacks_t g_origUpdateActionAttacks = nullptr;
+// Set by whoever owns the Entity_ProcessCommandMatches hook.
+bool g_counterGuardRouteAvailable = false;
+uint32_t g_pendingBeforeCommandMatches = 0;
 CheckArm_t g_origCheckHitState = nullptr;
 CheckArm_t g_origCheckGuardState = nullptr;
 CheckArm_t g_origCheckAirTech = nullptr;
@@ -459,6 +492,15 @@ const SetHitFlags1996_t   Native_SetPushAwayPosture =
 // Last decoded lane of the incoming attack, so the repel arm can pick its low
 // branch. One tick stale - the arming routines run before the collision phases.
 GroundGuardClass g_lastThreatClass = GroundGuardClass::None;
+
+// Last sample built by the frame plan, so the command-time hooks can ask the
+// same prediction the driver uses instead of recomputing it.
+DefenseDriveSample g_lastDrive{};
+
+// Drained by the practice runtime once per success.
+bool g_defensiveSuccessPending = false;
+uint32_t g_defensiveSuccessFrame = 0;
+uint32_t g_defensiveSuccessResult = 0;
 
 PracticeDefenseArmState g_arm{};
 
@@ -510,6 +552,17 @@ void NoteArm(const char* mechanic, uintptr_t entity, int detail) {
 bool ForceDefenceAllowed(uintptr_t entity, const char* mechanic) {
     const uint32_t action = ReadMemory<uint32_t>(entity + ENTITY_OFF_ACTION_ID);
     if (Training::IsHitstun(action) || Training::IsKnockdownOrLaunch(action)) {
+        return false;
+    }
+    // Committed to its own move - startup included, and character specials
+    // included, which only the route vector can see. Blockstun and proximity
+    // guard are explicitly still defensible: parry and push away are both meant
+    // to work from there.
+    if (!Training::IsBlockstun(action) && !Training::IsProximityGuard(action) &&
+        !NeutralRouteOpen(PracticeRecovery_ReadSample(entity))) {
+        return false;
+    }
+    if (ReadMemory<uint8_t>(entity + ENTITY_OFF_ATTACK_STATE) == 1) {
         return false;
     }
     if (ReadMemory<uint8_t>(entity + ENTITY_OFF_DEFENCE_ALLOWED) == 1) {
@@ -725,6 +778,146 @@ void PublishArmState(uintptr_t dummy, int category, DefensiveResponse effective,
     s_lastPush = g_arm.pushAwayTimer;
 }
 
+// True for the six blockstun states the guard-cancel offer is keyed on.
+bool IsBlockstunAction(uint32_t action) {
+    return action == 64 || action == 65 || action == 67 ||
+           action == 68 || action == 70 || action == 71;
+}
+
+// The preemptive counter-guard.
+//
+// Its engine entry is sub_522F30 / sub_5D99C0 on route slot 0, reached when
+// Entity_ProcessCommandMatches finds that route's command matched. Writing that
+// route byte is the same kind of arming the parry gets: the mod states that the
+// command happened and then touches nothing else - the handler still checks its
+// own gates, still consumes command 26, and the 57-frame state that follows is
+// entirely the engine's. Feeding 2-1-4-D instead meant the match had to land on
+// exactly the right frame and got consumed whether or not a hit came, which is
+// what made it wonky.
+void CommandMatchesEntry(uintptr_t dummy) {
+    if (g_counterGuardRouteAvailable && PracticeGateOpen() && dummy && dummy == DummyEntity() &&
+        EffectiveResponse(PracticeDefense_DummyDefenseCategory()) ==
+            DefensiveResponse::AbsoluteDefenceFirst) {
+        const uint32_t action = ReadMemory<uint32_t>(dummy + ENTITY_OFF_ACTION_ID);
+        // Only where a player could have input it: not out of hitstun, not out
+        // of the dummy's own move. Blockstun is allowed - the route is lower
+        // priority than the blockstun cancel, so whichever the engine prefers
+        // wins on its own terms.
+        const bool couldInput =
+            !Training::IsHitstun(action) && !Training::IsKnockdownOrLaunch(action) &&
+            ReadMemory<uint8_t>(dummy + ENTITY_OFF_ATTACK_STATE) != 1 &&
+            (Training::IsBlockstun(action) || Training::IsProximityGuard(action) ||
+             NeutralRouteOpen(PracticeRecovery_ReadSample(dummy)));
+
+        // Read the prediction fresh. g_lastDrive is built in the collision
+        // phase, which is LATER in the tick than command matching, so relying
+        // on it here would always be a tick behind.
+        const uintptr_t attacker = AttackerEntity();
+        const bool incoming = AttackerCommitted(attacker);
+
+        if (couldInput && incoming) {
+            // The charge has to be there when sub_522F30 reads it, and it reads
+            // it inside the call below. Something clears +823 every frame - the
+            // 13-16-19 log grants it on every single collision phase and finds
+            // it back at 0 on the next - so checking it first and bailing meant
+            // the route byte was never written at all. Grant, then state the
+            // command matched, in that order.
+            if (ReadMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE) == 0) {
+                WriteMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE, 1);
+                g_arm.absoluteStockForced++;
+            }
+            const uintptr_t slot = dummy + ENTITY_OFF_COMMAND_ROUTE_TIMERS +
+                                   ENTITY_ROUTE_COUNTER_GUARD;
+            if (ReadMemory<uint8_t>(slot) == 0) {
+                WriteMemory<uint8_t>(slot, 1);
+                g_arm.counterGuardRouteOpened++;
+            }
+        }
+    }
+
+    g_pendingBeforeCommandMatches =
+        dummy ? ReadMemory<uint32_t>(dummy + ENTITY_OFF_PENDING_ACTION_1) : 0;
+}
+
+// Whether stating the match actually produced the counter guard. Logged on
+// change only, so a working run is a couple of lines and a broken one says
+// which term the handler refused on.
+void CommandMatchesExit(uintptr_t dummy) {
+    if (!dummy || g_arm.counterGuardRouteOpened == g_arm.lastRouteLogCount) {
+        return;
+    }
+    g_arm.lastRouteLogCount = g_arm.counterGuardRouteOpened;
+    const uint32_t after = ReadMemory<uint32_t>(dummy + ENTITY_OFF_PENDING_ACTION_1);
+    LOG_INFO("[Defence] counter-guard route stated frame=%u action=%u pending %u -> %u "
+             "stock823=%u (%s)",
+             ReadSimFrame(),
+             (unsigned)ReadMemory<uint32_t>(dummy + ENTITY_OFF_ACTION_ID),
+             (unsigned)g_pendingBeforeCommandMatches, (unsigned)after,
+             (unsigned)ReadMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE),
+             (after == ACTION_ABSOLUTE_DEFENCE_GROUND ||
+              after == ACTION_ABSOLUTE_DEFENCE_AIR)
+                 ? "queued the counter guard"
+                 : "handler declined");
+}
+
+// The guard-cancel offer.
+//
+// Absolute defence needs no input - the offer's condition is the character's
+// category and the stock byte at +823, nothing else - so the only thing the mod
+// can supply is the stock, and it has to be there BEFORE the offer reads it.
+// Writing it from the collision phase was a whole phase too late in the tick,
+// which is why the dummy blocked and never countered.
+void __cdecl Hook_UpdateActionAttacks(int entity, uint32_t* pendingAction) {
+    const uintptr_t defender = (uintptr_t)entity;
+    const uint32_t action = defender ? ReadMemory<uint32_t>(defender + ENTITY_OFF_ACTION_ID) : 0;
+    const bool blockstun = IsBlockstunAction(action);
+    const bool isDummy = PracticeGateOpen() && defender != 0 && defender == DummyEntity();
+    const DefensiveResponse response =
+        isDummy ? EffectiveResponse(PracticeDefense_DummyDefenseCategory())
+                : DefensiveResponse::NormalGuard;
+
+    if (isDummy && blockstun &&
+        (response == DefensiveResponse::AbsoluteDefence ||
+         response == DefensiveResponse::AbsoluteDefenceFirst) &&
+        ReadMemory<uint8_t>(defender + ENTITY_OFF_DEFENSE_RESOURCE) == 0) {
+        WriteMemory<uint8_t>(defender + ENTITY_OFF_DEFENSE_RESOURCE, 1);
+        g_arm.absoluteStockForced++;
+        LOG_INFO("[Defence] absolute-defence stock granted at the offer (action=%u frame=%u)",
+                 (unsigned)action, ReadSimFrame());
+    }
+
+    const uint32_t before = pendingAction ? pendingAction[0] : 0;
+    if (g_origUpdateActionAttacks) {
+        g_origUpdateActionAttacks(entity, pendingAction);
+    }
+
+    // Only blockstun frames say anything, and only for the mod's own dummy, so
+    // this is a handful of lines per string rather than one per frame.
+    if (isDummy && blockstun) {
+        const uint32_t after = pendingAction ? pendingAction[0] : 0;
+        if (after != before) {
+            g_arm.guardCancelsOffered++;
+            LOG_INFO("[Defence] guard cancel offered: action %u -> %u (from %u) frame=%u",
+                     (unsigned)action, (unsigned)after, (unsigned)before, ReadSimFrame());
+        } else {
+            static uint32_t s_lastRefusalFrame = 0xFFFFFFFFu;
+            const uint32_t frame = ReadSimFrame();
+            if (frame != s_lastRefusalFrame) {
+                s_lastRefusalFrame = frame;
+                LOG_INFO("[Defence] guard cancel NOT offered frame=%u action=%u response=%s "
+                         "category=%d stock823=%u meter=%u d_edge=%u back=%u",
+                         frame, (unsigned)action,
+                         DefensiveResponseLabel(response),
+                         PracticeDefense_DummyDefenseCategory(),
+                         (unsigned)ReadMemory<uint8_t>(defender + ENTITY_OFF_DEFENSE_RESOURCE),
+                         (unsigned)ReadMemory<uint16_t>(defender + ENTITY_OFF_METER),
+                         (unsigned)ReadMemory<uint16_t>(defender + 78),
+                         (unsigned)ReadMemory<uint16_t>(defender + ENTITY_OFF_INPUT_BACK));
+            }
+        }
+    }
+}
+
 int __cdecl Hook_CheckHitState(int entity) {
     const int result = g_origCheckHitState ? g_origCheckHitState(entity) : entity;
     ForceParryArm((uintptr_t)entity);
@@ -776,15 +969,26 @@ DefenceResolve2_t g_origResolveDodge = nullptr;
 //
 // Every resolver tests the STAND lane first, so a mask carrying both lanes is a
 // stand contact and only a crouch-only mask takes the low branch.
-void PrepareDefenceForContact(int attackerCtx, uint32_t attackMask) {
+// What a preparation temporarily changed, so it can be put back the moment the
+// resolver has read it - the same discipline ScopedGuardLane uses for the guard
+// lanes it lends the ordinary-guard resolver.
+struct DefencePreparation {
+    uintptr_t defender = 0;
+    bool flagsChanged = false;
+    uint32_t oldFlags = 0;
+};
+
+DefencePreparation PrepareDefenceForContact(int attackerCtx, uint32_t attackMask) {
+    DefencePreparation prep{};
     const uintptr_t defender = (uintptr_t)ReadMemory<uint32_t>(
         (uintptr_t)attackerCtx + ENTITY_OFF_OPPONENT);
+    prep.defender = defender;
     const DefensiveResponse response = ArmTargetResponse(defender);
     if (!ResponseArmedByNativeHook(response)) {
-        return;
+        return prep;
     }
     if (!ForceDefenceAllowed(defender, DefensiveResponseLabel(response))) {
-        return;
+        return prep;
     }
 
     const bool airborne = ReadMemory<uint8_t>(defender + ENTITY_OFF_AIRBORNE) == 1;
@@ -829,9 +1033,23 @@ void PrepareDefenceForContact(int attackerCtx, uint32_t attackMask) {
             break;
         }
         default:
-            return;
+            return prep;
     }
     g_arm.contactsPrepared++;
+    return prep;
+}
+
+// Puts back anything the preparation lent the resolver.
+void FinishDefenceForContact(const DefencePreparation& prep) {
+    if (!prep.flagsChanged || !prep.defender) {
+        return;
+    }
+    // Re-read rather than restoring blind: the resolver may legitimately have
+    // written other bits of +1940 while it ran.
+    const uint32_t after = ReadMemory<uint32_t>(prep.defender + ENTITY_OFF_MAX_HIT_FLAGS);
+    const uint32_t restored = (after & ~(uint32_t)DEFENDER_FLAG_ABSOLUTE_DEFENCE) |
+                              (prep.oldFlags & DEFENDER_FLAG_ABSOLUTE_DEFENCE);
+    WriteMemory<uint32_t>(prep.defender + ENTITY_OFF_MAX_HIT_FLAGS, restored);
 }
 
 void TraceResolve(const char* mechanic, int attackerCtx, uint32_t attackMask, int result) {
@@ -843,6 +1061,11 @@ void TraceResolve(const char* mechanic, int attackerCtx, uint32_t attackMask, in
     g_arm.resolverCalls++;
     if (result == CONTACT_RESULT_NONE) {
         g_arm.resolverDeclines++;
+    } else {
+        // Anything other than "declined" means the mechanic was awarded.
+        g_defensiveSuccessPending = true;
+        g_defensiveSuccessFrame = ReadSimFrame();
+        g_defensiveSuccessResult = (uint32_t)result;
     }
     LOG_INFO("[Defence] resolve %s mask=0x%05X class=%s -> %s(%d) | "
              "allow1949=%u kind1989=%u react1980=%d flags1940=0x%04X "
@@ -866,17 +1089,18 @@ void TraceResolve(const char* mechanic, int attackerCtx, uint32_t attackMask, in
              (unsigned)ReadMemory<uint16_t>(defender + ENTITY_OFF_METER));
 }
 
-#define DEFENCE_RESOLVE_HOOK(name, orig, label)                                    \
-    int __cdecl name(int attackerCtx, int sourceObject, int16_t* contactPos,       \
-                     char attackerFacing, int payloadAddress) {                    \
-        const uint32_t mask = ReadMemory<uint32_t>((uintptr_t)payloadAddress + 4); \
-        PrepareDefenceForContact(attackerCtx, mask);                               \
-        const int result = orig                                                    \
-            ? orig(attackerCtx, sourceObject, contactPos, attackerFacing,          \
-                   payloadAddress)                                                 \
-            : CONTACT_RESULT_NONE;                                                 \
-        TraceResolve(label, attackerCtx, mask, result);                            \
-        return result;                                                             \
+#define DEFENCE_RESOLVE_HOOK(name, orig, label)                                      \
+    int __cdecl name(int attackerCtx, int sourceObject, int16_t* contactPos,         \
+                     char attackerFacing, int payloadAddress) {                      \
+        const uint32_t mask = ReadMemory<uint32_t>((uintptr_t)payloadAddress + 4);   \
+        const DefencePreparation prep = PrepareDefenceForContact(attackerCtx, mask); \
+        const int result = orig                                                      \
+            ? orig(attackerCtx, sourceObject, contactPos, attackerFacing,            \
+                   payloadAddress)                                                   \
+            : CONTACT_RESULT_NONE;                                                   \
+        FinishDefenceForContact(prep);                                               \
+        TraceResolve(label, attackerCtx, mask, result);                              \
+        return result;                                                               \
     }
 
 DEFENCE_RESOLVE_HOOK(Hook_ResolveCounter, g_origResolveCounter, "guard_counter")
@@ -890,6 +1114,9 @@ DEFENCE_RESOLVE_HOOK(Hook_ResolveAbsolute, g_origResolveAbsolute, "absolute_defe
 // The dodge takes the payload as its second argument instead of its fifth.
 int __cdecl Hook_ResolveDodge(int attackerCtx, int payloadAddress) {
     const uint32_t mask = ReadMemory<uint32_t>((uintptr_t)payloadAddress + 4);
+    // The dodge is deliberately NOT prepared. sub_4A5D30 only stamps the result
+    // code - the roll itself comes from the action the dummy is already in - so
+    // lending it its flag would report a dodge the dummy never performed.
     const int result = g_origResolveDodge
         ? g_origResolveDodge(attackerCtx, payloadAddress)
         : CONTACT_RESULT_NONE;
@@ -1027,6 +1254,9 @@ void BuildFramePlan() {
                      g_arm.arms, g_arm.parryArms, g_arm.repelArms, g_arm.pushAwayArms,
                      g_arm.defenceAllowedForced,
                      g_arm.resolverCalls, g_arm.resolverDeclines);
+            LOG_INFO("[Defence] totals route_stated=%u stock_granted=%u cancels_offered=%u",
+                     g_arm.counterGuardRouteOpened, g_arm.absoluteStockForced,
+                     g_arm.guardCancelsOffered);
             LOG_INFO("[Defence] totals contacts_prepared=%u (the window was pointed at a "
                      "specific contact this many times, projectiles included)",
                      g_arm.contactsPrepared);
@@ -1068,17 +1298,32 @@ void BuildFramePlan() {
     const int dummyCategory = PracticeDefense_DummyDefenseCategory();
     const DefensiveResponse response = EffectiveResponse(dummyCategory);
 
-    // Category 5's whole gate is the stock byte at +823, and nothing in the
-    // decompiled C ever writes it - it comes from a move script. Logging it on
-    // change is the only way to learn whether it starts armed (so the defence
-    // really is automatic) or has to be earned with the character's D special.
+    // Absolute defence has no input and no window: Entity_UpdateAction_Attacks
+    // queues action 49 (52 airborne) out of any blockstun state whenever the
+    // character is category 5 and the stock byte at +823 is non-zero, and
+    // action 49 is what carries the +1940 & 0x100 the resolver wants. Nothing
+    // in the decompiled C ever writes +823 - it comes from a move script - so a
+    // dummy told to use the mechanic gets the stock, the same way +1949 is
+    // supplied for the window mechanics.
     if (dummyCategory == kDefenseCategoryAbsolute) {
         static int s_lastStock = -1;
         const int stock = ReadMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE);
         if (stock != s_lastStock) {
             s_lastStock = stock;
-            LOG_INFO("[AutoBlock] absolute-defence stock +823 = %d (action=%u)",
+            LOG_INFO("[Defence] absolute-defence stock +823 = %d (action=%u)",
                      stock, (unsigned)defenderState.actionId);
+        }
+        // +823 gates BOTH entries: the blockstun cancel in
+        // Entity_UpdateAction_Attacks, and the neutral 214D command itself
+        // (sub_5045a0 tests it before it will even queue the move). Nothing in
+        // the executable ever writes it, so it is a resource handed out
+        // elsewhere - and a dummy told to use the mechanic is a dummy that has
+        // its charge. Everything past this point stays the engine's.
+        if (stock == 0 && (response == DefensiveResponse::AbsoluteDefence ||
+                           response == DefensiveResponse::AbsoluteDefenceFirst)) {
+            WriteMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE, 1);
+            g_arm.absoluteStockForced++;
+            LOG_INFO("[Defence] absolute-defence charge granted (+823 was 0)");
         }
     }
 
@@ -1096,10 +1341,15 @@ void BuildFramePlan() {
     // carries the box. Waiting for +1736 to flip is the same instant as waiting
     // for the box, which is why keying off it changed nothing.
     drive.recordsToAttack = (int16_t)RecordsUntilAttackBox(attacker);
-    drive.attackerCommitted = !NeutralRouteOpen(PracticeRecovery_ReadSample(attacker));
-    drive.nativeArmActive = g_armHooksInstalled;
+    drive.attackerCommitted = AttackerCommitted(attacker);
+    // The preemptive counter guard is armed through the command-matches seam,
+    // which belongs to another hook - so it is only "hook driven" when that
+    // seam is actually live.
+    drive.nativeArmActive =
+        g_armHooksInstalled &&
+        (response != DefensiveResponse::AbsoluteDefenceFirst || g_counterGuardRouteAvailable);
     drive.actionable = CanAutoGuardAtContact(defenderState);
-    drive.guardStateArmed =
+    drive.counterGuardStock =
         ReadMemory<uint8_t>(dummy + ENTITY_OFF_DEFENSE_RESOURCE) != 0;
     // The parry direction depends on what is coming, so decode the threat the
     // dummy would be reacting to. The latched lane is the fallback for a plan
@@ -1113,9 +1363,13 @@ void BuildFramePlan() {
     }
     g_defenseInput = EvaluateDefenseInput(response, drive, g_defenseDrive);
     g_lastThreatClass = drive.threatClass;
+    g_lastDrive = drive;
     PublishArmState(dummy, dummyCategory, response, drive);
 
-    if (policyWould && CanAutoGuardAtContact(defenderState)) {
+    const bool anticipatedLaneAllowed =
+        !firstOverlap ||
+        PolicyAllowsLane(effectivePolicy, firstOverlap->attackMask, g_config.preferCrouch);
+    if (policyWould && anticipatedLaneAllowed && CanAutoGuardAtContact(defenderState)) {
         if (g_plan.laneLatched) {
             g_anticipatoryGuard = SemanticGuardForLane(g_plan.lane, g_plan.defenderAirborne);
             g_anticipatoryMask = firstOverlap ? firstOverlap->attackMask : 0;
@@ -1281,7 +1535,18 @@ int __cdecl Hook_OrdinaryGuard(int attackerCtx, int sourceObject, int16_t* conta
         }
     }
 
-    const bool augment = g_plan.policyWantsBlock && eligible && compatible && !nativeAlready;
+    // Stance Only holds one lane rather than switching, so an attack the stance
+    // does not cover is let through on purpose.
+    const bool laneAllowed =
+        PolicyAllowsLane(EffectiveBlockPolicy(), attackMask, g_config.preferCrouch);
+    const bool augment =
+        g_plan.policyWantsBlock && eligible && compatible && laneAllowed && !nativeAlready;
+    if (g_plan.policyWantsBlock && eligible && compatible && !laneAllowed) {
+        LOG_INFO("[AutoBlock] stance-only let a %s through frame=%u mask=0x%05X (stance covers %s)",
+                 GroundGuardClassLabel(DecodeGroundGuardClass(attackMask)),
+                 frame, (unsigned)attackMask,
+                 g_config.preferCrouch ? "crouch" : "stand");
+    }
 
     g_telemetry.hasLastContact = true;
     g_telemetry.lastContactFrame = frame;
@@ -1499,6 +1764,14 @@ bool PracticeDefense_Install() {
                                          reinterpret_cast<void*>(&Hook_CheckAirTech),
                                          reinterpret_cast<void**>(&g_origCheckAirTech),
                                          "push-away arm");
+    g_armHooksInstalled = parryArm && repelArm && pushArm;
+    // The guard-cancel offer: absolute defence is granted its stock here, one
+    // whole tick phase earlier than the collision pass could manage.
+    CreateAndEnable(ADDR_ENTITY_UPDATE_ACTION_ATTACKS,
+                    reinterpret_cast<void*>(&Hook_UpdateActionAttacks),
+                    reinterpret_cast<void**>(&g_origUpdateActionAttacks),
+                    "guard cancel offer");
+
     // Tracing only: every category's resolver, so a contact that declined says
     // which of its own gate terms was not met.
     CreateAndEnable(ADDR_DEFENCE_RESOLVE_COUNTER,
@@ -1556,6 +1829,7 @@ void PracticeDefense_Uninstall() {
     MH_DisableHook(reinterpret_cast<void*>(ADDR_DEFENCE_RESOLVE_PUSH_AWAY));
     MH_DisableHook(reinterpret_cast<void*>(ADDR_DEFENCE_RESOLVE_ABSOLUTE));
     MH_DisableHook(reinterpret_cast<void*>(ADDR_DEFENCE_RESOLVE_DODGE));
+    MH_DisableHook(reinterpret_cast<void*>(ADDR_ENTITY_UPDATE_ACTION_ATTACKS));
     g_installed = false;
     g_ordinaryGuardHooked = false;
     g_armHooksInstalled = false;
@@ -1605,6 +1879,34 @@ const PracticeDefenseArmState& PracticeDefense_GetArmState() {
 
 bool PracticeDefense_ArmHooksActive() {
     return g_armHooksInstalled;
+}
+
+void PracticeDefense_OnCommandMatchesEntry(uintptr_t entity) {
+    CommandMatchesEntry(entity);
+}
+
+void PracticeDefense_OnCommandMatchesExit(uintptr_t entity) {
+    CommandMatchesExit(entity);
+}
+
+void PracticeDefense_SetCounterGuardRouteAvailable(bool available) {
+    if (g_counterGuardRouteAvailable == available) {
+        return;
+    }
+    g_counterGuardRouteAvailable = available;
+    LOG_INFO("[Defence] counter-guard route seam %s",
+             available ? "available" : "unavailable (preemptive absolute defence "
+                                       "falls back to feeding 214D)");
+}
+
+bool PracticeDefense_ConsumeDefensiveSuccess(uint32_t* outFrame, uint32_t* outResult) {
+    if (!g_defensiveSuccessPending) {
+        return false;
+    }
+    g_defensiveSuccessPending = false;
+    if (outFrame) *outFrame = g_defensiveSuccessFrame;
+    if (outResult) *outResult = g_defensiveSuccessResult;
+    return true;
 }
 
 bool PracticeDefense_BlockForcedByResponse() {
@@ -1658,6 +1960,10 @@ void PracticeDefense_Reset() {
     g_lastHitEpoch = 0;
     g_lastHitWantedBlock = false;
     g_lastThreatClass = GroundGuardClass::None;
+    g_lastDrive = DefenseDriveSample{};
+    g_defensiveSuccessPending = false;
+    g_defensiveSuccessFrame = 0;
+    g_defensiveSuccessResult = 0;
     g_arm = PracticeDefenseArmState{};
     g_arm.installed = g_armHooksInstalled;
 }

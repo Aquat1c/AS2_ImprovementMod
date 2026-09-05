@@ -1,4 +1,5 @@
 #include "training/hotkey_config.h"
+#include "ui/strings.h"
 
 #include "training/practice_tools.h"
 #include "imgui.h"
@@ -49,19 +50,19 @@ static const KeyBinding_t kDefaultBindings[HOTKEY_COUNT] = {
     { SDL_SCANCODE_DELETE, -1, -1, 0 },  // HOTKEY_OVERLAY_TOGGLE
 };
 
-static const char* kActionNames[HOTKEY_COUNT] = {
-    "Hitbox Toggle",
-    "Pause Toggle",
-    "Frame Step",
-    "Control Swap",
-    "Save State",
-    "Load State",
-    "Position Load",
-    "Position Save",
-    "Macro Record",
-    "Macro Play/Stop",
-    "Macro Slot Next",
-    "Hide Netplay/Replay Overlay",
+static const Str kActionNames[HOTKEY_COUNT] = {
+    Str::Hk_HitboxToggle,
+    Str::Hk_PauseToggle,
+    Str::Hk_FrameStep,
+    Str::Hk_ControlSwap,
+    Str::Hk_SaveState,
+    Str::Hk_LoadState,
+    Str::Hk_PositionLoad,
+    Str::Hk_PositionSave,
+    Str::Hk_MacroRecord,
+    Str::Hk_MacroPlayStop,
+    Str::Hk_MacroSlotNext,
+    Str::Hk_OverlayToggle,
 };
 
 // Savestates are offered in arcade and versus as well, so gating them on
@@ -487,7 +488,7 @@ void HotkeyConfig_FormatLabel(char* out, int outSize, const char* text,
 
 const char* HotkeyConfig_ActionName(HotkeyAction action) {
     if (action < 0 || action >= HOTKEY_COUNT) return "?";
-    return kActionNames[action];
+    return S(kActionNames[action]);
 }
 
 // Applies to every action: the window is not ours, a binding capture owns the
@@ -631,7 +632,7 @@ void HotkeyConfig_RenderImGui(void) {
         ImGui::PushID(i);
 
         if (s_rebindAction == i) {
-            ImGui::Text("%-18s", kActionNames[i]);
+            ImGui::Text("%-18s", S(kActionNames[i]));
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f),
                                "Press a key or controller input...");
@@ -658,7 +659,7 @@ void HotkeyConfig_RenderImGui(void) {
             char bindingLabel[128] = {};
             HotkeyConfig_GetBindingDisplayName(action, bindingLabel, (int)sizeof(bindingLabel));
 
-            ImGui::Text("%-18s", kActionNames[i]);
+            ImGui::Text("%-18s", S(kActionNames[i]));
             ImGui::SameLine();
 
             char label[160] = {};

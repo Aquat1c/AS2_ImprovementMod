@@ -18,6 +18,7 @@
 #include "training/practice_tools.h"
 #include "rollback/rollback_session.h"
 #include "imgui.h"
+#include "ui/strings.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -492,23 +493,23 @@ void ModMenu_Render() {
     
     // Menu bar
     if (ImGui::BeginMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Save Config")) {
+        if (ImGui::BeginMenu(S(Str::Mm_File))) {
+            if (ImGui::MenuItem(S(Str::Mm_SaveConfig))) {
                 InputSystem_SaveConfig("as2_input.cfg");
                 LOG_INFO("Config saved");
             }
-            if (ImGui::MenuItem("Load Config")) {
+            if (ImGui::MenuItem(S(Str::Mm_LoadConfig))) {
                 InputSystem_LoadConfig("as2_input.cfg");
                 LOG_INFO("Config loaded");
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Hide Menu", "F1")) {
+            if (ImGui::MenuItem(S(Str::Mm_HideMenu), "F1")) {
                 ProxySetMenuVisible(false, "Settings/File Hide Menu");
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem("Advanced Mode", nullptr, &g_showAdvanced);
+        if (ImGui::BeginMenu(S(Str::Mm_View))) {
+            ImGui::MenuItem(S(Str::Mm_AdvancedMode), nullptr, &g_showAdvanced);
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();

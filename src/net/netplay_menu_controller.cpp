@@ -7,6 +7,7 @@
  */
 
 #include "net/netplay_menu_controller.h"
+#include "ui/strings.h"
 #include "net/mode_ownership.h"
 #include "net/session_manager.h"
 #include "net/transition_barrier.h"
@@ -89,6 +90,8 @@ static uint32_t      s_selectedIndex     = 0;
 static int           s_fadeFrames        = 0;
 static bool          s_captureInput      = false;
 static bool          s_waitForNeutral    = false;
+// Pre-menu default only; the controller overwrites it with the localised
+// text the moment the menu opens.
 static char          s_status[128]       = "Choose an online option.";
 static char          s_lastError[128]    = "";
 static char          s_textEditBuffer[96] = "";
@@ -1514,7 +1517,7 @@ static bool TryJoinSpectatorProbeFallback(const char* failureReason) {
     CopyText(s_joinSpectatorProbeEndpoint,
         sizeof(s_joinSpectatorProbeEndpoint),
         s_joinSpectatorFallbackEndpoint);
-    SetStatus("The main watch address did not respond. Trying the relay watch address...");
+    SetStatus(S(Str::Np_MsgMainWatchNoReply));
     SPECTATE_MENU_LOG(LOG_WARNING, "SPROBE",
         "[SPROBE] fallback endpoint=%s reason=%s",
         s_joinSpectatorFallbackEndpoint,
@@ -1556,7 +1559,7 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
     char targetHost[96] = {};
     uint16_t targetPort = 0;
     if (!ParseEndpoint(endpoint, targetHost, sizeof(targetHost), &targetPort, s_allowIPv6Endpoint)) {
-        SetStatus("Enter the host address as host:port or [ipv6]:port.");
+        SetStatus(S(Str::Np_MsgEnterHostAddress));
         return false;
     }
 
@@ -1570,7 +1573,7 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
 
     Net::NatRuntimeConfig natCfg{};
     if (!BuildNatRuntimeConfig(&natCfg)) {
-        SetStatus("Connection settings are invalid.");
+        SetStatus(S(Str::Np_MsgConnSettingsInvalid));
         return false;
     }
 
@@ -1596,7 +1599,7 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
         char relayHost[96] = {};
         uint16_t relayPort = 0;
         if (!ParseEndpoint(s_relayEndpoint, relayHost, sizeof(relayHost), &relayPort, true)) {
-            SetStatus("The punch relay address is invalid.");
+            SetStatus(S(Str::Np_MsgPunchRelayInvalid));
             return false;
         }
         strncpy_s(cfg.nat.relay_host, sizeof(cfg.nat.relay_host), relayHost, _TRUNCATE);
@@ -1608,7 +1611,7 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
     CopyText(s_remoteEndpoint, sizeof(s_remoteEndpoint), endpoint);
 
     if (!Net::Session_StartJoin(&cfg)) {
-        SetStatus("Couldn't start joining the room.");
+        SetStatus(S(Str::Np_MsgJoinFailed));
         return false;
     }
 
@@ -1616,7 +1619,7 @@ static bool StartJoinSessionToEndpoint(const char* endpoint,
     s_activeBranch = RootBranch::DirectPlay;
     s_selectedIndex = 0;
     ClearError();
-    SetStatus("%s", statusText && statusText[0] ? statusText : "Connecting to host...");
+    SetStatus("%s", statusText && statusText[0] ? statusText : S(Str::Np_MsgConnectingToHost));
     TransitionTo(MenuState::Connecting, transitionWhy ? transitionWhy : "join started");
     return true;
 }
@@ -1633,7 +1636,7 @@ static void CancelSpectatorConnectionAndReturn(const char* disconnectReason,
     if (fromJoinProbe) {
         s_activeBranch = RootBranch::DirectPlay;
         s_connectionEntry = ConnectionEntry::None;
-        SetStatus(statusText && statusText[0] ? statusText : "Returned to Join a Match.");
+        SetStatus(statusText && statusText[0] ? statusText : S(Str::Np_MsgReturnedToJoin));
         TransitionTo(MenuState::JoinEntry, transitionWhy ? transitionWhy : "cancel join spectator probe");
         return;
     }
@@ -1686,7 +1689,7 @@ static bool BeginJoinSpectatorProbe(const char* sessionError) {
     s_connectionEntry = ConnectionEntry::Join;
     s_selectedIndex = 0;
     ClearError();
-    SetStatus("The host may already be playing. Checking whether a live watch feed is available...");
+    SetStatus(S(Str::Np_MsgHostMayBePlaying));
     SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
         "[MENU] begin_join_spectator_probe endpoint=%s",
         s_joinSpectatorProbeEndpoint);
@@ -1715,7 +1718,7 @@ static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg) {
         char stunHost[96] = {};
         uint16_t stunPort = 0;
         if (!ParseEndpoint(s_stunEndpoint, stunHost, sizeof(stunHost), &stunPort, true)) {
-            SetStatus("The STUN server address is invalid.");
+            SetStatus(S(Str::Np_MsgStunInvalid));
             return false;
         }
         strncpy_s(cfg.stun_host, sizeof(cfg.stun_host), stunHost, _TRUNCATE);
@@ -1729,7 +1732,7 @@ static bool BuildNatRuntimeConfig(Net::NatRuntimeConfig* outCfg) {
         char turnHost[96] = {};
         uint16_t turnPort = 0;
         if (!ParseEndpoint(s_turnEndpoint, turnHost, sizeof(turnHost), &turnPort, true)) {
-            SetStatus("The TURN server address is invalid.");
+            SetStatus(S(Str::Np_MsgTurnInvalid));
             return false;
         }
         strncpy_s(cfg.turn_host, sizeof(cfg.turn_host), turnHost, _TRUNCATE);
@@ -2620,7 +2623,7 @@ static void OpenMenu() {
     s_captureInput = true;
     ResetMenuInputState();
     ClearError();
-    SetStatus("Opening the online menu.");
+    SetStatus(S(Str::Np_MsgOpeningOnlineMenu));
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Opening custom netplay menu");
     TransitionTo(MenuState::MenuRoot, "Network selected");
 }
@@ -2639,7 +2642,7 @@ static void FinishClose() {
     ClearTextEditState();
     s_waitForNeutral = true;
     s_selectedIndex = 0;
-    SetStatus("Choose an online option.");
+    SetStatus(S(Str::Np_MsgChooseOption));
     TransitionTo(MenuState::Inactive, "menu closed");
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Custom netplay menu closed");
     InputSystem_ResetRepeatState(0);
@@ -2653,7 +2656,7 @@ static void FinishClose() {
 static void BeginClose(const char* why) {
     if (!MenuVisible() || s_phase == MenuPhase::Closing) return;
     LOG_NETPLAY(LOG_INFO, "[NetMenu] Closing custom menu (%s)", why ? why : "?");
-    SetStatus("Closing the online menu.");
+    SetStatus(S(Str::Np_MsgClosingOnlineMenu));
     s_phase = MenuPhase::Closing;
     s_waitForNeutral = true;
     ClearTextEditState();
@@ -2829,12 +2832,12 @@ static void SyncSessionState() {
                 LOG_NETPLAY(LOG_INFO, "[NetMenu] Session connected — opening config screen");
                 s_activeBranch = RootBranch::DirectPlay;
                 TransitionTo(MenuState::ConnectedSession, "session connected");
-                SetStatus("%s", snap.status_text[0] ? snap.status_text : "Session connected.");
+                SetStatus("%s", snap.status_text[0] ? snap.status_text : S(Str::Np_MsgSessionConnected));
                 s_selectedIndex = 0;
             } else if (s_state != MenuState::ConnectedSession && s_state != MenuState::CharSelTransition) {
                 s_activeBranch = RootBranch::DirectPlay;
                 TransitionTo(MenuState::ConnectedSession, "session connected");
-                SetStatus("%s", snap.status_text[0] ? snap.status_text : "Session connected.");
+                SetStatus("%s", snap.status_text[0] ? snap.status_text : S(Str::Np_MsgSessionConnected));
                 s_selectedIndex = 0;
             }
             break;
@@ -2898,7 +2901,7 @@ static void HideMenuForLaunch(const char* why) {
     s_waitForNeutral = false;
     s_selectedIndex = 0;
     ClearError();
-    SetStatus("Waiting for network menu selection.");
+    SetStatus(S(Str::Np_MsgWaitingSelection));
     TransitionTo(MenuState::Inactive, why ? why : "launch");
     InputSystem_ResetRepeatState(0);
 }
@@ -3304,15 +3307,15 @@ static void FinishTextEdit(bool commit) {
     if (field == TextEditField::Nickname && s_textEditBuffer[0]) {
         CopyText(s_localNickname, sizeof(s_localNickname), s_textEditBuffer);
         LOG_NETPLAY(LOG_INFO, "[NetMenu] Nickname set to: %s", s_localNickname);
-        SetStatus("Display name: %s", s_localNickname);
+        SetStatus(S(Str::Np_MsgDisplayName), s_localNickname);
     } else if (field == TextEditField::ListenPort && s_textEditBuffer[0]) {
         int port = atoi(s_textEditBuffer);
         if (port > 0 && port <= 65535) {
             s_listenPort = (uint16_t)port;
             LOG_NETPLAY(LOG_INFO, "[NetMenu] Listen port set to: %u", s_listenPort);
-            SetStatus("Room port: %u", s_listenPort);
+            SetStatus(S(Str::Np_MsgRoomPort), s_listenPort);
         } else {
-            SetStatus("Enter a valid room port from 1 to 65535.");
+            SetStatus(S(Str::Np_MsgRoomPortRange));
         }
     } else if (field == TextEditField::RemoteEndpoint && s_textEditBuffer[0]) {
         char testHost[96] = {};
@@ -3320,9 +3323,9 @@ static void FinishTextEdit(bool commit) {
         if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, s_allowIPv6Endpoint)) {
             CopyText(s_remoteEndpoint, sizeof(s_remoteEndpoint), s_textEditBuffer);
             LOG_NETPLAY(LOG_INFO, "[NetMenu] Remote endpoint set to: %s", s_remoteEndpoint);
-            SetStatus("Host address: %s", s_remoteEndpoint);
+            SetStatus(S(Str::Np_MsgHostAddress), s_remoteEndpoint);
         } else {
-            SetStatus("Enter an address as host:port or [ipv6]:port.");
+            SetStatus(S(Str::Np_MsgEnterAddress));
         }
     } else if (field == TextEditField::SpectatorEndpoint && s_textEditBuffer[0]) {
         char testHost[96] = {};
@@ -3330,9 +3333,9 @@ static void FinishTextEdit(bool commit) {
         if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
             CopyText(s_spectatorEndpoint, sizeof(s_spectatorEndpoint), s_textEditBuffer);
             SPECTATE_MENU_LOG(LOG_INFO, "SMENU", "[NetMenu] Spectator endpoint set to: %s", s_spectatorEndpoint);
-            SetStatus("Watch address: %s", s_spectatorEndpoint);
+            SetStatus(S(Str::Np_MsgWatchAddress), s_spectatorEndpoint);
         } else {
-            SetStatus("Enter a valid watch address.");
+            SetStatus(S(Str::Np_MsgWatchAddressInvalid));
         }
     } else if (field == TextEditField::SpectatorPort && s_textEditBuffer[0]) {
         int port = atoi(s_textEditBuffer);
@@ -3340,38 +3343,38 @@ static void FinishTextEdit(bool commit) {
             s_spectatorListenPort = (uint16_t)port;
             ApplySpectatorSettingsToRuntime("text edit commit");
             SPECTATE_MENU_LOG(LOG_INFO, "SMENU", "[NetMenu] Spectator listen port set to: %u", s_spectatorListenPort);
-            SetStatus("Watch port: %u", s_spectatorListenPort);
+            SetStatus(S(Str::Np_MsgWatchPort), s_spectatorListenPort);
         } else {
-            SetStatus("Enter a valid watch port from 1 to 65535.");
+            SetStatus(S(Str::Np_MsgWatchPortRange));
         }
     } else if (field == TextEditField::RelayEndpoint) {
         if (!s_textEditBuffer[0]) {
             s_relayEndpoint[0] = '\0';
-            SetStatus("Punch relay reset to the default server.");
+            SetStatus(S(Str::Np_MsgPunchRelayReset));
         } else {
             char testHost[96] = {};
             uint16_t testPort = 0;
             if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
                 CopyText(s_relayEndpoint, sizeof(s_relayEndpoint), s_textEditBuffer);
                 LOG_NETPLAY(LOG_INFO, "[NetMenu] Punch relay endpoint set to: %s", s_relayEndpoint);
-                SetStatus("Punch relay set to custom server.");
+                SetStatus(S(Str::Np_MsgPunchRelayCustom));
             } else {
-                SetStatus("Enter a valid punch relay address.");
+                SetStatus(S(Str::Np_MsgPunchRelayEnter));
             }
         }
     } else if (field == TextEditField::StunEndpoint) {
         if (!s_textEditBuffer[0]) {
             CopyText(s_stunEndpoint, sizeof(s_stunEndpoint), "stun.l.google.com:19302");
-            SetStatus("STUN server reset to the default address.");
+            SetStatus(S(Str::Np_MsgStunReset));
         } else {
             char testHost[96] = {};
             uint16_t testPort = 0;
             if (ParseEndpoint(s_textEditBuffer, testHost, sizeof(testHost), &testPort, true)) {
                 CopyText(s_stunEndpoint, sizeof(s_stunEndpoint), s_textEditBuffer);
                 LOG_NETPLAY(LOG_INFO, "[NetMenu] STUN endpoint set to: %s", s_stunEndpoint);
-                SetStatus("STUN server: %s", s_stunEndpoint);
+                SetStatus(S(Str::Np_MsgStunServer), s_stunEndpoint);
             } else {
-                SetStatus("Enter a valid STUN server address.");
+                SetStatus(S(Str::Np_MsgStunEnter));
             }
         }
     }
@@ -3545,14 +3548,14 @@ static void ApplyDiscoveredSpectatorEndpoint(const Net::SpectatorDiscoveryEntry&
         entry.match_active ? 1 : 0);
 
     if (entry.match_active) {
-        SetStatus("LAN room %u/%u: %s (%s vs %s)",
+        SetStatus(S(Str::Np_MsgLanRoomMatch),
             (unsigned)(index + 1),
             (unsigned)count,
             entry.endpoint,
             entry.p1_name[0] ? entry.p1_name : "P1",
             entry.p2_name[0] ? entry.p2_name : "P2");
     } else {
-        SetStatus("LAN room %u/%u: %s (waiting for a match)",
+        SetStatus(S(Str::Np_MsgLanRoomWaiting),
             (unsigned)(index + 1),
             (unsigned)count,
             entry.endpoint);
@@ -3617,7 +3620,7 @@ static void SyncSpectatorClientState() {
     CopyDisplayedSpectatorEndpoint(activeEndpoint, sizeof(activeEndpoint), &spectator);
 
     if (spectator.state == Net::SpectatorClientState::Redirected && spectator.redirect_endpoint[0]) {
-        SetStatus("This watch address redirected you to %s.", spectator.redirect_endpoint);
+        SetStatus(S(Str::Np_MsgWatchRedirected), spectator.redirect_endpoint);
         SPECTATE_MENU_LOG(LOG_INFO, "SPROBE",
             "[SPROBE] redirect endpoint=%s",
             spectator.redirect_endpoint);
@@ -3696,7 +3699,7 @@ static void SyncSpectatorClientState() {
             } else if (IsActionPromptOpen() &&
                        s_actionPromptKind == ActionPromptKind::JoinInsteadOfWaiting) {
                 ClearActionPrompt("active_match_started");
-                SetStatus("A match just started. You're now watching.");
+                SetStatus(S(Str::Np_MsgMatchStartedWatching));
             }
             break;
 
@@ -3731,7 +3734,7 @@ static void SyncSpectatorClientState() {
                 // error-screen cycle to every join retry. Return to the join
                 // screen with the reason shown instead.
                 SetError("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
-                SetStatus("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
+                SetStatus("%s", errorBuf[0] ? errorBuf : S(Str::Np_MsgCouldNotReachHost));
                 s_selectedIndex = 0;
                 TransitionTo(MenuState::JoinEntry, "join spectator probe failed");
                 return;
@@ -3758,7 +3761,7 @@ static void SyncSpectatorClientState() {
                         errorBuf[0] ? errorBuf : "idle_without_result");
                     ClearJoinSpectatorProbe("idle_without_result");
                     SetError("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
-                    SetStatus("%s", errorBuf[0] ? errorBuf : "Could not reach the host.");
+                    SetStatus("%s", errorBuf[0] ? errorBuf : S(Str::Np_MsgCouldNotReachHost));
                     s_selectedIndex = 0;
                     TransitionTo(MenuState::JoinEntry, "join spectator probe failed");
                     return;
@@ -3819,7 +3822,7 @@ static void HandleNavigationInput() {
                     ClearJoinSpectatorProbe("accept_join_as_spectator");
                     s_activeBranch = RootBranch::Spectate;
                     s_selectedIndex = 0;
-                    SetStatus("Now watching the live match.");
+                    SetStatus(S(Str::Np_MsgNowWatching));
                     TransitionTo(MenuState::SpectatorConnected, "accept join as spectator");
                 } else {
                     ClearActionPrompt("decline_join_as_spectator");
@@ -3827,7 +3830,7 @@ static void HandleNavigationInput() {
                     Net::SpectatorClient_Disconnect("declined spectator redirect");
                     s_activeBranch = RootBranch::DirectPlay;
                     s_selectedIndex = 0;
-                    SetStatus("Returned to Join a Match.");
+                    SetStatus(S(Str::Np_MsgReturnedToJoin));
                     TransitionTo(MenuState::JoinEntry, "decline join as spectator");
                 }
             } else if (s_actionPromptKind == ActionPromptKind::JoinInsteadOfWaiting) {
@@ -3839,7 +3842,7 @@ static void HandleNavigationInput() {
                         BuildSessionEndpointFromSpectator(spectator, joinEndpoint, sizeof(joinEndpoint));
                     }
                     if (!joinEndpoint[0]) {
-                        SetStatus("This watch server did not advertise a room address to join.");
+                        SetStatus(S(Str::Np_MsgNoRoomAdvertised));
                         return;
                     }
                     if (StartJoinSessionToEndpoint(
@@ -3855,7 +3858,7 @@ static void HandleNavigationInput() {
                     s_idleSpectatorPromptDeferred = true;
                     s_activeBranch = RootBranch::Spectate;
                     s_selectedIndex = 0;
-                    SetStatus("Waiting for the host to start a match.");
+                    SetStatus(S(Str::Np_MsgWaitingHostStart));
                     TransitionTo(MenuState::SpectatorConnected, "wait for active spectator match");
                 } else {
                     ClearActionPrompt("cancel_idle_spectator_prompt");
@@ -3879,7 +3882,7 @@ static void HandleNavigationInput() {
                 Net::SpectatorClient_Disconnect("declined spectator redirect");
                 s_activeBranch = RootBranch::DirectPlay;
                 s_selectedIndex = 0;
-                SetStatus("Returned to Join a Match.");
+                SetStatus(S(Str::Np_MsgReturnedToJoin));
                 TransitionTo(MenuState::JoinEntry, "back decline join as spectator");
             } else if (s_actionPromptKind == ActionPromptKind::JoinInsteadOfWaiting) {
                 ClearActionPrompt("back_cancel_idle_spectator_prompt");
@@ -3900,7 +3903,7 @@ static void HandleNavigationInput() {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
             GameSettingsKeys_CancelCapture();
             GameSettingsHotkeys_CancelCapture();
-            SetStatus("Rebind canceled.");
+            SetStatus(S(Str::Gs_RebindCanceled));
         }
         return;
     }
@@ -3996,7 +3999,7 @@ static void HandleNavigationInput() {
                 }
                 if (changed) {
                     Net::DelayPolicy_SetRollbackToleranceK(s_rollbackTolerance);
-                    SetStatus("Stability bias: %d", s_rollbackTolerance);
+                    SetStatus(S(Str::Np_MsgStabilityBias), s_rollbackTolerance);
                 }
             } else if (gid == 200) {
                 int mode = (int)s_connectPreference;
@@ -4234,7 +4237,7 @@ static void ActivateCurrentSelection() {
                 cfg.connect_preference = s_connectPreference;
                 Net::NatRuntimeConfig natCfg{};
                 if (!BuildNatRuntimeConfig(&natCfg)) {
-                    SetStatus("Connection settings are invalid.");
+                    SetStatus(S(Str::Np_MsgConnSettingsInvalid));
                     break;
                 }
                 cfg.nat.enable_upnp = natCfg.enable_upnp;
@@ -4543,7 +4546,7 @@ static void ActivateCurrentSelection() {
                 s_connectionEntry = ConnectionEntry::None;
                 s_activeBranch = RootBranch::DirectPlay;
                 s_selectedIndex = 0;
-                SetStatus(target == MenuState::JoinEntry ? "Returned to Join a Match."
+                SetStatus(target == MenuState::JoinEntry ? S(Str::Np_MsgReturnedToJoin)
                         : target == MenuState::HostEntry ? "Returned to Host a Room."
                         : "Returned to Play Online.");
                 TransitionTo(target, "cancel connection");
@@ -4696,7 +4699,7 @@ static void HandleBackNavigation() {
                 s_connectionEntry = ConnectionEntry::None;
                 s_activeBranch = RootBranch::DirectPlay;
                 s_selectedIndex = 0;
-                SetStatus(target == MenuState::JoinEntry ? "Returned to Join a Match."
+                SetStatus(target == MenuState::JoinEntry ? S(Str::Np_MsgReturnedToJoin)
                         : target == MenuState::HostEntry ? "Returned to Host a Room."
                         : "Returned to Play Online.");
                 TransitionTo(target, "cancel connection");

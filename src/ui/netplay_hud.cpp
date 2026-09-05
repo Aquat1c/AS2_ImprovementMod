@@ -8,6 +8,7 @@
  */
 
 #include "ui/netplay_hud.h"
+#include "ui/strings.h"
 #include "net/continue_flow.h"
 #include "net/spectator_playback.h"
 #include "rollback/stress_hooks.h"
@@ -480,7 +481,7 @@ void NetplayHud_Render() {
     if (Net::ConnectionSupervisor_IsProgressStallWarned()) {
         char warn[96] = {};
         snprintf(warn, sizeof(warn),
-                 "Opponent's game stopped responding (%us)",
+                 S(Str::Hud_OpponentStopped),
                  Net::ConnectionSupervisor_GetProgressStallMs() / 1000u);
         const ImVec2 wsz = ImGui::CalcTextSize(warn);
         const float warnW = wsz.x + kStatsPadW * 2.0f;

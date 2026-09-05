@@ -1,4 +1,5 @@
 #include "training/auto_block.h"
+#include "training/motion_script.h"
 
 #include <cstdio>
 
@@ -137,7 +138,8 @@ static void TestPolicy() {
     TEST_CHECK(PolicyWantsBlock(BlockPolicy::Off, seq, 0) == false, "Off never blocks");
     TEST_CHECK(PolicyWantsBlock(BlockPolicy::All, seq, 0), "All blocks ordinal 0");
     TEST_CHECK(PolicyWantsBlock(BlockPolicy::All, seq, 7), "All blocks later ordinals");
-    TEST_CHECK(PolicyWantsBlock(BlockPolicy::Adaptive, seq, 3), "Adaptive always wants block");
+    TEST_CHECK(PolicyWantsBlock(BlockPolicy::StanceOnly, seq, 3),
+               "Stance Only still wants to block; the lane check is what refuses");
 
     TEST_CHECK(PolicyWantsBlock(BlockPolicy::FirstHit, seq, 0), "First Hit blocks ordinal 0");
     TEST_CHECK(!PolicyWantsBlock(BlockPolicy::FirstHit, seq, 1), "First Hit skips ordinal 1");
@@ -165,9 +167,18 @@ static void TestSequenceLifetime() {
     AutoBlockSequenceState seq{};
     SequenceBegin(seq, 200, 0, 0);
 
-    // A one-frame inactive gap inside a multi-hit action must not end it.
-    TEST_CHECK(!SequenceTickQuiet(seq, false, false, kSequenceQuietGrace), "one quiet frame keeps it alive");
+    // The gap between two hits of a blockstring is quiet frames with the
+    // defender already out of blockstun, so the grace is what decides whether
+    // the next hit is "the same pressure" or a fresh sequence. A short grace
+    // made First Hit block the second hit of anything with a 2f gap as if it
+    // were the first.
+    for (uint32_t i = 1; i < kSequenceQuietGrace; ++i) {
+        TEST_CHECK(!SequenceTickQuiet(seq, false, false, kSequenceQuietGrace),
+                   "a gap inside the grace keeps the sequence alive");
+    }
     TEST_CHECK(SequenceTickQuiet(seq, false, false, kSequenceQuietGrace), "grace expiry ends it");
+    TEST_CHECK(kSequenceQuietGrace >= 20u,
+               "the blockstring window has to outlast a real gap, not a 1f one");
 
     SequenceBegin(seq, 300, 0, 0);
     TEST_CHECK(!SequenceTickQuiet(seq, true, false, kSequenceQuietGrace), "armed threat keeps it alive");
@@ -509,41 +520,131 @@ static void TestDefensiveResponses() {
                    "Native picks the free one");
     }
 
-    // 214D arms a state from neutral rather than cancelling out of blockstun,
-    // so unlike the dodge it does not imply that the dummy is blocking.
-    TEST_CHECK(!ResponseRequiresBlockstun(DefensiveResponse::AbsoluteDefence),
-               "the counter guard is armed before the pressure, not during it");
+    // Absolute defence follows the engine's own route rather than being armed
+    // at the resolver: the +1940 & 0x100 its resolver wants belongs to action
+    // 49/52, so the only honest way in is stock plus blockstun plus the
+    // guard-cancel offer. That means it implies guarding, and presses nothing.
+    TEST_CHECK(ResponseRequiresBlockstun(DefensiveResponse::AbsoluteDefence),
+               "the cancel is only offered from blockstun, so it implies guarding");
+    TEST_CHECK(ResponseUsesBlockstunCancel(DefensiveResponse::AbsoluteDefence),
+               "and its cancel lives there");
+    TEST_CHECK(!ResponseArmsBeforeContact(DefensiveResponse::AbsoluteDefence),
+               "there is no window to open ahead of the hit");
     {
         DefenseDriveState st{};
         DefenseDriveSample sm{};
-        sm.threatArmed = true;
         sm.actionable = true;
-        sm.guardStateArmed = false;
+        sm.counterGuardStock = true;
 
-        // The motion is walked one frame at a time and then stops on its own.
-        for (int i = 0; i < kGuardStateMotionFrames; ++i) {
-            TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+        sm.actionId = 67;   // crouch blockstun, where the offer runs
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+                       DefenseInputKind::None,
+                   "absolute defence presses nothing in blockstun");
+        TEST_CHECK(st.armStep < 0, "and runs no motion");
+
+        sm.actionId = 2;    // standing neutral
+        sm.recordsToAttack = 4;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+                       DefenseInputKind::None,
+                   "nor outside it - the charge is what the engine tests, not an input");
+    }
+
+    // The other entry. sub_522F30 queues the same action 49, but only when
+    // command 26 has matched - so this one performs the 214D, before the first
+    // hit rather than as a cancel out of blocking it. Both share the +823 gate.
+    TEST_CHECK(ResponseSupportedByCategory(DefensiveResponse::AbsoluteDefenceFirst,
+                                           kDefenseCategoryAbsolute),
+               "the preemptive entry is category 5 too");
+    TEST_CHECK(!ResponseSupportedByCategory(DefensiveResponse::AbsoluteDefenceFirst, 3),
+               "and nowhere else");
+    TEST_CHECK(ResponseArmsBeforeContact(DefensiveResponse::AbsoluteDefenceFirst),
+               "the 57-frame state has to be up before the hit it absorbs");
+    TEST_CHECK(!ResponseRequiresBlockstun(DefensiveResponse::AbsoluteDefenceFirst),
+               "taking it first means NOT blocking first");
+    TEST_CHECK(ResponseArmedByNativeHook(DefensiveResponse::AbsoluteDefenceFirst),
+               "the counter-guard route byte IS a window the mod can write");
+    {
+        DefenseDriveState st{};
+        DefenseDriveSample sm{};
+        sm.actionable = true;
+        sm.actionId = 2;
+        sm.recordsToAttack = 3;   // an attack on its way, no box yet
+
+        // Loops: the route consumes the match whether or not a hit came.
+        int8_t seen[kGuardStateMotionFrames] = {};
+        for (int i = 0; i < kGuardStateMotionFrames * 3; ++i) {
+            TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefenceFirst, sm, st) ==
                            DefenseInputKind::ArmGuardState,
-                       "214D motion keeps feeding while it runs");
-            TEST_CHECK(st.armStep == i, "214D motion advances one step per frame");
+                       "214D keeps being fed while an attack is coming");
+            TEST_CHECK(st.armStep >= 0 && st.armStep < kGuardStateMotionFrames,
+                       "and the step stays inside the motion");
+            seen[st.armStep] = 1;
         }
-        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
-                       DefenseInputKind::None,
-                   "214D motion stops once it has been fed");
-        TEST_CHECK(st.armStep < 0, "214D motion resets when it ends");
+        for (int i = 0; i < kGuardStateMotionFrames; ++i) {
+            TEST_CHECK(seen[i] != 0, "every frame of the motion gets fed");
+        }
 
-        // Nothing to do once the state is up - the engine repels on its own.
-        sm.guardStateArmed = true;
-        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
-                       DefenseInputKind::None,
-                   "no re-arm while the guard state holds");
+        // With the route arm installed there is no motion at all: feeding
+        // 2-1-4 repeatedly is what let the command reader see 2...2 and give
+        // the dummy a 22D instead of the counter guard.
+        DefenseDriveSample hooked = sm;
+        hooked.nativeArmActive = true;
+        DefenseDriveState hookedSt{};
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefenceFirst,
+                                        hooked, hookedSt) == DefenseInputKind::None,
+                   "the route arm replaces the motion entirely");
 
-        // And nothing to do when the engine would not take an input anyway.
-        sm.guardStateArmed = false;
-        sm.actionable = false;
-        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefence, sm, st) ==
+        // Nothing coming: the motion would only walk the dummy backwards.
+        DefenseDriveState idleSt{};
+        DefenseDriveSample idle{};
+        idle.actionId = 2;
+        idle.actionable = true;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefenceFirst, idle, idleSt) ==
                        DefenseInputKind::None,
-                   "no arming while the dummy is locked");
+                   "nothing coming, nothing fed");
+
+        // Blockstun still drives it, so a dummy that did end up blocking can
+        // still take the cancel.
+        DefenseDriveState blockSt{};
+        DefenseDriveSample block{};
+        block.actionId = 70;   // air blockstun
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefenceFirst, block, blockSt) ==
+                       DefenseInputKind::ArmGuardState,
+                   "and blockstun drives it too");
+    }
+
+    // The dodge's condition reads the DERIVED D word, so the press has to be a
+    // fresh edge. Holding it means one chance and no retry.
+    {
+        DefenseDriveState st{};
+        DefenseDriveSample sm{};
+        sm.actionId = 67;
+        sm.meter = 500;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, sm, st) ==
+                       DefenseInputKind::DodgePress, "the dodge presses D");
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, sm, st) ==
+                       DefenseInputKind::None, "releases so the next press is an edge");
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, sm, st) ==
+                       DefenseInputKind::DodgePress, "and presses again");
+
+        sm.actionId = 2;
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Dodge, sm, st) ==
+                       DefenseInputKind::None, "nothing outside blockstun");
+        TEST_CHECK(!st.dodgePhase, "and the alternation resets with the window");
+    }
+
+    // The category-1 counter is a move with startup, so it has to be started
+    // before the hit lands - the same rule as the two windows.
+    TEST_CHECK(ResponseArmsBeforeContact(DefensiveResponse::GuardCounter),
+               "the guard counter has to be under way before contact");
+    {
+        DefenseDriveState st{};
+        DefenseDriveSample sm{};
+        sm.actionable = true;
+        sm.recordsToAttack = 4;   // startup only; no box exists yet
+        TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::GuardCounter, sm, st) ==
+                       DefenseInputKind::CounterForward,
+                   "an attack still in startup is enough to commit the counter");
     }
 
     // The accepting action set is wider than the dodge's and the meter gate is
@@ -752,7 +853,7 @@ static void TestNativeArmSuppressesInput() {
     TEST_CHECK(!ResponseArmedByNativeHook(DefensiveResponse::GuardCounter),
                "the counter is a guard cancel too");
     TEST_CHECK(!ResponseArmedByNativeHook(DefensiveResponse::AbsoluteDefence),
-               "214D is a motion the dummy still has to perform");
+               "absolute defence's bit belongs to action 49, not to the resolver");
 
     DefenseDriveSample d = Drive();
     d.nativeArmActive = true;
@@ -761,6 +862,7 @@ static void TestNativeArmSuppressesInput() {
                DefenseInputKind::None, "hooked repel needs no input");
     TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::JustParry, d, st) ==
                DefenseInputKind::None, "hooked parry needs no input");
+
 
     // A guard cancel is not a window, so the hook changes nothing about it.
     DefenseDriveSample dodge = Drive();
@@ -850,6 +952,161 @@ static void TestDodgeWindow() {
     TEST_CHECK(!DodgeWindowOpen(67, 0), "no meter, no dodge");
 }
 
+// All must never degrade into the vanilla adaptive guard, which picks a POSTURE
+// from a rule of thumb (sub_4A8D00 crouches unless mask & 3 == 1) and can
+// therefore be opened up by the lane it guessed against. The mod's All takes
+// the lane from the attack itself, so the stance cannot lose it a mixup.
+static void TestAllBlocksBothLanesRegardlessOfStance() {
+    // A stand-only attack is stand-guarded even with the crouch stance set...
+    {
+        FrameGuardPlan plan{};
+        ResetPlan(plan, 1, false);
+        PlanAccumulateContact(plan, kGuardLaneStand);
+        PlanFinalize(plan, /*preferCrouch=*/true);
+        TEST_CHECK(plan.lane == GuardLane::Stand,
+                   "All stand-guards a high even while the stance prefers crouch");
+    }
+    // ...and a crouch-only attack is crouch-guarded even with the stand stance.
+    {
+        FrameGuardPlan plan{};
+        ResetPlan(plan, 1, false);
+        PlanAccumulateContact(plan, kGuardLaneCrouch);
+        PlanFinalize(plan, /*preferCrouch=*/false);
+        TEST_CHECK(plan.lane == GuardLane::Crouch,
+                   "All crouch-guards a low even while the stance prefers stand");
+    }
+    // Only when the attack allows either does the stance get a say - and then
+    // both lanes guard it, so the choice cannot lose.
+    {
+        FrameGuardPlan plan{};
+        ResetPlan(plan, 1, false);
+        PlanAccumulateContact(plan, kGroundGuardMask);
+        PlanFinalize(plan, /*preferCrouch=*/true);
+        TEST_CHECK(plan.lane == GuardLane::Crouch, "a mid follows the stance");
+    }
+
+    // And the policy layer never refuses a lane for All, whatever the stance.
+    TEST_CHECK(PolicyAllowsLane(BlockPolicy::All, kGuardLaneCrouch, false),
+               "All covers a low from a standing stance");
+    TEST_CHECK(PolicyAllowsLane(BlockPolicy::All, kGuardLaneStand, true),
+               "All covers a high from a crouching stance");
+}
+
+// The prediction must not answer a walk. attackerCommitted is set from the
+// attacker's ATTACK PAYLOAD, which Entity_ResetHitData clears on entry to every
+// ordinary action, so walking toward the dummy is not an incoming attack -
+// reading the command-route vector instead treated it as one, and the dummy
+// spent its counter guard on someone strolling over.
+static void TestThreatPredictionIgnoresWalking() {
+    DefenseDriveSample walking{};
+    walking.actionable = true;
+    walking.recordsToAttack = -1;   // no committed attack, so no lookahead
+    walking.attackerCommitted = false;
+    walking.threatArmed = false;
+    TEST_CHECK(!ThreatIsIncoming(walking), "walking toward the dummy is not a threat");
+
+    DefenseDriveSample startup = walking;
+    startup.attackerCommitted = true;
+    TEST_CHECK(ThreatIsIncoming(startup), "a committed attack is, before any box exists");
+
+    DefenseDriveSample predicted = walking;
+    predicted.recordsToAttack = 3;
+    TEST_CHECK(ThreatIsIncoming(predicted), "and so is one the lookahead can see");
+
+    DefenseDriveSample live = walking;
+    live.threatArmed = true;
+    TEST_CHECK(ThreatIsIncoming(live), "a live box obviously still counts");
+
+    // Nothing that only reacts to a hit should be moved by the prediction.
+    DefenseDriveState st{};
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::AbsoluteDefenceFirst, walking, st) ==
+                   DefenseInputKind::None,
+               "the preemptive counter guard stays put while the attacker walks");
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::Repel, walking, st) ==
+                   DefenseInputKind::None,
+               "and so does the repel arm");
+    TEST_CHECK(EvaluateDefenseInput(DefensiveResponse::GuardCounter, walking, st) ==
+                   DefenseInputKind::None,
+               "and the counter");
+}
+
+// Adaptive holds the stance's own lane instead of switching to whatever is
+// incoming, so a mixup the stance loses to actually lands.
+static void TestAdaptiveLane() {
+    // Standing: covers the stand lane, loses to a crouch-only attack.
+    TEST_CHECK(PolicyAllowsLane(BlockPolicy::StanceOnly, kGuardLaneStand, false),
+               "standing covers a high");
+    TEST_CHECK(PolicyAllowsLane(BlockPolicy::StanceOnly, kGroundGuardMask, false),
+               "standing covers a mid");
+    TEST_CHECK(!PolicyAllowsLane(BlockPolicy::StanceOnly, kGuardLaneCrouch, false),
+               "standing loses to a low");
+
+    // Crouching: the mirror image.
+    TEST_CHECK(PolicyAllowsLane(BlockPolicy::StanceOnly, kGuardLaneCrouch, true),
+               "crouching covers a low");
+    TEST_CHECK(!PolicyAllowsLane(BlockPolicy::StanceOnly, kGuardLaneStand, true),
+               "crouching loses to a high");
+
+    // Every other policy switches lane per contact, so none of them refuse.
+    const BlockPolicy switching[] = { BlockPolicy::All, BlockPolicy::FirstHit,
+                                      BlockPolicy::AfterFirstHit, BlockPolicy::Random };
+    for (size_t i = 0; i < sizeof(switching) / sizeof(switching[0]); ++i) {
+        TEST_CHECK(PolicyAllowsLane(switching[i], kGuardLaneCrouch, false),
+                   "only Adaptive holds one lane");
+        TEST_CHECK(PolicyAllowsLane(switching[i], kGuardLaneStand, true),
+                   "only Adaptive holds one lane");
+    }
+}
+
+// The motion string syntax. A charge segment and an explicitly named button
+// are the two things a plain "one digit per frame" reader could not express,
+// and both are needed for a route like 21[4]D~6C.
+static void TestMotionScript() {
+    MotionFrame frames[80];
+
+    // Plain motions are unchanged: one frame per digit, no buttons of their own.
+    TEST_CHECK(MotionLength("236", 50) == 3, "a plain motion is one frame per digit");
+    TEST_CHECK(!MotionNamesButtons("236"), "a plain motion names no button");
+    {
+        const int n = ExpandMotion("236", 50, frames, 80);
+        TEST_CHECK(n == 3, "236 expands to three frames");
+        TEST_CHECK(frames[0].dir == '2' && frames[1].dir == '3' && frames[2].dir == '6',
+                   "and in order");
+        TEST_CHECK(frames[2].buttonMask == 0, "the row's button is applied by the caller");
+    }
+
+    // A charge holds one direction for the charge length.
+    TEST_CHECK(MotionLength("[4]6", 50) == 51, "a charge is held for its whole length");
+    {
+        const int n = ExpandMotion("[4]6", 50, frames, 80);
+        TEST_CHECK(n == 51, "charge plus the release frame");
+        TEST_CHECK(frames[0].dir == '4' && frames[49].dir == '4', "held throughout");
+        TEST_CHECK(frames[50].dir == '6', "then released forward");
+    }
+
+    // The route the absolute-defence follow-up needs: 2, 1, hold 4, D on the
+    // last charge frame, then 6 with the row's own button.
+    TEST_CHECK(MotionNamesButtons("21[4]d6"), "the route names its own D");
+    TEST_CHECK(MotionExplicitButtons("21[4]d6") == (1u << 3), "and only D");
+    {
+        const int n = ExpandMotion("21[4]d6", 50, frames, 80);
+        TEST_CHECK(n == 53, "2, 1, fifty charge frames, then the 6");
+        TEST_CHECK(frames[0].dir == '2' && frames[1].dir == '1', "the 21 leads");
+        TEST_CHECK(frames[2].dir == '4' && frames[51].dir == '4', "the charge is the 4");
+        TEST_CHECK(frames[51].buttonMask == (1u << 3),
+                   "D presses on the last charge frame, still holding 4");
+        TEST_CHECK(frames[50].buttonMask == 0, "and not before it");
+        TEST_CHECK(frames[52].dir == '6' && frames[52].buttonMask == 0,
+                   "the cancel is a bare 6 - its button comes from the row");
+    }
+
+    // Degenerate input must not invent frames.
+    TEST_CHECK(ExpandMotion(nullptr, 50, frames, 80) == 0, "no string, no frames");
+    TEST_CHECK(MotionLength("21[4", 50) == 2, "an unterminated charge stops the expansion");
+    TEST_CHECK(ExpandMotion("236", 50, frames, 2) == 2, "capacity is respected");
+    TEST_CHECK(MotionLength("d", 50) == 0, "a button with no frame to attach to is dropped");
+}
+
 int main() {
     TestParryRearm();
     TestDefensiveResponses();
@@ -865,6 +1122,10 @@ int main() {
     TestFallbackRefusals();
     TestPolicy();
     TestContactGroups();
+    TestMotionScript();
+    TestAdaptiveLane();
+    TestThreatPredictionIgnoresWalking();
+    TestAllBlocksBothLanesRegardlessOfStance();
     TestSequenceLifetime();
     TestDeterministicRandom();
     TestScopedLaneBits();

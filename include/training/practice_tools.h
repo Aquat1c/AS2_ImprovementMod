@@ -110,6 +110,7 @@ enum PracticeSettingId : int {
 	PRACTICE_SET_TRIGGER_3,
 	PRACTICE_SET_TRIGGER_4,
 	PRACTICE_SET_TRIGGER_5,
+	PRACTICE_SET_TRIGGER_6,
 	// These address whichever slot PracticeTrigger_SelectSlot last chose.
 	PRACTICE_SET_TRIGGER_BUTTON,
 	PRACTICE_SET_TRIGGER_DELAY,

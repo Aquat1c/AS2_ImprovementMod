@@ -767,6 +767,33 @@
 #define ADDR_ENTITY_SET_HIT_STATE_1973 (GAME_BASE + 0x09EA30) // records DOWN / BACK held
 #define ADDR_ENTITY_SET_HIT_FLAGS_1996 (GAME_BASE + 0x09EBE0) // push-away DOWN / BACK held
 
+// The guard-cancel offer (sub_424910). Reached through the route-23 slot at
+// +1675, which the blockstun handlers open themselves, so it runs while the
+// defender is in one of the six blockstun actions. It writes the action it
+// wants into the caller's pending-action triple:
+//   category 5 + (+823 > 0)         -> action 49 (52 airborne, needs y < 6960)
+//                                      and consumes command 26, the 214D
+//   category 6 + 500 meter + D EDGE -> action 60 with BACK held, 59 without
+// Everything else falls through. Action 49's own handler (sub_430af0) then sets
+// +1940 = 0x103 for its first 57 frames and 0 after, which IS the counter-guard
+// window; sub_4A5C20 fires inside it and hands off to sub_49EED0 code 11/12,
+// whose handlers enter actions 50->51 / 53->54 - also 0x103, so the counter
+// guard chains through follow-up hits.
+#define ADDR_ENTITY_UPDATE_ACTION_ATTACKS (GAME_BASE + 0x024910)
+
+
+// Route slot 0 is the counter-guard command for every category-5 character:
+// all six dispatchers send case 0 to sub_522F30 or sub_5D99C0, and both queue
+// action 49 and consume command 26 once the +823 charge is there. The route
+// byte at +1652 is what Entity_ProcessCommandMatches tests to decide the
+// command matched, so writing it IS "the 214D was input" - the same kind of
+// state write that opens the parry window, rather than a simulated motion.
+// It is also the LOWEST priority slot: the loop walks 23 down to 0 and exits on
+// the first match, so a real special always wins over it.
+#define ENTITY_ROUTE_COUNTER_GUARD 0
+#define ACTION_ABSOLUTE_DEFENCE_GROUND 49
+#define ACTION_ABSOLUTE_DEFENCE_AIR    52
+
 // --- Just-parry window (defender-relative) --------------------------------
 // Entity_CheckHitState arms the window when BACK is FRESHLY pressed (+86 == 1)
 // and +1965 reads idle (0xFF). +1965 takes a KIND, not a frame count:
@@ -864,6 +891,11 @@
 // window path entirely.
 #define DEFENDER_FLAGS_PARRY_DIRECT  0x23
 #define DEFENDER_FLAGS_REPEL_DIRECT  0x43
+// Categories 1, 5 and 6 have no window at all - their whole gate is one bit of
+// +1940, written wholesale from the action's own flags by Entity_UpdateMaxHitData.
+#define DEFENDER_FLAG_GUARD_COUNTER    0x0010
+#define DEFENDER_FLAG_ABSOLUTE_DEFENCE 0x0100
+#define DEFENDER_FLAG_DODGE            0x0200
 
 // Contact resolution codes. Every handler except ordinary guard also stores its
 // code at defender+1944; ordinary guard (10) only ever appears as the resolver

@@ -20,6 +20,7 @@
 #include "patches/tick_hooks.h"
 #include "rollback/netplay_log.h"
 #include "ui/log_window.h"
+#include "ui/strings.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -447,6 +448,8 @@ static bool SavePersistentSettings(const char* reason) {
         "local_rematch=%d\r\n"
         "; background_input: 1 keeps reading pads while the window is unfocused\r\n"
         "background_input=%d\r\n"
+        "; language: en or ja - the language of the mod's own menus\r\n"
+        "language=%s\r\n"
         "\r\n"
         "[GameSettings]\r\n"
         "; difficulty: 0=easy, 1=normal, 2=hard\r\n"
@@ -472,6 +475,7 @@ static bool SavePersistentSettings(const char* reason) {
         inputGuard.shell_hotkeys_ime ? 1 : 0,
         LocalRematch::IsEnabled() ? 1 : 0,
         InputSystem_IsBackgroundInputEnabled() ? 1 : 0,
+        Ui::Strings_LanguageCode(Ui::Strings_Language()),
         ReadMemory<uint8_t>(kGameOptionDifficulty),
         GameSettingsSync_RoundsToWin(s_persistedRoundOption),
         ReadMemory<uint8_t>(ADDR_STAGESEL_ENABLE),
@@ -533,6 +537,18 @@ static void LoadPersistentSettingsIfReady(const char* reason) {
     int backgroundInput = 0;
     if (ReadIniInt(L"ModSettings", L"background_input", &backgroundInput)) {
         InputSystem_SetBackgroundInputEnabled(backgroundInput != 0);
+    }
+
+    // Menu language. Read here, with the other standing preferences, so the
+    // menus are already in the right language the first time they open.
+    wchar_t langW[16] = {};
+    if (ReadIniString(L"ModSettings", L"language", langW, sizeof(langW) / sizeof(langW[0]))) {
+        char langA[16] = {};
+        WideCharToMultiByte(CP_UTF8, 0, langW, -1, langA, sizeof(langA), nullptr, nullptr);
+        Ui::Lang lang = Ui::Lang::English;
+        if (Ui::Strings_ParseLanguageCode(langA, &lang)) {
+            Ui::Strings_SetLanguage(lang);
+        }
     }
 
     ApplyFriendlyIniOverrides();
@@ -616,6 +632,12 @@ static void CacheLocalIfNeeded(const char* reason) {
 }
 
 } // namespace
+
+// The frame-update change detector compares the raw vanilla blocks only, so a
+// preference that lives outside them - the menu language - has to ask.
+bool GameSettingsSync_SaveLocalSettings(const char* reason) {
+    return SavePersistentSettings(reason ? reason : "explicit save");
+}
 
 void GameSettingsSync_Init() {
     if (s_initialized) {
