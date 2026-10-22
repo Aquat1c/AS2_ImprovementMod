@@ -1,0 +1,7 @@
+#include "overlay_resources.h"
+
+// Noto Sans CJK JP (SIL Open Font License 1.1) embedded so the overlay renders
+// Latin, Japanese and Cyrillic without depending on the host's system fonts.
+IDR_OVERLAY_FONT RCDATA "../assets/fonts/NotoSansCJKjp-Regular.ttf"
+
+IDR_MENU_FONT RCDATA "../assets/fonts/ShipporiMincho-Bold.ttf"

@@ -1,0 +1,1591 @@
+/**
+ * Alice Senki 2 - Netplay Menu UI
+ *
+ * In-game rendering using the game's native DXLib-based render primitives.
+ * All drawing goes through function pointers to the game's own render API.
+ */
+
+#include "net/netplay_menu_ui.h"
+#include "rollback/netplay_log.h"
+#include "ui/log_window.h"
+#include "net/netplay_menu_state.h"
+#include "ui/game_settings_menu.h"
+#include "ui/strings.h"
+#include "net/netplay_menu_render.h"
+#include "net/player_side_mapping.h"
+#include "net/session_manager.h"
+#include "net/set_tracker.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+#include <string>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+namespace {
+
+constexpr uintptr_t ADDR_RENDER_FILL_RECT    = 0x5D2F50;
+constexpr uintptr_t ADDR_RENDER_SET_BLEND     = 0x5D2F80;
+constexpr uintptr_t ADDR_RENDER_SET_COLOR     = 0x5D3030;
+constexpr uintptr_t ADDR_RENDER_CREATE_COLOR  = 0x5D3150;
+constexpr uintptr_t ADDR_RENDER_DRAW_SPRITE   = 0x5D3130;
+constexpr uintptr_t ADDR_DRAW_FORMAT_STRING   = 0x629A20;
+
+constexpr uintptr_t ADDR_TITLE_MENU_BG_ACTIVE = 0x8EA00C;
+constexpr uintptr_t ADDR_NET_MENU_BG = 0x7AC2A4;  // data\net.bin sprite (vanilla dword_7AC2A4)
+
+typedef int (__cdecl *RenderFillRect_t)(int left, int top, int right, int bottom, int color, int drawFlag);
+typedef int (__cdecl *RenderSetBlendMode_t)(int blendMode, unsigned __int8 alphaValue);
+typedef int (__cdecl *RenderCreateColor_t)(unsigned __int8 r, unsigned __int8 g, unsigned __int8 b);
+typedef int (__cdecl *RenderDrawSprite_t)(int x, int y, int spriteHandle, int transFlag);
+typedef int (__cdecl *DrawFormatString_t)(int x, int y, unsigned int color, char* fmt, ...);
+typedef int (__cdecl *RenderSetDrawColor_t)(unsigned __int8 r, unsigned __int8 g, unsigned __int8 b);
+
+// Layout constants — 640x480, font 8px/char half-width, 16px tall
+constexpr int kPanelLeft    = 16;
+constexpr int kPanelTop     = 16;  // same as the key config screen
+constexpr int kPanelRight   = 604;
+constexpr int kPanelBottom  = 452;
+constexpr int kContentLeft  = 24;
+constexpr int kContentRight = 588;
+constexpr int kLabelX       = 32;
+constexpr int kValueX       = 240;
+constexpr int kSelectorX    = 220;
+constexpr int kHintX        = 360;
+constexpr int kHeaderBottom = 96;   // title + subtitle + status need room
+constexpr int kRowStartY    = 106;
+constexpr int kRowStep      = 32;  // vanilla row pitch, kept comfortable to navigate
+constexpr int kSectionGap   = 18;  // between the action rows and an info block
+constexpr int kSectionLabel = 22;  // between a section heading and its first line
+constexpr int kInfoStep     = 24;
+constexpr int kFooterTop    = 418;
+constexpr int kFooterStep   = 16;
+constexpr int kFadeFrames   = 25;
+constexpr int kContentBottom = kFooterTop - 6;
+
+// Widths are in characters, so they track the face being drawn. The 19px
+// Mincho averages ~10px per character, not the 8px the vanilla bitmap font used,
+// so every column holds proportionally fewer.
+constexpr size_t kLabelChars  = 18;   // 32 -> kSelectorX(220), 188px / 10
+constexpr size_t kValueChars  = 30;   // 240 -> kContentRight(544)
+constexpr size_t kSelectorChars = 13; // fixed selector column width
+constexpr size_t kHintChars   = 18;   // 360 -> 544
+constexpr size_t kFullChars   = 50;   // 32 -> 544
+constexpr size_t kFooterChars = 50;
+
+static void FormatPlayerMatchupLine(char* out, size_t outCap,
+                                    const char* p1Name, int p1Wins,
+                                    int p2Wins,
+                                    const char* p2Name) {
+    if (!out || outCap == 0) {
+        return;
+    }
+    _snprintf_s(out, outCap, _TRUNCATE, "%s (%d)    (%d)    %s",
+        p1Name && p1Name[0] ? p1Name : S(Str::Common_P1),
+        p1Wins,
+        p2Wins,
+        p2Name && p2Name[0] ? p2Name : S(Str::Common_P2));
+}
+
+static void FormatSessionMatchupLine(char* out, size_t outCap,
+                                     const NetMenu::MenuSnapshot* snap) {
+    if (!out || outCap == 0 || !snap) {
+        return;
+    }
+
+    int p1Wins = 0;
+    int p2Wins = 0;
+    Net::SetTracker_GetGameSideWins(&p1Wins, &p2Wins);
+
+    const char* local = snap->local_nickname[0] ? snap->local_nickname : S(Str::Common_Local);
+    const char* peer = snap->peer_nickname[0] ? snap->peer_nickname : S(Str::Common_Remote);
+
+    int localSlot = Net::PlayerMapping_GetLocalGameSlot();
+    if (localSlot != 0 && localSlot != 1) {
+        localSlot = Net::Session_GetRole() == Net::SessionRole::Host ? 0 : 1;
+    }
+
+    const char* p1Name = localSlot == 0 ? local : peer;
+    const char* p2Name = localSlot == 0 ? peer : local;
+    FormatPlayerMatchupLine(out, outCap, p1Name, p1Wins, p2Wins, p2Name);
+}
+
+static int GameCreateColor(uint8_t r, uint8_t g, uint8_t b) {
+    return ((RenderCreateColor_t)ADDR_RENDER_CREATE_COLOR)(r, g, b);
+}
+
+static void GameDrawSprite(int x, int y, int spriteHandle) {
+    if (spriteHandle > 0) {
+        ((RenderDrawSprite_t)ADDR_RENDER_DRAW_SPRITE)(x, y, spriteHandle, 1);
+    }
+}
+
+static uint32_t ReadU32(uintptr_t a, uint32_t d = 0) {
+    __try { return *(volatile uint32_t*)a; } __except(EXCEPTION_EXECUTE_HANDLER) { return d; }
+}
+
+// The overlay draws through ImGui, which knows nothing about the game's blend
+// state, so text ignored every fade. Remember the alpha the menu just set and
+// carry it into the text colour.
+static uint8_t s_menuTextAlpha = 255;
+
+static void GameSetBlend(int mode, uint8_t alpha) {
+    if (mode != 0) {
+        s_menuTextAlpha = alpha;
+    }
+    ((RenderSetBlendMode_t)ADDR_RENDER_SET_BLEND)(mode, alpha);
+}
+
+static void GameFillRect(int l, int t, int r, int b, uint8_t cr, uint8_t cg, uint8_t cb) {
+    ((RenderFillRect_t)ADDR_RENDER_FILL_RECT)(l, t, r, b, GameCreateColor(cr, cg, cb), 1);
+}
+
+static void GameSetDrawColor(uint8_t r, uint8_t g, uint8_t b) {
+    ((RenderSetDrawColor_t)ADDR_RENDER_SET_COLOR)(r, g, b);
+}
+
+static bool IsUtf8ContinuationByte(unsigned char value) {
+    return (value & 0xC0) == 0x80;
+}
+
+static size_t Utf8CodepointBytes(const char* text, size_t offset) {
+    size_t next = offset + 1;
+    while (text && text[next] && IsUtf8ContinuationByte((unsigned char)text[next])) {
+        ++next;
+    }
+    return next - offset;
+}
+
+static size_t Utf8PrefixBytes(const char* text, size_t displayUnits) {
+    size_t offset = 0;
+    size_t units = 0;
+    while (text && text[offset]) {
+        const size_t codepointBytes = Utf8CodepointBytes(text, offset);
+        const size_t codepointUnits = ((unsigned char)text[offset] & 0x80) ? 2 : 1;
+        if (units + codepointUnits > displayUnits) {
+            break;
+        }
+        offset += codepointBytes;
+        units += codepointUnits;
+    }
+    return offset;
+}
+
+static size_t Utf8CountCodepoints(const char* text) {
+    size_t units = 0;
+    for (size_t offset = 0; text && text[offset]; ) {
+        units += ((unsigned char)text[offset] & 0x80) ? 2 : 1;
+        offset += Utf8CodepointBytes(text, offset);
+    }
+    return units;
+}
+
+static std::wstring Utf8ToWide(const char* text) {
+    if (!text || !text[0]) {
+        return {};
+    }
+
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nullptr, 0);
+    if (size <= 1) {
+        return {};
+    }
+
+    std::wstring result(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, result.data(), size);
+    result.resize(static_cast<size_t>(size - 1));
+    return result;
+}
+
+static std::string WideToGameText(const std::wstring& text) {
+    if (text.empty()) {
+        return {};
+    }
+
+    const int size = WideCharToMultiByte(932, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) {
+        return {};
+    }
+
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(932, 0, text.c_str(), -1, result.data(), size, nullptr, nullptr);
+    result.resize(static_cast<size_t>(size - 1));
+    return result;
+}
+
+static std::string Utf8ToGameText(const char* text) {
+    const std::wstring wideText = Utf8ToWide(text);
+    if (wideText.empty()) {
+        return text ? std::string(text) : std::string();
+    }
+    return WideToGameText(wideText);
+}
+
+// The proxy hosts ImGui and the Mincho face that matches the vanilla labels.
+// Its coordinate space is already the game's 640x480, so positions pass through
+// unchanged. Resolved once; if it is missing we keep using the game's renderer.
+typedef void  (*ProxyDrawMenuText_t)(float, float, unsigned int, const char*, float);
+typedef int   (*ProxyMenuFontReady_t)();
+typedef float (*ProxyMeasureMenuText_t)(const char*, float);
+
+static ProxyDrawMenuText_t     s_proxyDrawMenuText = nullptr;
+static ProxyMeasureMenuText_t  s_proxyMeasureMenuText = nullptr;
+static bool                    s_proxyMenuTextResolved = false;
+
+static ProxyDrawMenuText_t ResolveProxyMenuText() {
+    if (s_proxyMenuTextResolved) {
+        return s_proxyDrawMenuText;
+    }
+    s_proxyMenuTextResolved = true;
+
+    HMODULE proxy = GetModuleHandleA("d3d9.dll");
+    if (!proxy) {
+        return nullptr;
+    }
+    auto ready = (ProxyMenuFontReady_t)GetProcAddress(proxy, "AS2Proxy_MenuFontReady");
+    if (!ready || !ready()) {
+        return nullptr;
+    }
+    s_proxyDrawMenuText =
+        (ProxyDrawMenuText_t)GetProcAddress(proxy, "AS2Proxy_DrawMenuText");
+    s_proxyMeasureMenuText =
+        (ProxyMeasureMenuText_t)GetProcAddress(proxy, "AS2Proxy_MeasureMenuText");
+
+    return s_proxyDrawMenuText;
+}
+
+// Netplay screens keep the tighter size their column widths were built around;
+// the settings screens ask for a larger one explicitly.
+constexpr float kNetplayTextSize = 22.0f;  // same proportion vanilla uses in a 32px row
+static float s_menuTextSize = kNetplayTextSize;
+
+static void GameDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* fmt, ...) {
+    char utf8Buf[256];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(utf8Buf, sizeof(utf8Buf), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    if (ProxyDrawMenuText_t draw = ResolveProxyMenuText()) {
+        // ImGui packs colour as ABGR; UTF-8 goes straight through, so this path
+        // also carries scripts the game's CP932 font cannot show.
+        const unsigned int abgr = ((unsigned)s_menuTextAlpha << 24) |
+                                  ((unsigned)b << 16) | ((unsigned)g << 8) | (unsigned)r;
+        draw((float)x, (float)y, abgr, utf8Buf, s_menuTextSize);
+        return;
+    }
+
+    const std::string gameText = Utf8ToGameText(utf8Buf);
+    const char* drawText = gameText.empty() ? utf8Buf : gameText.c_str();
+    ((DrawFormatString_t)ADDR_DRAW_FORMAT_STRING)(x, y, (unsigned int)GameCreateColor(r, g, b), (char*)"%s", (char*)drawText);
+}
+
+// Same as GameDrawText but at an explicit size, so headings, body rows and
+// footnotes can differ instead of all rendering at one weight.
+static void GameDrawTextSized(int x, int y, uint8_t r, uint8_t g, uint8_t b,
+                              float size, const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    const float prev = s_menuTextSize;
+    s_menuTextSize = size;
+    GameDrawText(x, y, r, g, b, "%s", buf);
+    s_menuTextSize = prev;
+}
+
+constexpr float kTitleSize    = 26.0f;
+constexpr float kBodySize     = 22.0f;
+constexpr float kNoteSize     = 17.0f;
+constexpr float kFootSize     = 16.0f;
+
+static void ClipText(char* out, size_t outCap, const char* in, size_t maxChars) {
+    if (!out || outCap == 0) return;
+    out[0] = '\0';
+    if (!in || !in[0]) return;
+
+    char normalized[256] = {};
+    size_t n = 0;
+    for (size_t i = 0; in[i] && n + 1 < sizeof(normalized); ++i) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        if (c < 32) continue;
+        if (c == ' ' && n > 0 && normalized[n - 1] == ' ') continue;
+        normalized[n++] = (char)c;
+    }
+    while (n > 0 && normalized[n - 1] == ' ') {
+        --n;
+    }
+    normalized[n] = '\0';
+    if (!normalized[0]) return;
+
+    const size_t codepointCount = Utf8CountCodepoints(normalized);
+    if (codepointCount <= maxChars || maxChars < 4) {
+        strncpy_s(out, outCap, normalized, _TRUNCATE);
+        return;
+    }
+
+    const size_t prefixBytes = Utf8PrefixBytes(normalized, maxChars - 3);
+    _snprintf_s(out, outCap, _TRUNCATE, "%.*s...", (int)prefixBytes, normalized);
+}
+
+/// Format text edit buffer with cursor indicator at the given position.
+/// Output: "> text|rest" where | is the cursor position.
+static void FormatEditBufferWithCursor(char* out, size_t outLen, const char* buf, int cursorPos) {
+    int len = (int)strlen(buf);
+    if (cursorPos < 0) cursorPos = 0;
+    if (cursorPos > len) cursorPos = len;
+    _snprintf_s(out, outLen, _TRUNCATE, "> %.*s|%s", cursorPos, buf, buf + cursorPos);
+}
+
+static int Alpha8(float normalized, int maxAlpha) {
+    if (normalized < 0.0f) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+    return (int)(normalized * (float)maxAlpha);
+}
+
+static int WrapTextLines(const char* text,
+                         char lines[][96],
+                         int maxLines,
+                         size_t maxCharsPerLine) {
+    if (!text || !text[0] || !lines || maxLines <= 0 || maxCharsPerLine == 0) {
+        return 0;
+    }
+
+    for (int index = 0; index < maxLines; index++) {
+        lines[index][0] = '\0';
+    }
+
+    char normalized[256] = {};
+    ClipText(normalized, sizeof(normalized), text, sizeof(normalized) - 1);
+    if (!normalized[0]) {
+        return 0;
+    }
+
+    int lineCount = 0;
+    char* context = nullptr;
+    char* word = strtok_s(normalized, " ", &context);
+    while (word && lineCount < maxLines) {
+        char candidate[96] = {};
+        if (lines[lineCount][0]) {
+            _snprintf_s(candidate, sizeof(candidate), _TRUNCATE, "%s %s", lines[lineCount], word);
+        } else {
+            _snprintf_s(candidate, sizeof(candidate), _TRUNCATE, "%s", word);
+        }
+
+        if (Utf8CountCodepoints(candidate) > maxCharsPerLine) {
+            if (lines[lineCount][0]) {
+                lineCount++;
+                if (lineCount >= maxLines) {
+                    break;
+                }
+                ClipText(lines[lineCount], sizeof(lines[lineCount]), word, maxCharsPerLine);
+            } else {
+                ClipText(lines[lineCount], sizeof(lines[lineCount]), word, maxCharsPerLine);
+            }
+        } else {
+            strncpy_s(lines[lineCount], sizeof(lines[lineCount]), candidate, _TRUNCATE);
+        }
+
+        word = strtok_s(nullptr, " ", &context);
+        if (!word && lines[lineCount][0]) {
+            lineCount++;
+        }
+    }
+
+    return lineCount;
+}
+
+// The panel is drawn before the content, so it sizes itself from the extent the
+// previous frame recorded. A menu holds still, so the one-frame lag never shows;
+// it stops short screens sitting in a tall empty box.
+static int s_contentBottomCur  = 0;
+static int s_contentBottomPrev = 0;
+
+static void NoteContentBottom(int y) {
+    const int bottom = y + 20;
+    if (bottom > s_contentBottomCur) {
+        s_contentBottomCur = bottom;
+    }
+}
+
+// A row past the bottom is not just invisible — it stays selectable, because
+// the cursor is driven by ItemCount rather than by what was drawn.
+// Suppressing the draw silently hides a selectable row, so the first offender
+// per page says so.
+static void ReportClippedRow(int y, const char* what) {
+    static int s_lastReported = -1;
+    if (s_lastReported == y) {
+        return;
+    }
+    s_lastReported = y;
+    LOG_WARN("[NetMenu] %s clipped at y=%d (content bottom %d) - it is still "
+             "selectable, so the page needs to be shorter",
+             what, y, kContentBottom);
+}
+
+static bool HasRowSpace(int y) {
+    if (y < kHeaderBottom) {
+        return false;
+    }
+    if ((y + 20) > kContentBottom) {
+        ReportClippedRow(y, "row");
+        return false;
+    }
+    return true;
+}
+
+static bool HasInfoSpace(int y) {
+    return y >= kHeaderBottom && (y + 16) <= kContentBottom;
+}
+
+static void RenderSectionLabel(int y, const char* label, uint8_t alpha) {
+    if (!HasInfoSpace(y)) return;
+    NoteContentBottom(y);
+
+    char clippedLabel[64];
+    ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
+    GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 180));
+    GameDrawText(kLabelX, y, 163, 163, 163, "%s", clippedLabel);
+}
+
+static const char* GetHeaderBadge(const NetMenu::MenuSnapshot* snap) {
+    switch (snap->state) {
+        case NetMenu::MenuState::MenuRoot:
+            return S(Str::Np_TagOnline);
+        case NetMenu::MenuState::SpectateEntry:
+        case NetMenu::MenuState::SpectatorConnected:
+            return S(Str::Np_TagWatch);
+        case NetMenu::MenuState::SpectatorConnecting:
+            return snap->join_spectator_probe_active ? S(Str::Np_TagPlay) : S(Str::Np_TagWatch);
+        case NetMenu::MenuState::SettingsEntry:
+        case NetMenu::MenuState::SettingsCategoryMenu:
+            return S(Str::Np_TagSetup);
+        case NetMenu::MenuState::DisconnectError:
+            return S(Str::Np_TagNotice);
+        default:
+            return S(Str::Np_TagPlay);
+    }
+}
+
+static void RenderHeaderBadge(const char* label, uint8_t alpha) {
+    if (!label || !label[0]) {
+        return;
+    }
+
+    // Measured for the face actually in use.
+    const int width = (int)((float)strlen(label) * kNoteSize * 0.62f);
+    const int x = kContentRight - width;
+    GameSetBlend(1, alpha);
+    GameDrawTextSized(x, kPanelTop + 10, 184, 184, 184, kNoteSize, "%s", label);
+}
+
+static const char* GetStateSummary(const NetMenu::MenuSnapshot* snap) {
+    switch (snap->state) {
+        case NetMenu::MenuState::SpectatorConnecting:
+            return snap->join_spectator_probe_active
+                ? S(Str::Np_StatusProbingHost)
+                : S(Str::Np_StatusReachingWatch);
+        case NetMenu::MenuState::SpectatorConnected:
+            return (snap->spectator_client_match_id != 0 || snap->spectator_playback_active)
+                ? S(Str::Np_StatusWatchingLive)
+                : S(Str::Np_StatusWaitingMatch);
+        case NetMenu::MenuState::Connecting:
+        case NetMenu::MenuState::Handshake:
+            return snap->connecting_as_host
+                ? S(Str::Np_StatusOpeningRoom)
+                : S(Str::Np_StatusConnectingHost);
+        case NetMenu::MenuState::ConnectedSession:
+            return S(Str::Np_StatusReadyUp);
+        case NetMenu::MenuState::CharSelTransition:
+            return S(Str::Np_StatusBothConnected);
+        case NetMenu::MenuState::PostMatch:
+            return S(Str::Np_StatusMatchComplete);
+        case NetMenu::MenuState::DisconnectError:
+            return S(Str::Np_StatusInterrupted);
+        default:
+            return nullptr;
+    }
+}
+
+static const char* GetFooterLabel(const NetMenu::MenuSnapshot* snap) {
+    switch (snap->state) {
+        case NetMenu::MenuState::MenuRoot:
+            return S(Str::Np_TitleOnlineMenu);
+        case NetMenu::MenuState::SpectateEntry:
+        case NetMenu::MenuState::SpectatorConnected:
+            return S(Str::Np_TitleWatch);
+        case NetMenu::MenuState::SpectatorConnecting:
+            return snap->join_spectator_probe_active ? S(Str::Np_TitlePlayOnline) : S(Str::Np_TitleWatch);
+        case NetMenu::MenuState::SettingsEntry:
+        case NetMenu::MenuState::SettingsCategoryMenu:
+            return S(Str::Np_TitleConnSettings);
+        case NetMenu::MenuState::DisconnectError:
+            return S(Str::Np_TitleConnNotice);
+        default:
+            return S(Str::Np_TitlePlayOnline);
+    }
+}
+
+static bool ShouldShowStatusCard(const NetMenu::MenuSnapshot* snap) {
+    // Settings pages already show the active value on each row; the status card
+    // duplicates that feedback and steals vertical space from dense submenus.
+    if (snap->state == NetMenu::MenuState::SettingsEntry ||
+        snap->state == NetMenu::MenuState::SettingsCategoryMenu) {
+        return false;
+    }
+    if (snap->status[0]) return true;
+    return GetStateSummary(snap) != nullptr;
+}
+
+static void RenderStatusCard(const NetMenu::MenuSnapshot* snap, uint8_t alpha, float fadeNorm, int* outBottom) {
+    if (!ShouldShowStatusCard(snap)) {
+        if (outBottom) *outBottom = kRowStartY;
+        return;
+    }
+
+    const char* summary = GetStateSummary(snap);
+    const char* primary = snap->status[0] ? snap->status : summary;
+    if (!primary || !primary[0]) {
+        if (outBottom) *outBottom = kRowStartY;
+        return;
+    }
+
+    const int cardTop = kHeaderBottom + 4;
+    const int cardBottom = cardTop + 26;
+    if (outBottom) *outBottom = cardBottom + 10;
+
+    char primaryText[192] = {};
+    ClipText(primaryText, sizeof(primaryText), primary, kFullChars);
+
+    GameSetBlend(1, alpha);
+    GameDrawTextSized(kLabelX, cardTop + 2, 193, 193, 193, kNoteSize,
+                      "%s", primaryText);
+}
+
+static void DrawRowHighlight(int y, bool selected, bool enabled, uint8_t alpha) {
+    // Same treatment as the vanilla options screen: a red bar over the selected
+    // row (decomp sub_55C720 / sub_55D6F0), everything else just dimmed.
+    if (selected) {
+        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 70));
+        GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 24, 0, 0, 0);
+        GameSetBlend(2, (uint8_t)Alpha8((float)alpha / 255.0f, 128));
+        GameFillRect(kContentLeft, y - 5, kContentRight, y + 23,
+            enabled ? 255 : 120, 0, 0);
+        GameSetBlend(1, alpha);
+    } else {
+        GameSetBlend(1, (uint8_t)Alpha8((float)alpha / 255.0f, 60));
+        GameFillRect(kContentLeft - 2, y - 6, kContentRight + 2, y + 24, 0, 0, 0);
+    }
+}
+
+static void RenderRow(int y, const char* label, const char* value, bool selected, bool enabled, uint8_t alpha) {
+    if (!HasRowSpace(y)) return;
+    NoteContentBottom(y);
+
+    DrawRowHighlight(y, selected, enabled, alpha);
+
+    GameSetBlend(1, alpha);
+    char clippedLabel[80];
+    ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
+    GameDrawText(kLabelX, y,
+        selected ? (enabled ? 255 : 200) : (enabled ? 232 : 168),
+        selected ? (enabled ? 255 : 200) : (enabled ? 232 : 168),
+        selected ? (enabled ? 255 : 200) : (enabled ? 232 : 168),
+        "%s", clippedLabel);
+    if (value && value[0]) {
+        char clippedValue[192];
+        ClipText(clippedValue, sizeof(clippedValue), value, kValueChars);
+        GameDrawText(kValueX, y,
+            selected ? (enabled ? 232 : 164) : (enabled ? 190 : 144),
+            selected ? (enabled ? 232 : 164) : (enabled ? 190 : 144),
+            selected ? (enabled ? 232 : 164) : (enabled ? 190 : 144),
+            "%s", clippedValue);
+    }
+}
+
+static void RenderSettingRow(int y,
+                             const char* label,
+                             const char* selector,
+                             const char* hint,
+                             bool selected,
+                             bool enabled,
+                             uint8_t alpha) {
+    if (!HasRowSpace(y)) return;
+
+    DrawRowHighlight(y, selected, enabled, alpha);
+    GameSetBlend(1, alpha);
+
+    char clippedLabel[80];
+    ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
+    GameDrawText(kLabelX, y,
+        selected ? (enabled ? 255 : 200) : (enabled ? 236 : 168),
+        selected ? (enabled ? 248 : 200) : (enabled ? 228 : 168),
+        selected ? (enabled ? 240 : 204) : (enabled ? 216 : 172),
+        "%s", clippedLabel);
+
+    if (selector && selector[0]) {
+        char clippedSelector[64];
+        ClipText(clippedSelector, sizeof(clippedSelector), selector, kSelectorChars);
+        GameDrawText(kSelectorX, y,
+            selected ? (enabled ? 255 : 200) : (enabled ? 220 : 176),
+            selected ? (enabled ? 248 : 200) : (enabled ? 232 : 184),
+            selected ? (enabled ? 220 : 176) : (enabled ? 208 : 168),
+            "%s", clippedSelector);
+    }
+
+    if (hint && hint[0]) {
+        char clippedHint[128];
+        ClipText(clippedHint, sizeof(clippedHint), hint, kHintChars);
+        GameDrawText(kHintX, y,
+            selected ? (enabled ? 196 : 156) : (enabled ? 168 : 140),
+            selected ? (enabled ? 196 : 156) : (enabled ? 160 : 136),
+            selected ? (enabled ? 188 : 148) : (enabled ? 152 : 132),
+            "%s", clippedHint);
+    }
+}
+
+static void RenderInfoLine(int y, const char* label, const char* value, uint8_t alpha) {
+    if (!HasInfoSpace(y)) return;
+    NoteContentBottom(y);
+
+    GameSetBlend(1, alpha);
+    char clippedLabel[80];
+    ClipText(clippedLabel, sizeof(clippedLabel), label, kLabelChars);
+    GameDrawText(kLabelX, y, 163, 163, 163, "%s", clippedLabel);
+    if (value && value[0]) {
+        // Value column, not the hint column: kValueX lines the value up with
+        // the rows above instead of leaving a wide gap after the label.
+        char clippedValue[192];
+        ClipText(clippedValue, sizeof(clippedValue), value, kValueChars);
+        GameDrawText(kValueX, y, 208, 208, 208, "%s", clippedValue);
+    }
+}
+
+static void RenderPromptOverlay(const NetMenu::MenuSnapshot* snap, uint8_t alpha, float fadeNorm) {
+    if (!snap->prompt_active || snap->prompt_option_count == 0) {
+        return;
+    }
+
+    const int modalLeft = 116;
+    const int modalTop = 142;
+    const int modalRight = 524;
+    const int modalBottom = 324;
+
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 160));
+    GameFillRect(0, 0, 639, 479, 0, 0, 0);
+
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 210));
+    GameFillRect(modalLeft, modalTop, modalRight, modalBottom, 24, 20, 18);
+
+    GameSetBlend(1, alpha);
+    char clippedTitle[96] = {};
+    ClipText(clippedTitle, sizeof(clippedTitle),
+        snap->prompt_title[0] ? snap->prompt_title : S(Str::Np_Confirm),
+        30);
+    GameDrawText(modalLeft + 28, modalTop + 20, 244, 244, 244, "%s", clippedTitle);
+
+    char wrappedLines[3][96] = {};
+    const int lineCount = WrapTextLines(
+        snap->prompt_body,
+        wrappedLines,
+        3,
+        40);
+    int bodyY = modalTop + 54;
+    for (int index = 0; index < lineCount; index++) {
+        GameDrawText(modalLeft + 28, bodyY, 209, 209, 209, "%s", wrappedLines[index]);
+        bodyY += 18;
+    }
+
+    const int buttonGap = 10;
+    const int buttonTop = modalBottom - 56;
+    const int buttonBottom = modalBottom - 22;
+    const int buttonWidth = (modalRight - modalLeft - 32 - (buttonGap * ((int)snap->prompt_option_count - 1))) /
+        (int)snap->prompt_option_count;
+    int buttonLeft = modalLeft + 16;
+    for (uint32_t index = 0; index < snap->prompt_option_count; index++) {
+        const bool selected = snap->prompt_selected_index == index;
+        const char* label = snap->prompt_option_labels[index][0]
+            ? snap->prompt_option_labels[index]
+            : S(Str::Np_Option);
+
+        GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, selected ? 140 : 80));
+        GameFillRect(buttonLeft, buttonTop, buttonLeft + buttonWidth, buttonBottom,
+            selected ? 180 : 50,
+            selected ? 60 : 40,
+            selected ? 50 : 38);
+
+        char clippedLabel[48];
+        ClipText(clippedLabel, sizeof(clippedLabel), label, 18);
+        GameSetBlend(1, alpha);
+        GameDrawText(buttonLeft + 12, buttonTop + 9,
+            selected ? 255 : 230,
+            selected ? 244 : 220,
+            selected ? 222 : 204,
+            "%s",
+            clippedLabel);
+        buttonLeft += buttonWidth + buttonGap;
+    }
+}
+
+static const char* ConnectModeLabel(int mode) {
+    switch (mode) {
+        case 0: return S(Str::Np_RouteAutomatic);
+        case 1: return S(Str::Np_RouteDirectOnly);
+        case 2: return S(Str::Np_RouteRelayNA);
+        default: return S(Str::Common_Unknown);
+    }
+}
+
+static const char* FrameTimingLabel(int mode) {
+    switch (mode) {
+        case 0: return "58.8 FPS";
+        case 1: return "60.0 FPS";
+        default: return S(Str::Common_Unknown);
+    }
+}
+
+static void FormatFrameTimingInfo(const NetMenu::MenuSnapshot* snap,
+                                  char* out,
+                                  size_t outSize) {
+    if (!out || outSize == 0) {
+        return;
+    }
+
+    const char* local = FrameTimingLabel(snap ? snap->local_frame_timing_mode : -1);
+    if (snap && snap->remote_frame_timing_valid) {
+        const char* remote = FrameTimingLabel(snap->remote_frame_timing_mode);
+        if (snap->frame_timing_session_locked) {
+            _snprintf_s(out, outSize, _TRUNCATE, "%s locked, peer announced %s", local, remote);
+        } else {
+            _snprintf_s(out, outSize, _TRUNCATE, "%s local, peer %s", local, remote);
+        }
+    } else {
+        _snprintf_s(out, outSize, _TRUNCATE, "%s%s",
+            local,
+            (snap && snap->frame_timing_session_locked) ? " locked" : "");
+    }
+}
+
+static void RenderMenuRoot(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    // Join covers watching too: if the room is already playing, the gameplay
+    // connect fails and the spectator probe offers to watch instead.
+    RenderRow(y, S(Str::Common_Host), S(Str::Np_HintOpenRoom), snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_Join), S(Str::Np_HintConnectOrWatch), snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Common_Settings), S(Str::Np_HintNameRouting), snap->selected_index == 2, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_Close), S(Str::Np_HintReturnGame), snap->selected_index == 3, true, alpha);
+}
+
+static void RenderDirectConnect(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, S(Str::Common_Host), S(Str::Np_HintOpenRoom), snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_Join), S(Str::Np_HintConnectHost), snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Common_Back), S(Str::Np_HintOnlineMenu), snap->selected_index == 2, true, alpha);
+}
+
+// Build "Status [ext-IP:port]" for host-side STUN display. Join/guest screens
+// use snap->nat_stun_status directly (no endpoint) to avoid showing the user's
+// own external address where it would be mistaken for the connection target.
+static void FormatStunStatusWithEndpoint(char* out, size_t cap,
+                                         const NetMenu::MenuSnapshot* snap) {
+    if (snap->nat_stun_endpoint[0]) {
+        _snprintf_s(out, cap, _TRUNCATE, "%s %s", snap->nat_stun_status, snap->nat_stun_endpoint);
+    } else {
+        strncpy_s(out, cap, snap->nat_stun_status, _TRUNCATE);
+    }
+}
+
+static void RenderHostEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, S(Str::Np_StartHosting),  S(Str::Np_HintOpenTheRoom),  snap->selected_index == 0, true, alpha); y += kRowStep;
+
+    char portVal[16];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::ListenPort) {
+        FormatEditBufferWithCursor(portVal, sizeof(portVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(portVal, sizeof(portVal), _TRUNCATE, "%u", snap->listen_port);
+    }
+    RenderRow(y, S(Str::Np_RoomPort), portVal, snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Common_Back), S(Str::Np_TitleOnlineMenu), snap->selected_index == 2, true, alpha);
+    y += kRowStep + kSectionGap;
+
+    RenderSectionLabel(y, S(Str::Np_ShareThisRoom), alpha);
+    y += kSectionLabel;
+    char addrBuf[144];
+    if (snap->clipboard_flash[0]) {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s  (%s)", snap->your_address, snap->clipboard_flash);
+    } else {
+        _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s", snap->your_address);
+    }
+    RenderInfoLine(y, S(Str::Common_Address), addrBuf, alpha);
+    y += kInfoStep;
+    // Route/Mapping/Punch/STUN are diagnostics, not player information; they
+    // stay in the log.
+    RenderInfoLine(y, S(Str::Common_Status), snap->nat_route_status, alpha);
+}
+
+static void RenderJoinEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, "Connect to Host", S(Str::Np_HintStartConnection), snap->selected_index == 0, true, alpha); y += kRowStep;
+
+    char endpointVal[128];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::RemoteEndpoint) {
+        FormatEditBufferWithCursor(endpointVal, sizeof(endpointVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(endpointVal, sizeof(endpointVal), _TRUNCATE, "%s", snap->remote_endpoint);
+    }
+    RenderRow(y, S(Str::Np_HostAddress), endpointVal,  snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Common_Back), S(Str::Np_TitleOnlineMenu), snap->selected_index == 2, true, alpha);
+    y += kRowStep + kSectionGap;
+    RenderSectionLabel(y, S(Str::Np_Connection), alpha);
+    y += kSectionLabel;
+    RenderInfoLine(y, S(Str::Common_Status), snap->nat_route_status, alpha);
+}
+
+static void RenderSpectateEntry(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, "Start Watching", S(Str::Np_Connect), snap->selected_index == 0, true, alpha); y += kRowStep;
+
+    char discoveryVal[64];
+    if (snap->spectator_lan_discovery_active) {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE, "%s", S(Str::Np_ScanningLan));
+    } else if (snap->spectator_lan_result_count > 1) {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE,
+            S(Str::Np_FoundRooms), snap->spectator_lan_result_count);
+    } else if (snap->spectator_lan_result_count == 1) {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE, "%s", S(Str::Np_FoundOneRoom));
+    } else {
+        _snprintf_s(discoveryVal, sizeof(discoveryVal), _TRUNCATE, "%s", S(Str::Np_HintSearchNearby));
+    }
+    RenderRow(y, S(Str::Np_ScanLocalLan), discoveryVal, snap->selected_index == 1, true, alpha); y += kRowStep;
+
+    char endpointVal[128];
+    if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::SpectatorEndpoint) {
+        FormatEditBufferWithCursor(endpointVal, sizeof(endpointVal), snap->text_edit_buffer, snap->text_cursor_pos);
+    } else {
+        _snprintf_s(endpointVal, sizeof(endpointVal), _TRUNCATE, "%s", snap->spectator_endpoint);
+    }
+    RenderRow(y, S(Str::Np_WatchAddress), endpointVal, snap->selected_index == 2, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Common_Back), S(Str::Np_HintOnlineMenu), snap->selected_index == 3, true, alpha);
+    y += kRowStep + kSectionGap;
+
+    RenderSectionLabel(y, S(Str::Np_Details), alpha);
+    y += kSectionLabel;
+    RenderInfoLine(y, S(Str::Np_LanSearch), snap->spectator_lan_discovery_status, alpha);
+    y += kInfoStep;
+
+    char serverBuf[64];
+    _snprintf_s(serverBuf, sizeof(serverBuf), _TRUNCATE, "%s  Port %u  %d viewers",
+        snap->spectators_enabled ? "On" : S(Str::Common_Off),
+        snap->spectator_listen_port,
+        snap->connected_spectators);
+    RenderInfoLine(y, S(Str::Np_Server), serverBuf, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, S(Str::Np_Punch), snap->spectator_punch_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, S(Str::Common_Status), snap->spectator_status, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, S(Str::Np_Palettes), snap->palette_status, alpha);
+}
+
+static void RenderSettingsCategoryMenu(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, S(Str::Common_Player), S(Str::Np_HintNameGameplay), snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_TitleAppearance), S(Str::Np_HintHudColors), snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_TitleNetwork), S(Str::Np_HintRoutingServers), snap->selected_index == 2, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_TitleWatchSettings), S(Str::Np_HintSpectatorPalettes), snap->selected_index == 3, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_TitleDiagnostics), S(Str::Np_HintDebugLogs), snap->selected_index == 4, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Common_Back), S(Str::Np_HintOnlineMenu), snap->selected_index == 5, true, alpha);
+}
+
+static void RenderSettings(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+
+    switch (snap->settings_category) {
+    case NetMenu::SettingsCategory::Identity: {
+        char nickVal[128];
+        if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::Nickname) {
+            FormatEditBufferWithCursor(nickVal, sizeof(nickVal), snap->text_edit_buffer, snap->text_cursor_pos);
+        } else {
+            _snprintf_s(nickVal, sizeof(nickVal), _TRUNCATE, "%s", snap->local_nickname);
+        }
+        RenderRow(y, S(Str::Np_DisplayName), nickVal, snap->selected_index == 0, true, alpha); y += kRowStep;
+
+        char delayVal[48];
+        _snprintf_s(delayVal, sizeof(delayVal), _TRUNCATE, "< %d > frames input lag", snap->preferred_delay);
+        RenderRow(y, S(Str::Np_InputDelay), delayVal, snap->selected_index == 1, true, alpha); y += kRowStep;
+
+        char rbVal[48];
+        _snprintf_s(rbVal, sizeof(rbVal), _TRUNCATE, "< %d > prediction depth", snap->rollback_budget);
+        RenderRow(y, S(Str::Np_MaxRollback), rbVal, snap->selected_index == 2, true, alpha); y += kRowStep;
+
+        // Stability Bias (raw tolerance K) and Delay mode are expert knobs the
+        // peers negotiate anyway; config-file only.
+        RenderRow(y, S(Str::Common_Back), S(Str::Common_Settings), snap->selected_index == 3, true, alpha);
+        break;
+    }
+    case NetMenu::SettingsCategory::Appearance: {
+        char selector[32];
+
+        _snprintf_s(selector, sizeof(selector), _TRUNCATE, "< %s >",
+            snap->hud_trail_color_label[0] ? snap->hud_trail_color_label : S(Str::Np_ColorBlue));
+        RenderSettingRow(y, "Bar color", selector, S(Str::Np_HintNameBar),
+            snap->selected_index == 0, true, alpha); y += kRowStep;
+
+        _snprintf_s(selector, sizeof(selector), _TRUNCATE, "< %s >",
+            snap->hud_text_color_label[0] ? snap->hud_text_color_label : S(Str::Np_ColorWhite));
+        RenderSettingRow(y, "Text color", selector, S(Str::Np_HintNicknameText),
+            snap->selected_index == 1, true, alpha); y += kRowStep;
+
+        _snprintf_s(selector, sizeof(selector), _TRUNCATE, "< %s >",
+            snap->hud_score_color_label[0] ? snap->hud_score_color_label : S(Str::Np_ColorGold));
+        RenderSettingRow(y, "Score color", selector, S(Str::Np_HintP2Score),
+            snap->selected_index == 2, true, alpha); y += kRowStep;
+
+        _snprintf_s(selector, sizeof(selector), _TRUNCATE, "< %d >",
+            snap->hud_trail_length > 0 ? snap->hud_trail_length : 160);
+        RenderSettingRow(y, "Bar extend", selector, S(Str::Np_HintPxOutward),
+            snap->selected_index == 3, true, alpha); y += kRowStep;
+
+        _snprintf_s(selector, sizeof(selector), _TRUNCATE, "< %s >",
+            snap->hud_vertical_position_label[0] ? snap->hud_vertical_position_label : S(Str::Np_MenuSafe));
+        RenderSettingRow(y, "Name position", selector, S(Str::Np_HintNameRow),
+            snap->selected_index == 4, true, alpha); y += kRowStep;
+
+        _snprintf_s(selector, sizeof(selector), _TRUNCATE, "< %s >",
+            snap->hud_font_size_label[0] ? snap->hud_font_size_label : S(Str::Np_Large));
+        RenderSettingRow(y, "Font size", selector, S(Str::Np_HintNicknameText),
+            snap->selected_index == 5, true, alpha); y += kRowStep;
+
+        _snprintf_s(selector, sizeof(selector), _TRUNCATE, "< %s >",
+            snap->hud_render_mode_label[0] ? snap->hud_render_mode_label : S(Str::Np_Overlay));
+        RenderSettingRow(y, "Render mode", selector, S(Str::Np_HintNicknameDraw),
+            snap->selected_index == 6, true, alpha); y += kRowStep;
+
+        // Back goes directly after the rows; anything between them can push it
+        // past HasRowSpace, which drops the row while it stays selectable.
+        RenderRow(y, S(Str::Common_Back), S(Str::Common_Settings), snap->selected_index == 7, true, alpha);
+        y += kRowStep;
+
+        // The notes are per-setting annotations, so only the ones that apply to
+        // the selected row are shown. Two is the most any row needs, and two is
+        // what fits.
+        switch (snap->selected_index) {
+        case 0:
+        case 1:
+        case 2:
+            RenderInfoLine(y, "Sync", S(Str::Np_NoteColorsSent), alpha);
+            y += kInfoStep;
+            break;
+        case 4:
+            RenderInfoLine(y, S(Str::Common_Local), S(Str::Np_NoteNamePosition), alpha);
+            y += kInfoStep;
+            RenderInfoLine(y, "F1 menu", S(Str::Np_NoteTopDrops), alpha);
+            y += kInfoStep;
+            break;
+        case 6:
+            RenderInfoLine(y, "Vanilla", S(Str::Np_NoteGameDraw), alpha);
+            y += kInfoStep;
+            break;
+        default:
+            break;
+        }
+        break;
+    }
+    case NetMenu::SettingsCategory::Endpoint: {
+        char modeVal[48];
+        _snprintf_s(modeVal, sizeof(modeVal), _TRUNCATE, "< %s > connection path", ConnectModeLabel(snap->connection_mode));
+        RenderRow(y, S(Str::Np_Route), modeVal, snap->selected_index == 0, true, alpha); y += kRowStep;
+
+        RenderRow(y, "Use UPnP",        snap->upnp_enabled ? "< On > port mapping" : S(Str::Np_HintPortMapping), snap->selected_index == 1, true, alpha); y += kRowStep;
+        RenderRow(y, "Use STUN",        snap->stun_enabled ? "< On > NAT traversal" : S(Str::Np_HintNatTraversal), snap->selected_index == 2, true, alpha); y += kRowStep;
+        RenderRow(y, "UDP Hole Punch",  snap->hole_punch_enabled ? "< On > direct connect" : S(Str::Np_HintDirectConnect), snap->selected_index == 3, true, alpha); y += kRowStep;
+        RenderRow(y, "Allow IPv6",      snap->allow_ipv6_endpoint ? "< On > dual-stack" : S(Str::Np_HintDualStack), snap->selected_index == 4, true, alpha); y += kRowStep;
+
+        char relayVal[120];
+        if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::RelayEndpoint) {
+            FormatEditBufferWithCursor(relayVal, sizeof(relayVal), snap->text_edit_buffer, snap->text_cursor_pos);
+        } else if (snap->relay_endpoint[0]) {
+            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "%s", S(Str::Np_CustomRelay));
+        } else {
+            _snprintf_s(relayVal, sizeof(relayVal), _TRUNCATE, "%s", S(Str::Np_DefaultRelay));
+        }
+        RenderRow(y, S(Str::Np_PunchRelay), relayVal, snap->selected_index == 5, true, alpha); y += kRowStep;
+
+        char stunVal[120];
+        if (snap->is_text_editing && snap->text_edit_field == NetMenu::TextEditField::StunEndpoint) {
+            FormatEditBufferWithCursor(stunVal, sizeof(stunVal), snap->text_edit_buffer, snap->text_cursor_pos);
+        } else {
+            _snprintf_s(stunVal, sizeof(stunVal), _TRUNCATE, "%s", snap->stun_endpoint);
+        }
+        RenderRow(y, S(Str::Np_StunServer), stunVal, snap->selected_index == 6, true, alpha); y += kRowStep;
+
+        RenderRow(y, S(Str::Common_Back), S(Str::Common_Settings), snap->selected_index == 7, true, alpha);
+        break;
+    }
+    case NetMenu::SettingsCategory::SessionMatch: {
+        RenderRow(y, "Watchers", snap->spectators_enabled ? "< On > allow spectation" : S(Str::Np_HintAllowSpectation), snap->selected_index == 0, true, alpha); y += kRowStep;
+
+        // Watch Port is bound ephemerally; the relay maps it on lookup, so
+        // there is nothing for a player to choose. Config-file only.
+        RenderRow(y, "Sync Palettes", snap->palette_sync_enabled ? "< On > share colors" : S(Str::Np_HintShareColors), snap->selected_index == 1, true, alpha); y += kRowStep;
+        RenderRow(y, "Preview Remote", snap->remote_palette_preview_enabled ? "< On > see opponent" : S(Str::Np_HintSeeOpponent), snap->selected_index == 2, true, alpha); y += kRowStep;
+
+        RenderRow(y, S(Str::Common_Back), S(Str::Common_Settings), snap->selected_index == 3, true, alpha);
+        break;
+    }
+    case NetMenu::SettingsCategory::Diagnostics: {
+        RenderRow(y, "Debug Logging", snap->debug_logging_enabled ? "< On > detailed logs" : S(Str::Np_HintKeyEventsOnly), snap->selected_index == 0, true, alpha); y += kRowStep;
+        RenderRow(y, S(Str::Common_Back), S(Str::Common_Settings), snap->selected_index == 1, true, alpha);
+        break;
+    }
+    default:
+        RenderRow(y, S(Str::Common_Back), S(Str::Common_Settings), snap->selected_index == 0, true, alpha);
+        break;
+    }
+}
+
+static void RenderSpectatorConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, "Cancel", S(Str::Np_StopConnecting), snap->selected_index == 0, true, alpha);
+    y += kRowStep + kSectionGap;
+
+    RenderSectionLabel(y, S(Str::Np_Details), alpha);
+    y += kSectionLabel;
+
+    if (snap->join_spectator_probe_active && snap->remote_endpoint[0]) {
+        RenderInfoLine(y, S(Str::Common_Host), snap->remote_endpoint, alpha);
+        y += kInfoStep;
+    }
+    RenderInfoLine(y,
+        snap->join_spectator_probe_active ? "Watch Port" : S(Str::Common_Address),
+        snap->spectator_endpoint,
+        alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, S(Str::Np_Punch), snap->spectator_punch_status, alpha);
+    y += kInfoStep;
+    if (snap->spectator_client_match_id != 0) {
+        char matchBuf[40];
+        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, S(Str::Np_GameN),
+            snap->spectator_client_match_ordinal != 0 ? snap->spectator_client_match_ordinal : 1);
+        RenderInfoLine(y, S(Str::Np_CurrentGame), matchBuf, alpha);
+        y += kInfoStep;
+    }
+    if (snap->spectator_p1_name[0] || snap->spectator_p2_name[0]) {
+        char playersBuf[176];
+        FormatPlayerMatchupLine(playersBuf, sizeof(playersBuf),
+            snap->spectator_p1_name[0] ? snap->spectator_p1_name : S(Str::Common_P1),
+            snap->spectator_p1_wins,
+            snap->spectator_p2_wins,
+            snap->spectator_p2_name[0] ? snap->spectator_p2_name : S(Str::Common_P2));
+        RenderInfoLine(y, S(Str::Common_Players), playersBuf, alpha);
+        y += kInfoStep;
+    }
+    RenderInfoLine(y, S(Str::Common_Status), snap->spectator_client_status, alpha);
+}
+
+static void RenderSpectatorConnected(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, "Stop Watching", S(Str::Np_ReturnToMenu), snap->selected_index == 0, true, alpha);
+    y += kRowStep + kSectionGap;
+
+    RenderSectionLabel(y, S(Str::Np_Match), alpha);
+    y += kSectionLabel;
+
+    RenderInfoLine(y, S(Str::Common_Address), snap->spectator_endpoint, alpha);
+    y += kInfoStep;
+    RenderInfoLine(y, S(Str::Np_Punch), snap->spectator_punch_status, alpha);
+    y += kInfoStep;
+
+    if (snap->spectator_client_match_id != 0) {
+        char matchBuf[40];
+        _snprintf_s(matchBuf, sizeof(matchBuf), _TRUNCATE, S(Str::Np_GameN),
+            snap->spectator_client_match_ordinal != 0 ? snap->spectator_client_match_ordinal : 1);
+        RenderInfoLine(y, S(Str::Np_CurrentGame), matchBuf, alpha);
+        y += kInfoStep;
+    }
+
+    if (snap->spectator_p1_name[0] || snap->spectator_p2_name[0]) {
+        char playersBuf[176];
+        FormatPlayerMatchupLine(playersBuf, sizeof(playersBuf),
+            snap->spectator_p1_name[0] ? snap->spectator_p1_name : S(Str::Common_P1),
+            snap->spectator_p1_wins,
+            snap->spectator_p2_wins,
+            snap->spectator_p2_name[0] ? snap->spectator_p2_name : S(Str::Common_P2));
+        RenderInfoLine(y, S(Str::Common_Players), playersBuf, alpha);
+        y += kInfoStep;
+    }
+
+    if (snap->spectator_client_relay_active) {
+        char relayBuf[64];
+        _snprintf_s(relayBuf, sizeof(relayBuf), _TRUNCATE, S(Str::Np_PortViewers),
+            snap->spectator_client_relay_port,
+            snap->spectator_client_relay_spectators);
+        RenderInfoLine(y, S(Str::Np_Rebroadcast), relayBuf, alpha);
+        y += kInfoStep;
+    }
+
+    if (snap->spectator_playback_active && snap->spectator_playback_status[0]) {
+        RenderInfoLine(y, S(Str::Np_Playback), snap->spectator_playback_status, alpha);
+        y += kInfoStep;
+    }
+
+    RenderInfoLine(y, S(Str::Common_Status), snap->spectator_client_status, alpha);
+}
+
+static void RenderConnecting(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, "Cancel", S(Str::Np_StopConnecting), snap->selected_index == 0, true, alpha);
+    y += kRowStep + kSectionGap;
+
+    RenderSectionLabel(y, S(Str::Np_Details), alpha);
+    y += kSectionLabel;
+
+    if (snap->connecting_as_host) {
+        char addrBuf[144];
+        if (snap->clipboard_flash[0]) {
+            _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s  (%s)", snap->your_address, snap->clipboard_flash);
+        } else {
+            _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s", snap->your_address);
+        }
+        RenderInfoLine(y, S(Str::Common_Address), addrBuf, alpha);
+        y += kInfoStep;
+    } else if (snap->remote_endpoint[0]) {
+        RenderInfoLine(y, S(Str::Common_Host), snap->remote_endpoint, alpha);
+        y += kInfoStep;
+    }
+
+    // Ping/FPS/Mapping/Punch/STUN are diagnostics; they live in the log.
+    RenderInfoLine(y, S(Str::Common_Status), snap->nat_route_status, alpha);
+}
+
+static void RenderConnectedSession(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+
+    // Row 0: Rollback Frames (adjustable left/right)
+    {
+        char rbVal[48];
+        _snprintf_s(rbVal, sizeof(rbVal), _TRUNCATE, "< %d > prediction depth", snap->rollback_budget);
+        RenderRow(y, S(Str::Np_MaxRollback), rbVal, snap->selected_index == 0, true, alpha);
+        y += kRowStep;
+    }
+
+    // Row 1: Input delay (adjustable left/right)
+    {
+        char delVal[48];
+        _snprintf_s(delVal, sizeof(delVal), _TRUNCATE, "< %d > frames input lag", snap->preferred_delay);
+        RenderRow(y, S(Str::Np_InputDelay), delVal, snap->selected_index == 1, true, alpha);
+        y += kRowStep;
+    }
+
+    // Row 2: Accept Match
+    {
+        const char* label = snap->local_accepted ? S(Str::Np_Ready) : S(Str::Np_ReadyUp);
+        const char* hint  = snap->local_accepted ? "Waiting" : S(Str::Np_HintConfirmSettings);
+        RenderRow(y, label, hint, snap->selected_index == 2, !snap->local_accepted, alpha);
+        y += kRowStep;
+    }
+
+    // Row 3: Decline
+    RenderRow(y, "Leave Room", S(Str::Np_Disconnect), snap->selected_index == 3, true, alpha);
+    y += kRowStep + 8;
+
+    RenderInfoLine(y, "Role", snap->is_host ? S(Str::Common_Host) : S(Str::Np_Guest), alpha);
+    y += kInfoStep;
+
+    if (snap->local_nickname[0] || snap->peer_nickname[0]) {
+        char matchupBuf[176] = {};
+        FormatSessionMatchupLine(matchupBuf, sizeof(matchupBuf), snap);
+        RenderInfoLine(y, S(Str::Common_Players), matchupBuf, alpha);
+        y += kInfoStep;
+    }
+    {
+        char acceptBuf[64];
+        _snprintf_s(acceptBuf, sizeof(acceptBuf), _TRUNCATE, "%s / %s",
+            snap->local_accepted  ? "You: Ready" : S(Str::Np_YouWaiting),
+            snap->remote_accepted ? "Opp: Ready" : S(Str::Np_OppWaiting));
+        RenderInfoLine(y, S(Str::Np_Ready), acceptBuf, alpha);
+        y += kInfoStep;
+    }
+    if (snap->rtt_ms > 0.0f) {
+        char pingBuf[32];
+        _snprintf_s(pingBuf, sizeof(pingBuf), _TRUNCATE, "%.0f ms", snap->rtt_ms);
+        RenderInfoLine(y, S(Str::Np_Ping), pingBuf, alpha);
+        y += kInfoStep;
+    }
+    // Stall threshold, delay mode and frame-timing internals: log only.
+    if (snap->current_rounds_label[0]) {
+        RenderInfoLine(y, S(Str::Np_Rounds), snap->current_rounds_label, alpha);
+        y += kInfoStep;
+    }
+    if (snap->is_host) {
+        char addrBuf[144];
+        if (snap->clipboard_flash[0]) {
+            _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s  (%s)", snap->your_address, snap->clipboard_flash);
+        } else {
+            _snprintf_s(addrBuf, sizeof(addrBuf), _TRUNCATE, "%s", snap->your_address);
+        }
+        RenderInfoLine(y, S(Str::Common_Address), addrBuf, alpha);
+        y += kInfoStep;
+    } else if (snap->remote_endpoint[0]) {
+        RenderInfoLine(y, S(Str::Common_Host), snap->remote_endpoint, alpha);
+        y += kInfoStep;
+    }
+    RenderInfoLine(y, S(Str::Np_Punch), snap->nat_punch_status, alpha);
+    y += kInfoStep;
+    {
+        char stunBuf[96];
+        if (snap->is_host) {
+            FormatStunStatusWithEndpoint(stunBuf, sizeof(stunBuf), snap);
+        } else {
+            strncpy_s(stunBuf, sizeof(stunBuf), snap->nat_stun_status, _TRUNCATE);
+        }
+        RenderInfoLine(y, S(Str::Np_Stun), stunBuf, alpha);
+    }
+}
+
+static void RenderCharSelTransition(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, "Char Select", S(Str::Np_StartNextGame), snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Back to Room",   S(Str::Np_StayConnected), snap->selected_index == 1, true, alpha);
+    y += kRowStep + 8;
+
+    if (snap->local_nickname[0] || snap->peer_nickname[0]) {
+        char matchupBuf[176] = {};
+        FormatSessionMatchupLine(matchupBuf, sizeof(matchupBuf), snap);
+        RenderInfoLine(y, S(Str::Common_Players), matchupBuf, alpha);
+        y += kInfoStep;
+    }
+}
+
+static void RenderPostMatch(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    RenderRow(y, "Play Again",    S(Str::Np_CharacterSelect), snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, "Back to Room",  S(Str::Np_StayConnected), snap->selected_index == 1, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_Disconnect),    S(Str::Np_LeaveRoom),   snap->selected_index == 2, true, alpha);
+    y += kRowStep + 8;
+
+    if (snap->local_nickname[0] || snap->peer_nickname[0]) {
+        char matchupBuf[176] = {};
+        FormatSessionMatchupLine(matchupBuf, sizeof(matchupBuf), snap);
+        RenderInfoLine(y, S(Str::Common_Players), matchupBuf, alpha);
+        y += kInfoStep;
+    }
+}
+
+static void RenderDisconnectError(const NetMenu::MenuSnapshot* snap, uint8_t alpha, int startY) {
+    int y = startY;
+    if (snap->last_error[0]) {
+        GameSetBlend(1, alpha);
+        char wrappedError[2][96] = {};
+        const int errorLines = WrapTextLines(snap->last_error, wrappedError, 2, kFullChars);
+        for (int index = 0; index < errorLines; ++index) {
+            GameDrawText(kLabelX, y, 255, 128, 128, "%s", wrappedError[index]);
+            y += 18;
+        }
+        y += 8;
+    }
+    y += kRowStep;
+    RenderRow(y, "OK",         S(Str::Np_ClearMessage), snap->selected_index == 0, true, alpha); y += kRowStep;
+    RenderRow(y, S(Str::Np_Close), S(Str::Np_HintReturnGame), snap->selected_index == 1, true, alpha);
+}
+
+static const char* GetHeaderTitle(const NetMenu::MenuSnapshot* snap) {
+    switch (snap->state) {
+        case NetMenu::MenuState::MenuRoot:
+            return S(Str::Np_TitleOnlineMenu);
+        case NetMenu::MenuState::DirectConnectEntry:
+        case NetMenu::MenuState::HostEntry:
+        case NetMenu::MenuState::JoinEntry:
+        case NetMenu::MenuState::Connecting:
+        case NetMenu::MenuState::Handshake:
+        case NetMenu::MenuState::ConnectedSession:
+        case NetMenu::MenuState::CharSelTransition:
+        case NetMenu::MenuState::PostMatch:
+            return S(Str::Np_TitlePlayOnline);
+        case NetMenu::MenuState::SpectateEntry:
+        case NetMenu::MenuState::SpectatorConnected:
+            return S(Str::Np_TitleWatch);
+        case NetMenu::MenuState::SpectatorConnecting:
+            return snap->join_spectator_probe_active ? S(Str::Np_TitlePlayOnline) : S(Str::Np_TitleWatch);
+        case NetMenu::MenuState::SettingsCategoryMenu:
+            return S(Str::Common_Settings);
+        case NetMenu::MenuState::SettingsEntry:
+            switch (snap->settings_category) {
+                case NetMenu::SettingsCategory::Identity:    return S(Str::Common_Player);
+                case NetMenu::SettingsCategory::Appearance:  return S(Str::Np_TitleAppearance);
+                case NetMenu::SettingsCategory::Endpoint:    return S(Str::Np_TitleNetwork);
+                case NetMenu::SettingsCategory::SessionMatch: return S(Str::Np_TitleWatchSettings);
+                case NetMenu::SettingsCategory::Diagnostics:  return S(Str::Np_TitleDiagnostics);
+                case NetMenu::SettingsCategory::GameGeneral:  return S(Str::Np_TitleGame);
+                default: return S(Str::Common_Settings);
+            }
+        case NetMenu::MenuState::DisconnectError:
+            return S(Str::Np_TitleConnNotice);
+        default:
+            return S(Str::Np_TitleOnlineMenu);
+    }
+}
+
+static const char* GetHeaderSubtitle(const NetMenu::MenuSnapshot* snap) {
+    switch (snap->state) {
+        case NetMenu::MenuState::MenuRoot:            return "Choose what to do";
+        case NetMenu::MenuState::DirectConnectEntry:  return "Host or join";
+        case NetMenu::MenuState::HostEntry:           return S(Str::Np_HintOpenRoom);
+        case NetMenu::MenuState::JoinEntry:           return S(Str::Np_HintConnectHost);
+        case NetMenu::MenuState::SpectateEntry:       return "Find a live match";
+        case NetMenu::MenuState::SpectatorConnecting:
+            return snap->join_spectator_probe_active ? "Checking host status" : "Connecting";
+        case NetMenu::MenuState::SpectatorConnected:
+            return (snap->spectator_client_match_id != 0 || snap->spectator_playback_active)
+                ? "Watching live"
+                : "Waiting for a match";
+        case NetMenu::MenuState::SettingsCategoryMenu: return "Choose a category";
+        case NetMenu::MenuState::SettingsEntry:
+            switch (snap->settings_category) {
+                case NetMenu::SettingsCategory::Identity:    return "Name and gameplay tuning";
+                case NetMenu::SettingsCategory::Appearance:  return "HUD colors and trail styling";
+                case NetMenu::SettingsCategory::Endpoint:    return "Routing and server addresses";
+                case NetMenu::SettingsCategory::SessionMatch: return "Spectator and palette options";
+                case NetMenu::SettingsCategory::Diagnostics:  return "Logging controls";
+                default: return "Adjust settings";
+            }
+        case NetMenu::MenuState::Connecting:
+            return snap->connecting_as_host ? "Opening your room" : "Connecting to host";
+        case NetMenu::MenuState::Handshake:
+            return snap->connecting_as_host ? "Confirming your room" : "Confirming connection";
+        case NetMenu::MenuState::ConnectedSession:    return "Ready check";
+        case NetMenu::MenuState::CharSelTransition:   return "Open character select";
+        case NetMenu::MenuState::PostMatch:           return "Choose the next step";
+        case NetMenu::MenuState::DisconnectError:     return "Review the message";
+        default:                                      return "";
+    }
+}
+
+} // anonymous namespace
+
+namespace NetMenu {
+
+// Shared with the game settings menu so both screens keep one row style.
+void RenderMenuRow(int y, const char* label, const char* value,
+                   bool selected, bool enabled, uint8_t alpha) {
+    RenderRow(y, label, value, selected, enabled, alpha);
+}
+
+void RenderMenuInfoLine(int y, const char* label, const char* value, uint8_t alpha) {
+    RenderInfoLine(y, label, value, alpha);
+}
+
+int MenuRowStep() {
+    return kRowStep;
+}
+
+void MenuSetTextAlpha(uint8_t alpha) {
+    s_menuTextAlpha = alpha;
+}
+
+void MenuSetBlend(int mode, uint8_t alpha) {
+    GameSetBlend(mode, alpha);
+}
+
+void MenuFillRect(int l, int t, int r, int b, uint8_t cr, uint8_t cg, uint8_t cb) {
+    GameFillRect(l, t, r, b, cr, cg, cb);
+}
+
+void MenuDrawText(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char* text) {
+    GameDrawText(x, y, r, g, b, "%s", text ? text : "");
+}
+
+float MenuMeasureText(const char* text, float size) {
+    ResolveProxyMenuText();
+    if (s_proxyMeasureMenuText && text) {
+        return s_proxyMeasureMenuText(text, size);
+    }
+    // The game's own renderer is a fixed-cell font; approximate at half the size.
+    return text ? (float)strlen(text) * size * 0.5f : 0.0f;
+}
+
+void MenuDrawTextSized(int x, int y, uint8_t r, uint8_t g, uint8_t b, float size, const char* text) {
+    const float prev = s_menuTextSize;
+    s_menuTextSize = size > 0.0f ? size : kNetplayTextSize;
+    GameDrawText(x, y, r, g, b, "%s", text ? text : "");
+    s_menuTextSize = prev;
+}
+
+} // namespace NetMenu
+
+
+namespace NetMenuUI {
+
+void RenderFullscreenFade(uint8_t blackAlpha) {
+    if (blackAlpha == 0) return;
+    GameSetBlend(1, blackAlpha);
+    GameFillRect(0, 0, 639, 479, 0, 0, 0);
+    GameSetBlend(0, 255);
+    GameSetDrawColor(255, 255, 255);
+}
+
+void Render(const NetMenu::MenuSnapshot* snap) {
+    if (!snap || !snap->menu_active) return;
+
+    // Background sprite: prefer the vanilla net.bin background (loaded by the
+    // controller's presentation step); fall back to the title background if it
+    // isn't loaded yet.
+    int bgHandle = (int)ReadU32(ADDR_NET_MENU_BG, 0);
+    if (bgHandle == 0) {
+        bgHandle = (int)ReadU32(ADDR_TITLE_MENU_BG_ACTIVE, 0);
+    }
+    GameSetBlend(0, 255);
+    GameSetDrawColor(255, 255, 255);
+    GameDrawSprite(0, 0, bgHandle);
+
+    float fadeNorm = (float)snap->fade_frames / (float)kFadeFrames;
+    if (fadeNorm < 0.0f) fadeNorm = 0.0f;
+    if (fadeNorm > 1.0f) fadeNorm = 1.0f;
+    uint8_t alpha = (uint8_t)Alpha8(fadeNorm, 255);
+
+    // Fade the whole scene (background included) from / to black, settling on a
+    // constant readability dim once the menu is fully open. fadeNorm: 0 = black,
+    // 1 = open.
+    constexpr int kSceneDim = 120;
+    uint8_t sceneOverlay = (uint8_t)((float)kSceneDim + (1.0f - fadeNorm) * (255.0f - (float)kSceneDim));
+    GameSetBlend(1, sceneOverlay);
+    GameFillRect(0, 0, 639, 479, 0, 0, 0);
+
+    if (!alpha) {
+        GameSetBlend(0, 255);
+        GameSetDrawColor(255, 255, 255);
+        return;
+    }
+
+    // The game settings pages reproduce the native options screen, so they draw
+    // the whole screen themselves instead of sitting inside the netplay frame.
+    if (snap->state == NetMenu::MenuState::SettingsEntry &&
+        (snap->settings_category == NetMenu::SettingsCategory::GameGeneral ||
+         snap->settings_category == NetMenu::SettingsCategory::GameVoice  ||
+         snap->settings_category == NetMenu::SettingsCategory::GameRoot   ||
+         snap->settings_category == NetMenu::SettingsCategory::GameKeys   ||
+         snap->settings_category == NetMenu::SettingsCategory::GameSystem  ||
+         snap->settings_category == NetMenu::SettingsCategory::GameHotkeys)) {
+        if (snap->settings_category == NetMenu::SettingsCategory::GameVoice) {
+            NetMenu::GameSettingsVoice_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameRoot) {
+            NetMenu::GameSettingsRoot_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameKeys) {
+            NetMenu::GameSettingsKeys_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameSystem) {
+            NetMenu::GameSettingsSystem_RenderScreen(snap->selected_index, alpha);
+        } else if (snap->settings_category == NetMenu::SettingsCategory::GameHotkeys) {
+            NetMenu::GameSettingsHotkeys_RenderScreen(snap->selected_index, alpha);
+        } else {
+            NetMenu::GameSettingsMenu_RenderScreen(snap->selected_index, alpha);
+        }
+        GameSetBlend(0, 255);
+        GameSetDrawColor(255, 255, 255);
+        return;
+    }
+
+    // Panel backing, matched to the key config screen exactly: two passes at
+    // half alpha.
+    s_contentBottomCur = kRowStartY;
+    const int footerTop = (s_contentBottomPrev > 0 ? s_contentBottomPrev : kFooterTop) + 10;
+    const int panelBottom = footerTop + 2 * kFooterStep + 12 < kPanelBottom
+                          ? footerTop + 2 * kFooterStep + 12
+                          : kPanelBottom;
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 128));
+    GameFillRect(kPanelLeft, kPanelTop, kPanelRight, panelBottom, 0, 0, 0);
+    GameFillRect(kPanelLeft, kPanelTop, kPanelRight, panelBottom, 0, 0, 0);
+
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 40));
+    GameFillRect(kContentLeft - 4, kPanelTop + 6, kContentRight + 4, kHeaderBottom + 2, 0, 0, 0);
+
+    GameSetBlend(1, alpha);
+    GameDrawTextSized(kLabelX, kPanelTop + 6, 255, 255, 255, kTitleSize,
+                      "%s", GetHeaderTitle(snap));
+    GameDrawTextSized(kLabelX, kPanelTop + 40, 160, 160, 160, kNoteSize,
+                      "%s", GetHeaderSubtitle(snap));
+    RenderHeaderBadge(GetHeaderBadge(snap), alpha);
+
+    int contentStartY = kRowStartY;
+    RenderStatusCard(snap, alpha, fadeNorm, &contentStartY);
+
+    switch (snap->state) {
+        case NetMenu::MenuState::MenuRoot:           RenderMenuRoot(snap, alpha, contentStartY);         break;
+        case NetMenu::MenuState::DirectConnectEntry: RenderDirectConnect(snap, alpha, contentStartY);    break;
+        case NetMenu::MenuState::HostEntry:          RenderHostEntry(snap, alpha, contentStartY);        break;
+        case NetMenu::MenuState::JoinEntry:          RenderJoinEntry(snap, alpha, contentStartY);        break;
+        case NetMenu::MenuState::SpectateEntry:      RenderSpectateEntry(snap, alpha, contentStartY);    break;
+        case NetMenu::MenuState::SpectatorConnecting:RenderSpectatorConnecting(snap, alpha, contentStartY); break;
+        case NetMenu::MenuState::SpectatorConnected: RenderSpectatorConnected(snap, alpha, contentStartY); break;
+        case NetMenu::MenuState::SettingsCategoryMenu: RenderSettingsCategoryMenu(snap, alpha, contentStartY); break;
+        case NetMenu::MenuState::SettingsEntry:      RenderSettings(snap, alpha, contentStartY);         break;
+        case NetMenu::MenuState::Connecting:
+        case NetMenu::MenuState::Handshake:          RenderConnecting(snap, alpha, contentStartY);       break;
+        case NetMenu::MenuState::ConnectedSession:   RenderConnectedSession(snap, alpha, contentStartY); break;
+        case NetMenu::MenuState::CharSelTransition:  RenderCharSelTransition(snap, alpha, contentStartY);break;
+        case NetMenu::MenuState::PostMatch:          RenderPostMatch(snap, alpha, contentStartY);        break;
+        case NetMenu::MenuState::DisconnectError:    RenderDisconnectError(snap, alpha, contentStartY);  break;
+        default: break;
+    }
+
+    RenderPromptOverlay(snap, alpha, fadeNorm);
+
+    // Footer sits just under the content, the way the key config screen does,
+    // rather than pinned to the bottom of the screen.
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 40));
+    GameFillRect(kContentLeft - 4, footerTop - 2, kContentRight + 4, panelBottom - 2, 0, 0, 0);
+
+    GameSetBlend(1, (uint8_t)Alpha8(fadeNorm, 180));
+
+    const char* hint1 = "A Select  B Back  Up/Down Move";
+    if (snap->prompt_active) {
+        hint1 = "A Choose  B Cancel  Left/Right Switch";
+    } else {
+        switch (snap->state) {
+            case NetMenu::MenuState::JoinEntry:
+                hint1 = snap->selected_index == 1
+                    ? "A Edit  B Back  C Paste  D Watch"
+                    : "A Choose  B Back  D Watch";
+                break;
+            case NetMenu::MenuState::HostEntry:
+            case NetMenu::MenuState::Connecting:
+            case NetMenu::MenuState::Handshake:
+            case NetMenu::MenuState::ConnectedSession:
+                if (snap->connecting_as_host || snap->is_host) {
+                    hint1 = "A Choose  B Back  C Copy Address";
+                }
+                break;
+            case NetMenu::MenuState::SettingsEntry:
+                hint1 = "A Choose  B Back  Left/Right Adjust";
+                break;
+            default:
+                hint1 = "A Choose  B Back  Up/Down Move";
+                break;
+        }
+    }
+    char clippedHint[96];
+    ClipText(clippedHint, sizeof(clippedHint), hint1, kFooterChars);
+    GameDrawTextSized(kLabelX, footerTop + 4, 150, 150, 150, kFootSize, "%s", clippedHint);
+
+    // Only worth a second line when it says something the heading does not.
+    if (snap->prompt_active) {
+        GameDrawTextSized(kLabelX, footerTop + 4 + kFooterStep, 255, 255, 255,
+                          kFootSize, "Decision Required");
+    }
+
+    s_contentBottomPrev = s_contentBottomCur;
+
+    // Restore render state (blend + draw color) so the game's next frame
+    // starts clean.
+    GameSetBlend(0, 255);
+    GameSetDrawColor(255, 255, 255);
+}
+
+} // namespace NetMenuUI

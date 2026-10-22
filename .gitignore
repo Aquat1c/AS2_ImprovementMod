@@ -1,0 +1,29 @@
+# Build folders
+build/
+bin/
+out/
+dist/
+# Editor / CI
+.vscode/
+.github
+docs/*
+!docs/MASTER_DOCUMENT.md
+!docs/HOW_IT_WORKS.md
+
+# Logs / temp
+logs.txt
+*.log
+temp_*.cpp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+
+# OS
+Thumbs.db
+.DS_Store
+*.txt
+!CMAKELISTS.TXT
+!README_PLAYER.txt
+*.c__pycache__/
+*.pyc

@@ -1,0 +1,15 @@
+[submodule "lib/enet"]
+	path = lib/enet
+	url = https://github.com/lsalzman/enet.git
+[submodule "lib/minhook_src"]
+	path = lib/minhook_src
+	url = https://github.com/TsudaKageyu/minhook.git
+[submodule "third_party/libjuice"]
+	path = third_party/libjuice
+	url = https://github.com/paullouisageneau/libjuice.git
+[submodule "third_party/libpcpnatpmp"]
+	path = third_party/libpcpnatpmp
+	url = https://github.com/libpcp/pcp.git
+[submodule "third_party/miniupnp_suite"]
+	path = third_party/miniupnp_suite
+	url = https://github.com/miniupnp/miniupnp.git

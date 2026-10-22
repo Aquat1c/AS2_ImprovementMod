@@ -1,0 +1,1331 @@
+/**
+ * Alice Senki 2 - Mod Main Module
+ *
+ * Lifecycle / game-state core. Input hooks live in input_override, tick hooks
+ * in tick_hooks, hook installation in hook_installer.
+ */
+
+#include "mod_main.h"
+#include "core/local_rematch.h"
+#include "input_system.h"
+#include "log_window.h"
+#include "mod_menu.h"
+#include "hitbox_viewer.h"
+#include "ui/mod_menu.h"
+#include "ui/netplay_hud.h"
+#include "ui/pause_menu.h"
+#include "ui/strings.h"
+#include "ui/netplay_hud_style.h"
+#include "game_console.h"
+#include "patches/memory_utils.h"
+#include "patches/unlock_patch.h"
+#include "patches/input_override.h"
+#include "patches/shell_hotkey_patch.h"
+#include "patches/hook_installer.h"
+#include "patches/filesystem_patch.h"
+#include "patches/palette_asset_hook.h"
+#include "patches/charsel_palette_select.h"
+#include "patches/tick_hooks.h"
+#include "patches/session_pump_hook.h"
+#include "rollback/determinism_verify.h"
+#include "rollback/savestate.h"
+#include "rollback/rollback_session.h"
+#include "rollback/rollback_debug.h"
+#include "rollback/netplay_log.h"
+#include "rollback/rollback_audio.h"
+#include "rollback/rollback_combo_fx.h"
+#include "rollback/rollback_status_fx.h"
+#include "rollback/stress_hooks.h"
+#include "rollback/online_wiring.h"
+#include "net/spectator_runtime.h"
+#include "net/session_exit.h"
+#include "net/spectator_client.h"
+#include "net/spectator_playback.h"
+#include "net/netplay_palette_runtime.h"
+#include "net/enet_transport.h"
+#include "net/session_manager.h"
+#include "net/connection_supervisor.h"
+#include "net/link_emulator.h"
+#include "net/time_probe.h"
+#include "net/continue_flow.h"
+#include "net/transition_barrier.h"
+#include "net/mode_ownership.h"
+#include "net/netplay_menu_controller.h"
+#include "net/pregame_sync.h"
+#include "net/match_lifecycle.h"
+#include "net/sync_policy.h"
+#include "net/sync_trace.h"
+#include "net/delay_policy.h"
+#include "net/game_settings_sync.h"
+#include "net/set_tracker.h"
+#include "net/player_side_mapping.h"
+#include "replay/replay_runtime.h"
+#include "testing/scripted_input_runner.h"
+#include "training/hotkey_config.h"
+#include "training/practice_tools.h"
+#include "imgui.h"
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <mmsystem.h>
+
+// Configuration
+
+struct ModConfig {
+    bool useSDLInput;
+    bool bypassGameInput;
+    int  inputDisplayMode;
+    bool showHitboxes;
+    bool showFrameData;
+    bool verboseLogging;
+    int  rollbackFrames;
+    int  inputDelay;
+};
+
+static ModConfig g_config = {
+    true,   // useSDLInput
+    false,  // bypassGameInput
+    1,      // inputDisplayMode
+    false,  // showHitboxes
+    false,  // showFrameData
+    false,  // verboseLogging
+    8,      // rollbackFrames (unused, kept for compat)
+    0       // inputDelay    (unused, kept for compat)
+};
+
+// Internal state
+
+static HMODULE g_gameModule = nullptr;
+static bool g_initialized = false;
+static bool g_forceBorderlessFullscreen = false;
+static bool g_imguiBaseStyleCaptured = false;
+static float g_lastAppliedImGuiScale = -1.0f;
+static ImGuiStyle g_imguiBaseStyle = {};
+
+typedef void (__cdecl *ProxyGetResolution_t)(int* width, int* height);
+
+// Config accessors
+
+static void ModWideToUtf8(const wchar_t* wide, char* out, int cap) {
+    if (!out || cap <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!wide) {
+        strncpy_s(out, cap, "<null>", _TRUNCATE);
+        return;
+    }
+
+    int written = WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, cap, nullptr, nullptr);
+    if (written <= 0) {
+        snprintf(out, cap, "<utf8 conversion failed err=%lu>", GetLastError());
+    }
+}
+
+static void LogModulePath(const char* label, HMODULE module) {
+    char pathA[MAX_PATH] = {};
+    wchar_t pathW[MAX_PATH] = {};
+    char pathUtf8[1024] = {};
+
+    if (module && GetModuleFileNameA(module, pathA, MAX_PATH) > 0) {
+        LOG_INFO("[StartupDiag] %s A: base=0x%p path=%s", label ? label : "module", module, pathA);
+    } else {
+        LOG_WARN("[StartupDiag] %s A path unavailable (err=%lu)", label ? label : "module", GetLastError());
+    }
+
+    if (module && GetModuleFileNameW(module, pathW, MAX_PATH) > 0) {
+        ModWideToUtf8(pathW, pathUtf8, sizeof(pathUtf8));
+        LOG_INFO("[StartupDiag] %s W: %s", label ? label : "module", pathUtf8);
+    } else {
+        LOG_WARN("[StartupDiag] %s W path unavailable (err=%lu)", label ? label : "module", GetLastError());
+    }
+}
+
+static void LogStartupEnvironment(HMODULE gameModule) {
+    LOG_INFO("[StartupDiag] PID=%lu TID=%lu ACP=%u OEMCP=%u ThreadLocale=0x%08lX UIlang=0x%04X",
+             GetCurrentProcessId(),
+             GetCurrentThreadId(),
+             GetACP(),
+             GetOEMCP(),
+             (DWORD)GetThreadLocale(),
+             (unsigned)GetThreadUILanguage());
+
+    char localeName[128] = {};
+    if (GetLocaleInfoA(LOCALE_SYSTEM_DEFAULT, LOCALE_SNAME, localeName, sizeof(localeName)) > 0) {
+        LOG_INFO("[StartupDiag] System locale: %s", localeName);
+    }
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SNAME, localeName, sizeof(localeName)) > 0) {
+        LOG_INFO("[StartupDiag] User locale: %s", localeName);
+    }
+
+    char cwdA[MAX_PATH] = {};
+    if (GetCurrentDirectoryA(MAX_PATH, cwdA) > 0) {
+        LOG_INFO("[StartupDiag] CurrentDirectoryA: %s", cwdA);
+    }
+    wchar_t cwdW[MAX_PATH] = {};
+    if (GetCurrentDirectoryW(MAX_PATH, cwdW) > 0) {
+        char cwdUtf8[1024] = {};
+        ModWideToUtf8(cwdW, cwdUtf8, sizeof(cwdUtf8));
+        LOG_INFO("[StartupDiag] CurrentDirectoryW: %s", cwdUtf8);
+    }
+
+    LOG_INFO("[StartupDiag] CommandLineA: %s", GetCommandLineA());
+    char cmdUtf8[2048] = {};
+    ModWideToUtf8(GetCommandLineW(), cmdUtf8, sizeof(cmdUtf8));
+    LOG_INFO("[StartupDiag] CommandLineW: %s", cmdUtf8);
+
+    if (HMODULE ntdll = GetModuleHandleA("ntdll.dll")) {
+        typedef const char* (__cdecl *WineVersionFn)(void);
+        typedef void (__cdecl *WineHostVersionFn)(const char** sysname, const char** release);
+        WineVersionFn wineVersion = (WineVersionFn)GetProcAddress(ntdll, "wine_get_version");
+        if (wineVersion) {
+            const char* sysname = nullptr;
+            const char* release = nullptr;
+            WineHostVersionFn hostVersion = (WineHostVersionFn)GetProcAddress(ntdll, "wine_get_host_version");
+            if (hostVersion) {
+                hostVersion(&sysname, &release);
+            }
+            LOG_INFO("[StartupDiag] Runtime: Wine %s host=%s %s",
+                     wineVersion(), sysname ? sysname : "?", release ? release : "?");
+        } else {
+            LOG_INFO("[StartupDiag] Runtime: native Windows");
+        }
+
+        typedef LONG (WINAPI *RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+        RtlGetVersionFn rtlGetVersion = (RtlGetVersionFn)GetProcAddress(ntdll, "RtlGetVersion");
+        RTL_OSVERSIONINFOW osv = {};
+        osv.dwOSVersionInfoSize = sizeof(osv);
+        if (rtlGetVersion && rtlGetVersion(&osv) == 0) {
+            LOG_INFO("[StartupDiag] Reported Windows version: %lu.%lu build %lu",
+                     osv.dwMajorVersion, osv.dwMinorVersion, osv.dwBuildNumber);
+        }
+    }
+
+    char envValue[512] = {};
+    const char* envKeys[] = { "WINEPREFIX", "WINEDLLOVERRIDES", "XDG_SESSION_TYPE", "LANG", "LC_ALL",
+                              "SDL_JOYSTICK_HIDAPI", "SDL_GAMECONTROLLERCONFIG", "AS2_PACKET_LOG",
+                              "AS2_LAUNCHER" };
+    for (const char* key : envKeys) {
+        const DWORD len = GetEnvironmentVariableA(key, envValue, sizeof(envValue));
+        if (len > 0 && len < sizeof(envValue)) {
+            LOG_INFO("[StartupDiag] %s=%s", key, envValue);
+        }
+    }
+
+    LogModulePath("Game module", gameModule);
+    HMODULE selfModule = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&ModInit, &selfModule)) {
+        LogModulePath("Mod DLL", selfModule);
+    }
+}
+
+typedef void (*ProxyReportInitStage_t)(const char* step, int state);
+
+static ProxyReportInitStage_t ResolveProxyReportInitStage() {
+    static ProxyReportInitStage_t s_report = nullptr;
+    static bool s_resolved = false;
+    if (!s_resolved) {
+        s_resolved = true;
+        if (HMODULE proxy = GetModuleHandleA("d3d9.dll")) {
+            s_report = (ProxyReportInitStage_t)GetProcAddress(proxy, "AS2Proxy_ReportInitStage");
+        }
+    }
+    return s_report;
+}
+
+// Each step is timed and mirrored into the proxy's stage timeline/breadcrumb.
+static void LogInitStep(const char* step, const char* state) {
+    static DWORD s_beginTick = 0;
+    const bool begin = state && strcmp(state, "BEGIN") == 0;
+    const bool failed = state && strcmp(state, "FAILED") == 0;
+    if (begin) {
+        s_beginTick = GetTickCount();
+        LOG_INFO("[InitStep] %s %s", state, step ? step : "?");
+    } else {
+        LOG_INFO("[InitStep] %s %s (+%lu ms)", state ? state : "?", step ? step : "?", GetTickCount() - s_beginTick);
+    }
+    LogWindow_Flush();
+    if (ProxyReportInitStage_t report = ResolveProxyReportInitStage()) {
+        report(step ? step : "?", begin ? 0 : (failed ? 2 : 1));
+    }
+}
+
+static bool g_deferredInitFailed = false;
+
+bool ModConfig_UseSDLInput() {
+    return g_config.useSDLInput;
+}
+
+bool ModConfig_VerboseLogging() {
+    return g_config.verboseLogging;
+}
+
+static float ClampFloat(float value, float minValue, float maxValue) {
+    if (value < minValue) {
+        return minValue;
+    }
+    if (value > maxValue) {
+        return maxValue;
+    }
+    return value;
+}
+
+float ModUI_GetScale() {
+    static HMODULE s_proxyModule = nullptr;
+    static ProxyGetResolution_t s_getNativeResolution = nullptr;
+    static ProxyGetResolution_t s_getScreenResolution = nullptr;
+    static int s_cachedNativeWidth = 0;
+    static int s_cachedNativeHeight = 0;
+    static int s_cachedScreenWidth = 0;
+    static int s_cachedScreenHeight = 0;
+    static float s_cachedScale = 1.0f;
+    static bool s_hasCachedScale = false;
+
+    HMODULE currentProxyModule = GetModuleHandleA("d3d9.dll");
+    if (currentProxyModule != s_proxyModule || !s_getNativeResolution || !s_getScreenResolution) {
+        s_proxyModule = currentProxyModule;
+        s_getNativeResolution = nullptr;
+        s_getScreenResolution = nullptr;
+        s_hasCachedScale = false;
+
+        if (s_proxyModule) {
+            s_getNativeResolution = (ProxyGetResolution_t)GetProcAddress(s_proxyModule, "GetNativeResolution");
+            s_getScreenResolution = (ProxyGetResolution_t)GetProcAddress(s_proxyModule, "GetScreenResolution");
+        }
+    }
+
+    if (!s_getNativeResolution || !s_getScreenResolution) {
+        return 1.0f;
+    }
+
+    int nativeWidth = 0;
+    int nativeHeight = 0;
+    int screenWidth = 0;
+    int screenHeight = 0;
+    s_getNativeResolution(&nativeWidth, &nativeHeight);
+    s_getScreenResolution(&screenWidth, &screenHeight);
+    if (nativeWidth <= 0 || nativeHeight <= 0 || screenWidth <= 0 || screenHeight <= 0) {
+        s_hasCachedScale = false;
+        return 1.0f;
+    }
+
+    if (s_hasCachedScale &&
+        s_cachedNativeWidth == nativeWidth &&
+        s_cachedNativeHeight == nativeHeight &&
+        s_cachedScreenWidth == screenWidth &&
+        s_cachedScreenHeight == screenHeight) {
+        return s_cachedScale;
+    }
+
+    const float scaleX = (float)screenWidth / (float)nativeWidth;
+    const float scaleY = (float)screenHeight / (float)nativeHeight;
+    float upscale = scaleX < scaleY ? scaleX : scaleY;
+    if (upscale < 1.0f) {
+        upscale = 1.0f;
+    }
+
+    s_cachedNativeWidth = nativeWidth;
+    s_cachedNativeHeight = nativeHeight;
+    s_cachedScreenWidth = screenWidth;
+    s_cachedScreenHeight = screenHeight;
+    s_cachedScale = ClampFloat(1.0f / upscale, 0.40f, 1.0f);
+    s_hasCachedScale = true;
+    return s_cachedScale;
+}
+
+float ModUI_Scale(float value) {
+    return value * ModUI_GetScale();
+}
+
+static void ApplySharedImGuiScale() {
+    if (!ImGui::GetCurrentContext()) {
+        return;
+    }
+
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImGuiIO& io = ImGui::GetIO();
+    if (!g_imguiBaseStyleCaptured) {
+        g_imguiBaseStyle = style;
+        g_imguiBaseStyleCaptured = true;
+    }
+
+    const float scale = ModUI_GetScale();
+    if (fabsf(scale - g_lastAppliedImGuiScale) < 0.001f) {
+        return;
+    }
+
+    style = g_imguiBaseStyle;
+    style.ScaleAllSizes(scale);
+    io.FontGlobalScale = scale;
+    g_lastAppliedImGuiScale = scale;
+}
+
+static bool HasVisibleImGuiOverlay() {
+    if (!g_initialized) {
+        return false;
+    }
+
+    if (ModMenu_IsOpen()) {
+        return true;
+    }
+
+    if (!Rollback::RollbackSession_IsActive() &&
+        HitboxViewer_IsEnabled() &&
+        AS2_IsInMatch()) {
+        return true;
+    }
+
+    if (NetplayHud_HasVisibleHud()) {
+        return true;
+    }
+
+    if (PracticeTools_HasVisibleHud()) {
+        return true;
+    }
+
+    if (Replay::ReplayRuntime_HasVisibleHud()) {
+        return true;
+    }
+
+    return false;
+}
+
+// Verbose logging control
+
+void SetVerboseLogging(bool enabled) {
+    g_config.verboseLogging = enabled;
+    Rollback::NetplayLog_SetVerbose(enabled);
+    LOG_INFO("[Mod] Verbose logging %s", enabled ? "enabled" : "disabled");
+}
+
+bool GetVerboseLogging() {
+    return g_config.verboseLogging;
+}
+
+// Game State Queries
+
+uint32_t AS2_GetFrameNumber() {
+    return ReadMemory<uint32_t>(ADDR_SIM_FRAME_COUNTER);
+}
+
+bool AS2_IsInMatch() {
+    return GetGameMode() == MODE_MATCH;
+}
+
+bool AS2_IsInGameplay() {
+    return IsInActiveGameplay();
+}
+
+bool AS2_IsInPlayableGameplay() {
+    return IsInPlayableMatchGameplay();
+}
+
+bool AS2_IsInPauseMenu() {
+    return GetGameMode() == MODE_MATCH && GetSubstate() == 4;
+}
+
+bool AS2_IsInMenu() {
+    uint32_t mode = GetGameMode();
+    return mode != MODE_MATCH || GetSubstate() != 3;
+}
+
+// Entity / HP access
+
+uint16_t GetP1HP() {
+    return ReadMemory<uint16_t>(ADDR_P1_HP_DIRECT);
+}
+
+uint16_t GetP2HP() {
+    return ReadMemory<uint16_t>(ADDR_P2_HP_DIRECT);
+}
+
+uintptr_t GetEntityBase(int player) {
+    if (player == 0) {
+        return ADDR_P1_HP_DIRECT - ENTITY_OFF_HP;
+    } else {
+        return ADDR_P2_HP_DIRECT - ENTITY_OFF_HP;
+    }
+}
+
+// Quick Checksum (replicates sub_49EE60)
+
+uint32_t AS2_GetQuickChecksum() {
+    uintptr_t p1Base = GetEntityBase(0);
+    uintptr_t p2Base = GetEntityBase(1);
+
+    uint16_t p1HP = ReadMemory<uint16_t>(p1Base + ENTITY_OFF_HP);
+    uint16_t p1Meter = ReadMemory<uint16_t>(p1Base + ENTITY_OFF_METER);
+    int16_t  p1X = ReadMemory<int16_t>(p1Base + ENTITY_OFF_X_POS);
+    int16_t  p1Y = ReadMemory<int16_t>(p1Base + ENTITY_OFF_Y_POS);
+
+    uint16_t p2HP = ReadMemory<uint16_t>(p2Base + ENTITY_OFF_HP);
+    uint16_t p2Meter = ReadMemory<uint16_t>(p2Base + ENTITY_OFF_METER);
+    int16_t  p2X = ReadMemory<int16_t>(p2Base + ENTITY_OFF_X_POS);
+    int16_t  p2Y = ReadMemory<int16_t>(p2Base + ENTITY_OFF_Y_POS);
+
+    uint32_t sum = (uint32_t)p1HP + (uint32_t)p1Meter + (uint32_t)(uint16_t)p1X + (uint32_t)(uint16_t)p1Y
+                 + (uint32_t)p2HP + (uint32_t)p2Meter + (uint32_t)(uint16_t)p2X + (uint32_t)(uint16_t)p2Y;
+
+    return (uint16_t)(sum % 0x10000);
+}
+
+// Clear Vanilla Netplay Buffers
+
+void AS2_ClearVanillaNetplayBuffers() {
+    LOG_INFO("[AS2] Clearing vanilla netplay buffers...");
+
+    __try {
+        *reinterpret_cast<uint32_t*>(ADDR_FRAME_DISPLAY) = 0;
+        *reinterpret_cast<uint32_t*>(ADDR_FRAME_WRITE_IDX) = 0;
+        *reinterpret_cast<uint32_t*>(ADDR_FRAME_NET_IDX) = 0;
+        *reinterpret_cast<uint32_t*>(ADDR_REMOTE_FRAME) = 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("[AS2] Failed to clear vanilla frame counters");
+    }
+
+    __try {
+        memset(reinterpret_cast<void*>(ADDR_VANILLA_LOCAL_INPUTS), 0xFF, VANILLA_LOCAL_INPUT_SIZE);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("[AS2] Failed to clear vanilla local input buffer");
+    }
+
+    __try {
+        memset(reinterpret_cast<void*>(ADDR_VANILLA_REMOTE_INPUTS), 0xFF, VANILLA_REMOTE_INPUT_SIZE);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("[AS2] Failed to clear vanilla remote input buffer");
+    }
+
+    __try {
+        memset(reinterpret_cast<void*>(ADDR_VANILLA_SYNC_LOCAL), 0, 10);
+        memset(reinterpret_cast<void*>(ADDR_VANILLA_SYNC_REMOTE), 0, 10);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("[AS2] Failed to clear vanilla sync flags");
+    }
+}
+
+// Deferred Initialization (first frame when D3D9 is ready)
+
+static void DeferredInit() {
+    LOG_INFO("Performing deferred initialization...");
+    LogInitStep("DeferredInit", "BEGIN");
+
+    LogInitStep("InputSystem_Init", "BEGIN");
+    if (!InputSystem_Init()) {
+        LOG_WARN("Failed to initialize SDL input system - using native input only");
+    } else {
+        LOG_INFO("SDL3 input system initialized");
+    }
+    LogInitStep("InputSystem_Init", "END");
+
+    LogInitStep("TickHooks_LoadSettings", "BEGIN");
+    TickHooks_LoadSettings();
+    LogInitStep("TickHooks_LoadSettings", "END");
+
+    LogInitStep("InputOverride_LoadSettings", "BEGIN");
+    InputOverride_LoadSettings();
+    LogInitStep("InputOverride_LoadSettings", "END");
+
+    LogInitStep("InstallHooks", "BEGIN");
+    if (!InstallHooks()) {
+        LOG_ERROR("Failed to install hooks! Deferred init will not be retried; the mod stays inactive.");
+        LogInitStep("InstallHooks", "FAILED");
+        LogInitStep("DeferredInit", "FAILED");
+        g_deferredInitFailed = true;
+        return;
+    }
+    LogInitStep("InstallHooks", "END");
+
+    LogInitStep("GameConsole_Init", "BEGIN");
+    GameConsole_Init();
+    LogInitStep("GameConsole_Init", "END");
+
+    LogInitStep("DetVer_Init", "BEGIN");
+    DetVer_Init();
+    DetVer_SetLogDir(LogWindow_GetLogDir());
+    LogInitStep("DetVer_Init", "END");
+
+    LogInitStep("Savestate_Init", "BEGIN");
+    Savestate_Init();
+    Savestate_SetLogDir(LogWindow_GetLogDir());
+    LogInitStep("Savestate_Init", "END");
+
+    LogInitStep("Transport_GlobalInit", "BEGIN");
+    Net::Transport_GlobalInit();
+    LogInitStep("Transport_GlobalInit", "END");
+    LogInitStep("Session_Init", "BEGIN");
+    Net::Session_Init();
+    LogInitStep("Session_Init", "END");
+    LogInitStep("ConnectionSupervisor_Init", "BEGIN");
+    Net::ConnectionSupervisor_Init();
+    LogInitStep("ConnectionSupervisor_Init", "END");
+
+    // TimeProbe is the delay policy's PRIMARY latency source (percentiles and
+    // jitter; delay_policy falls back to ENet's coarse average without it).
+    LogInitStep("TimeProbe_Init", "BEGIN");
+    Net::TimeProbe_Init();
+    LogInitStep("TimeProbe_Init", "END");
+
+    // Link emulation is armed from as2_stress.cfg before any session can
+    // start, so the very first handshake already experiences the emulated
+    // latency.
+    LogInitStep("LinkEmulator_LoadConfig", "BEGIN");
+    Net::LinkEmulator_LoadConfig();
+    Net::LinkEmulator_ApplyHandleSerialSkew();
+    LogInitStep("LinkEmulator_LoadConfig", "END");
+    LogInitStep("TransitionBarrier_Init", "BEGIN");
+    Net::TransitionBarrier_Init();
+    LogInitStep("TransitionBarrier_Init", "END");
+    // No FrameUpdate — the continue flow is driven by WinScreenSync's
+    // lockstep consume path.
+    LogInitStep("ContinueFlow_Init", "BEGIN");
+    Net::ContinueFlow_Init();
+    LogInitStep("ContinueFlow_Init", "END");
+
+    LogInitStep("LocalRematch_Init", "BEGIN");
+    LocalRematch::Init();
+    LogInitStep("LocalRematch_Init", "END");
+    LogInitStep("NetplayPaletteRuntime_Init", "BEGIN");
+    Net::NetplayPaletteRuntime_Init();
+    LogInitStep("NetplayPaletteRuntime_Init", "END");
+    LogInitStep("SpectatorRuntime_Init", "BEGIN");
+    Net::SpectatorRuntime_Init();
+    LogInitStep("SpectatorRuntime_Init", "END");
+    LogInitStep("SpectatorClient_Init", "BEGIN");
+    Net::SpectatorClient_Init();
+    LogInitStep("SpectatorClient_Init", "END");
+    LogInitStep("SpectatorPlayback_Init", "BEGIN");
+    Net::SpectatorPlayback_Init();
+    LogInitStep("SpectatorPlayback_Init", "END");
+    LogInitStep("GameSettingsSync_Init", "BEGIN");
+    Net::GameSettingsSync_Init();
+    LogInitStep("GameSettingsSync_Init", "END");
+
+    LogInitStep("NetMenu::Init", "BEGIN");
+    NetMenu::Init();
+    LogInitStep("NetMenu::Init", "END");
+    LogInitStep("ModeOwnership::Install", "BEGIN");
+    if (!ModeOwnership::Install()) {
+        LOG_ERROR("Failed to install mode ownership hooks!");
+    }
+    LogInitStep("ModeOwnership::Install", "END");
+
+    LogInitStep("PregameSync_Init", "BEGIN");
+    Net::PregameSync_Init();
+    LogInitStep("PregameSync_Init", "END");
+
+    LogInitStep("MatchLifecycle_Init", "BEGIN");
+    Net::MatchLifecycle_Init();
+    LogInitStep("MatchLifecycle_Init", "END");
+
+    LogInitStep("SyncPolicy_Init", "BEGIN");
+    Net::SyncPolicy_Init();
+    LogInitStep("SyncPolicy_Init", "END");
+    LogInitStep("DelayPolicy_Init", "BEGIN");
+    Net::DelayPolicy_Init();
+    LogInitStep("DelayPolicy_Init", "END");
+
+    LogInitStep("RollbackSession_Init", "BEGIN");
+    Rollback::RollbackSession_Init();
+    LogInitStep("RollbackSession_Init", "END");
+    LogInitStep("RollbackDebug_Init", "BEGIN");
+    Rollback::RollbackDebug_Init();
+    LogInitStep("RollbackDebug_Init", "END");
+
+    LogInitStep("NetplayLog_Init", "BEGIN");
+    Rollback::NetplayLog_Init();
+    Rollback::NetplayLog_SetLogDir(LogWindow_GetLogDir());
+    Rollback::NetplayLog_SetVerbose(g_config.verboseLogging);
+    LogInitStep("NetplayLog_Init", "END");
+    LogInitStep("SessionPumpHook_Init", "BEGIN");
+    Net::SessionPumpHook_Init();
+    LogInitStep("SessionPumpHook_Init", "END");
+    LogInitStep("RollbackAudio_Init", "BEGIN");
+    Rollback::RollbackAudio_Init();
+    LogInitStep("RollbackAudio_Init", "END");
+    LogInitStep("RollbackStatusFx_Init", "BEGIN");
+    Rollback::RollbackStatusFx_Init();
+    LogInitStep("RollbackStatusFx_Init", "END");
+    LogInitStep("RollbackComboFx_Init", "BEGIN");
+    Rollback::RollbackComboFx_Init();
+    LogInitStep("RollbackComboFx_Init", "END");
+    LogInitStep("SyncTrace_Init", "BEGIN");
+    Net::SyncTrace_Init();
+    LogInitStep("SyncTrace_Init", "END");
+    LogInitStep("OnlineWiring_Init", "BEGIN");
+    Rollback::OnlineWiring_Init();
+    LogInitStep("OnlineWiring_Init", "END");
+
+    LogInitStep("SIR_Init", "BEGIN");
+    SIR_Init();
+    LogInitStep("SIR_Init", "END");
+
+    LogInitStep("PracticeTools_Init", "BEGIN");
+    PracticeTools_Init();
+    LogInitStep("PracticeTools_Init", "END");
+    LogInitStep("ReplayRuntime_Init", "BEGIN");
+    Replay::ReplayRuntime_Init();
+    LogInitStep("ReplayRuntime_Init", "END");
+
+    LOG_INFO("Frame Counter: 0x%08X = %d", ADDR_SIM_FRAME_COUNTER, AS2_GetFrameNumber());
+    LOG_INFO("Game Mode: 0x%08X = %d", ADDR_GAME_MODE, GetGameMode());
+    LOG_INFO("P1 HP: 0x%08X = %d", ADDR_P1_HP_DIRECT, GetP1HP());
+    LOG_INFO("P2 HP: 0x%08X = %d", ADDR_P2_HP_DIRECT, GetP2HP());
+
+    g_initialized = true;
+
+    LogInitStep("ModMenu_Init", "BEGIN");
+    ModMenu_Init();
+    LogInitStep("ModMenu_Init", "END");
+    LogInitStep("HitboxViewer_Init", "BEGIN");
+    HitboxViewer_Init();
+    LogInitStep("HitboxViewer_Init", "END");
+
+    LOG_INFO("========================================");
+    LOG_INFO("Initialization complete!");
+    // Defaults only; all rebindable in Settings > System > Practice Hotkeys.
+    LOG_INFO("Hotkeys (defaults): F1=Menu  F4=Hitbox  F5=SaveState  F6=LoadState  "
+             "F7=Pause  F8=Step  F9=Swap  -- rebind in Settings > System");
+    LOG_INFO("========================================");
+    LogInitStep("DeferredInit", "END");
+    LogWindow_SetForceFlush(false);
+    LogWindow_Flush();
+}
+
+// Exported Functions
+
+extern "C" {
+
+__declspec(dllexport) const char* AS2_GetFullscreenHotkeyLabel() {
+    static char label[64];
+    HotkeyConfig_GetBindingDisplayName(HOTKEY_FULLSCREEN_TOGGLE, label, sizeof(label));
+    return label;
+}
+
+// d3d9_proxy: call instead of CallWindowProcW(DXLib 0xFFFFxxxx). See docs/SHELL_HOTKEY_POLICY.md
+__declspec(dllexport) bool ModCallGameWndProc(HWND hwnd,
+                                              UINT msg,
+                                              WPARAM wParam,
+                                              LPARAM lParam,
+                                              LRESULT* outResult) {
+    if (!outResult) {
+        return false;
+    }
+    return ShellHotkey_CallGameWndProc(hwnd, msg, wParam, lParam, outResult);
+}
+
+__declspec(dllexport) void ModSetImGuiContext(void* ctx) {
+    ImGui::SetCurrentContext((ImGuiContext*)ctx);
+    g_imguiBaseStyleCaptured = false;
+    g_lastAppliedImGuiScale = -1.0f;
+}
+
+__declspec(dllexport) void ModSetLogDir(const char* dir) {
+    LogWindow_SetLogDir(dir);
+}
+
+__declspec(dllexport) void ModInit(HMODULE gameModule) {
+    g_gameModule = gameModule;
+
+    // Register before the first atlas build so opening styled UI cannot trigger a rebuild.
+    if (HMODULE proxy = GetModuleHandleA("d3d9.dll")) {
+        using SetMenuGlyphText = void (*)(const char *);
+        if (auto setGlyphs = (SetMenuGlyphText)GetProcAddress(proxy, "AS2Proxy_SetMenuGlyphText"))
+            setGlyphs(Ui::Strings_JapaneseGlyphText());
+    }
+
+    LogWindow_Init();
+    timeBeginPeriod(1);
+
+    LOG_INFO("========================================");
+    LOG_INFO("Alice Senki 2 - Mod 0.7-beta6");
+    LOG_INFO("Build: %s %s", __DATE__, __TIME__);
+    LOG_INFO("========================================");
+    LOG_INFO("Game module: 0x%p", gameModule);
+    LOG_INFO("[ModInit] External log dir: %s", LogWindow_GetLogDir());
+    LogStartupEnvironment(gameModule);
+
+    HMODULE selfModule = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&ModInit, &selfModule)) {
+        LOG_INFO("Mod DLL base: 0x%p", selfModule);
+    }
+
+    LogInitStep("FilesystemPatch_Init", "BEGIN");
+    FilesystemPatch_Init(gameModule);
+    LogInitStep("FilesystemPatch_Init", "END");
+    LogInitStep("FilesystemPatch_InstallHooks", "BEGIN");
+    if (!FilesystemPatch_InstallHooks()) {
+        LOG_WARN("Filesystem hooks failed during ModInit; file overrides will be unavailable");
+    }
+    LogInitStep("FilesystemPatch_InstallHooks", "END");
+
+    LOG_INFO("Initialization deferred - will complete when game is ready...");
+
+    // Cache autoconnect config immediately at DLL load time.
+    // The test harness overwrites this file 3s later with the client config,
+    // so we must snapshot it before DeferredInit (which may run after that).
+    LogInitStep("NetMenu::CacheAutoConnectFile", "BEGIN");
+    NetMenu::CacheAutoConnectFile();
+    LogInitStep("NetMenu::CacheAutoConnectFile", "END");
+    LogWindow_Flush();
+}
+
+__declspec(dllexport) void ModShutdown() {
+    LOG_INFO("Mod shutdown...");
+
+    if (g_initialized) {
+        Replay::ReplayRuntime_Shutdown();
+        PracticeTools_Shutdown();
+        SIR_Shutdown();
+        Rollback::OnlineWiring_Shutdown();
+        Net::SyncTrace_Shutdown();
+        Rollback::RollbackComboFx_Shutdown();
+        Rollback::RollbackStatusFx_Shutdown();
+        Rollback::RollbackAudio_Shutdown();
+        Net::SessionPumpHook_Shutdown();
+        Rollback::NetplayLog_Shutdown();
+        Rollback::RollbackDebug_Shutdown();
+        Rollback::RollbackSession_Shutdown();
+        Net::DelayPolicy_Shutdown();
+        Net::SyncPolicy_Shutdown();
+            Net::MatchLifecycle_Shutdown();
+        Net::PregameSync_Shutdown();
+        NetMenu::Shutdown();
+        ModeOwnership::Remove();
+        Net::SpectatorPlayback_Shutdown();
+        Net::SpectatorClient_Shutdown();
+        Net::SpectatorRuntime_Shutdown();
+        PaletteAssetHook_Shutdown();
+        Net::NetplayPaletteRuntime_Shutdown();
+        Net::ContinueFlow_Shutdown();
+        LocalRematch::Shutdown();
+        Net::TransitionBarrier_Shutdown();
+        Net::ConnectionSupervisor_Shutdown();
+        Net::Session_Shutdown();
+        Net::GameSettingsSync_Shutdown();
+        Net::Transport_GlobalDeinit();
+        Savestate_Shutdown();
+        DetVer_Shutdown();
+        FilesystemPatch_Shutdown();
+        RemoveHooks();
+        InputOverride_Shutdown();
+        InputSystem_Shutdown();
+    } else {
+        FilesystemPatch_Shutdown();
+        RemoveHooks();
+    }
+
+    timeEndPeriod(1);
+    LogWindow_Shutdown();
+}
+
+__declspec(dllexport) void ModOnGameExit(int exitCode, const char* reason) {
+    LOG_INFO("=====================================================");
+    if (exitCode == 0) {
+        LOG_INFO("[EXIT] Game exiting normally: %s", reason ? reason : "Unknown");
+    } else {
+        LOG_ERROR("[EXIT] Game CRASHED! Exit code: %d", exitCode);
+        LOG_ERROR("[EXIT] Reason: %s", reason ? reason : "Unknown");
+    }
+
+    // Tell the peer we're going away; a fast exit otherwise looks like a
+    // crash/link-death on their side. Skipped on crash paths (exitCode != 0)
+    // where process state may be unreliable.
+    if (exitCode == 0 && g_initialized) {
+        Net::Session_NotifyGameExit();
+        // Spectators need the same courtesy, or every viewer waits out ENet's
+        // timeout on a frozen frame.
+        Net::SpectatorRuntime_OnDisconnect("host closed the game");
+    }
+
+    // The fast-exit path terminates without running ModShutdown; flush every
+    // buffered log now or the tail (up to 256 KB) is lost and the capture
+    // looks like an abrupt mid-gameplay cutoff.
+    if (g_initialized) {
+        Rollback::NetplayLog_Flush();
+    }
+    LOG_INFO("=====================================================");
+    LOG_INFO("[EXIT] Cleanup complete");
+    LogWindow_Flush();
+}
+
+__declspec(dllexport) void ModOnFrame() {
+    if (!g_initialized && !g_deferredInitFailed) {
+        DeferredInit();
+    }
+    if (!g_initialized) return;
+
+    // Keep log files current so crashes/fast exits don't lose the tail.
+    LogWindow_PeriodicFlush();
+
+    // Apply content unlocks after config.dat has been loaded
+    {
+        static bool s_unlockApplied = false;
+        if (!s_unlockApplied) {
+            uint32_t version = ReadMemory<uint32_t>(ADDR_CONFIG_VERSION);
+            if (version == 258) {
+                UnlockAllContent();
+                s_unlockApplied = true;
+            }
+        }
+    }
+
+    Net::GameSettingsSync_FrameUpdate();
+
+    // Liveness verdict must be fresh before any netplay layer consumes it.
+    Net::ConnectionSupervisor_FrameUpdate();
+    Net::TransitionBarrier_FrameUpdate();
+
+    ModeOwnership::FrameUpdate();
+    NetMenu::FrameUpdate();
+
+    Net::PregameSync_FrameUpdate();
+
+    Net::MatchLifecycle_FrameUpdate();
+
+    Net::SyncPolicy_FrameUpdate();
+    Net::DelayPolicy_FrameUpdate();
+
+    // Drain queued transport events and SDL input immediately before
+    // rollback/pregame decisions so gameplay uses the newest packets and
+    // local sample. ENet servicing itself runs on the dedicated network thread.
+    Net::Session_Update();
+    Net::NetplayPaletteRuntime_FrameUpdate();
+    PaletteAssetHook_FrameUpdate();
+    Net::CharSelPaletteSelect_FrameUpdate();
+
+    // One edge update per frame, before anything reads a hotkey.
+    HotkeyConfig_Update();
+    if (HotkeyConfig_JustPressed(HOTKEY_FULLSCREEN_TOGGLE)) {
+        HMODULE proxy = GetModuleHandleA("d3d9.dll");
+        auto get = (int (*)())GetProcAddress(proxy, "AS2Proxy_GetDisplayBorderless");
+        auto set = (void (*)(int))GetProcAddress(proxy, "AS2Proxy_SetDisplayBorderless");
+        if (get && set) set(!get());
+    }
+
+    // Overlay hide is not practice-gated, so it is polled here rather than in
+    // PracticeTools_FrameUpdate. Purely local presentation: nothing it touches
+    // is simulated or sent, so it cannot desync a session.
+    //
+    // Skipped while a menu owns input. The default key is Backspace, which is
+    // also P1 SELECT, and SELECT is "back" in the netplay menu and the pause
+    // menu — backing out of a screen would otherwise silently flip the HUD off
+    // with nothing on screen to show it happened.
+    if (HotkeyConfig_JustPressed(HOTKEY_OVERLAY_TOGGLE) &&
+        !NetMenu::ConsumesGameInput() &&
+        !PauseMenu_IsActive() &&
+        !ModMenu_IsOpen()) {
+        NetplayHud_ToggleHidden();
+        // One key, both overlays: driven from the netplay flag so the two
+        // cannot end up disagreeing.
+        Replay::ReplayRuntime_SetHudVisible(!NetplayHud_IsHidden());
+    }
+
+    // Offline continue-screen rematch. Self-gated to a local versus match with
+    // no session, so it is inert during netplay and everywhere else.
+    LocalRematch::FrameUpdate();
+
+    Savestate_ProcessHotkeys();
+
+    PracticeTools_FrameUpdate();
+
+    // Injects input overrides before SDL update.
+    SIR_OnFrame();
+
+    // Session exit gesture + pause block: every frame, EVERY mode (gameplay,
+    // character select, loading), because a local pause stalls the peer
+    // wherever it happens. Self-gating on Session_IsConnected().
+    Net::SessionExit_FrameUpdate();
+
+    Net::SpectatorRuntime_FrameUpdate();
+    Net::SpectatorClient_FrameUpdate();
+    Net::SpectatorPlayback_FrameUpdate();
+
+    // Poll SDL after local override producers have staged their desired input.
+    InputSystem_Update();
+    Replay::ReplayRuntime_FrameUpdate();
+
+    Rollback::OnlineWiring_FrameUpdate();
+
+    if (Rollback::RollbackSession_IsActive()) {
+        Rollback::RollbackDebug_FrameUpdate();
+    }
+    Net::SyncTrace_FrameUpdate();
+
+    static uint16_t prevSdlP1 = 0;
+    static uint16_t prevSdlP2 = 0;
+
+    uint16_t sdlP1 = InputSystem_GetInput(0);
+    uint16_t sdlP2 = InputSystem_GetInput(1);
+
+    if (sdlP1 != prevSdlP1) {
+        if (g_config.verboseLogging) {
+            LOG_INFO("[INPUT] SDL P1: 0x%04X -> 0x%04X (U%d D%d L%d R%d A%d B%d C%d D%d St%d Se%d)",
+                prevSdlP1, sdlP1,
+                (sdlP1 & INPUT_UP) ? 1 : 0, (sdlP1 & INPUT_DOWN) ? 1 : 0,
+                (sdlP1 & INPUT_LEFT) ? 1 : 0, (sdlP1 & INPUT_RIGHT) ? 1 : 0,
+                (sdlP1 & INPUT_A) ? 1 : 0, (sdlP1 & INPUT_B) ? 1 : 0,
+                (sdlP1 & INPUT_C) ? 1 : 0, (sdlP1 & INPUT_D) ? 1 : 0,
+                (sdlP1 & INPUT_START) ? 1 : 0, (sdlP1 & INPUT_SELECT) ? 1 : 0);
+        }
+        prevSdlP1 = sdlP1;
+    }
+
+    if (sdlP2 != prevSdlP2) {
+        if (g_config.verboseLogging) {
+            LOG_INFO("[INPUT] SDL P2: 0x%04X -> 0x%04X", prevSdlP2, sdlP2);
+        }
+        prevSdlP2 = sdlP2;
+    }
+
+    static int prevGameMode = -1;
+    static int prevSubState = -1;
+    int curGameMode = GetGameMode();
+    int curSubState = GetSubstate();
+
+    if (curGameMode != prevGameMode) {
+        if (g_config.verboseLogging) {
+            LOG_INFO("[STATE] Game Mode changed: %d -> %d", prevGameMode, curGameMode);
+        }
+        prevGameMode = curGameMode;
+    }
+    if (curSubState != prevSubState) {
+        if (g_config.verboseLogging) {
+            LOG_INFO("[STATE] Sub-State changed: %d -> %d", prevSubState, curSubState);
+        }
+        prevSubState = curSubState;
+    }
+
+    static int frameCount = 0;
+    frameCount++;
+    if (frameCount % 300 == 0 && g_config.verboseLogging) {
+        LOG_DEBUG("[STATUS] Hooks: KB=%d(%d inj) Joy=%d(%d inj) | SDL P1=0x%04X P2=0x%04X",
+            g_inputDebug.keyboardHookCalls, g_inputDebug.keyboardInjectedCount,
+            g_inputDebug.joystickHookCalls, g_inputDebug.joystickInjectedCount,
+            sdlP1, sdlP2);
+    }
+
+    // Determinism verification.
+    {
+        static bool s_detverFrameOpen = false;
+        static int  s_detverPrevFrame = -1;
+        int simFrame = (int)AS2_GetFrameNumber();
+
+        if (DetVer_IsEnabled() && AS2_IsInGameplay()) {
+            if (s_detverFrameOpen) {
+                DetVer_EndFrame(s_detverPrevFrame);
+            }
+            DetVer_BeginFrame(simFrame);
+            s_detverFrameOpen = true;
+            s_detverPrevFrame = simFrame;
+        } else if (s_detverFrameOpen) {
+            DetVer_EndFrame(s_detverPrevFrame);
+            s_detverFrameOpen = false;
+        }
+    }
+
+}
+
+__declspec(dllexport) void ModOnPresent(void* pDevice) {
+    if (!g_initialized) return;
+    ApplySharedImGuiScale();
+    if (!Rollback::RollbackSession_IsActive()) {
+        HitboxViewer_Render();
+    }
+    NetplayHud_Render();
+    PracticeTools_RenderHUD();
+    Replay::ReplayRuntime_RenderHUD();
+    ModMenu_Render();
+}
+
+__declspec(dllexport) bool ModWantsExclusiveOverlay() {
+    return false;
+}
+
+__declspec(dllexport) void ModToggleMenu() {
+    ModMenu_Toggle();
+}
+
+__declspec(dllexport) bool ModIsMenuRequestedOpen() {
+    return ModMenu_IsRequestedOpen();
+}
+
+__declspec(dllexport) bool ModShouldRenderImGui() {
+    return HasVisibleImGuiOverlay();
+}
+
+__declspec(dllexport) bool ModGetNetplayHudText(char* out, int cap) {
+    (void)out; (void)cap;
+    return false;
+}
+
+__declspec(dllexport) bool ModGetMatchHudData(MatchHudData* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!g_initialized) return false;
+
+    Net::SpectatorPlaybackSnapshot spectatorPlayback{};
+    Net::SpectatorPlayback_GetSnapshot(&spectatorPlayback);
+    Net::SpectatorClientSnapshot spectatorClient{};
+    Net::SpectatorClient_GetSnapshot(&spectatorClient);
+    if (spectatorPlayback.gameplay_owned &&
+        spectatorClient.active &&
+        spectatorClient.match_id != 0 &&
+        GetGameMode() != MODE_MENU) {
+        out->active = true;
+        out->is_host = false;
+        out->spectator_mode = true;
+        out->show_connection_stats = false;
+        strncpy_s(out->p1_name, sizeof(out->p1_name),
+            spectatorClient.p1_name[0] ? spectatorClient.p1_name : "P1",
+            _TRUNCATE);
+        strncpy_s(out->p2_name, sizeof(out->p2_name),
+            spectatorClient.p2_name[0] ? spectatorClient.p2_name : "P2",
+            _TRUNCATE);
+        out->p1_wins = spectatorClient.p1_wins;
+        out->p2_wins = spectatorClient.p2_wins;
+        NetplayHudStyle::Settings defaultStyle{};
+        NetplayHudStyle::SetDefaults(&defaultStyle);
+        out->p1_trail_r = defaultStyle.trail_r;
+        out->p1_trail_g = defaultStyle.trail_g;
+        out->p1_trail_b = defaultStyle.trail_b;
+        out->p1_text_r = defaultStyle.text_r;
+        out->p1_text_g = defaultStyle.text_g;
+        out->p1_text_b = defaultStyle.text_b;
+        out->p2_trail_r = 120;
+        out->p2_trail_g = 20;
+        out->p2_trail_b = 30;
+        out->p2_text_r = defaultStyle.text_r;
+        out->p2_text_g = defaultStyle.text_g;
+        out->p2_text_b = defaultStyle.text_b;
+        out->p1_score_r = defaultStyle.score_r;
+        out->p1_score_g = defaultStyle.score_g;
+        out->p1_score_b = defaultStyle.score_b;
+        out->p2_score_r = defaultStyle.score_r;
+        out->p2_score_g = defaultStyle.score_g;
+        out->p2_score_b = defaultStyle.score_b;
+        out->p1_trail_length_px = defaultStyle.trail_length_px;
+        out->p2_trail_length_px = defaultStyle.trail_length_px;
+        out->p1_vertical_position = defaultStyle.vertical_position;
+        out->p2_vertical_position = defaultStyle.vertical_position;
+        out->p1_font_size = defaultStyle.font_size;
+        out->p2_font_size = defaultStyle.font_size;
+        out->ping_ms = -1.0f;
+        out->delay_frames = 0;
+        out->rollback_frames = 0;
+        out->rollback_depth_now = 0;
+        out->local_frame = spectatorPlayback.local_playback_rb_frame;
+        out->remote_frame = spectatorPlayback.confirmed_edge_rb_frame;
+
+        const char* statusText = "SPECTATING";
+        switch (spectatorPlayback.state) {
+            case Net::SpectatorPlaybackState::Buffering:
+                statusText = "SPECTATING / BUFFERING";
+                break;
+            case Net::SpectatorPlaybackState::CatchingUp:
+                statusText = "SPECTATING / CATCHING UP";
+                break;
+            case Net::SpectatorPlaybackState::Live:
+                statusText = "SPECTATING / LIVE";
+                break;
+            case Net::SpectatorPlaybackState::ReadyToBootstrap:
+            case Net::SpectatorPlaybackState::BootstrappingFrontend:
+            case Net::SpectatorPlaybackState::WaitingInteractiveStart:
+                statusText = "SPECTATING / STARTING";
+                break;
+            case Net::SpectatorPlaybackState::EndOfMatch:
+            case Net::SpectatorPlaybackState::WaitingNextMatch:
+                statusText = "SPECTATING / PAUSED - WAITING FOR NEXT MATCH";
+                break;
+            case Net::SpectatorPlaybackState::PlaybackError:
+                statusText = "SPECTATING / ERROR";
+                break;
+            default:
+                break;
+        }
+
+        if (spectatorPlayback.state == Net::SpectatorPlaybackState::CatchingUp &&
+            spectatorPlayback.tick_scale_target > 1.0f) {
+            _snprintf_s(out->status_text,
+                sizeof(out->status_text),
+                _TRUNCATE,
+                "%s %.2fx",
+                statusText,
+                spectatorPlayback.tick_scale_target);
+        } else if (spectatorPlayback.manual_catchup_scale > 0.0f) {
+            _snprintf_s(out->status_text,
+                sizeof(out->status_text),
+                _TRUNCATE,
+                "%s max %.2fx",
+                statusText,
+                spectatorPlayback.manual_catchup_scale);
+        } else {
+            strncpy_s(out->status_text, sizeof(out->status_text), statusText, _TRUNCATE);
+        }
+        return true;
+    }
+
+    Net::SessionSnapshot sessionSnap{};
+    Net::Session_GetSnapshot(&sessionSnap);
+    if (!sessionSnap.active || sessionSnap.state < Net::SessionState::Connected)
+        return false;
+
+    // Show HUD during match, charsel, winscreen modes — any online phase
+    Net::MatchLifecycleSnapshot lifeSnap{};
+    Net::MatchLifecycle_GetSnapshot(&lifeSnap);
+
+    bool inMatch = lifeSnap.active && lifeSnap.match_owned;
+    bool rollbackActive = Rollback::RollbackSession_IsActive();
+    // Also show HUD during charsel/stagesel lockstep (pregame active but no
+    // match lifecycle or rollback yet). This covers initial charsel and rematch
+    // charsel where MatchLifecycle is Inactive and rollback hasn't started.
+    bool pregameActive = Net::PregameSync_IsActive();
+
+    if (!inMatch && !rollbackActive && !pregameActive) return false;
+
+    out->active = true;
+    out->is_host = (Net::Session_GetRole() == Net::SessionRole::Host);
+    out->spectator_mode = false;
+    out->show_connection_stats = true;
+    out->status_text[0] = '\0';
+
+    // Continue prompt: one status line sourced only from continue_flow state
+    // (single source of truth for both players' choice status).
+    if (Net::ContinueFlow_IsPromptActive()) {
+        const auto choiceLabel = [](Net::ContinueChoiceState st) -> const char* {
+            switch (st) {
+                case Net::ContinueChoiceState::LockedYes: return "YES";
+                case Net::ContinueChoiceState::LockedNo:  return "NO";
+                default:                                  return "DECIDING";
+            }
+        };
+        _snprintf_s(out->status_text, sizeof(out->status_text), _TRUNCATE,
+            "REMATCH?  You: %s   Opponent: %s",
+            choiceLabel(Net::ContinueFlow_GetLocalChoiceState()),
+            choiceLabel(Net::ContinueFlow_GetRemoteChoiceState()));
+        out->show_connection_stats = false;
+    }
+
+    // Names: P1 = game P1, P2 = game P2
+    NetMenu::MenuSnapshot menuSnap{};
+    NetMenu::GetSnapshot(&menuSnap);
+
+    const char* localNick = menuSnap.local_nickname[0] ? menuSnap.local_nickname : "Local";
+    const char* remoteNick = sessionSnap.remote_peer.nickname[0] ? sessionSnap.remote_peer.nickname : "Remote";
+
+    int localSlot = Net::PlayerMapping_GetLocalGameSlot();
+    // Before bootstrap assigns the player slot (initial charsel, rematch charsel
+    // before bootstrap), fall back to session role: host=P1, client=P2.
+    if (localSlot != 0 && localSlot != 1) {
+        localSlot = (Net::Session_GetRole() == Net::SessionRole::Host) ? 0 : 1;
+    }
+    if (localSlot == 0) {
+        strncpy_s(out->p1_name, sizeof(out->p1_name), localNick, _TRUNCATE);
+        strncpy_s(out->p2_name, sizeof(out->p2_name), remoteNick, _TRUNCATE);
+    } else {
+        strncpy_s(out->p1_name, sizeof(out->p1_name), remoteNick, _TRUNCATE);
+        strncpy_s(out->p2_name, sizeof(out->p2_name), localNick, _TRUNCATE);
+    }
+
+    // Win counts: game-side P1/P2
+    Net::SetTracker_GetGameSideWins(&out->p1_wins, &out->p2_wins);
+
+    NetplayHudStyle::Settings remoteStyle{};
+    if (sessionSnap.remote_peer.hud_style_valid) {
+        NetplayHudStyle::WireStyle wire{};
+        wire.trail_r = sessionSnap.remote_peer.hud_trail_r;
+        wire.trail_g = sessionSnap.remote_peer.hud_trail_g;
+        wire.trail_b = sessionSnap.remote_peer.hud_trail_b;
+        wire.text_r = sessionSnap.remote_peer.hud_text_r;
+        wire.text_g = sessionSnap.remote_peer.hud_text_g;
+        wire.text_b = sessionSnap.remote_peer.hud_text_b;
+        wire.trail_length = sessionSnap.remote_peer.hud_trail_length;
+        wire.score_r = sessionSnap.remote_peer.hud_score_r;
+        wire.score_g = sessionSnap.remote_peer.hud_score_g;
+        wire.score_b = sessionSnap.remote_peer.hud_score_b;
+        wire.font_size = sessionSnap.remote_peer.hud_font_size;
+        NetplayHudStyle::UnpackWire(&wire, &remoteStyle);
+    } else {
+        NetplayHudStyle::SetDefaults(&remoteStyle);
+    }
+
+    NetplayHudStyle::ResolvedSideStyle p1Style{};
+    NetplayHudStyle::ResolvedSideStyle p2Style{};
+    NetplayHudStyle::ResolveSideStyles(localSlot,
+                                       sessionSnap.remote_peer.hud_style_valid,
+                                       &remoteStyle,
+                                       &p1Style,
+                                       &p2Style);
+    out->p1_trail_r = p1Style.trail_r;
+    out->p1_trail_g = p1Style.trail_g;
+    out->p1_trail_b = p1Style.trail_b;
+    out->p1_text_r = p1Style.text_r;
+    out->p1_text_g = p1Style.text_g;
+    out->p1_text_b = p1Style.text_b;
+    out->p1_score_r = p1Style.score_r;
+    out->p1_score_g = p1Style.score_g;
+    out->p1_score_b = p1Style.score_b;
+    out->p1_trail_length_px = p1Style.trail_length_px;
+    out->p1_font_size = p1Style.font_size;
+    out->p2_trail_r = p2Style.trail_r;
+    out->p2_trail_g = p2Style.trail_g;
+    out->p2_trail_b = p2Style.trail_b;
+    out->p2_text_r = p2Style.text_r;
+    out->p2_text_g = p2Style.text_g;
+    out->p2_text_b = p2Style.text_b;
+    out->p2_score_r = p2Style.score_r;
+    out->p2_score_g = p2Style.score_g;
+    out->p2_score_b = p2Style.score_b;
+    out->p2_trail_length_px = p2Style.trail_length_px;
+    out->p2_font_size = p2Style.font_size;
+
+    NetplayHudStyle::Settings localHud{};
+    NetplayHudStyle::GetLocal(&localHud);
+    out->p1_vertical_position = localHud.vertical_position;
+    out->p2_vertical_position = localHud.vertical_position;
+
+    // Ping: show the SAME latency the netcode reacts to - the delay policy's
+    // TimeProbe measurement (it sets delay and prediction depth). ENet's
+    // estimate is only the fallback before TimeProbe has enough samples.
+    {
+        Net::DelayPolicySnapshot pingSnap{};
+        Net::DelayPolicy_GetSnapshot(&pingSnap);
+        out->ping_ms = pingSnap.measurement_valid
+                           ? pingSnap.measured_avg_ping_ms
+                           : sessionSnap.stats.rtt_ms;
+    }
+
+    // Delay and rollback: from rollback session if active
+    if (rollbackActive) {
+        Rollback::RollbackSessionSnapshot rbSnap{};
+        Rollback::RollbackSession_GetSnapshot(&rbSnap);
+        out->delay_frames = Net::DelayPolicy_GetActiveDelay();
+        out->rollback_frames = rbSnap.rollback_budget;
+        out->rollback_depth_now = rbSnap.last_rollback_replay_length;
+        out->local_frame = rbSnap.rb_frame_current;
+        out->remote_frame = rbSnap.rb_frame_last_remote_received;
+    } else {
+        out->delay_frames = Net::DelayPolicy_GetActiveDelay();
+        out->rollback_frames = 0;
+        out->rollback_depth_now = 0;
+        out->local_frame = 0;
+        out->remote_frame = 0;
+    }
+
+    return true;
+}
+
+__declspec(dllexport) uint32_t GetCurrentFrame() {
+    return AS2_GetFrameNumber();
+}
+
+__declspec(dllexport) uint16_t GetPlayerHP(int player) {
+    return player == 0 ? GetP1HP() : GetP2HP();
+}
+
+__declspec(dllexport) bool* GetForceBorderlessPtr() {
+    return &g_forceBorderlessFullscreen;
+}
+
+} // extern "C"

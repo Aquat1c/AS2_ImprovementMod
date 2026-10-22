@@ -1,0 +1,2 @@
+# Shell scripts ship to Linux users; never convert their line endings.
+*.sh text eol=lf

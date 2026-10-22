@@ -1,0 +1,80 @@
+/**
+ * Inbound link emulator (test instrumentation)
+ *
+ * Applies a configurable one-way latency, jitter and loss to EVERY inbound
+ * transport event, inside the transport2 worker, before the game thread ever
+ * sees it. Every packet class goes through it — session handshake, pregame,
+ * charsel/stage/winscreen frontend lockstep, gameplay InputStream, SyncHash,
+ * TimeProbe.
+ *
+ * Both peers emulate their own INBOUND direction, so configuring N ms on each
+ * side yields a round trip of ~2N.
+ *
+ * ORDERING: release times are monotonic per queue — jitter only ever adds
+ * delay, it never reorders (a reliable channel must never be handed a
+ * reordered sequence).
+ *
+ * LOSS: only unreliable packets may be dropped — ENet has already
+ * acknowledged a reliable packet to the sender by the time we see it, so
+ * dropping it here is permanent (no retransmit will ever come).
+ */
+
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+
+namespace Net {
+
+struct LinkEmulatorConfig {
+    // Not a link property. Starting value forced into the game's image-handle
+    // serial (dword_91EA74) so a same-machine pair can reproduce a divergent
+    // allocation history. 0 = off.
+    uint32_t handle_serial_skew;
+
+    uint32_t one_way_latency_ms = 0;  // 0 disables the emulator entirely
+    uint32_t jitter_ms = 0;           // uniform [0, jitter_ms], added only
+    uint32_t loss_percent = 0;        // unreliable packets only
+    uint32_t seed = 0x9E3779B9u;
+};
+
+/// Read `as2_stress.cfg` (same resolution as StressHooks: exe dir, then this
+/// DLL's dir, then CWD) and apply link_latency_ms / link_jitter_ms /
+/// link_loss_pct. Safe to call more than once; logs what it armed, and what
+/// it searched when it finds nothing.
+void LinkEmulator_LoadConfig();
+
+/// Apply handle_serial_skew (no-op when 0). Call once, before a match loads.
+void LinkEmulator_ApplyHandleSerialSkew();
+
+void LinkEmulator_Configure(const LinkEmulatorConfig& cfg);
+void LinkEmulator_GetConfig(LinkEmulatorConfig* out);
+
+/// True when a nonzero one-way latency (or loss) is armed. Callers use this to
+/// skip the queue entirely in production.
+bool LinkEmulator_IsActive();
+
+/// Hand an inbound event to the emulator. Returns false if the packet was
+/// dropped (loss); otherwise it is queued for release at `now + latency`.
+/// `reliable` suppresses loss. `now_ms` is the caller's clock (GetTickCount).
+bool LinkEmulator_Submit(const void* event, size_t event_size,
+                         bool reliable, uint32_t now_ms);
+
+/// Pop the next event whose release time has arrived. Returns false when
+/// nothing is due. Call in a loop each worker iteration.
+bool LinkEmulator_PopDue(void* out_event, size_t event_size, uint32_t now_ms);
+
+/// Drop everything queued (session teardown / reset).
+void LinkEmulator_Reset();
+
+struct LinkEmulatorStats {
+    uint32_t queued;          // currently held
+    uint32_t total_delayed;
+    uint32_t total_dropped;
+    uint32_t total_released;
+    uint32_t overflow_forced; // released early because the queue was full
+    uint32_t peak_queued;
+};
+void LinkEmulator_GetStats(LinkEmulatorStats* out);
+
+} // namespace Net

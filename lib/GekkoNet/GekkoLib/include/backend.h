@@ -1,0 +1,261 @@
+#pragma once
+
+#include "gekkonet.h"
+
+#include "gekko_types.h"
+
+#include "compression.h"
+#include "net.h"
+#include "event.h"
+
+#include <memory>
+#include <list>
+#include <vector>
+#include <queue>
+#include <chrono>
+#include <map>
+#include <climits>
+
+namespace Gekko {
+
+    enum PlayerStatus {
+        Initiating,
+        Connected,
+        Disconnected,
+    };
+
+	struct InputCache {
+		Frame last_acked_frame = -1;
+		Frame last_input_frame = -1;
+		std::vector<InputMsg> packets;
+
+		bool IsValid(Frame current_ack, Frame current_last_input) const;
+	};
+
+	struct AdvantageHistory {
+	public:
+		void Init();
+
+		void Update(Frame frame);
+
+		f32 GetAverageAdvantage();
+
+		void SetLocalAdvantage(i8 adv);
+
+		void SetRemoteAdvantage(i8 adv);
+
+	private:
+		static const i32 HISTORY_SIZE = 26;
+
+        i8 _local_frame_adv;
+
+        i8 _remote_frame_adv;
+
+		i8 _local[HISTORY_SIZE];
+
+		i8 _remote[HISTORY_SIZE];
+
+        bool _written[HISTORY_SIZE];
+
+        i32 _written_count;
+	};
+
+	class Player
+	{
+	public:
+		Player(Handle phandle, GekkoPlayerType type, NetAddress* addr, u32 magic = 0);
+
+        GekkoPlayerType GetType();
+
+		PlayerStatus GetStatus();
+
+		void SetStatus(PlayerStatus type);
+
+        void SetChecksum(Frame frame, u32 checksum);
+
+	public:
+		Handle handle;
+
+		u8 sync_num;
+
+		u16 session_magic;
+
+		// AS2 patch: parallel liveness flag. True while inbound silence has
+		// exceeded the interrupt timeout but not yet the disconnect timeout.
+		// Status stays Connected so address/magic/sync state and resends
+		// survive the interruption; cleared on the first packet received.
+		bool interrupted = false;
+
+		NetStats stats;
+
+		NetAddress address;
+
+        std::map<Frame, u32> session_health;
+
+		InputCache input_cache;
+
+		u64 last_input_send_time = 0;
+
+		AdvantageHistory adv_history;
+
+	private:
+        GekkoPlayerType _type;
+
+		PlayerStatus _status;
+	};
+
+    struct NetoutAggregate {
+        u64 window_start_ms = 0;
+        u32 packets_sent = 0;
+        u32 cache_hit_resends = 0;
+        u32 cache_miss_rebuilds = 0;
+        u32 input_frames = 0;
+        Frame first_frame = INT_MAX;
+        Frame last_frame = -1;
+        Frame peer_last_ack = -1;
+        u32 queue_size = 0;
+    };
+
+    struct NetinAggregate {
+        u64 window_start_ms = 0;
+        u32 packets_received = 0;
+        u32 input_slots = 0;
+        u32 accepted_inputs = 0;
+        u32 duplicate_inputs = 0;
+        u32 gap_inputs = 0;
+        u32 gap_before_frames = 0;
+        u32 gap_after_frames = 0;
+        Frame first_frame = INT_MAX;
+        Frame last_frame = -1;
+        Frame local_last_added = -1;
+        u32 queue_size = 0;
+    };
+
+	class MessageSystem {
+	public:
+		MessageSystem();
+
+        // AS2 patch: timeouts are configurable per session (0 = defaults:
+        // NetStats::DISCONNECT_TIMEOUT / NetStats::INTERRUPT_TIMEOUT).
+        void Init(u8 num_players, u32 input_size,
+                  u64 disconnect_timeout_ms = 0, u64 interrupt_timeout_ms = 0);
+
+		void AddInput(Frame input_frame, Handle player, u8 input[], bool remote = false);
+
+		void AddSpectatorInput(Frame input_frame, u8 input[]);
+
+		void SendPendingOutput(GekkoNetAdapter* host);
+
+		void HandleData(GekkoNetAdapter* host, GekkoNetResult** data, u32 length);
+
+		void SendInputAck(Handle player, Frame frame, i8 local_advantage);
+
+		Frame GetLastAddedInput(bool spectator = false);
+
+		bool CheckStatusActors();
+
+        void SendSessionHealth(Frame frame, u32 checksum);
+
+        void SendNetworkHealth();
+
+        Frame GetLastAddedInputFrom(Handle player);
+
+        std::deque<std::unique_ptr<u8[]>>& GetNetPlayerQueue(Handle player);
+
+	public:
+		std::vector<std::unique_ptr<Player>> locals;
+
+		std::vector<std::unique_ptr<Player>> remotes;
+
+		std::vector<std::unique_ptr<Player>> spectators;
+
+		SessionEventSystem session_events;
+
+        std::map<Frame, u32> local_health;
+
+        struct NetInputQueue {
+            Frame last_added_input = -1;
+            std::deque<std::unique_ptr<u8[]>> inputs;
+
+            NetInputQueue(const NetInputQueue&) = delete;
+            NetInputQueue& operator=(const NetInputQueue&) = delete;
+
+            NetInputQueue(NetInputQueue&&) = default;
+            NetInputQueue& operator=(NetInputQueue&&) = default;
+
+            NetInputQueue() = default;
+
+            void TrimToAck(Frame min_ack, u32 max_size);
+        };
+
+	private:
+		void SendSyncRequest(NetAddress* addr);
+
+		void SendSyncResponse(NetAddress* addr, u16 magic);
+
+		void SendInputsToPeer(Player* peer, GekkoNetAdapter* host, bool spectator);
+
+		std::vector<Handle> GetRemoteHandlesForAddress(NetAddress* addr);
+
+		Player* GetPlayerByHandle(Handle handle);
+
+		Frame GetMinLastAckedFrame(bool spectator = false);
+
+		void HandleTooFarBehindActors(bool spectator = false);
+
+		u64 TimeSinceEpoch();
+
+        void SendDataToAll(NetData* pkt, GekkoNetAdapter* host, bool spectators_only = false);
+
+        void SendDataTo(NetData* pkt, GekkoNetAdapter* host);
+
+        void ParsePacket(NetAddress& addr, NetPacket& pkt, u32 packet_size);
+
+        void OnSyncRequest(NetAddress& addr, NetPacket& pkt);
+
+        void OnSyncResponse(NetAddress& addr, NetPacket& pkt);
+
+        void OnInputs(NetAddress& addr, NetPacket& pkt);
+
+        void OnInputAck(NetAddress& addr, NetPacket& pkt);
+
+        void OnSessionHealth(NetAddress& addr, NetPacket& pkt);
+
+        void OnNetworkHealth(NetAddress& addr, NetPacket& pkt);
+
+	private:
+		// AS2 patch: raised 128 -> 1800 (30s at 60fps). This caps a
+		// std::deque of per-frame heap inputs (input_size bytes each), not a
+		// fixed array, so worst case is ~1800 * (ptr + small alloc) per queue
+		// — well under 100 KB. It bounds the unacked resend window; 128
+		// (~2.1s) silently dropped unacked inputs during interruptions longer
+		// than ~2s, permanently corrupting the stream on resume.
+		const u32 MAX_INPUT_QUEUE_SIZE = 1800;
+	    const u32 NUM_TO_SYNC = 4;
+
+		u32 _input_size;
+
+		u16 _session_magic;
+
+        u8  _num_players;
+
+        // AS2 patch: effective liveness timeouts for this session (ms).
+        u64 _disconnect_timeout = NetStats::DISCONNECT_TIMEOUT;
+        u64 _interrupt_timeout = NetStats::INTERRUPT_TIMEOUT;
+
+        // input queue for each player for either sending or receiving
+        std::vector<NetInputQueue> _net_player_queue;
+
+        // input queue for spectator inputs
+        NetInputQueue _net_spectator_queue;
+
+		std::queue<std::unique_ptr<NetData>> _pending_output;
+
+        std::vector<u8> _bin_buffer;
+
+        u64 _last_sent_network_check;
+
+        std::map<Handle, NetoutAggregate> _netout_aggregate_by_peer;
+        std::map<Handle, NetinAggregate> _netin_aggregate_by_peer;
+	};
+}

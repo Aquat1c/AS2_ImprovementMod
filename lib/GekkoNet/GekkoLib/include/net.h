@@ -1,0 +1,175 @@
+#pragma once
+
+#include "gekkonet.h"
+#include "gekko_types.h"
+
+#include <memory>
+#include <vector>
+#include <chrono>
+
+#include "zpp/serializer.h"
+
+namespace Gekko {
+    struct NetAddress {
+        NetAddress();
+        NetAddress(void* data, u32 size);
+
+        u8* GetAddress();
+        u32 GetSize();
+
+        void Copy(NetAddress* other);
+        bool Equals(NetAddress& other);
+
+    private:
+        std::unique_ptr<u8[]> _data;
+        u32 _size;
+    };
+
+    enum PacketType : u8 {
+        Inputs = 1,
+        SpectatorInputs,
+        InputAck,
+        SyncRequest,
+        SyncResponse,
+        SessionHealth,
+        NetworkHealth
+    };
+
+    struct MsgHeader {
+        PacketType type;
+        u16 magic;
+
+        template <typename Archive, typename Self>
+        static void serialize(Archive& a, Self& s) {
+            a(s.type, s.magic);
+        }
+    };
+
+    struct MsgBody : public zpp::serializer::polymorphic {
+    };
+
+    struct InputMsg : MsgBody {
+        Frame start_frame;
+        u16 input_count;
+        u16 total_size;
+        bool compressed;
+
+        std::vector<u8> inputs;
+
+        void Copy(const InputMsg* other) {
+            start_frame = other->start_frame;
+            input_count = other->input_count;
+            total_size = other->total_size;
+            compressed = other->compressed;
+
+            inputs.clear();
+            inputs.insert(inputs.begin(), other->inputs.begin(), other->inputs.end());
+        }
+
+        template <typename Archive, typename Self>
+        static void serialize(Archive& a, Self& s) {
+            a(s.start_frame, s.input_count, s.total_size, s.compressed, s.inputs);
+        }
+    };
+
+    struct InputAckMsg : MsgBody {
+        Frame ack_frame;
+        i8 frame_advantage;
+
+        template <typename Archive, typename Self>
+        static void serialize(Archive& a, Self& s) {
+            a(s.ack_frame, s.frame_advantage);
+        }
+    };
+
+    struct SyncMsg : MsgBody {
+        u16 rng_data;
+
+        template <typename Archive, typename Self>
+        static void serialize(Archive& a, Self& s) {
+            a(s.rng_data);
+        }
+    };
+
+    struct SessionHealthMsg : MsgBody {
+        Frame frame;
+        u32 checksum;
+
+        template <typename Archive, typename Self>
+        static void serialize(Archive& a, Self& s) {
+            a(s.frame, s.checksum);
+        }
+    };
+
+    struct NetworkHealthMsg : MsgBody {
+        u64 send_time;
+        bool received;
+
+        template <typename Archive, typename Self>
+        static void serialize(Archive& a, Self& s) {
+            a(s.send_time, s.received);
+        }
+    };
+
+    struct NetPacket {
+        MsgHeader header;
+        std::unique_ptr<MsgBody> body;
+    };
+
+    struct NetData {
+        NetAddress addr;
+        NetPacket pkt;
+    };
+
+    struct NetStats {
+        // AS2 patch: DISCONNECT_TIMEOUT is now only the DEFAULT; the effective
+        // timeout is instance-configurable (see disconnect_timeout below and
+        // MessageSystem::Init). INTERRUPT_TIMEOUT is the default silence
+        // threshold for the new Interrupted (freeze & keep resending) state.
+        static const u64 DISCONNECT_TIMEOUT = 5000;
+        static const u64 INTERRUPT_TIMEOUT = 3000;
+        static const u64 SYNC_MSG_DELAY = 200;
+        static const u64 NET_CHECK_DELAY = 500;
+        static const u64 INPUT_RETRY_INTERVAL = 50;
+        static const u32 RTT_HISTORY_SIZE = 32;
+
+        // AS2 patch: instance-configurable liveness timeouts (ms).
+        u64 disconnect_timeout = DISCONNECT_TIMEOUT;
+        u64 interrupt_timeout = INTERRUPT_TIMEOUT;
+
+        Frame last_acked_frame = -1;
+        u64 last_sent_sync_message = 0;
+        u64 last_received_message = 0;
+        u64 last_received_frame = 0;
+
+        float kb_sent_per_sec = 0;
+        float kb_received_per_sec = 0;
+        u32 bytes_sent_accum = 0;
+        u32 bytes_received_accum = 0;
+        u64 last_bandwidth_update = 0;
+
+        std::vector<u16> rtt;
+        float packet_loss_ewma = 0.0f;
+        int loss_burst_current = 0;
+        int loss_burst_max = 0;
+
+        void AddRTT(u16 rtt_ms);
+        void RecordInputDelivery(u32 input_slots,
+                                 u32 accepted_inputs,
+                                 u32 duplicate_inputs,
+                                 u32 gap_inputs,
+                                 u32 gap_before_frames,
+                                 u32 gap_after_frames);
+        void UpdateBandwidth();
+        float CalculateJitter();
+        float CalculateRTTPercentile(float p);
+        float CalculateJitterPercentile(float p);
+        float CalculateAvgRTT();
+        u32 LastRTT();
+    };
+
+    struct NetInputData {
+        std::vector<Handle> handles;
+        InputMsg input;
+    };
+}
